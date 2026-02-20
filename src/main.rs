@@ -1,4 +1,6 @@
 mod ast;
+pub mod crypto;
+mod interpreter;
 mod lexer;
 mod parser;
 mod typeck;
@@ -12,13 +14,19 @@ use std::fs;
 fn main() {
     let args: Vec<String> = env::args().collect();
 
-    if args.len() < 3 {
-        eprintln!("Usage: vortex <command> <file.vx>");
-        eprintln!("Commands: check, parse, lex");
+    if args.len() < 2 {
+        eprintln!("Usage: vortex <command> [file.vx]");
+        eprintln!("Commands: run, check, parse, lex");
         std::process::exit(1);
     }
 
     let command = &args[1];
+
+    if args.len() < 3 {
+        eprintln!("Usage: vortex {} <file.vx>", command);
+        std::process::exit(1);
+    }
+
     let filename = &args[2];
 
     let source = match fs::read_to_string(filename) {
@@ -79,9 +87,29 @@ fn main() {
                 }
             }
         }
+        "run" => {
+            let tokens = lexer::lex(&source);
+            match parser::parse(tokens, file_id) {
+                Ok(program) => {
+                    match interpreter::interpret(&program) {
+                        Ok(_output) => {}
+                        Err(e) => {
+                            eprintln!("Runtime error: {}", e);
+                            std::process::exit(1);
+                        }
+                    }
+                }
+                Err(diagnostics) => {
+                    for diag in &diagnostics {
+                        term::emit(&mut writer.lock(), &config, &files, diag).unwrap();
+                    }
+                    std::process::exit(1);
+                }
+            }
+        }
         _ => {
             eprintln!("Unknown command: {}", command);
-            eprintln!("Commands: check, parse, lex");
+            eprintln!("Commands: run, check, parse, lex");
             std::process::exit(1);
         }
     }

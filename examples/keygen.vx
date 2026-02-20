@@ -1,0 +1,50 @@
+// secp256k1 Key Generation in Vortex
+// Generates a public key from a private key using elliptic curve scalar multiplication
+//
+// This demonstrates: private_key * G = public_key
+// where G is the secp256k1 generator point (used in Bitcoin/Ethereum)
+
+fn main() {
+    println("=== Vortex secp256k1 Key Generation ===")
+    println("")
+
+    // Private key (256-bit secret scalar)
+    // In production this would be a cryptographically secure random number
+    let private_key = bigint_from_hex("1")
+
+    // Get the secp256k1 generator point G
+    let G = secp256k1_generator()
+
+    // Compute public key: P = private_key * G
+    let public_key = scalar_mul(private_key, G)
+
+    // Extract affine coordinates
+    let pub_x = point_x(public_key)
+    let pub_y = point_y(public_key)
+
+    println("Private key: 0x1 (for testing)")
+    println("")
+    println("Public key (uncompressed):")
+    print("  X: ")
+    println(to_hex(pub_x))
+    print("  Y: ")
+    println(to_hex(pub_y))
+
+    println("")
+    println("--- Now with a real-looking private key ---")
+    println("")
+
+    // A more realistic private key
+    let privkey2 = bigint_from_hex("DEADBEEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEFDEADBEEF")
+    let pubkey2 = scalar_mul(privkey2, secp256k1_generator())
+    let x2 = point_x(pubkey2)
+    let y2 = point_y(pubkey2)
+
+    println("Private key: 0xDEADBEEF0123456789ABCDEF...DEADBEEF")
+    println("")
+    println("Public key (uncompressed):")
+    print("  X: ")
+    println(to_hex(x2))
+    print("  Y: ")
+    println(to_hex(y2))
+}
