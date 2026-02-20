@@ -7,6 +7,7 @@ mod lexer;
 mod module;
 mod msm;
 mod ntt;
+mod poly;
 mod parser;
 mod pipeline;
 mod runtime;
