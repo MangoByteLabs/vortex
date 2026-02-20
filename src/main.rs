@@ -1,5 +1,6 @@
 mod ast;
 mod codegen;
+mod ctcheck;
 pub mod crypto;
 mod fields;
 mod interpreter;
