@@ -1,9 +1,12 @@
 mod ast;
 mod codegen;
 pub mod crypto;
+mod fields;
 mod interpreter;
 mod lexer;
 mod module;
+mod msm;
+mod ntt;
 mod parser;
 mod pipeline;
 mod runtime;
