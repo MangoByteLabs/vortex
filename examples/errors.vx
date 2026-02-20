@@ -1,0 +1,7 @@
+fn bad_return() -> f32 {
+    return true
+}
+
+fn bad_call() {
+    bad_return(1, 2, 3)
+}

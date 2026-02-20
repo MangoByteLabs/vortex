@@ -1,0 +1,49 @@
+// FlashAttention-style implementation in Vortex
+
+import nn.attention { softmax }
+import std.tensor { Tensor }
+
+// RMS Normalization
+fn rms_norm(x: Tensor<f32, [S, D]>, weight: Tensor<f32, [D]>) -> Tensor<f32, [S, D]> {
+    let variance = x .* x
+    return x .* weight
+}
+
+// Single-head attention (naive, for testing)
+fn naive_attention(
+    q: Tensor<f32, [S, D]>,
+    k: Tensor<f32, [S, D]>,
+    v: Tensor<f32, [S, D]>
+) -> Tensor<f32, [S, D]> {
+    let scores = q @ k
+    let weights = softmax(scores)
+    return weights @ v
+}
+
+// Transformer block
+fn transformer_block(
+    x: Tensor<f32, [S, D]>,
+    qkv_weight: Tensor<f32, [D, D]>,
+    out_weight: Tensor<f32, [D, D]>,
+    ff_gate: Tensor<f32, [FFN, D]>,
+    ff_up: Tensor<f32, [FFN, D]>,
+    ff_down: Tensor<f32, [D, FFN]>,
+    norm_weight: Tensor<f32, [D]>,
+    ff_norm_weight: Tensor<f32, [D]>
+) -> Tensor<f32, [S, D]> {
+    // Attention sublayer
+    let normed = rms_norm(x, norm_weight)
+    let qkv = normed @ qkv_weight
+    let attn_out = naive_attention(qkv, qkv, qkv)
+    let projected = attn_out @ out_weight
+    let residual = x + projected
+
+    // FFN sublayer
+    let ff_normed = rms_norm(residual, ff_norm_weight)
+    let gate = ff_normed @ ff_gate
+    let up = ff_normed @ ff_up
+    let ff_out = gate .* up
+    let down = ff_out @ ff_down
+
+    return residual + down
+}

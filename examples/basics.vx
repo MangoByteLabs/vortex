@@ -1,0 +1,42 @@
+// Basic language features demonstration
+
+import std.tensor { Tensor }
+
+const PI: f64 = 3.14159
+
+type Vec3 = Tensor<f32, [3]>
+
+struct Point {
+    x: f32,
+    y: f32,
+    z: f32,
+}
+
+trait Numeric {
+    fn zero() -> Self
+    fn one() -> Self
+    fn add(self: Self, other: Self) -> Self
+}
+
+fn add(a: f32, b: f32) -> f32 {
+    return a + b
+}
+
+fn abs(x: f32) -> f32 {
+    if x > 0.0 { x } else { -x }
+}
+
+fn sum_range() -> i64 {
+    var total = 0
+    for i in 0..100 {
+        total += i
+    }
+    return total
+}
+
+fn factorial(n: i64) -> i64 {
+    if n <= 1 {
+        return 1
+    }
+    return n * factorial(n - 1)
+}

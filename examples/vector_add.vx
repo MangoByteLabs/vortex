@@ -1,0 +1,10 @@
+// Vector addition kernel — the "hello world" of GPU programming
+kernel vector_add(a: Tensor<f32, [N]>, b: Tensor<f32, [N]>) -> Tensor<f32, [N]> {
+    return a + b
+}
+
+fn main() {
+    let a = [1.0, 2.0, 3.0, 4.0]
+    let b = [5.0, 6.0, 7.0, 8.0]
+    let c = vector_add(a, b)
+}

@@ -1,0 +1,12 @@
+[package]
+name = "vortex"
+version = "0.1.0"
+edition = "2021"
+description = "The Vortex GPU programming language compiler"
+
+[dependencies]
+logos = "0.14"
+codespan-reporting = "0.11"
+
+[dev-dependencies]
+insta = "1.39"

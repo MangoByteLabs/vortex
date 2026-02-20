@@ -1,0 +1,17 @@
+// Simple matrix multiplication
+fn matmul(a: Tensor<f32, [M, K]>, b: Tensor<f32, [K, N]>) -> Tensor<f32, [M, N]> {
+    return a @ b
+}
+
+// Tiled GEMM kernel
+kernel gemm(
+    a: Tensor<f32, [M, K]>,
+    b: Tensor<f32, [K, N]>
+) -> Tensor<f32, [M, N]> {
+    return a @ b
+}
+
+// Dot product
+fn dot<T: Numeric, const N: usize>(a: Tensor<T, [N]>, b: Tensor<T, [N]>) -> T {
+    return a + b
+}

@@ -1,0 +1,44 @@
+// Cryptographic primitives example — ZK proof building blocks
+
+import crypto.fields.bn254 { Fr }
+import crypto.ntt { ntt_forward, ntt_inverse }
+import crypto.msm { msm }
+
+type Scalar = Fr
+type G1Point = Point<BN254>
+
+// NTT butterfly operation (core of Number Theoretic Transform)
+fn butterfly<F: PrimeField>(a: F, b: F, w: F) -> (F, F) {
+    let t = b * w
+    return (a + t, a - t)
+}
+
+// Polynomial evaluation using Horner's method
+fn poly_eval<F: PrimeField, const N: usize>(
+    coeffs: Tensor<F, [N]>,
+    point: F
+) -> F {
+    var result = coeffs[0]
+    var power = point
+    for i in 1..N {
+        result = result + coeffs[i] * power
+        power = power * point
+    }
+    return result
+}
+
+// Multi-scalar multiplication kernel
+kernel msm_kernel(
+    scalars: Tensor<Scalar, [N]>,
+    points: Tensor<G1Point, [N]>
+) -> G1Point {
+    return msm(scalars, points)
+}
+
+// Simple commitment scheme: commit to a polynomial
+fn commit(
+    poly: Tensor<Scalar, [N]>,
+    generators: Tensor<G1Point, [N]>
+) -> G1Point {
+    return msm_kernel(poly, generators)
+}
