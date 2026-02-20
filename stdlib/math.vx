@@ -1,15 +1,56 @@
 // Vortex Math Library
-pub fn abs(x: i64) -> i64 {
-    if x < 0 { return 0 - x }
-    return x
+
+fn sqrt(x) { x ** 0.5 }
+fn cbrt(x) { x ** (1.0 / 3.0) }
+fn floor(x) { x - (x % 1.0) }
+fn ceil(x) { floor(x) + 1 }
+fn round(x) { floor(x + 0.5) }
+fn log2(x) { log(x) / log(2.0) }
+fn log10(x) { log(x) / log(10.0) }
+fn degrees(rad) { rad * 180.0 / 3.14159265358979 }
+fn radians(deg) { deg * 3.14159265358979 / 180.0 }
+fn lerp(a, b, t) { a + (b - a) * t }
+fn smoothstep(edge0, edge1, x) {
+    let t = clamp((x - edge0) / (edge1 - edge0), 0.0, 1.0)
+    t * t * (3.0 - 2.0 * t)
 }
 
-pub fn pow(base: i64, exp: i64) -> i64 {
+// Integer power
+fn pow(base, exp) {
     let result = 1
     let i = 0
     while i < exp {
         result = result * base
         i = i + 1
     }
-    return result
+    result
+}
+
+// Constants
+let PI = 3.14159265358979323846
+let E = 2.71828182845904523536
+let TAU = 6.28318530717958647692
+let PHI = 1.61803398874989484820
+let SQRT2 = 1.41421356237309504880
+let INF = 1.0 / 0.0
+let NAN = 0.0 / 0.0
+
+// Vector operations
+fn dot_product(a, b) {
+    let s = 0.0
+    for i in 0..len(a) { s = s + a[i] * b[i] }
+    s
+}
+
+fn norm(v) { sqrt(dot_product(v, v)) }
+
+fn normalize(v) {
+    let n = norm(v)
+    let result = []
+    for i in 0..len(v) { push(result, v[i] / n) }
+    result
+}
+
+fn cross(a, b) {
+    [a[1]*b[2] - a[2]*b[1], a[2]*b[0] - a[0]*b[2], a[0]*b[1] - a[1]*b[0]]
 }

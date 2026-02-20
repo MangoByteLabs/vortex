@@ -1,0 +1,97 @@
+// Vortex Neural Network Library
+
+// Activation functions
+fn relu(x) { if x > 0.0 { x } else { 0.0 } }
+fn relu_array(arr) {
+    let result = []
+    for i in 0..len(arr) { push(result, relu(arr[i])) }
+    result
+}
+
+fn sigmoid(x) { 1.0 / (1.0 + exp(-x)) }
+fn sigmoid_array(arr) {
+    let result = []
+    for i in 0..len(arr) { push(result, sigmoid(arr[i])) }
+    result
+}
+
+fn tanh_act(x) { (exp(x) - exp(-x)) / (exp(x) + exp(-x)) }
+
+fn gelu_act(x) { 0.5 * x * (1.0 + tanh_act(0.7978845608 * (x + 0.044715 * x * x * x))) }
+
+fn swish(x) { x * sigmoid(x) }
+
+// Softmax
+fn softmax_array(arr) {
+    let max_val = arr[0]
+    for i in 1..len(arr) { if arr[i] > max_val { max_val = arr[i] } }
+    let exps = []
+    let sum_exp = 0.0
+    for i in 0..len(arr) {
+        let e = exp(arr[i] - max_val)
+        push(exps, e)
+        sum_exp = sum_exp + e
+    }
+    let result = []
+    for i in 0..len(exps) { push(result, exps[i] / sum_exp) }
+    result
+}
+
+// Loss functions
+fn mse(predictions, targets) {
+    let s = 0.0
+    for i in 0..len(predictions) {
+        let diff = predictions[i] - targets[i]
+        s = s + diff * diff
+    }
+    s / len(predictions)
+}
+
+fn cross_entropy(probs, target_idx) {
+    -log(probs[target_idx])
+}
+
+// Layer normalization
+fn layer_norm_fn(x, gamma, beta, eps) {
+    let n = len(x)
+    let mean_val = 0.0
+    for i in 0..n { mean_val = mean_val + x[i] }
+    mean_val = mean_val / n
+    let var_val = 0.0
+    for i in 0..n {
+        let diff = x[i] - mean_val
+        var_val = var_val + diff * diff
+    }
+    var_val = var_val / n
+    let result = []
+    for i in 0..n {
+        let norm_x = (x[i] - mean_val) / sqrt(var_val + eps)
+        push(result, gamma[i] * norm_x + beta[i])
+    }
+    result
+}
+
+// Dense (fully connected) layer
+fn dense(input, weights, bias, n_in, n_out) {
+    let result = []
+    for j in 0..n_out {
+        let s = bias[j]
+        for i in 0..n_in {
+            s = s + input[i] * weights[i * n_out + j]
+        }
+        push(result, s)
+    }
+    result
+}
+
+// Dropout (training mode)
+fn dropout(x, rate) {
+    let result = []
+    let scale = 1.0 / (1.0 - rate)
+    for i in 0..len(x) {
+        // Simple deterministic "dropout" for interpreter
+        if i % 3 == 0 { push(result, 0.0) }
+        else { push(result, x[i] * scale) }
+    }
+    result
+}

@@ -1,0 +1,38 @@
+// Vortex Crypto Utilities — higher-level crypto built on builtins
+
+// Key generation
+fn generate_keypair() {
+    let privkey = field_from_hex("1")  // placeholder
+    let pubkey = scalar_mul(privkey, secp256k1_generator())
+    [privkey, pubkey]
+}
+
+// Hash-to-field
+fn hash_to_field(data) {
+    let h = sha256(data)
+    field_from_hex(to_hex(h))
+}
+
+// Pedersen commitment: C = r*H + v*G
+fn pedersen_commit(value, blinding) {
+    let g = secp256k1_generator()
+    let h = scalar_mul(field_from_hex("2"), g)
+    point_add(scalar_mul(blinding, h), scalar_mul(value, g))
+}
+
+// Merkle tree
+fn merkle_hash(left, right) {
+    sha256(to_string(left) + to_string(right))
+}
+
+fn merkle_root(leaves) {
+    if len(leaves) == 1 { return leaves[0] }
+    let next_level = []
+    for i in 0..len(leaves) / 2 {
+        push(next_level, merkle_hash(leaves[i * 2], leaves[i * 2 + 1]))
+    }
+    if len(leaves) % 2 == 1 {
+        push(next_level, leaves[len(leaves) - 1])
+    }
+    merkle_root(next_level)
+}

@@ -1,10 +1,15 @@
-// Vortex Prelude
-pub fn min(a: i64, b: i64) -> i64 {
-    if a < b { return a }
-    return b
-}
+// Vortex Prelude — common utilities available everywhere
 
-pub fn max(a: i64, b: i64) -> i64 {
-    if a > b { return a }
-    return b
+fn min(a, b) { if a < b { a } else { b } }
+fn max(a, b) { if a > b { a } else { b } }
+fn clamp(x, lo, hi) { min(max(x, lo), hi) }
+fn abs(x) { if x < 0 { -x } else { x } }
+fn sign(x) { if x > 0 { 1 } else { if x < 0 { -1 } else { 0 } } }
+fn swap(a, b) { let tmp = a; a = b; b = tmp }
+fn identity(x) { x }
+fn compose(f, g) { |x| f(g(x)) }
+fn range_array(start, end) {
+    let result = []
+    for i in start..end { push(result, i) }
+    result
 }
