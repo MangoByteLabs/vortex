@@ -1339,6 +1339,14 @@ impl Parser {
                         },
                     };
                 }
+                TokenKind::Question => {
+                    // Try operator: expr?
+                    let end = self.advance().span;
+                    expr = Expr {
+                        span: expr.span.merge(end),
+                        kind: ExprKind::Try(Box::new(expr)),
+                    };
+                }
                 _ => break,
             }
         }
@@ -1488,11 +1496,78 @@ impl Parser {
             }
             TokenKind::If => self.parse_if_expr(),
             TokenKind::Match => self.parse_match_expr(),
+            TokenKind::Pipe => self.parse_closure(),
+            TokenKind::PipePipe => {
+                // || is a zero-param closure: || expr
+                self.advance();
+                let body = self.parse_expr()?;
+                let span = start.merge(body.span);
+                Ok(Expr {
+                    kind: ExprKind::Closure {
+                        params: Vec::new(),
+                        body: Box::new(body),
+                    },
+                    span,
+                })
+            }
             _ => {
                 self.error(start, format!("expected expression, found `{}`", tok.kind));
                 Err(())
             }
         }
+    }
+
+    fn parse_closure(&mut self) -> Result<Expr, ()> {
+        let start = self.span();
+        self.expect(TokenKind::Pipe)?;
+
+        let mut params = Vec::new();
+        while !self.check(TokenKind::Pipe) && !self.at_end() {
+            let pstart = self.span();
+            let name = self.parse_ident()?;
+            // Optional type annotation
+            let ty = if self.eat(TokenKind::Colon).is_some() {
+                self.parse_type()?
+            } else {
+                // Default to a placeholder type for untyped closure params
+                TypeExpr {
+                    kind: TypeExprKind::Named(Ident::new("_".to_string(), name.span)),
+                    span: name.span,
+                }
+            };
+            let pend = self.span();
+            params.push(Param {
+                name,
+                ty,
+                default: None,
+                span: pstart.merge(pend),
+            });
+            if !self.eat(TokenKind::Comma).is_some() {
+                break;
+            }
+        }
+        self.expect(TokenKind::Pipe)?;
+
+        // Body: either a block { ... } or a single expression
+        let body = if self.check(TokenKind::LBrace) {
+            let block = self.parse_block()?;
+            let span = block.span;
+            Expr {
+                kind: ExprKind::Block(block),
+                span,
+            }
+        } else {
+            self.parse_expr()?
+        };
+
+        let span = start.merge(body.span);
+        Ok(Expr {
+            kind: ExprKind::Closure {
+                params,
+                body: Box::new(body),
+            },
+            span,
+        })
     }
 
     fn parse_struct_literal(&mut self, name: Ident) -> Result<Expr, ()> {
@@ -1843,6 +1918,23 @@ fn main() {
                 || f.body.expr.as_ref().map(|e| matches!(&e.kind, ExprKind::Block(_))).unwrap_or(false);
             // Check body contains dispatch somewhere
             assert!(f.body.stmts.len() >= 1 || f.body.expr.is_some());
+        } else {
+            panic!("expected function");
+        }
+    }
+
+    #[test]
+    fn test_parse_closure() {
+        let program = parse_ok(
+            "fn main() {
+                let f = |x, y| x + y
+                let g = |x| { return x * 2 }
+            }",
+        );
+        assert_eq!(program.items.len(), 1);
+        if let ItemKind::Function(func) = &program.items[0].kind {
+            // Should have 2 let statements (both pulled as stmts since 2nd is last => trailing expr)
+            assert!(func.body.stmts.len() >= 1);
         } else {
             panic!("expected function");
         }

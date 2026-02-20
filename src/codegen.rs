@@ -860,7 +860,7 @@ impl CodeGen {
                 }
             }
 
-            ExprKind::TypeCall { .. } => {
+            ExprKind::TypeCall { .. } | ExprKind::Closure { .. } | ExprKind::Try(_) => {
                 let ssa = self.fresh_ssa();
                 self.emit_line(&format!("{} = arith.constant 0 : i64", ssa));
                 (ssa, MLIRType::I64)

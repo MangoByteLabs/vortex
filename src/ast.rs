@@ -367,6 +367,13 @@ pub enum ExprKind {
         expr: Box<Expr>,
         arms: Vec<MatchArm>,
     },
+    /// Closure/lambda: |x, y| x + y
+    Closure {
+        params: Vec<Param>,
+        body: Box<Expr>,
+    },
+    /// Try operator: expr?
+    Try(Box<Expr>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1007,6 +1014,15 @@ impl fmt::Display for Expr {
                 }
                 write!(f, "}}")
             }
+            ExprKind::Closure { params, body } => {
+                write!(f, "|")?;
+                for (i, p) in params.iter().enumerate() {
+                    if i > 0 { write!(f, ", ")?; }
+                    write!(f, "{}", p.name.name)?;
+                }
+                write!(f, "| {}", body)
+            }
+            ExprKind::Try(inner) => write!(f, "{}?", inner),
         }
     }
 }

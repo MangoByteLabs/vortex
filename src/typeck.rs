@@ -843,6 +843,9 @@ fn infer_expr(env: &mut TypeEnv, expr: &Expr) -> Type {
             }
             result_ty
         }
+
+        ExprKind::Closure { .. } => env.fresh_var(),
+        ExprKind::Try(inner) => infer_expr(env, inner),
     }
 }
 

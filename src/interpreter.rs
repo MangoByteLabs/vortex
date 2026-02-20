@@ -3426,4 +3426,42 @@ println(unwrap(r))
 }");
         assert_eq!(o, vec!["true", "80"]);
     }
+
+    #[test]
+    fn test_closure_capture() {
+        let o = rv("fn main() {
+let x = 10
+let add_x = |y| y + x
+let result = add_x(5)
+println(result)
+}");
+        assert_eq!(o, vec!["15"]);
+    }
+
+    #[test]
+    fn test_map_filter_fold() {
+        let o = rv("fn main() {
+let nums = [1, 2, 3, 4, 5]
+let doubled = map(nums, |x| x * 2)
+println(doubled)
+let evens = filter(nums, |x| x % 2 == 0)
+println(evens)
+let total = fold(nums, 0, |acc, x| acc + x)
+println(total)
+}");
+        assert_eq!(o, vec!["[2, 4, 6, 8, 10]", "[2, 4]", "15"]);
+    }
+
+    #[test]
+    fn test_closure_as_argument() {
+        let o = rv("fn apply(f: fn(i64) -> i64, x: i64) -> i64 {
+return f(x)
+}
+fn main() {
+let double = |x| x * 2
+let result = apply(double, 21)
+println(result)
+}");
+        assert_eq!(o, vec!["42"]);
+    }
 }
