@@ -1,0 +1,30 @@
+// Codegen Demo - try: vortex codegen examples/codegen_demo.vx
+// This outputs MLIR IR using func/arith/scf/gpu dialects
+
+fn dot_product(a: f64, b: f64, c: f64, d: f64) -> f64 {
+    return a * c + b * d
+}
+
+fn clamp(x: f64, lo: f64, hi: f64) -> f64 {
+    if x < lo {
+        return lo
+    } else {
+        if x > hi {
+            return hi
+        } else {
+            return x
+        }
+    }
+}
+
+fn sum_squares(n: i64) -> i64 {
+    var total: i64 = 0
+    for i in 0..n {
+        total += i * i
+    }
+    return total
+}
+
+kernel saxpy(a: f32, x: Tensor<f32, [N]>, y: Tensor<f32, [N]>) -> Tensor<f32, [N]> {
+    return a * x + y
+}

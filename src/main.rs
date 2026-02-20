@@ -1,4 +1,5 @@
 mod ast;
+mod codegen;
 pub mod crypto;
 mod interpreter;
 mod lexer;
@@ -16,7 +17,7 @@ fn main() {
 
     if args.len() < 2 {
         eprintln!("Usage: vortex <command> [file.vx]");
-        eprintln!("Commands: run, check, parse, lex");
+        eprintln!("Commands: run, check, parse, lex, codegen");
         std::process::exit(1);
     }
 
@@ -87,6 +88,21 @@ fn main() {
                 }
             }
         }
+        "codegen" | "emit" => {
+            let tokens = lexer::lex(&source);
+            match parser::parse(tokens, file_id) {
+                Ok(program) => {
+                    let mlir = codegen::generate_mlir(&program);
+                    print!("{}", mlir);
+                }
+                Err(diagnostics) => {
+                    for diag in &diagnostics {
+                        term::emit(&mut writer.lock(), &config, &files, diag).unwrap();
+                    }
+                    std::process::exit(1);
+                }
+            }
+        }
         "run" => {
             let tokens = lexer::lex(&source);
             match parser::parse(tokens, file_id) {
@@ -109,7 +125,7 @@ fn main() {
         }
         _ => {
             eprintln!("Unknown command: {}", command);
-            eprintln!("Commands: run, check, parse, lex");
+            eprintln!("Commands: run, check, parse, lex, codegen");
             std::process::exit(1);
         }
     }
