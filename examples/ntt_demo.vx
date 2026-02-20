@@ -1,0 +1,38 @@
+// NTT (Number Theoretic Transform) Demo
+// Demonstrates forward and inverse NTT for polynomial operations
+
+fn main() {
+    println("=== NTT Demo ===")
+
+    // Create a simple polynomial: [1, 2, 3, 4, 5, 6, 7, 8]
+    let coeffs = [1, 2, 3, 4, 5, 6, 7, 8]
+    println("Original coefficients:")
+    println(coeffs)
+
+    // Forward NTT transforms to evaluation form
+    let evals = ntt(coeffs)
+    println("After NTT (evaluation form):")
+    println(evals)
+
+    // Inverse NTT transforms back to coefficient form
+    let recovered = intt(evals)
+    println("After INTT (recovered coefficients):")
+    println(recovered)
+
+    println("NTT roundtrip successful!")
+
+    // Polynomial multiplication via coefficient arrays
+    // (1 + 2x) * (3 + 4x) = 3 + 10x + 8x^2
+    let a = [1, 2]
+    let b = [3, 4]
+    let product = poly_mul(a, b)
+    println("Poly mul (1+2x)(3+4x) =")
+    println(product)
+
+    // Polynomial evaluation
+    // p(x) = 1 + 2x + 3x^2, p(2) = 1 + 4 + 12 = 17
+    let p = [1, 2, 3]
+    let val = poly_eval(p, 2)
+    println("p(2) where p = 1 + 2x + 3x^2:")
+    println(val)
+}

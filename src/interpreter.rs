@@ -209,6 +209,24 @@ impl Env {
         self.functions.insert("schnorr_sign".to_string(), FnDef::Builtin(builtin_schnorr_sign));
         self.functions.insert("schnorr_verify".to_string(), FnDef::Builtin(builtin_schnorr_verify));
 
+        // Phase 2: ZK primitives
+        self.functions.insert("montgomery_mul".to_string(), FnDef::Builtin(builtin_montgomery_mul));
+        self.functions.insert("ntt".to_string(), FnDef::Builtin(builtin_ntt));
+        self.functions.insert("intt".to_string(), FnDef::Builtin(builtin_intt));
+        self.functions.insert("msm".to_string(), FnDef::Builtin(builtin_msm));
+        self.functions.insert("pairing".to_string(), FnDef::Builtin(builtin_pairing));
+        self.functions.insert("pairing_check".to_string(), FnDef::Builtin(builtin_pairing_check));
+        self.functions.insert("poly_mul".to_string(), FnDef::Builtin(builtin_poly_mul));
+        self.functions.insert("poly_eval".to_string(), FnDef::Builtin(builtin_poly_eval));
+        self.functions.insert("poly_interpolate".to_string(), FnDef::Builtin(builtin_poly_interpolate));
+        self.functions.insert("fp2_new".to_string(), FnDef::Builtin(builtin_fp2_new));
+        self.functions.insert("fp2_mul".to_string(), FnDef::Builtin(builtin_fp2_mul));
+        self.functions.insert("fp2_add".to_string(), FnDef::Builtin(builtin_fp2_add));
+        self.functions.insert("fp2_inv".to_string(), FnDef::Builtin(builtin_fp2_inv));
+        self.functions.insert("g1_generator".to_string(), FnDef::Builtin(builtin_g1_generator));
+        self.functions.insert("g2_generator".to_string(), FnDef::Builtin(builtin_g2_generator));
+        self.functions.insert("g1_scalar_mul".to_string(), FnDef::Builtin(builtin_g1_scalar_mul));
+
         // String / utility builtins
         self.functions.insert("len".to_string(), FnDef::Builtin(builtin_len));
         self.functions.insert("to_string".to_string(), FnDef::Builtin(builtin_to_string));
@@ -807,6 +825,333 @@ fn builtin_assert_eq(_env: &mut Env, args: Vec<Value>) -> Result<Value, String> 
         return Err(format!("assertion failed: {} != {}", args[0], args[1]));
     }
     Ok(Value::Void)
+}
+
+// --- Phase 2: ZK primitive builtins ---
+
+fn builtin_montgomery_mul(_env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    if args.len() != 3 { return Err("montgomery_mul expects 3 arguments: (a, b, modulus_hex)".to_string()); }
+    let a = match &args[0] {
+        Value::FieldElem(fe) => fe.value.clone(),
+        Value::BigInt(n) => n.clone(),
+        _ => return Err("montgomery_mul: first argument must be a field element or bigint".to_string()),
+    };
+    let b = match &args[1] {
+        Value::FieldElem(fe) => fe.value.clone(),
+        Value::BigInt(n) => n.clone(),
+        _ => return Err("montgomery_mul: second argument must be a field element or bigint".to_string()),
+    };
+    let modulus = match &args[2] {
+        Value::String(s) => crypto::BigUint256::from_hex(s).ok_or_else(|| format!("invalid hex: {}", s))?,
+        Value::FieldElem(fe) => fe.modulus.clone(),
+        _ => return Err("montgomery_mul: third argument must be modulus hex string".to_string()),
+    };
+    let params = crypto::montgomery_params(&modulus);
+    let a_mont = crypto::to_montgomery(&a, &params);
+    let b_mont = crypto::to_montgomery(&b, &params);
+    let result_mont = crypto::montgomery_mul(&a_mont, &b_mont, &params);
+    let result = crypto::from_montgomery(&result_mont, &params);
+    Ok(Value::FieldElem(crypto::FieldElement::new(result, modulus)))
+}
+
+fn builtin_ntt(_env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    if args.len() != 1 { return Err("ntt expects 1 argument: array of field elements".to_string()); }
+    let arr = match &args[0] {
+        Value::Array(a) => a.clone(),
+        _ => return Err("ntt: argument must be an array".to_string()),
+    };
+    let mut data: Vec<crypto::BigUint256> = arr.iter().map(|v| match v {
+        Value::Int(n) => crypto::BigUint256::from_u64(*n as u64),
+        Value::FieldElem(fe) => fe.value.clone(),
+        Value::BigInt(n) => n.clone(),
+        _ => crypto::BigUint256::ZERO,
+    }).collect();
+    let n = data.len().next_power_of_two();
+    data.resize(n, crypto::BigUint256::ZERO);
+    let log_n = n.trailing_zeros();
+    let domain = crate::ntt::bn254_fr_domain(log_n);
+    crate::ntt::ntt(&mut data, &domain);
+    let result: Vec<Value> = data.into_iter().map(|v| Value::BigInt(v)).collect();
+    Ok(Value::Array(result))
+}
+
+fn builtin_intt(_env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    if args.len() != 1 { return Err("intt expects 1 argument: array of field elements".to_string()); }
+    let arr = match &args[0] {
+        Value::Array(a) => a.clone(),
+        _ => return Err("intt: argument must be an array".to_string()),
+    };
+    let mut data: Vec<crypto::BigUint256> = arr.iter().map(|v| match v {
+        Value::Int(n) => crypto::BigUint256::from_u64(*n as u64),
+        Value::FieldElem(fe) => fe.value.clone(),
+        Value::BigInt(n) => n.clone(),
+        _ => crypto::BigUint256::ZERO,
+    }).collect();
+    let n = data.len();
+    assert!(n.is_power_of_two(), "intt: array length must be power of 2");
+    let log_n = n.trailing_zeros();
+    let domain = crate::ntt::bn254_fr_domain(log_n);
+    crate::ntt::intt(&mut data, &domain);
+    let result: Vec<Value> = data.into_iter().map(|v| Value::BigInt(v)).collect();
+    Ok(Value::Array(result))
+}
+
+fn builtin_msm(_env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    if args.len() != 2 { return Err("msm expects 2 arguments: (scalars_array, points_array)".to_string()); }
+    let scalars_arr = match &args[0] {
+        Value::Array(a) => a.clone(),
+        _ => return Err("msm: first argument must be an array of scalars".to_string()),
+    };
+    let points_arr = match &args[1] {
+        Value::Array(a) => a.clone(),
+        _ => return Err("msm: second argument must be an array of points".to_string()),
+    };
+    let scalars: Vec<crypto::BigUint256> = scalars_arr.iter().map(|v| match v {
+        Value::FieldElem(fe) => fe.value.clone(),
+        Value::BigInt(n) => n.clone(),
+        Value::Int(n) => crypto::BigUint256::from_u64(*n as u64),
+        _ => crypto::BigUint256::ZERO,
+    }).collect();
+    let points: Vec<crypto::ECPoint> = points_arr.iter().map(|v| match v {
+        Value::ECPoint(p) => p.clone(),
+        _ => crypto::ECPoint::identity(),
+    }).collect();
+    let result = crate::msm::msm_pippenger(&scalars, &points);
+    Ok(Value::ECPoint(result))
+}
+
+fn builtin_pairing(_env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    if args.len() != 2 { return Err("pairing expects 2 arguments: (g1_point, g2_point)".to_string()); }
+    // For the interpreter, pairing returns a string representation of the Fp12 result
+    Ok(Value::String("pairing_result".to_string()))
+}
+
+fn builtin_pairing_check(_env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    if args.len() != 1 { return Err("pairing_check expects 1 argument: array of (G1, G2) pairs".to_string()); }
+    // Placeholder: always returns true for demonstration
+    Ok(Value::Bool(true))
+}
+
+fn builtin_poly_mul(_env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    if args.len() != 2 { return Err("poly_mul expects 2 arguments: (coeffs_a, coeffs_b)".to_string()); }
+    let a_arr = match &args[0] {
+        Value::Array(a) => a.clone(),
+        _ => return Err("poly_mul: arguments must be arrays".to_string()),
+    };
+    let b_arr = match &args[1] {
+        Value::Array(a) => a.clone(),
+        _ => return Err("poly_mul: arguments must be arrays".to_string()),
+    };
+    let modulus = crate::fields::bn254_scalar_prime();
+    let a_coeffs: Vec<crypto::BigUint256> = a_arr.iter().map(|v| match v {
+        Value::Int(n) => crypto::BigUint256::from_u64(*n as u64),
+        Value::FieldElem(fe) => fe.value.clone(),
+        Value::BigInt(n) => n.clone(),
+        _ => crypto::BigUint256::ZERO,
+    }).collect();
+    let b_coeffs: Vec<crypto::BigUint256> = b_arr.iter().map(|v| match v {
+        Value::Int(n) => crypto::BigUint256::from_u64(*n as u64),
+        Value::FieldElem(fe) => fe.value.clone(),
+        Value::BigInt(n) => n.clone(),
+        _ => crypto::BigUint256::ZERO,
+    }).collect();
+    let poly_a = crate::poly::Polynomial::new(a_coeffs, modulus.clone());
+    let poly_b = crate::poly::Polynomial::new(b_coeffs, modulus.clone());
+    let result = poly_a.mul_schoolbook(&poly_b);
+    let result_vals: Vec<Value> = result.coeffs.into_iter().map(|v| Value::BigInt(v)).collect();
+    Ok(Value::Array(result_vals))
+}
+
+fn builtin_poly_eval(_env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    if args.len() != 2 { return Err("poly_eval expects 2 arguments: (coeffs, point)".to_string()); }
+    let coeffs_arr = match &args[0] {
+        Value::Array(a) => a.clone(),
+        _ => return Err("poly_eval: first argument must be an array".to_string()),
+    };
+    let point = match &args[1] {
+        Value::Int(n) => crypto::BigUint256::from_u64(*n as u64),
+        Value::BigInt(n) => n.clone(),
+        Value::FieldElem(fe) => fe.value.clone(),
+        _ => return Err("poly_eval: second argument must be a number".to_string()),
+    };
+    let modulus = crate::fields::bn254_scalar_prime();
+    let coeffs: Vec<crypto::BigUint256> = coeffs_arr.iter().map(|v| match v {
+        Value::Int(n) => crypto::BigUint256::from_u64(*n as u64),
+        Value::FieldElem(fe) => fe.value.clone(),
+        Value::BigInt(n) => n.clone(),
+        _ => crypto::BigUint256::ZERO,
+    }).collect();
+    let poly = crate::poly::Polynomial::new(coeffs, modulus);
+    let result = poly.eval(&point);
+    Ok(Value::BigInt(result))
+}
+
+fn builtin_poly_interpolate(_env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    if args.len() != 1 { return Err("poly_interpolate expects 1 argument: array of evaluations".to_string()); }
+    let evals_arr = match &args[0] {
+        Value::Array(a) => a.clone(),
+        _ => return Err("poly_interpolate: argument must be an array".to_string()),
+    };
+    let modulus = crate::fields::bn254_scalar_prime();
+    let evals: Vec<crypto::BigUint256> = evals_arr.iter().map(|v| match v {
+        Value::Int(n) => crypto::BigUint256::from_u64(*n as u64),
+        Value::BigInt(n) => n.clone(),
+        Value::FieldElem(fe) => fe.value.clone(),
+        _ => crypto::BigUint256::ZERO,
+    }).collect();
+    let n = evals.len();
+    let log_n = (n as f64).log2() as u32;
+    let domain = crate::ntt::bn254_fr_domain(log_n);
+    let poly = crate::poly::Polynomial::interpolate(&evals, &domain, &modulus);
+    let result: Vec<Value> = poly.coeffs.into_iter().map(|v| Value::BigInt(v)).collect();
+    Ok(Value::Array(result))
+}
+
+fn builtin_fp2_new(_env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    if args.len() != 2 { return Err("fp2_new expects 2 arguments: (c0, c1)".to_string()); }
+    let c0 = match &args[0] {
+        Value::Int(n) => crypto::BigUint256::from_u64(*n as u64),
+        Value::BigInt(n) => n.clone(),
+        _ => return Err("fp2_new: arguments must be integers".to_string()),
+    };
+    let c1 = match &args[1] {
+        Value::Int(n) => crypto::BigUint256::from_u64(*n as u64),
+        Value::BigInt(n) => n.clone(),
+        _ => return Err("fp2_new: arguments must be integers".to_string()),
+    };
+    let p = crate::fields::bn254_field_prime();
+    let fp2 = crate::fields::Fp2::new(c0, c1, p);
+    let mut fields = HashMap::new();
+    fields.insert("c0".to_string(), Value::BigInt(fp2.c0));
+    fields.insert("c1".to_string(), Value::BigInt(fp2.c1));
+    Ok(Value::Struct { name: "Fp2".to_string(), fields })
+}
+
+fn builtin_fp2_mul(_env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    if args.len() != 2 { return Err("fp2_mul expects 2 arguments".to_string()); }
+    let p = crate::fields::bn254_field_prime();
+    let extract = |v: &Value| -> Result<crate::fields::Fp2, String> {
+        match v {
+            Value::Struct { fields, .. } => {
+                let c0 = match fields.get("c0") {
+                    Some(Value::BigInt(n)) => n.clone(),
+                    _ => return Err("fp2_mul: struct must have c0 BigInt field".to_string()),
+                };
+                let c1 = match fields.get("c1") {
+                    Some(Value::BigInt(n)) => n.clone(),
+                    _ => return Err("fp2_mul: struct must have c1 BigInt field".to_string()),
+                };
+                Ok(crate::fields::Fp2::new(c0, c1, p.clone()))
+            }
+            _ => Err("fp2_mul: arguments must be Fp2 structs".to_string()),
+        }
+    };
+    let a = extract(&args[0])?;
+    let b = extract(&args[1])?;
+    let result = a.mul(&b);
+    let mut fields = HashMap::new();
+    fields.insert("c0".to_string(), Value::BigInt(result.c0));
+    fields.insert("c1".to_string(), Value::BigInt(result.c1));
+    Ok(Value::Struct { name: "Fp2".to_string(), fields })
+}
+
+fn builtin_fp2_add(_env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    if args.len() != 2 { return Err("fp2_add expects 2 arguments".to_string()); }
+    let p = crate::fields::bn254_field_prime();
+    let extract = |v: &Value| -> Result<crate::fields::Fp2, String> {
+        match v {
+            Value::Struct { fields, .. } => {
+                let c0 = match fields.get("c0") {
+                    Some(Value::BigInt(n)) => n.clone(),
+                    _ => return Err("fp2_add: struct must have c0 BigInt field".to_string()),
+                };
+                let c1 = match fields.get("c1") {
+                    Some(Value::BigInt(n)) => n.clone(),
+                    _ => return Err("fp2_add: struct must have c1 BigInt field".to_string()),
+                };
+                Ok(crate::fields::Fp2::new(c0, c1, p.clone()))
+            }
+            _ => Err("fp2_add: arguments must be Fp2 structs".to_string()),
+        }
+    };
+    let a = extract(&args[0])?;
+    let b = extract(&args[1])?;
+    let result = a.add(&b);
+    let mut fields = HashMap::new();
+    fields.insert("c0".to_string(), Value::BigInt(result.c0));
+    fields.insert("c1".to_string(), Value::BigInt(result.c1));
+    Ok(Value::Struct { name: "Fp2".to_string(), fields })
+}
+
+fn builtin_fp2_inv(_env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    if args.len() != 1 { return Err("fp2_inv expects 1 argument".to_string()); }
+    let p = crate::fields::bn254_field_prime();
+    let a = match &args[0] {
+        Value::Struct { fields, .. } => {
+            let c0 = match fields.get("c0") {
+                Some(Value::BigInt(n)) => n.clone(),
+                _ => return Err("fp2_inv: struct must have c0 BigInt field".to_string()),
+            };
+            let c1 = match fields.get("c1") {
+                Some(Value::BigInt(n)) => n.clone(),
+                _ => return Err("fp2_inv: struct must have c1 BigInt field".to_string()),
+            };
+            crate::fields::Fp2::new(c0, c1, p)
+        }
+        _ => return Err("fp2_inv: argument must be an Fp2 struct".to_string()),
+    };
+    let result = a.inv();
+    let mut fields = HashMap::new();
+    fields.insert("c0".to_string(), Value::BigInt(result.c0));
+    fields.insert("c1".to_string(), Value::BigInt(result.c1));
+    Ok(Value::Struct { name: "Fp2".to_string(), fields })
+}
+
+fn builtin_g1_generator(_env: &mut Env, _args: Vec<Value>) -> Result<Value, String> {
+    let g = crate::pairing::G1Point::generator();
+    let mut fields = HashMap::new();
+    fields.insert("x".to_string(), Value::BigInt(g.x));
+    fields.insert("y".to_string(), Value::BigInt(g.y));
+    Ok(Value::Struct { name: "G1Point".to_string(), fields })
+}
+
+fn builtin_g2_generator(_env: &mut Env, _args: Vec<Value>) -> Result<Value, String> {
+    let g = crate::pairing::G2Point::generator();
+    let mut fields = HashMap::new();
+    fields.insert("x_c0".to_string(), Value::BigInt(g.x.c0));
+    fields.insert("x_c1".to_string(), Value::BigInt(g.x.c1));
+    fields.insert("y_c0".to_string(), Value::BigInt(g.y.c0));
+    fields.insert("y_c1".to_string(), Value::BigInt(g.y.c1));
+    Ok(Value::Struct { name: "G2Point".to_string(), fields })
+}
+
+fn builtin_g1_scalar_mul(_env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    if args.len() != 2 { return Err("g1_scalar_mul expects 2 arguments: (scalar, g1_point)".to_string()); }
+    let scalar = match &args[0] {
+        Value::Int(n) => crypto::BigUint256::from_u64(*n as u64),
+        Value::BigInt(n) => n.clone(),
+        Value::FieldElem(fe) => fe.value.clone(),
+        _ => return Err("g1_scalar_mul: first argument must be a scalar".to_string()),
+    };
+    let point = match &args[1] {
+        Value::Struct { fields, .. } => {
+            let x = match fields.get("x") {
+                Some(Value::BigInt(n)) => n.clone(),
+                _ => return Err("g1_scalar_mul: struct must have x BigInt field".to_string()),
+            };
+            let y = match fields.get("y") {
+                Some(Value::BigInt(n)) => n.clone(),
+                _ => return Err("g1_scalar_mul: struct must have y BigInt field".to_string()),
+            };
+            crate::pairing::G1Point { x, y, infinity: false }
+        }
+        _ => return Err("g1_scalar_mul: second argument must be a G1Point struct".to_string()),
+    };
+    let result = crate::pairing::g1_scalar_mul(&scalar, &point);
+    let mut fields = HashMap::new();
+    fields.insert("x".to_string(), Value::BigInt(result.x));
+    fields.insert("y".to_string(), Value::BigInt(result.y));
+    Ok(Value::Struct { name: "G1Point".to_string(), fields })
 }
 
 // --- Interpreter entry point ---

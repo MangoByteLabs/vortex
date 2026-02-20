@@ -1,0 +1,47 @@
+// BN254 Pairing Demo
+// Demonstrates elliptic curve pairing primitives for ZK proofs
+
+fn main() {
+    println("=== BN254 Pairing Demo ===")
+
+    // Get G1 and G2 generators
+    let g1 = g1_generator()
+    println("G1 generator:")
+    println(g1)
+
+    let g2 = g2_generator()
+    println("G2 generator:")
+    println(g2)
+
+    // Scalar multiplication on G1
+    let g1_2 = g1_scalar_mul(2, g1)
+    println("2 * G1:")
+    println(g1_2)
+
+    let g1_3 = g1_scalar_mul(3, g1)
+    println("3 * G1:")
+    println(g1_3)
+
+    // Fp2 field extension arithmetic
+    let a = fp2_new(3, 4)
+    let b = fp2_new(1, 2)
+    println("Fp2 a = 3 + 4i:")
+    println(a)
+    println("Fp2 b = 1 + 2i:")
+    println(b)
+
+    let c = fp2_mul(a, b)
+    println("a * b =")
+    println(c)
+
+    let a_inv = fp2_inv(a)
+    println("a^(-1) =")
+    println(a_inv)
+
+    // Verify: a * a^(-1) should give (1, 0)
+    let identity = fp2_mul(a, a_inv)
+    println("a * a^(-1) =")
+    println(identity)
+
+    println("Pairing demo complete!")
+}

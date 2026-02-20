@@ -1,0 +1,71 @@
+// ZK Proof Primitives Demo
+// Demonstrates the building blocks for zero-knowledge proofs
+
+fn main() {
+    println("=== ZK Proof Primitives Demo ===")
+
+    // 1. Polynomial Operations
+    println("--- Polynomial Arithmetic ---")
+
+    // Define two polynomials and multiply them
+    let p1 = [1, 2, 3]
+    let p2 = [4, 5]
+    let product = poly_mul(p1, p2)
+    println("(1 + 2x + 3x^2) * (4 + 5x) =")
+    println(product)
+
+    // Evaluate polynomial at a point
+    let val = poly_eval(product, 2)
+    println("Product evaluated at x=2:")
+    println(val)
+
+    // 2. MSM (Multi-Scalar Multiplication)
+    println("--- Multi-Scalar Multiplication ---")
+
+    let g = secp256k1_generator()
+
+    // Create points: G, 2G, 3G
+    let p1 = g
+    let p2 = scalar_mul(field_from_hex("2"), g)
+    let p3 = scalar_mul(field_from_hex("3"), g)
+
+    let scalars = [field_from_hex("5"), field_from_hex("7"), field_from_hex("11")]
+    let points = [p1, p2, p3]
+
+    // MSM: 5*G + 7*2G + 11*3G = 5G + 14G + 33G = 52G
+    let msm_result = msm(scalars, points)
+    println("MSM result (5*G + 7*2G + 11*3G):")
+    println(msm_result)
+
+    // Verify: should equal 52*G
+    let expected = scalar_mul(field_from_hex("34"), g)
+    println("Expected (52*G):")
+    println(expected)
+
+    // 3. NTT for polynomial multiplication
+    println("--- NTT-based Polynomial Multiply ---")
+    let a = [1, 1, 0, 0, 0, 0, 0, 0]
+    let b = [1, 1, 0, 0, 0, 0, 0, 0]
+
+    // (1+x)^2 = 1 + 2x + x^2
+    let a_ntt = ntt(a)
+    let b_ntt = ntt(b)
+    println("NTT(1+x):")
+    println(a_ntt)
+
+    // 4. Montgomery Multiplication
+    println("--- Montgomery Multiplication ---")
+    let p_hex = "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC2F"
+    let a_val = field_from_hex("DEADBEEF")
+    let b_val = field_from_hex("CAFEBABE")
+    let mont_result = montgomery_mul(a_val, b_val, p_hex)
+    println("Montgomery mul result:")
+    println(mont_result)
+
+    // Compare with regular field mul
+    let regular_result = field_mul(a_val, b_val)
+    println("Regular field mul result:")
+    println(regular_result)
+
+    println("ZK primitives demo complete!")
+}
