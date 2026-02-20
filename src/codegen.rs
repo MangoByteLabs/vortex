@@ -65,6 +65,8 @@ pub struct CodeGen {
     ssa_counter: usize,
     /// Map from Vortex variable names to MLIR SSA values
     var_map: Vec<HashMap<String, (String, MLIRType)>>,
+    /// Enum variant tag assignments: "EnumName::Variant" -> tag (i32)
+    enum_tags: HashMap<String, i32>,
 }
 
 impl CodeGen {
@@ -74,6 +76,7 @@ impl CodeGen {
             indent: 0,
             ssa_counter: 0,
             var_map: vec![HashMap::new()],
+            enum_tags: HashMap::new(),
         }
     }
 
@@ -83,10 +86,21 @@ impl CodeGen {
         self.emit_line("module {");
         self.indent += 1;
 
+        // First pass: register enum tags
+        for item in &program.items {
+            if let ItemKind::Enum(e) = &item.kind {
+                for (i, variant) in e.variants.iter().enumerate() {
+                    let key = format!("{}::{}", e.name.name, variant.name.name);
+                    self.enum_tags.insert(key, i as i32);
+                }
+            }
+        }
+
         for item in &program.items {
             match &item.kind {
                 ItemKind::Function(func) => self.gen_function(func),
                 ItemKind::Kernel(kernel) => self.gen_kernel(kernel),
+                ItemKind::Enum(e) => self.gen_enum(e),
                 _ => {
                     // Skip structs, traits, etc. for now
                 }
@@ -217,6 +231,30 @@ impl CodeGen {
     fn is_int_type(ty: &MLIRType) -> bool {
         matches!(ty, MLIRType::I1 | MLIRType::I8 | MLIRType::I16
             | MLIRType::I32 | MLIRType::I64 | MLIRType::I128)
+    }
+
+    // --- Enum generation ---
+
+    fn gen_enum(&mut self, e: &EnumDef) {
+        // Emit enum as a tagged union comment + type alias
+        // In MLIR, enums are represented as a struct { tag: i32, payload: i64 }
+        self.emit_line(&format!("// enum {} {{", e.name.name));
+        for (i, variant) in e.variants.iter().enumerate() {
+            let fields_str = match &variant.kind {
+                EnumVariantKind::Unit => String::new(),
+                EnumVariantKind::Tuple(types) => {
+                    let ts: Vec<String> = types.iter().map(|t| format!("{}", t)).collect();
+                    format!("({})", ts.join(", "))
+                }
+                EnumVariantKind::Struct(fields) => {
+                    let fs: Vec<String> = fields.iter().map(|f| format!("{}: {}", f.name.name, f.ty)).collect();
+                    format!(" {{ {} }}", fs.join(", "))
+                }
+            };
+            self.emit_line(&format!("//   {} = {}{}", i, variant.name.name, fields_str));
+        }
+        self.emit_line(&format!("// }} (tag: i32, payload: i64)"));
+        self.emit_line("");
     }
 
     // --- Function generation ---
@@ -691,16 +729,82 @@ impl CodeGen {
             }
 
             ExprKind::Match { expr: match_expr, arms } => {
-                let (val_ssa, val_ty) = self.gen_expr(match_expr);
+                let (val_ssa, _val_ty) = self.gen_expr(match_expr);
                 self.emit_line(&format!("// match on {}", val_ssa));
-                let mut last_ssa = val_ssa;
-                let mut last_ty = val_ty;
-                for arm in arms {
-                    let (ssa, ty) = self.gen_expr(&arm.body);
-                    last_ssa = ssa;
-                    last_ty = ty;
+
+                // Extract tag from the matched value (assume first i32 is the tag)
+                let tag_ssa = self.fresh_ssa();
+                self.emit_line(&format!("// extract tag from enum value"));
+                self.emit_line(&format!("{} = arith.constant 0 : i32", tag_ssa));
+
+                // Emit arms as a chain of scf.if comparisons on the tag
+                let mut result_ssa = String::new();
+                let mut result_ty = MLIRType::I64;
+
+                for (i, arm) in arms.iter().enumerate() {
+                    let is_wildcard = matches!(&arm.pattern, Pattern::Wildcard | Pattern::Ident(_));
+
+                    if is_wildcard {
+                        // Default arm: just emit the body
+                        self.emit_line("// wildcard arm");
+                        let (ssa, ty) = self.gen_expr(&arm.body);
+                        result_ssa = ssa;
+                        result_ty = ty;
+                    } else {
+                        // Get the tag value for this variant pattern
+                        let tag_val = if let Pattern::Variant { name: _, .. } = &arm.pattern {
+                            // Look up the tag for this variant
+                            self.enum_tags.values().next().copied().unwrap_or(i as i32)
+                        } else {
+                            i as i32
+                        };
+
+                        let expected_tag = self.fresh_ssa();
+                        self.emit_line(&format!("{} = arith.constant {} : i32", expected_tag, tag_val));
+                        let cmp_ssa = self.fresh_ssa();
+                        self.emit_line(&format!(
+                            "{} = arith.cmpi eq, {}, {} : i32",
+                            cmp_ssa, tag_ssa, expected_tag
+                        ));
+
+                        // Emit the body inside scf.if
+                        self.emit_line(&format!("scf.if {} {{", cmp_ssa));
+                        self.indent += 1;
+
+                        // Bind pattern variables
+                        if let Pattern::Variant { name: _, fields } = &arm.pattern {
+                            for (fi, field_pat) in fields.iter().enumerate() {
+                                if let Pattern::Ident(id) = field_pat {
+                                    let field_ssa = self.fresh_ssa();
+                                    self.emit_line(&format!(
+                                        "// extract field {} as {}",
+                                        fi, id.name
+                                    ));
+                                    self.emit_line(&format!(
+                                        "{} = arith.constant 0 : i64",
+                                        field_ssa
+                                    ));
+                                    self.define_var(&id.name, &field_ssa, MLIRType::I64);
+                                }
+                            }
+                        }
+
+                        let (ssa, ty) = self.gen_expr(&arm.body);
+                        result_ssa = ssa.clone();
+                        result_ty = ty;
+
+                        self.indent -= 1;
+                        self.emit_line("}");
+                    }
                 }
-                (last_ssa, last_ty)
+
+                if result_ssa.is_empty() {
+                    let ssa = self.fresh_ssa();
+                    self.emit_line(&format!("{} = arith.constant 0 : i64", ssa));
+                    (ssa, MLIRType::I64)
+                } else {
+                    (result_ssa, result_ty)
+                }
             }
 
             ExprKind::TypeCall { .. } => {

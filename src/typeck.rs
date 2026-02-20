@@ -103,6 +103,15 @@ impl std::fmt::Display for ScalarType {
     }
 }
 
+/// Registered enum variant info for type checking
+#[derive(Debug, Clone)]
+struct EnumVariantInfo {
+    /// The parent enum name
+    enum_name: String,
+    /// Field types for this variant (empty for unit variants)
+    field_types: Vec<Type>,
+}
+
 /// Environment for type checking
 struct TypeEnv {
     /// Stack of scopes, each mapping names to types
@@ -118,6 +127,10 @@ struct TypeEnv {
     file_id: FileId,
     /// Counter for type variables
     next_var: usize,
+    /// Enum definitions: enum_name -> list of variant names
+    enum_variants: HashMap<String, Vec<String>>,
+    /// Variant info: variant_name -> EnumVariantInfo
+    variant_info: HashMap<String, EnumVariantInfo>,
 }
 
 impl TypeEnv {
@@ -130,6 +143,8 @@ impl TypeEnv {
             errors: Vec::new(),
             file_id,
             next_var: 0,
+            enum_variants: HashMap::new(),
+            variant_info: HashMap::new(),
         }
     }
 
@@ -165,6 +180,14 @@ impl TypeEnv {
     fn error(&mut self, span: Span, msg: String) {
         self.errors.push(
             Diagnostic::error()
+                .with_message(&msg)
+                .with_labels(vec![Label::primary(self.file_id, span.start..span.end)]),
+        );
+    }
+
+    fn warning(&mut self, span: Span, msg: String) {
+        self.errors.push(
+            Diagnostic::warning()
                 .with_message(&msg)
                 .with_labels(vec![Label::primary(self.file_id, span.start..span.end)]),
         );
@@ -226,6 +249,32 @@ fn collect_item_signature(env: &mut TypeEnv, item: &Item) {
             let resolved = resolve_type_expr(env, &alias.value);
             env.type_defs.insert(alias.name.name.clone(), resolved);
         }
+        ItemKind::Enum(e) => {
+            let enum_name = e.name.name.clone();
+            let mut variant_names = Vec::new();
+            for variant in &e.variants {
+                let vn = variant.name.name.clone();
+                variant_names.push(vn.clone());
+                let field_types = match &variant.kind {
+                    EnumVariantKind::Unit => {
+                        // Register unit variants as variables with the enum type
+                        env.define(&vn, Type::Named(enum_name.clone()));
+                        Vec::new()
+                    }
+                    EnumVariantKind::Tuple(types) => {
+                        types.iter().map(|t| resolve_type_expr(env, t)).collect()
+                    }
+                    EnumVariantKind::Struct(fields) => {
+                        fields.iter().map(|f| resolve_type_expr(env, &f.ty)).collect()
+                    }
+                };
+                env.variant_info.insert(vn, EnumVariantInfo {
+                    enum_name: enum_name.clone(),
+                    field_types,
+                });
+            }
+            env.enum_variants.insert(enum_name, variant_names);
+        }
         _ => {}
     }
 }
@@ -235,6 +284,7 @@ fn check_item(env: &mut TypeEnv, item: &Item) {
         ItemKind::Function(func) => check_function(env, func),
         ItemKind::Kernel(kernel) => check_kernel(env, kernel),
         ItemKind::Struct(s) => check_struct(env, s),
+        ItemKind::Enum(e) => check_enum(env, e),
         _ => {}
     }
 }
@@ -312,6 +362,24 @@ fn check_struct(env: &mut TypeEnv, s: &StructDef) {
     // Check that all field types are valid
     for field in &s.fields {
         let _ = resolve_type_expr(env, &field.ty);
+    }
+}
+
+fn check_enum(env: &mut TypeEnv, e: &EnumDef) {
+    for variant in &e.variants {
+        match &variant.kind {
+            EnumVariantKind::Unit => {}
+            EnumVariantKind::Tuple(types) => {
+                for ty in types {
+                    let _ = resolve_type_expr(env, ty);
+                }
+            }
+            EnumVariantKind::Struct(fields) => {
+                for field in fields {
+                    let _ = resolve_type_expr(env, &field.ty);
+                }
+            }
+        }
     }
 }
 
@@ -481,6 +549,31 @@ fn infer_expr(env: &mut TypeEnv, expr: &Expr) -> Type {
         }
 
         ExprKind::Call { func, args } => {
+            // Check if it's an enum variant constructor
+            if let ExprKind::Ident(id) = &func.kind {
+                if let Some(info) = env.variant_info.get(&id.name).cloned() {
+                    if !info.field_types.is_empty() {
+                        if args.len() != info.field_types.len() {
+                            env.error(
+                                expr.span,
+                                format!(
+                                    "variant `{}` expects {} fields, got {}",
+                                    id.name, info.field_types.len(), args.len()
+                                ),
+                            );
+                        } else {
+                            for (arg, expected) in args.iter().zip(info.field_types.iter()) {
+                                let arg_ty = infer_expr(env, arg);
+                                if !types_compatible(expected, &arg_ty) {
+                                    env.type_mismatch(arg.span, expected, &arg_ty);
+                                }
+                            }
+                        }
+                    }
+                    return Type::Named(info.enum_name.clone());
+                }
+            }
+
             // Check if it's a known function
             if let ExprKind::Ident(id) = &func.kind {
                 if let Some((param_types, ret_type)) = env.functions.get(&id.name).cloned() {
@@ -681,7 +774,62 @@ fn infer_expr(env: &mut TypeEnv, expr: &Expr) -> Type {
         }
 
         ExprKind::Match { expr: match_expr, arms } => {
-            infer_expr(env, match_expr);
+            let match_ty = infer_expr(env, match_expr);
+
+            // Collect variant names referenced in patterns and check for wildcard/catch-all
+            let mut covered_variants: Vec<String> = Vec::new();
+            let mut has_wildcard = false;
+
+            for arm in arms {
+                match &arm.pattern {
+                    Pattern::Wildcard => { has_wildcard = true; }
+                    Pattern::Ident(id) => {
+                        // If this identifier is a known variant name, treat as variant match
+                        if env.variant_info.contains_key(&id.name) {
+                            covered_variants.push(id.name.clone());
+                        } else {
+                            has_wildcard = true; // catch-all binding
+                        }
+                    }
+                    Pattern::Variant { name, fields } => {
+                        covered_variants.push(name.name.clone());
+                        // Check variant constructor field count
+                        if let Some(info) = env.variant_info.get(&name.name) {
+                            if !info.field_types.is_empty() && fields.len() != info.field_types.len() {
+                                env.error(
+                                    arm.span,
+                                    format!(
+                                        "variant `{}` expects {} fields, got {}",
+                                        name.name, info.field_types.len(), fields.len()
+                                    ),
+                                );
+                            }
+                        }
+                    }
+                    Pattern::Literal(_) => {}
+                }
+            }
+
+            // Exhaustiveness check: if the match target is a Named enum type,
+            // check all variants are covered
+            if !has_wildcard {
+                if let Type::Named(ref type_name) = match_ty {
+                    if let Some(all_variants) = env.enum_variants.get(type_name) {
+                        let missing: Vec<&String> = all_variants.iter()
+                            .filter(|v| !covered_variants.contains(v))
+                            .collect();
+                        if !missing.is_empty() {
+                            let names: Vec<&str> = missing.iter().map(|s| s.as_str()).collect();
+                            env.warning(
+                                expr.span,
+                                format!("non-exhaustive match: missing variants: {}", names.join(", ")),
+                            );
+                        }
+                    }
+                }
+            }
+
+            // Infer result type from arms
             let mut result_ty = env.fresh_var();
             for arm in arms {
                 let arm_ty = infer_expr(env, &arm.body);
@@ -990,5 +1138,57 @@ mod tests {
              fn test() { add(1.0) }",
         );
         assert!(!errs.is_empty());
+    }
+
+    #[test]
+    fn test_enum_type_checking() {
+        // Enum with tuple variant should register field types
+        check_ok(
+            "enum Option {
+                None
+                Some(i64)
+            }
+            fn test() -> i64 {
+                let x = Some(42)
+                return 0
+            }",
+        );
+    }
+
+    #[test]
+    fn test_match_exhaustiveness() {
+        // Non-exhaustive match on an enum should produce a warning
+        let tokens = lexer::lex(
+            "enum Color {
+                Red
+                Green
+                Blue
+            }
+            fn test() {
+                let c = Red
+                let x = match c {
+                    Red => 1
+                    Green => 2
+                }
+            }",
+        );
+        let program = parser::parse(tokens, 0).expect("parse failed");
+        let result = check(&program, 0);
+        // Should have a warning about missing Blue variant
+        match result {
+            Err(diags) => {
+                let has_exhaustiveness_warning = diags.iter().any(|d| {
+                    d.message.contains("non-exhaustive") || d.message.contains("missing variants")
+                });
+                assert!(has_exhaustiveness_warning, "expected exhaustiveness warning, got: {:?}", diags);
+            }
+            Ok(()) => {
+                // Warnings don't cause Err in current implementation since they use Diagnostic::warning
+                // which still gets added to errors vec. If it passes, that means the warning
+                // was generated but the check still returned Ok because warnings are in the errors vec.
+                // Actually warnings ARE in the errors vec so this should be Err.
+                panic!("expected diagnostics for non-exhaustive match");
+            }
+        }
     }
 }

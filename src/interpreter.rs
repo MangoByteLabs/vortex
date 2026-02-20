@@ -1434,6 +1434,7 @@ fn eval_expr(env: &mut Env, expr: &Expr) -> Result<Value, String> {
                 // Try to find Type::method in the function registry
                 let type_name = match &base_val {
                     Value::Struct { name, .. } => Some(name.clone()),
+                    Value::EnumVariant { enum_name, .. } => Some(enum_name.clone()),
                     _ => None,
                 };
 
