@@ -287,6 +287,17 @@ impl Env {
         self.functions.insert("ode_solve_rk4".to_string(), FnDef::Builtin(builtin_ode_solve_rk4));
         self.functions.insert("liquid_cell".to_string(), FnDef::Builtin(builtin_liquid_cell));
         self.functions.insert("cfc_cell".to_string(), FnDef::Builtin(builtin_cfc_cell));
+
+        // SSM scan builtins
+        self.functions.insert("ssm_scan".to_string(), FnDef::Builtin(builtin_ssm_scan));
+        self.functions.insert("selective_ssm".to_string(), FnDef::Builtin(builtin_selective_ssm));
+        self.functions.insert("parallel_scan".to_string(), FnDef::Builtin(builtin_parallel_scan));
+
+        // DynTensor builtins
+        self.functions.insert("dyn_tensor".to_string(), FnDef::Builtin(builtin_dyn_tensor));
+        self.functions.insert("compact".to_string(), FnDef::Builtin(builtin_compact));
+        self.functions.insert("pad".to_string(), FnDef::Builtin(builtin_pad));
+        self.functions.insert("stream_compact".to_string(), FnDef::Builtin(builtin_stream_compact));
     }
 }
 
@@ -944,7 +955,7 @@ fn builtin_memory_new(_env: &mut Env, args: Vec<Value>) -> Result<Value, String>
     Ok(Value::DiffMemory(Box::new(memory::DiffMemory::new(capacity, key_dim, val_dim))))
 }
 
-fn extract_f64_array(v: &Value) -> Result<Vec<f64>, String> {
+fn values_to_f64_vec(v: &Value) -> Result<Vec<f64>, String> {
     match v {
         Value::Array(arr) => arr.iter().map(|v| match v {
             Value::Float(f) => Ok(*f), Value::Int(i) => Ok(*i as f64),
@@ -957,7 +968,7 @@ fn extract_f64_array(v: &Value) -> Result<Vec<f64>, String> {
 fn builtin_memory_read(_env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
     if args.len() != 2 { return Err("memory_read expects 2 arguments: (mem, query)".to_string()); }
     let mem = match &args[0] { Value::DiffMemory(m) => m, _ => return Err("memory_read: first arg must be Memory".to_string()) };
-    let query = extract_f64_array(&args[1])?;
+    let query = values_to_f64_vec(&args[1])?;
     let result = mem.read(&query);
     Ok(Value::Array(result.into_iter().map(Value::Float).collect()))
 }
@@ -965,8 +976,8 @@ fn builtin_memory_read(_env: &mut Env, args: Vec<Value>) -> Result<Value, String
 fn builtin_memory_write(_env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
     if args.len() != 3 { return Err("memory_write expects 3 arguments: (mem, key, value)".to_string()); }
     let mut mem = match &args[0] { Value::DiffMemory(m) => (**m).clone(), _ => return Err("memory_write: first arg must be Memory".to_string()) };
-    let key = extract_f64_array(&args[1])?;
-    let value = extract_f64_array(&args[2])?;
+    let key = values_to_f64_vec(&args[1])?;
+    let value = values_to_f64_vec(&args[2])?;
     mem.write(&key, &value);
     Ok(Value::DiffMemory(Box::new(mem)))
 }
@@ -974,7 +985,7 @@ fn builtin_memory_write(_env: &mut Env, args: Vec<Value>) -> Result<Value, Strin
 fn builtin_memory_content_lookup(_env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
     if args.len() != 3 { return Err("memory_content_lookup expects 3 arguments: (mem, query, beta)".to_string()); }
     let mem = match &args[0] { Value::DiffMemory(m) => m, _ => return Err("first arg must be Memory".to_string()) };
-    let query = extract_f64_array(&args[1])?;
+    let query = values_to_f64_vec(&args[1])?;
     let beta = match &args[2] { Value::Float(f) => *f, Value::Int(i) => *i as f64, _ => return Err("beta must be numeric".to_string()) };
     let weights = mem.content_lookup(&query, beta);
     Ok(Value::Array(weights.into_iter().map(Value::Float).collect()))
@@ -2155,7 +2166,342 @@ fn value_cmp(
     }
 }
 
+// --- Sparse builtins ---
 
+fn builtin_sparse_topk(_env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err("sparse_topk expects 2 arguments: (values, k)".to_string());
+    }
+    let values = values_to_f64_vec(&args[0])?;
+    let k = value_to_int(&args[1])? as usize;
+    let idx = crate::sparse::sparse_topk(&values, k);
+    Ok(Value::SparseIdx(idx))
+}
+
+fn builtin_sparse_gather(_env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err("sparse_gather expects 2 arguments: (tensor, index)".to_string());
+    }
+    let dense = values_to_f64_vec(&args[0])?;
+    let idx = match &args[1] {
+        Value::SparseIdx(si) => si.clone(),
+        _ => return Err("sparse_gather: second argument must be a SparseIndex".to_string()),
+    };
+    let gathered = crate::sparse::sparse_gather(&dense, &idx);
+    let result: Vec<Value> = gathered.into_iter()
+        .map(|batch| Value::Array(batch.into_iter().map(Value::Float).collect()))
+        .collect();
+    Ok(Value::Array(result))
+}
+
+fn builtin_sparse_scatter(_env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    if args.len() != 3 {
+        return Err("sparse_scatter expects 3 arguments: (values, index, size)".to_string());
+    }
+    let sparse_vals: Vec<Vec<f64>> = match &args[0] {
+        Value::Array(batches) => batches.iter().map(|b| values_to_f64_vec(b)).collect::<Result<Vec<_>, _>>()?,
+        _ => return Err("sparse_scatter: first argument must be array of arrays".to_string()),
+    };
+    let idx = match &args[1] {
+        Value::SparseIdx(si) => si.clone(),
+        _ => return Err("sparse_scatter: second argument must be a SparseIndex".to_string()),
+    };
+    let size = value_to_int(&args[2])? as usize;
+    let result = crate::sparse::sparse_scatter(&sparse_vals, &idx, size);
+    Ok(Value::Array(result.into_iter().map(Value::Float).collect()))
+}
+
+fn builtin_sparse_matmul(_env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err("sparse_matmul expects 2 arguments: (sparse, dense)".to_string());
+    }
+    let sparse = match &args[0] {
+        Value::SparseTensor(st) => st.clone(),
+        _ => return Err("sparse_matmul: first argument must be a SparseTensor".to_string()),
+    };
+    let dense = values_to_f64_vec(&args[1])?;
+    let cols = if sparse.shape.len() > 1 { sparse.shape[1] } else { 1 };
+    let result = crate::sparse::sparse_matmul(&sparse, &dense, cols);
+    Ok(Value::Array(result.into_iter().map(Value::Float).collect()))
+}
+
+fn builtin_to_sparse(_env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err("to_sparse expects 2 arguments: (tensor, threshold)".to_string());
+    }
+    let values = values_to_f64_vec(&args[0])?;
+    let threshold = match &args[1] {
+        Value::Float(f) => *f,
+        Value::Int(n) => *n as f64,
+        _ => return Err("to_sparse: threshold must be numeric".to_string()),
+    };
+    let len = values.len();
+    let st = crate::sparse::to_sparse(&values, vec![len], threshold);
+    Ok(Value::SparseTensor(st))
+}
+
+// --- Local learning builtins ---
+
+fn f64_vec_to_value(arr: &[f64]) -> Value {
+    Value::Array(arr.iter().map(|x| Value::Float(*x)).collect())
+}
+
+fn builtin_goodness(_env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    if args.len() != 1 { return Err("goodness expects 1 argument".to_string()); }
+    let activations = values_to_f64_vec(&args[0])?;
+    Ok(Value::Float(crate::local_learn::goodness(&activations)))
+}
+
+fn builtin_hebbian_update(_env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    if args.len() != 6 { return Err("hebbian_update expects 6 arguments".to_string()); }
+    let pre = values_to_f64_vec(&args[0])?;
+    let post = values_to_f64_vec(&args[1])?;
+    let mut weights = values_to_f64_vec(&args[2])?;
+    let n_pre = match &args[3] { Value::Int(i) => *i as usize, _ => return Err("n_pre must be int".into()) };
+    let n_post = match &args[4] { Value::Int(i) => *i as usize, _ => return Err("n_post must be int".into()) };
+    let lr = match &args[5] { Value::Float(f) => *f, Value::Int(i) => *i as f64, _ => return Err("lr must be numeric".into()) };
+    crate::local_learn::hebbian_update(&pre, &post, &mut weights, n_pre, n_post, lr);
+    Ok(f64_vec_to_value(&weights))
+}
+
+fn builtin_ff_layer(_env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    if args.len() != 8 { return Err("ff_layer expects 8 arguments".to_string()); }
+    let pos_input = values_to_f64_vec(&args[0])?;
+    let neg_input = values_to_f64_vec(&args[1])?;
+    let mut weights = values_to_f64_vec(&args[2])?;
+    let mut bias = values_to_f64_vec(&args[3])?;
+    let n_in = match &args[4] { Value::Int(i) => *i as usize, _ => return Err("n_in must be int".into()) };
+    let n_out = match &args[5] { Value::Int(i) => *i as usize, _ => return Err("n_out must be int".into()) };
+    let lr = match &args[6] { Value::Float(f) => *f, Value::Int(i) => *i as f64, _ => return Err("lr must be numeric".into()) };
+    let threshold = match &args[7] { Value::Float(f) => *f, Value::Int(i) => *i as f64, _ => return Err("threshold must be numeric".into()) };
+    let (pos_act, neg_act) = crate::local_learn::ff_layer_forward(&pos_input, &neg_input, &mut weights, &mut bias, n_in, n_out, lr, threshold);
+    Ok(Value::Tuple(vec![f64_vec_to_value(&pos_act), f64_vec_to_value(&neg_act)]))
+}
+
+fn builtin_predictive_coding_update(_env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    if args.len() != 6 { return Err("predictive_coding_update expects 6 arguments".to_string()); }
+    let prediction = values_to_f64_vec(&args[0])?;
+    let target = values_to_f64_vec(&args[1])?;
+    let mut weights = values_to_f64_vec(&args[2])?;
+    let n_in = match &args[3] { Value::Int(i) => *i as usize, _ => return Err("n_in must be int".into()) };
+    let n_out = match &args[4] { Value::Int(i) => *i as usize, _ => return Err("n_out must be int".into()) };
+    let lr = match &args[5] { Value::Float(f) => *f, Value::Int(i) => *i as f64, _ => return Err("lr must be numeric".into()) };
+    let error = crate::local_learn::predictive_coding_update(&prediction, &target, &mut weights, n_in, n_out, lr);
+    Ok(f64_vec_to_value(&error))
+}
+
+// --- ODE / Liquid NN builtins ---
+
+fn builtin_ode_solve_euler(_env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    if args.len() != 11 { return Err("ode_solve_euler expects 11 arguments".to_string()); }
+    let y0 = values_to_f64_vec(&args[0])?;
+    let t_start = match &args[1] { Value::Float(f) => *f, Value::Int(i) => *i as f64, _ => return Err("t_start must be numeric".into()) };
+    let t_end = match &args[2] { Value::Float(f) => *f, Value::Int(i) => *i as f64, _ => return Err("t_end must be numeric".into()) };
+    let steps = match &args[3] { Value::Int(i) => *i as usize, _ => return Err("steps must be int".into()) };
+    let _h = values_to_f64_vec(&args[4])?;
+    let x = values_to_f64_vec(&args[5])?;
+    let w_h = values_to_f64_vec(&args[6])?;
+    let w_x = values_to_f64_vec(&args[7])?;
+    let tau = values_to_f64_vec(&args[8])?;
+    let n_hidden = match &args[9] { Value::Int(i) => *i as usize, _ => return Err("n_hidden must be int".into()) };
+    let n_input = match &args[10] { Value::Int(i) => *i as usize, _ => return Err("n_input must be int".into()) };
+    let f = move |_t: f64, state: &[f64]| -> Vec<f64> {
+        crate::ode::liquid_cell(state, &x, &w_h, &w_x, &tau, n_hidden, n_input)
+    };
+    let result = crate::ode::euler_solve(&f, &y0, t_start, t_end, steps);
+    Ok(f64_vec_to_value(&result))
+}
+
+fn builtin_ode_solve_rk4(_env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    if args.len() != 11 { return Err("ode_solve_rk4 expects 11 arguments".to_string()); }
+    let y0 = values_to_f64_vec(&args[0])?;
+    let t_start = match &args[1] { Value::Float(f) => *f, Value::Int(i) => *i as f64, _ => return Err("t_start must be numeric".into()) };
+    let t_end = match &args[2] { Value::Float(f) => *f, Value::Int(i) => *i as f64, _ => return Err("t_end must be numeric".into()) };
+    let steps = match &args[3] { Value::Int(i) => *i as usize, _ => return Err("steps must be int".into()) };
+    let _h = values_to_f64_vec(&args[4])?;
+    let x = values_to_f64_vec(&args[5])?;
+    let w_h = values_to_f64_vec(&args[6])?;
+    let w_x = values_to_f64_vec(&args[7])?;
+    let tau = values_to_f64_vec(&args[8])?;
+    let n_hidden = match &args[9] { Value::Int(i) => *i as usize, _ => return Err("n_hidden must be int".into()) };
+    let n_input = match &args[10] { Value::Int(i) => *i as usize, _ => return Err("n_input must be int".into()) };
+    let f = move |_t: f64, state: &[f64]| -> Vec<f64> {
+        crate::ode::liquid_cell(state, &x, &w_h, &w_x, &tau, n_hidden, n_input)
+    };
+    let result = crate::ode::rk4_solve(&f, &y0, t_start, t_end, steps);
+    Ok(f64_vec_to_value(&result))
+}
+
+fn builtin_liquid_cell(_env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    if args.len() != 7 { return Err("liquid_cell expects 7 arguments".to_string()); }
+    let h = values_to_f64_vec(&args[0])?;
+    let x = values_to_f64_vec(&args[1])?;
+    let w_h = values_to_f64_vec(&args[2])?;
+    let w_x = values_to_f64_vec(&args[3])?;
+    let tau = values_to_f64_vec(&args[4])?;
+    let n_hidden = match &args[5] { Value::Int(i) => *i as usize, _ => return Err("n_hidden must be int".into()) };
+    let n_input = match &args[6] { Value::Int(i) => *i as usize, _ => return Err("n_input must be int".into()) };
+    let result = crate::ode::liquid_cell(&h, &x, &w_h, &w_x, &tau, n_hidden, n_input);
+    Ok(f64_vec_to_value(&result))
+}
+
+fn builtin_cfc_cell(_env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    if args.len() != 8 { return Err("cfc_cell expects 8 arguments".to_string()); }
+    let h = values_to_f64_vec(&args[0])?;
+    let x = values_to_f64_vec(&args[1])?;
+    let w_h = values_to_f64_vec(&args[2])?;
+    let w_x = values_to_f64_vec(&args[3])?;
+    let tau = values_to_f64_vec(&args[4])?;
+    let dt = match &args[5] { Value::Float(f) => *f, Value::Int(i) => *i as f64, _ => return Err("dt must be numeric".into()) };
+    let n_hidden = match &args[6] { Value::Int(i) => *i as usize, _ => return Err("n_hidden must be int".into()) };
+    let n_input = match &args[7] { Value::Int(i) => *i as usize, _ => return Err("n_input must be int".into()) };
+    let result = crate::ode::cfc_cell(&h, &x, &w_h, &w_x, &tau, dt, n_hidden, n_input);
+    Ok(f64_vec_to_value(&result))
+}
+
+// --- SSM scan builtins ---
+
+fn builtin_ssm_scan(_env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    if args.len() != 3 { return Err("ssm_scan expects 3 arguments: (a, b, x)".to_string()); }
+    let a = values_to_f64_vec(&args[0])?;
+    let b = values_to_f64_vec(&args[1])?;
+    let x = values_to_f64_vec(&args[2])?;
+    let result = crate::ssm::sequential_scan(&a, &b, &x);
+    Ok(f64_vec_to_value(&result))
+}
+
+fn builtin_parallel_scan(_env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    if args.len() != 3 { return Err("parallel_scan expects 3 arguments: (a, b, x)".to_string()); }
+    let a = values_to_f64_vec(&args[0])?;
+    let b = values_to_f64_vec(&args[1])?;
+    let x = values_to_f64_vec(&args[2])?;
+    let result = crate::ssm::parallel_scan(&a, &b, &x);
+    Ok(f64_vec_to_value(&result))
+}
+
+fn builtin_selective_ssm(_env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    if args.len() != 6 { return Err("selective_ssm expects 6 arguments: (x, a_proj, b_proj, c_proj, d, delta)".to_string()); }
+    let x = values_to_f64_vec(&args[0])?;
+    let a_proj = values_to_f64_vec(&args[1])?;
+    let b_proj = values_to_f64_vec(&args[2])?;
+    let c_proj = values_to_f64_vec(&args[3])?;
+    let d = match &args[4] { Value::Float(f) => *f, Value::Int(i) => *i as f64, _ => return Err("d must be numeric".into()) };
+    let delta = values_to_f64_vec(&args[5])?;
+    let result = crate::ssm::selective_ssm(&x, &a_proj, &b_proj, &c_proj, d, &delta);
+    Ok(f64_vec_to_value(&result))
+}
+
+// --- DynTensor builtins ---
+
+fn builtin_dyn_tensor(_env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    if args.len() != 1 { return Err("dyn_tensor expects 1 argument: ragged array".to_string()); }
+    // Input: array of arrays
+    match &args[0] {
+        Value::Array(rows) => {
+            let mut ragged = Vec::new();
+            for row in rows {
+                match row {
+                    Value::Array(elems) => {
+                        let mut r = Vec::new();
+                        for e in elems {
+                            match e {
+                                Value::Float(f) => r.push(*f),
+                                Value::Int(i) => r.push(*i as f64),
+                                _ => return Err("dyn_tensor: elements must be numeric".into()),
+                            }
+                        }
+                        ragged.push(r);
+                    }
+                    _ => return Err("dyn_tensor: argument must be array of arrays".into()),
+                }
+            }
+            let dt = crate::dyntensor::DynTensor::new(ragged);
+            // Return as array of arrays (preserving ragged structure)
+            let result: Vec<Value> = dt.data.iter().map(|row| {
+                Value::Array(row.iter().map(|&v| Value::Float(v)).collect())
+            }).collect();
+            Ok(Value::Array(result))
+        }
+        _ => Err("dyn_tensor: argument must be an array".into()),
+    }
+}
+
+fn builtin_compact(_env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    if args.len() != 2 { return Err("compact expects 2 arguments: (tensor, mask)".to_string()); }
+    let rows = match &args[0] {
+        Value::Array(rows) => {
+            let mut ragged = Vec::new();
+            for row in rows {
+                let r = values_to_f64_vec(row)?;
+                ragged.push(r);
+            }
+            ragged
+        }
+        _ => return Err("compact: first argument must be array of arrays".into()),
+    };
+    let mask = match &args[1] {
+        Value::Array(elems) => {
+            let mut m = Vec::new();
+            for e in elems {
+                match e {
+                    Value::Bool(b) => m.push(*b),
+                    _ => return Err("compact: mask elements must be booleans".into()),
+                }
+            }
+            m
+        }
+        _ => return Err("compact: second argument must be boolean array".into()),
+    };
+    let dt = crate::dyntensor::DynTensor::new(rows);
+    let compacted = dt.compact(&mask);
+    let result: Vec<Value> = compacted.data.iter().map(|row| {
+        Value::Array(row.iter().map(|&v| Value::Float(v)).collect())
+    }).collect();
+    Ok(Value::Array(result))
+}
+
+fn builtin_pad(_env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    if args.len() != 2 { return Err("pad expects 2 arguments: (dyn_tensor, pad_value)".to_string()); }
+    let rows = match &args[0] {
+        Value::Array(rows) => {
+            let mut ragged = Vec::new();
+            for row in rows {
+                let r = values_to_f64_vec(row)?;
+                ragged.push(r);
+            }
+            ragged
+        }
+        _ => return Err("pad: first argument must be array of arrays".into()),
+    };
+    let pad_val = match &args[1] { Value::Float(f) => *f, Value::Int(i) => *i as f64, _ => return Err("pad: second argument must be numeric".into()) };
+    let dt = crate::dyntensor::DynTensor::new(rows);
+    let (padded, _lengths) = dt.to_padded(pad_val);
+    Ok(f64_vec_to_value(&padded))
+}
+
+fn builtin_stream_compact(_env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    if args.len() != 2 { return Err("stream_compact expects 2 arguments: (data, mask)".to_string()); }
+    let data = values_to_f64_vec(&args[0])?;
+    let mask = match &args[1] {
+        Value::Array(elems) => {
+            let mut m = Vec::new();
+            for e in elems {
+                match e {
+                    Value::Bool(b) => m.push(*b),
+                    _ => return Err("stream_compact: mask elements must be booleans".into()),
+                }
+            }
+            m
+        }
+        _ => return Err("stream_compact: second argument must be boolean array".into()),
+    };
+    if data.len() % mask.len() != 0 {
+        return Err("stream_compact: data length must be a multiple of mask length".into());
+    }
+    let stride = data.len() / mask.len();
+    let result = crate::dyntensor::stream_compact(&data, &mask, stride);
+    Ok(f64_vec_to_value(&result))
+}
 
 #[cfg(test)]
 mod interpreter_tests {
@@ -2176,5 +2522,19 @@ let x = [1.0, 2.0, 3.0]\nlet r = softmax(x)\nprintln(r)
 let q = [1.0, 0.0]\nlet k = [1.0, 0.0]\nlet v = [0.5, 0.3]\nlet r = attention(q, k, v)\nprintln(r)
 }");
         assert!(!o.is_empty()); assert!(o[0].contains("0.5"), "{}", o[0]);
+    }
+
+    #[test]
+    fn test_dispatch_interpreter() {
+        let o = rv("fn double(x: i64) -> i64 { return x * 2 }
+fn triple(x: i64) -> i64 { return x * 3 }
+fn main() {
+let idx = 1
+dispatch idx -> [double, triple](5)
+let r = triple(5)
+println(r)
+}");
+        assert!(!o.is_empty());
+        assert!(o[0].contains("15"), "{}", o[0]);
     }
 }
