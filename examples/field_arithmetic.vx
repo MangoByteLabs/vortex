@@ -1,0 +1,76 @@
+// Vortex Field<P> Arithmetic Demo
+// Demonstrates finite field operations with different prime moduli
+
+fn main() {
+    println("=== Field<P> Arithmetic Demo ===")
+    println("")
+
+    // Get the secp256k1 field prime
+    let p = field_prime("secp256k1")
+    println(format("secp256k1 field prime: {}", p))
+
+    // Create field elements
+    let a = field_new(42, p)
+    let b = field_new(7, p)
+    println("")
+    println(format("a = {}", a))
+    println(format("b = {}", b))
+
+    // Basic arithmetic with operators (automatic field dispatch)
+    let sum = a + b
+    let diff = a - b
+    let prod = a * b
+    let quot = a / b
+    println("")
+    println(format("a + b = {}", sum))
+    println(format("a - b = {}", diff))
+    println(format("a * b = {}", prod))
+    println(format("a / b = {}", quot))
+
+    // Verify: (a / b) * b == a
+    let check = quot * b
+    println(format("(a/b)*b = {} (should equal a)", check))
+    assert(field_eq(check, a), "field division identity failed")
+
+    println("")
+
+    // Field inversion: a * a^{-1} == 1
+    let a_inv = field_inv(a)
+    let one_check = field_mul(a, a_inv)
+    let one = field_one(p)
+    println(format("a^-1 = {}", a_inv))
+    println(format("a * a^-1 = {}", one_check))
+    assert(field_eq(one_check, one), "field inverse identity failed")
+
+    println("")
+
+    // Negation: a + (-a) == 0
+    let neg_a = -a
+    let zero_check = a + neg_a
+    let zero = field_zero(p)
+    println(format("-a = {}", neg_a))
+    println(format("a + (-a) = {}", zero_check))
+    assert(field_eq(zero_check, zero), "field negation identity failed")
+
+    println("")
+
+    // Power: Fermat's little theorem: a^(p-1) == 1 (mod p)
+    // We'll test with a small prime instead
+    let small_p = "7" // prime = 7
+    let x = field_new(3, small_p)
+    let x_pow_6 = field_pow(x, 6)  // 3^6 mod 7 = 729 mod 7 = 1
+    println(format("Using F_7: x = {}", x))
+    println(format("x^6 mod 7 = {} (Fermat: should be 1)", x_pow_6))
+
+    // BN254 field (used in Ethereum's alt_bn128 precompiles)
+    println("")
+    let bn254_p = field_prime("bn254")
+    println(format("BN254 field prime: {}", bn254_p))
+    let c = field_new(1000, bn254_p)
+    let d = field_new(999, bn254_p)
+    let cd_sum = c + d
+    println(format("In F_bn254: 1000 + 999 = {}", cd_sum))
+
+    println("")
+    println("=== All field arithmetic tests passed! ===")
+}

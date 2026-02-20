@@ -1,0 +1,24 @@
+// Module Import Demo
+// Shows how to import functions from other files
+
+import math.utils { square, cube, max, min }
+
+fn main() {
+    println("=== Module Import Demo ===")
+    println("")
+
+    let x = 5
+    println(format("x = {}", to_string(x)))
+    println(format("square({}) = {}", to_string(x), to_string(square(x))))
+    println(format("cube({}) = {}", to_string(x), to_string(cube(x))))
+
+    println("")
+
+    let a = 42
+    let b = 17
+    println(format("max({}, {}) = {}", to_string(a), to_string(b), to_string(max(a, b))))
+    println(format("min({}, {}) = {}", to_string(a), to_string(b), to_string(min(a, b))))
+
+    println("")
+    println("=== Module import tests passed! ===")
+}

@@ -175,6 +175,16 @@ impl Env {
         self.functions.insert("bigint_from_hex".to_string(), FnDef::Builtin(builtin_bigint_from_hex));
         self.functions.insert("to_hex".to_string(), FnDef::Builtin(builtin_to_hex));
 
+        // Extended field arithmetic builtins
+        self.functions.insert("field_new".to_string(), FnDef::Builtin(builtin_field_new));
+        self.functions.insert("field_sub".to_string(), FnDef::Builtin(builtin_field_sub));
+        self.functions.insert("field_pow".to_string(), FnDef::Builtin(builtin_field_pow));
+        self.functions.insert("field_neg".to_string(), FnDef::Builtin(builtin_field_neg));
+        self.functions.insert("field_zero".to_string(), FnDef::Builtin(builtin_field_zero));
+        self.functions.insert("field_one".to_string(), FnDef::Builtin(builtin_field_one));
+        self.functions.insert("field_eq".to_string(), FnDef::Builtin(builtin_field_eq));
+        self.functions.insert("field_prime".to_string(), FnDef::Builtin(builtin_field_prime));
+
         // String / utility builtins
         self.functions.insert("len".to_string(), FnDef::Builtin(builtin_len));
         self.functions.insert("to_string".to_string(), FnDef::Builtin(builtin_to_string));
@@ -279,6 +289,130 @@ fn builtin_field_add(_env: &mut Env, args: Vec<Value>) -> Result<Value, String> 
         (Value::FieldElem(a), Value::FieldElem(b)) => Ok(Value::FieldElem(a.add(b))),
         _ => Err("field_add: arguments must be field elements".to_string()),
     }
+}
+
+fn builtin_field_new(_env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err("field_new expects 2 arguments: (value_hex, modulus_hex) or (int, modulus_hex)".to_string());
+    }
+    let modulus = match &args[1] {
+        Value::String(s) => crypto::BigUint256::from_hex(s)
+            .ok_or_else(|| format!("invalid modulus hex: {}", s))?,
+        Value::FieldElem(fe) => fe.modulus.clone(),
+        _ => return Err("field_new: second argument must be a hex string or field element".to_string()),
+    };
+    let value = match &args[0] {
+        Value::String(s) => crypto::BigUint256::from_hex(s)
+            .ok_or_else(|| format!("invalid value hex: {}", s))?,
+        Value::Int(n) => {
+            let hex = format!("{:x}", n);
+            crypto::BigUint256::from_hex(&hex)
+                .ok_or_else(|| format!("cannot convert {} to bigint", n))?
+        }
+        Value::BigInt(n) => n.clone(),
+        _ => return Err("field_new: first argument must be a hex string, integer, or bigint".to_string()),
+    };
+    Ok(Value::FieldElem(crypto::FieldElement::new(value, modulus)))
+}
+
+fn builtin_field_sub(_env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err("field_sub expects 2 arguments".to_string());
+    }
+    match (&args[0], &args[1]) {
+        (Value::FieldElem(a), Value::FieldElem(b)) => Ok(Value::FieldElem(a.sub(b))),
+        _ => Err("field_sub: arguments must be field elements".to_string()),
+    }
+}
+
+fn builtin_field_pow(_env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err("field_pow expects 2 arguments: (field_elem, exponent)".to_string());
+    }
+    let fe = match &args[0] {
+        Value::FieldElem(fe) => fe,
+        _ => return Err("field_pow: first argument must be a field element".to_string()),
+    };
+    let exp = match &args[1] {
+        Value::BigInt(n) => n.clone(),
+        Value::Int(n) => {
+            let hex = format!("{:x}", n);
+            crypto::BigUint256::from_hex(&hex)
+                .ok_or_else(|| format!("cannot convert {} to bigint", n))?
+        }
+        _ => return Err("field_pow: second argument must be a bigint or integer".to_string()),
+    };
+    Ok(Value::FieldElem(fe.pow(&exp)))
+}
+
+fn builtin_field_neg(_env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err("field_neg expects 1 argument".to_string());
+    }
+    match &args[0] {
+        Value::FieldElem(fe) => Ok(Value::FieldElem(fe.neg())),
+        _ => Err("field_neg: argument must be a field element".to_string()),
+    }
+}
+
+fn builtin_field_zero(_env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err("field_zero expects 1 argument: modulus_hex".to_string());
+    }
+    let modulus = match &args[0] {
+        Value::String(s) => crypto::BigUint256::from_hex(s)
+            .ok_or_else(|| format!("invalid modulus hex: {}", s))?,
+        Value::FieldElem(fe) => fe.modulus.clone(),
+        _ => return Err("field_zero: argument must be a hex string or field element".to_string()),
+    };
+    Ok(Value::FieldElem(crypto::FieldElement::zero(modulus)))
+}
+
+fn builtin_field_one(_env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err("field_one expects 1 argument: modulus_hex".to_string());
+    }
+    let modulus = match &args[0] {
+        Value::String(s) => crypto::BigUint256::from_hex(s)
+            .ok_or_else(|| format!("invalid modulus hex: {}", s))?,
+        Value::FieldElem(fe) => fe.modulus.clone(),
+        _ => return Err("field_one: argument must be a hex string or field element".to_string()),
+    };
+    Ok(Value::FieldElem(crypto::FieldElement::one(modulus)))
+}
+
+fn builtin_field_eq(_env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err("field_eq expects 2 arguments".to_string());
+    }
+    match (&args[0], &args[1]) {
+        (Value::FieldElem(a), Value::FieldElem(b)) => Ok(Value::Bool(a == b)),
+        _ => Err("field_eq: arguments must be field elements".to_string()),
+    }
+}
+
+fn builtin_field_prime(_env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err("field_prime expects 1 argument: prime name (e.g., \"secp256k1\", \"bn254\", \"bls12_381\")".to_string());
+    }
+    let name = match &args[0] {
+        Value::String(s) => s.clone(),
+        _ => return Err("field_prime: argument must be a string".to_string()),
+    };
+    let prime = match name.as_str() {
+        "secp256k1" | "secp256k1_field" => crypto::secp256k1_field_prime(),
+        "secp256k1_order" | "secp256k1_n" => crypto::secp256k1_order(),
+        "bn254" | "bn254_field" => {
+            // BN254 (alt_bn128) field prime: 21888242871839275222246405745257275088696311157297823662689037894645226208583
+            crypto::BigUint256::from_hex("30644e72e131a029b85045b68181585d97816a916871ca8d3c208c16d87cfd47").unwrap()
+        }
+        "bls12_381" | "bls12_381_field" => {
+            // BLS12-381 field prime
+            crypto::BigUint256::from_hex("1a0111ea397fe69a4b1ba7b6434bacd764774b84f38512bf6730d2a0f6b0f6241eabfffeb153ffffb9feffffffffaaab").unwrap()
+        }
+        _ => return Err(format!("unknown prime name: {}. Options: secp256k1, secp256k1_order, bn254, bls12_381", name)),
+    };
+    Ok(Value::String(format!("0x{}", prime)))
 }
 
 fn builtin_point_x(_env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
@@ -656,6 +790,7 @@ fn eval_expr(env: &mut Env, expr: &Expr) -> Result<Value, String> {
                 UnaryOp::Neg => match v {
                     Value::Int(n) => Ok(Value::Int(-n)),
                     Value::Float(n) => Ok(Value::Float(-n)),
+                    Value::FieldElem(fe) => Ok(Value::FieldElem(fe.neg())),
                     _ => Err("cannot negate this type".to_string()),
                 },
                 UnaryOp::Not => match v {
@@ -999,6 +1134,11 @@ fn eval_binop(lhs: &Value, op: BinOp, rhs: &Value) -> Result<Value, String> {
             match (lhs, rhs) {
                 (Value::Int(a), Value::Int(b)) => Ok(Value::Int(a.pow(*b as u32))),
                 (Value::Float(a), Value::Float(b)) => Ok(Value::Float(a.powf(*b))),
+                (Value::FieldElem(a), Value::Int(b)) => {
+                    let exp_hex = format!("{:x}", b);
+                    let exp = crypto::BigUint256::from_hex(&exp_hex).unwrap_or(crypto::BigUint256::ZERO);
+                    Ok(Value::FieldElem(a.pow(&exp)))
+                }
                 _ => Err("** requires numeric types".to_string()),
             }
         }
@@ -1063,6 +1203,7 @@ fn value_add(a: &Value, b: &Value) -> Result<Value, String> {
         (Value::Int(x), Value::Float(y)) => Ok(Value::Float(*x as f64 + y)),
         (Value::Float(x), Value::Int(y)) => Ok(Value::Float(x + *y as f64)),
         (Value::String(x), Value::String(y)) => Ok(Value::String(format!("{}{}", x, y))),
+        (Value::FieldElem(x), Value::FieldElem(y)) => Ok(Value::FieldElem(x.add(y))),
         _ => Err(format!("cannot add {} and {}", a, b)),
     }
 }
@@ -1073,6 +1214,7 @@ fn value_sub(a: &Value, b: &Value) -> Result<Value, String> {
         (Value::Float(x), Value::Float(y)) => Ok(Value::Float(x - y)),
         (Value::Int(x), Value::Float(y)) => Ok(Value::Float(*x as f64 - y)),
         (Value::Float(x), Value::Int(y)) => Ok(Value::Float(x - *y as f64)),
+        (Value::FieldElem(x), Value::FieldElem(y)) => Ok(Value::FieldElem(x.sub(y))),
         _ => Err(format!("cannot subtract {} and {}", a, b)),
     }
 }
@@ -1083,6 +1225,7 @@ fn value_mul(a: &Value, b: &Value) -> Result<Value, String> {
         (Value::Float(x), Value::Float(y)) => Ok(Value::Float(x * y)),
         (Value::Int(x), Value::Float(y)) => Ok(Value::Float(*x as f64 * y)),
         (Value::Float(x), Value::Int(y)) => Ok(Value::Float(x * *y as f64)),
+        (Value::FieldElem(x), Value::FieldElem(y)) => Ok(Value::FieldElem(x.mul(y))),
         _ => Err(format!("cannot multiply {} and {}", a, b)),
     }
 }
@@ -1094,6 +1237,10 @@ fn value_div(a: &Value, b: &Value) -> Result<Value, String> {
             Ok(Value::Int(x / y))
         }
         (Value::Float(x), Value::Float(y)) => Ok(Value::Float(x / y)),
+        (Value::FieldElem(x), Value::FieldElem(y)) => {
+            if y.is_zero() { return Err("division by zero in field".to_string()); }
+            Ok(Value::FieldElem(x.mul(&y.inv())))
+        }
         _ => Err(format!("cannot divide {} and {}", a, b)),
     }
 }
@@ -1121,6 +1268,7 @@ fn values_equal(a: &Value, b: &Value) -> bool {
         (Value::Float(x), Value::Float(y)) => x == y,
         (Value::Bool(x), Value::Bool(y)) => x == y,
         (Value::String(x), Value::String(y)) => x == y,
+        (Value::FieldElem(x), Value::FieldElem(y)) => x == y,
         _ => false,
     }
 }
