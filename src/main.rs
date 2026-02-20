@@ -8,6 +8,7 @@ mod lexer;
 mod module;
 mod msm;
 mod ntt;
+mod pairing;
 mod poly;
 mod parser;
 mod pipeline;
