@@ -209,6 +209,13 @@ impl Env {
         self.functions.insert("schnorr_sign".to_string(), FnDef::Builtin(builtin_schnorr_sign));
         self.functions.insert("schnorr_verify".to_string(), FnDef::Builtin(builtin_schnorr_verify));
 
+        // LLM operation builtins
+        self.functions.insert("softmax".to_string(), FnDef::Builtin(builtin_softmax));
+        self.functions.insert("gelu".to_string(), FnDef::Builtin(builtin_gelu));
+        self.functions.insert("layer_norm".to_string(), FnDef::Builtin(builtin_layer_norm));
+        self.functions.insert("attention".to_string(), FnDef::Builtin(builtin_attention));
+        self.functions.insert("rope".to_string(), FnDef::Builtin(builtin_rope));
+
         // Phase 2: ZK primitives
         self.functions.insert("montgomery_mul".to_string(), FnDef::Builtin(builtin_montgomery_mul));
         self.functions.insert("ntt".to_string(), FnDef::Builtin(builtin_ntt));
@@ -825,6 +832,64 @@ fn builtin_assert_eq(_env: &mut Env, args: Vec<Value>) -> Result<Value, String> 
         return Err(format!("assertion failed: {} != {}", args[0], args[1]));
     }
     Ok(Value::Void)
+}
+
+// --- LLM operation builtins (stubs) ---
+
+fn builtin_softmax(_env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    match args.first() {
+        Some(Value::Array(arr)) => {
+            let floats: Result<Vec<f64>, String> = arr.iter().map(|v| match v {
+                Value::Float(f) => Ok(*f),
+                Value::Int(i) => Ok(*i as f64),
+                _ => Err("softmax: expected numeric array".to_string()),
+            }).collect();
+            let floats = floats?;
+            let max = floats.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+            let exps: Vec<f64> = floats.iter().map(|x| (x - max).exp()).collect();
+            let sum: f64 = exps.iter().sum();
+            Ok(Value::Array(exps.iter().map(|e| Value::Float(e / sum)).collect()))
+        }
+        _ => Err("softmax expects an array argument".to_string()),
+    }
+}
+
+fn builtin_gelu(_env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    let x = match args.first() {
+        Some(Value::Float(f)) => *f,
+        Some(Value::Int(i)) => *i as f64,
+        _ => return Err("gelu expects a numeric argument".to_string()),
+    };
+    // GELU approximation: 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
+    let c = (2.0_f64 / std::f64::consts::PI).sqrt();
+    Ok(Value::Float(0.5 * x * (1.0 + (c * (x + 0.044715 * x.powi(3))).tanh())))
+}
+
+fn builtin_layer_norm(_env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    match args.first() {
+        Some(Value::Array(arr)) => {
+            let floats: Result<Vec<f64>, String> = arr.iter().map(|v| match v {
+                Value::Float(f) => Ok(*f),
+                Value::Int(i) => Ok(*i as f64),
+                _ => Err("layer_norm: expected numeric array".to_string()),
+            }).collect();
+            let floats = floats?;
+            let n = floats.len() as f64;
+            let mean = floats.iter().sum::<f64>() / n;
+            let var = floats.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / n;
+            let std = (var + 1e-5).sqrt();
+            Ok(Value::Array(floats.iter().map(|x| Value::Float((x - mean) / std)).collect()))
+        }
+        _ => Err("layer_norm expects an array argument".to_string()),
+    }
+}
+
+fn builtin_attention(_env: &mut Env, _args: Vec<Value>) -> Result<Value, String> {
+    Err("attention builtin is not yet fully implemented".to_string())
+}
+
+fn builtin_rope(_env: &mut Env, _args: Vec<Value>) -> Result<Value, String> {
+    Err("rope builtin is not yet fully implemented".to_string())
 }
 
 // --- Phase 2: ZK primitive builtins ---
