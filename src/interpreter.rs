@@ -25,6 +25,12 @@ pub enum Value {
         name: String,
         fields: HashMap<String, Value>,
     },
+    /// An enum variant value
+    EnumVariant {
+        enum_name: String,
+        variant: String,
+        fields: Vec<Value>,
+    },
     /// A function value (closure)
     Function {
         name: String,
@@ -65,6 +71,18 @@ impl fmt::Display for Value {
                     write!(f, "{}: {}", k, v)?;
                 }
                 write!(f, " }}")
+            }
+            Value::EnumVariant { enum_name, variant, fields } => {
+                write!(f, "{}::{}", enum_name, variant)?;
+                if !fields.is_empty() {
+                    write!(f, "(")?;
+                    for (i, v) in fields.iter().enumerate() {
+                        if i > 0 { write!(f, ", ")?; }
+                        write!(f, "{}", v)?;
+                    }
+                    write!(f, ")")?;
+                }
+                Ok(())
             }
             Value::BigInt(n) => write!(f, "0x{}", n),
             Value::FieldElem(fe) => write!(f, "{}", fe),
@@ -417,6 +435,32 @@ pub fn interpret(program: &Program) -> Result<Vec<String>, String> {
                 let field_names: Vec<String> = s.fields.iter().map(|f| f.name.name.clone()).collect();
                 env.struct_defs.insert(s.name.name.clone(), field_names);
             }
+            ItemKind::Enum(e) => {
+                let enum_name = e.name.name.clone();
+                for variant in &e.variants {
+                    let vn = variant.name.name.clone();
+                    let en = enum_name.clone();
+                    match &variant.kind {
+                        crate::ast::EnumVariantKind::Unit => {
+                            let val = Value::EnumVariant {
+                                enum_name: en.clone(),
+                                variant: vn.clone(),
+                                fields: Vec::new(),
+                            };
+                            env.define(&vn, val.clone());
+                            env.define(&format!("{}::{}", en, vn), val);
+                        }
+                        crate::ast::EnumVariantKind::Tuple(types) => {
+                            // Store arity info for constructor dispatch
+                            env.struct_defs.insert(
+                                format!("__enum_{}_{}", en, vn),
+                                (0..types.len()).map(|i| format!("_{}", i)).collect(),
+                            );
+                        }
+                        crate::ast::EnumVariantKind::Struct(_) => {}
+                    }
+                }
+            }
             ItemKind::Impl(impl_block) => {
                 // Get the target type name
                 let type_name = match &impl_block.target.kind {
@@ -699,6 +743,21 @@ fn eval_expr(env: &mut Env, expr: &Expr) -> Result<Value, String> {
                 _ => return Err("not a callable expression".to_string()),
             };
 
+            // Check if this is an enum variant constructor
+            for (key, _) in env.struct_defs.iter() {
+                if key.starts_with("__enum_") && key.ends_with(&format!("_{}", func_name)) {
+                    let parts: Vec<&str> = key.strip_prefix("__enum_").unwrap().rsplitn(2, '_').collect();
+                    if parts.len() == 2 {
+                        let enum_name = parts[1].to_string();
+                        return Ok(Value::EnumVariant {
+                            enum_name,
+                            variant: func_name,
+                            fields: arg_vals,
+                        });
+                    }
+                }
+            }
+
             let func_def = env.functions.get(&func_name).cloned()
                 .ok_or_else(|| format!("undefined function: {}", func_name))?;
 
@@ -843,7 +902,22 @@ fn eval_expr(env: &mut Env, expr: &Expr) -> Result<Value, String> {
 fn pattern_matches(pattern: &Pattern, value: &Value) -> bool {
     match pattern {
         Pattern::Wildcard => true,
-        Pattern::Ident(_) => true, // Ident always matches (it's a binding)
+        Pattern::Ident(id) => {
+            // If the value is an enum variant and the ident matches a variant name,
+            // treat this as a variant match (not a binding)
+            if let Value::EnumVariant { variant, fields, .. } = value {
+                if id.name == *variant && fields.is_empty() {
+                    return true; // Unit variant match
+                }
+                // If the ident doesn't match any variant name, it's a binding
+                // (but we can't distinguish perfectly without type info, so
+                // we check: if the ident starts with uppercase, treat as variant match)
+                if id.name.chars().next().map(|c| c.is_uppercase()).unwrap_or(false) {
+                    return id.name == *variant;
+                }
+            }
+            true // Regular identifier binding
+        }
         Pattern::Literal(expr) => {
             // Compare literal values
             match &expr.kind {
@@ -862,8 +936,26 @@ fn pattern_matches(pattern: &Pattern, value: &Value) -> bool {
                 _ => false,
             }
         }
-        Pattern::Variant { .. } => {
-            // Enum variants not fully implemented yet
+        Pattern::Variant { name, fields } => {
+            if let Value::EnumVariant { variant, fields: val_fields, .. } = value {
+                if variant == &name.name {
+                    // Match inner patterns
+                    if fields.is_empty() {
+                        return true;
+                    }
+                    if fields.len() != val_fields.len() {
+                        return false;
+                    }
+                    return fields.iter().zip(val_fields.iter())
+                        .all(|(pat, val)| pattern_matches(pat, val));
+                }
+            }
+            // Also check against unit variant identifiers
+            if let Value::EnumVariant { variant, fields: val_fields, .. } = value {
+                if variant == &name.name && fields.is_empty() && val_fields.is_empty() {
+                    return true;
+                }
+            }
             false
         }
     }
@@ -872,9 +964,22 @@ fn pattern_matches(pattern: &Pattern, value: &Value) -> bool {
 fn bind_pattern(env: &mut Env, pattern: &Pattern, value: &Value) {
     match pattern {
         Pattern::Ident(id) => {
+            // Don't bind uppercase idents that are enum variant matches
+            if let Value::EnumVariant { variant, .. } = value {
+                if id.name == *variant {
+                    return; // This was a variant match, not a binding
+                }
+            }
             env.define(&id.name, value.clone());
         }
-        Pattern::Wildcard | Pattern::Literal(_) | Pattern::Variant { .. } => {}
+        Pattern::Variant { name: _, fields } => {
+            if let Value::EnumVariant { fields: val_fields, .. } = value {
+                for (pat, val) in fields.iter().zip(val_fields.iter()) {
+                    bind_pattern(env, pat, val);
+                }
+            }
+        }
+        Pattern::Wildcard | Pattern::Literal(_) => {}
     }
 }
 

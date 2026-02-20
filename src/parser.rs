@@ -135,6 +135,7 @@ impl Parser {
                 TokenKind::Fn
                 | TokenKind::Kernel
                 | TokenKind::Struct
+                | TokenKind::Enum
                 | TokenKind::Trait
                 | TokenKind::Impl
                 | TokenKind::Import
@@ -159,6 +160,7 @@ impl Parser {
             TokenKind::Fn => ItemKind::Function(self.parse_function()?),
             TokenKind::Kernel => ItemKind::Kernel(self.parse_kernel()?),
             TokenKind::Struct => ItemKind::Struct(self.parse_struct()?),
+            TokenKind::Enum => ItemKind::Enum(self.parse_enum()?),
             TokenKind::Trait => ItemKind::Trait(self.parse_trait()?),
             TokenKind::Impl => ItemKind::Impl(self.parse_impl()?),
             TokenKind::Import => ItemKind::Import(self.parse_import()?),
@@ -278,6 +280,74 @@ impl Parser {
             name,
             generics,
             fields,
+        })
+    }
+
+    // --- Enum parsing ---
+
+    fn parse_enum(&mut self) -> Result<EnumDef, ()> {
+        self.expect(TokenKind::Enum)?;
+        let name = self.parse_ident()?;
+        let generics = self.parse_optional_generics()?;
+        self.expect(TokenKind::LBrace)?;
+
+        let mut variants = Vec::new();
+        while !self.check(TokenKind::RBrace) && !self.at_end() {
+            let start = self.span();
+            let variant_name = self.parse_ident()?;
+
+            let kind = if self.check(TokenKind::LParen) {
+                // Tuple variant: Variant(Type1, Type2)
+                self.advance();
+                let mut types = Vec::new();
+                while !self.check(TokenKind::RParen) && !self.at_end() {
+                    types.push(self.parse_type()?);
+                    if !self.eat(TokenKind::Comma).is_some() {
+                        break;
+                    }
+                }
+                self.expect(TokenKind::RParen)?;
+                EnumVariantKind::Tuple(types)
+            } else if self.check(TokenKind::LBrace) {
+                // Struct variant: Variant { field: Type }
+                self.advance();
+                let mut fields = Vec::new();
+                while !self.check(TokenKind::RBrace) && !self.at_end() {
+                    let fstart = self.span();
+                    let fname = self.parse_ident()?;
+                    self.expect(TokenKind::Colon)?;
+                    let fty = self.parse_type()?;
+                    let fend = self.span();
+                    self.eat(TokenKind::Comma);
+                    fields.push(Field {
+                        name: fname,
+                        ty: fty,
+                        default: None,
+                        is_pub: false,
+                        span: fstart.merge(fend),
+                    });
+                }
+                self.expect(TokenKind::RBrace)?;
+                EnumVariantKind::Struct(fields)
+            } else {
+                // Unit variant
+                EnumVariantKind::Unit
+            };
+
+            let end = self.span();
+            self.eat(TokenKind::Comma);
+            variants.push(EnumVariant {
+                name: variant_name,
+                kind,
+                span: start.merge(end),
+            });
+        }
+        self.expect(TokenKind::RBrace)?;
+
+        Ok(EnumDef {
+            name,
+            generics,
+            variants,
         })
     }
 

@@ -1,0 +1,69 @@
+// Vortex Enum / ADT Demo
+
+enum Color {
+    Red,
+    Green,
+    Blue,
+    Custom(i64, i64, i64),
+}
+
+enum Option {
+    Some(i64),
+    None,
+}
+
+fn describe_color(c: Color) -> str {
+    return match c {
+        Red => "red",
+        Green => "green",
+        Blue => "blue",
+        _ => "custom"
+    }
+}
+
+fn unwrap_or(opt: Option, default: i64) -> i64 {
+    return match opt {
+        Some(x) => x,
+        None => default
+    }
+}
+
+fn main() {
+    println("=== Enum / ADT Demo ===")
+    println("")
+
+    // Unit variants
+    let r = Red
+    let g = Green
+    let b = Blue
+
+    println(format("Red:   {}", describe_color(r)))
+    println(format("Green: {}", describe_color(g)))
+    println(format("Blue:  {}", describe_color(b)))
+
+    println("")
+
+    // Tuple variant constructors
+    let custom = Custom(255, 128, 0)
+    println(format("Custom: {}", describe_color(custom)))
+    println(format("Custom value: {}", custom))
+
+    println("")
+
+    // Option-like enum
+    let some_val = Some(42)
+    let none_val = None
+
+    println(format("Some(42) unwrapped: {}", to_string(unwrap_or(some_val, 0))))
+    println(format("None unwrapped:     {}", to_string(unwrap_or(none_val, -1))))
+
+    // Pattern matching with destructuring
+    let result = match some_val {
+        Some(x) => x * 2,
+        None => 0
+    }
+    println(format("Some(42) * 2 = {}", to_string(result)))
+
+    println("")
+    println("=== All enum tests passed! ===")
+}

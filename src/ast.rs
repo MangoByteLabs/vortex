@@ -20,6 +20,7 @@ pub enum ItemKind {
     Function(Function),
     Kernel(Kernel),
     Struct(StructDef),
+    Enum(EnumDef),
     Trait(TraitDef),
     Impl(ImplBlock),
     Import(ImportDecl),
@@ -73,6 +74,32 @@ pub struct Field {
     pub default: Option<Expr>,
     pub is_pub: bool,
     pub span: Span,
+}
+
+/// Enum definition
+#[derive(Debug, Clone)]
+pub struct EnumDef {
+    pub name: Ident,
+    pub generics: Vec<GenericParam>,
+    pub variants: Vec<EnumVariant>,
+}
+
+/// An enum variant
+#[derive(Debug, Clone)]
+pub struct EnumVariant {
+    pub name: Ident,
+    pub kind: EnumVariantKind,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone)]
+pub enum EnumVariantKind {
+    /// Unit variant: None
+    Unit,
+    /// Tuple variant: Some(T)
+    Tuple(Vec<TypeExpr>),
+    /// Struct variant: Point { x: f64, y: f64 }
+    Struct(Vec<Field>),
 }
 
 /// Trait definition
@@ -501,6 +528,7 @@ impl fmt::Display for Item {
             ItemKind::Function(func) => write!(f, "{}", func),
             ItemKind::Kernel(kernel) => write!(f, "{}", kernel),
             ItemKind::Struct(s) => write!(f, "{}", s),
+            ItemKind::Enum(e) => write!(f, "{}", e),
             ItemKind::Trait(t) => write!(f, "{}", t),
             ItemKind::Impl(i) => write!(f, "{}", i),
             ItemKind::Import(i) => write!(f, "{}", i),
@@ -592,6 +620,45 @@ impl fmt::Display for StructDef {
             write!(f, "{}: {}", field.name.name, field.ty)?;
             if let Some(default) = &field.default {
                 write!(f, " = {}", default)?;
+            }
+            writeln!(f, ",")?;
+        }
+        write!(f, "}}")
+    }
+}
+
+impl fmt::Display for EnumDef {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "enum {}", self.name.name)?;
+        if !self.generics.is_empty() {
+            write!(f, "<")?;
+            for (i, g) in self.generics.iter().enumerate() {
+                if i > 0 { write!(f, ", ")?; }
+                write!(f, "{}", g)?;
+            }
+            write!(f, ">")?;
+        }
+        writeln!(f, " {{")?;
+        for v in &self.variants {
+            write!(f, "    {}", v.name.name)?;
+            match &v.kind {
+                EnumVariantKind::Unit => {}
+                EnumVariantKind::Tuple(types) => {
+                    write!(f, "(")?;
+                    for (i, t) in types.iter().enumerate() {
+                        if i > 0 { write!(f, ", ")?; }
+                        write!(f, "{}", t)?;
+                    }
+                    write!(f, ")")?;
+                }
+                EnumVariantKind::Struct(fields) => {
+                    write!(f, " {{ ")?;
+                    for (i, field) in fields.iter().enumerate() {
+                        if i > 0 { write!(f, ", ")?; }
+                        write!(f, "{}: {}", field.name.name, field.ty)?;
+                    }
+                    write!(f, " }}")?;
+                }
             }
             writeln!(f, ",")?;
         }
