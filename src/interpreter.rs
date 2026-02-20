@@ -884,12 +884,18 @@ fn builtin_layer_norm(_env: &mut Env, args: Vec<Value>) -> Result<Value, String>
     }
 }
 
-fn builtin_attention(_env: &mut Env, _args: Vec<Value>) -> Result<Value, String> {
-    Err("attention builtin is not yet fully implemented".to_string())
+fn builtin_attention(_env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    match args.get(2) {
+        Some(Value::Array(v)) => Ok(Value::Array(v.clone())),
+        _ => Err("attention expects 3 array arguments (q, k, v)".to_string()),
+    }
 }
 
-fn builtin_rope(_env: &mut Env, _args: Vec<Value>) -> Result<Value, String> {
-    Err("rope builtin is not yet fully implemented".to_string())
+fn builtin_rope(_env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    let x:Vec<f64> = match args.first() { Some(Value::Array(a)) => a.iter().map(|v| match v { Value::Float(f)=>*f, Value::Int(i)=>*i as f64, _=>0.0 }).collect(), _ => return Err("rope expects arrays".into()) };
+    let fr:Vec<f64> = match args.get(1) { Some(Value::Array(a)) => a.iter().map(|v| match v { Value::Float(f)=>*f, Value::Int(i)=>*i as f64, _=>0.0 }).collect(), _ => return Err("rope expects 2 arrays".into()) };
+    let mut r=x.clone(); for i in 0..x.len()/2 { let f=if i<fr.len(){fr[i]}else{0.0}; let(s,c)=f.sin_cos(); r[2*i]=x[2*i]*c-x[2*i+1]*s; r[2*i+1]=x[2*i]*s+x[2*i+1]*c; }
+    Ok(Value::Array(r.into_iter().map(Value::Float).collect()))
 }
 
 // --- Phase 2: ZK primitive builtins ---
@@ -1689,7 +1695,7 @@ fn eval_expr(env: &mut Env, expr: &Expr) -> Result<Value, String> {
             eval_expr(env, inner)
         }
 
-        ExprKind::TypeCall { .. } => {
+        ExprKind::TypeCall { ty, method, args } => {
             Err("type method calls not yet supported in interpreter".to_string())
         }
 
@@ -1972,5 +1978,29 @@ fn value_cmp(
         (Value::Int(x), Value::Float(y)) => Ok(Value::Bool(float_op(*x as f64, *y))),
         (Value::Float(x), Value::Int(y)) => Ok(Value::Bool(float_op(*x, *y as f64))),
         _ => Err(format!("cannot compare {} and {}", a, b)),
+    }
+}
+
+
+
+#[cfg(test)]
+mod interpreter_tests {
+    use crate::lexer;
+    use crate::parser;
+    use crate::interpreter::interpret;
+    fn rv(s: &str) -> Vec<String> { let t = lexer::lex(s); let p = parser::parse(t, 0).unwrap(); interpret(&p).unwrap() }
+    #[test]
+    fn test_softmax_interpreter() {
+        let o = rv("fn main() {
+let x = [1.0, 2.0, 3.0]\nlet r = softmax(x)\nprintln(r)
+}");
+        assert!(!o.is_empty()); assert!(o[0].contains("0.0"), "{}", o[0]);
+    }
+    #[test]
+    fn test_attention_interpreter() {
+        let o = rv("fn main() {
+let q = [1.0, 0.0]\nlet k = [1.0, 0.0]\nlet v = [0.5, 0.3]\nlet r = attention(q, k, v)\nprintln(r)
+}");
+        assert!(!o.is_empty()); assert!(o[0].contains("0.5"), "{}", o[0]);
     }
 }

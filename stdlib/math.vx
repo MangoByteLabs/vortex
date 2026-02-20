@@ -1,0 +1,15 @@
+// Vortex Math Library
+pub fn abs(x: i64) -> i64 {
+    if x < 0 { return 0 - x }
+    return x
+}
+
+pub fn pow(base: i64, exp: i64) -> i64 {
+    let result = 1
+    let i = 0
+    while i < exp {
+        result = result * base
+        i = i + 1
+    }
+    return result
+}

@@ -85,7 +85,11 @@ fn main() {
         "check" => {
             let tokens = lexer::lex(&source);
             match parser::parse(tokens, file_id) {
-                Ok(program) => match typeck::check(&program, file_id) {
+                Ok(program) => {
+                    let fd = PathBuf::from(filename).parent().map(|p| p.to_path_buf()).unwrap_or_else(|| PathBuf::from("."));
+                    let mut resolver = module::ModuleResolver::new(fd);
+                    let program = match resolver.resolve_imports(&program) { Ok(p)=>p, Err(e)=>{eprintln!("Import error: {}",e);std::process::exit(1);} };
+                    match typeck::check(&program, file_id) {
                     Ok(()) => {
                         println!("Type check passed.");
                     }
@@ -95,7 +99,8 @@ fn main() {
                         }
                         std::process::exit(1);
                     }
-                },
+                    }
+                }
                 Err(diagnostics) => {
                     for diag in &diagnostics {
                         term::emit(&mut writer.lock(), &config, &files, diag).unwrap();

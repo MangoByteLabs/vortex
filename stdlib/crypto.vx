@@ -1,0 +1,7 @@
+// Vortex Crypto Library
+// Re-exports of crypto builtins
+// Usage: import crypto { sha256, field_new }
+
+// Note: crypto builtins (sha256, secp256k1_generator, field_*, point_*)
+// are available as interpreter builtins.
+// This module provides documentation and future pure-Vortex implementations.
