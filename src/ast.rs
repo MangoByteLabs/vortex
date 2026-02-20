@@ -37,6 +37,8 @@ pub struct Function {
     pub ret_type: Option<TypeExpr>,
     pub where_clause: Vec<WhereClause>,
     pub body: Block,
+    /// Annotations like @scan(...), @recurrent
+    pub annotations: Vec<Annotation>,
 }
 
 /// A GPU kernel function
@@ -49,6 +51,8 @@ pub struct Kernel {
     pub ret_type: Option<TypeExpr>,
     pub where_clause: Vec<WhereClause>,
     pub body: Block,
+    /// Annotations like @scan(...), @recurrent
+    pub annotations: Vec<Annotation>,
 }
 
 /// Schedule annotation like @schedule(tile_m=128, num_warps=4)
@@ -56,6 +60,17 @@ pub struct Kernel {
 pub struct ScheduleAnnotation {
     pub params: Vec<(Ident, Expr)>,
     pub span: Span,
+}
+
+/// An annotation on a function or kernel (e.g., @scan, @recurrent, @schedule)
+#[derive(Debug, Clone)]
+pub enum Annotation {
+    /// @schedule(tile_m=128, num_warps=4)
+    Schedule(ScheduleAnnotation),
+    /// @scan(mode = "parallel") or @scan with no params
+    Scan(Option<Vec<(Ident, Expr)>>),
+    /// @recurrent - marks for sequential recurrent execution
+    Recurrent,
 }
 
 /// Struct definition
@@ -247,6 +262,12 @@ pub enum StmtKind {
     Break,
     /// continue
     Continue,
+    /// dispatch index -> [target1, target2, ...](args)
+    Dispatch {
+        index: Box<Expr>,
+        targets: Vec<Ident>,
+        args: Vec<Expr>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -438,6 +459,10 @@ pub enum TypeExprKind {
         params: Vec<TypeExpr>,
         ret: Box<TypeExpr>,
     },
+    /// Sparse type: Sparse<T>
+    Sparse(Box<TypeExpr>),
+    /// SparseIndex type: SparseIndex[B, k]
+    SparseIndex { batch: Box<Expr>, k: Box<Expr> },
 }
 
 /// A type argument can be a type or a value (for const generics / shapes)
@@ -538,8 +563,29 @@ impl fmt::Display for Item {
     }
 }
 
+impl fmt::Display for Annotation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Annotation::Schedule(sched) => write!(f, "{}", sched),
+            Annotation::Scan(Some(params)) => {
+                write!(f, "@scan(")?;
+                for (i, (name, val)) in params.iter().enumerate() {
+                    if i > 0 { write!(f, ", ")?; }
+                    write!(f, "{} = {}", name.name, val)?;
+                }
+                write!(f, ")")
+            }
+            Annotation::Scan(None) => write!(f, "@scan"),
+            Annotation::Recurrent => write!(f, "@recurrent"),
+        }
+    }
+}
+
 impl fmt::Display for Function {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for ann in &self.annotations {
+            writeln!(f, "{}", ann)?;
+        }
         write!(f, "fn {}", self.name.name)?;
         if !self.generics.is_empty() {
             write!(f, "<")?;
@@ -844,6 +890,19 @@ impl fmt::Display for Stmt {
             }
             StmtKind::Break => write!(f, "break"),
             StmtKind::Continue => write!(f, "continue"),
+            StmtKind::Dispatch { index, targets, args } => {
+                write!(f, "dispatch {} -> [", index)?;
+                for (i, t) in targets.iter().enumerate() {
+                    if i > 0 { write!(f, ", ")?; }
+                    write!(f, "{}", t.name)?;
+                }
+                write!(f, "](")?;
+                for (i, a) in args.iter().enumerate() {
+                    if i > 0 { write!(f, ", ")?; }
+                    write!(f, "{}", a)?;
+                }
+                write!(f, ")")
+            }
         }
     }
 }
@@ -1042,6 +1101,8 @@ impl fmt::Display for TypeExpr {
                 }
                 write!(f, ") -> {}", ret)
             }
+            TypeExprKind::Sparse(inner) => write!(f, "Sparse<{}>", inner),
+            TypeExprKind::SparseIndex { batch, k } => write!(f, "SparseIndex[{}, {}]", batch, k),
         }
     }
 }

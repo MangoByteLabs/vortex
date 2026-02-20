@@ -465,6 +465,12 @@ fn check_stmt(env: &mut TypeEnv, stmt: &Stmt, expected_ret: &Type) {
             env.pop_scope();
         }
         StmtKind::Break | StmtKind::Continue => {}
+        StmtKind::Dispatch { index, targets: _, args } => {
+            let _ = infer_expr(env, index);
+            for arg in args {
+                let _ = infer_expr(env, arg);
+            }
+        }
     }
 }
 
@@ -1036,6 +1042,13 @@ fn resolve_type_expr(env: &mut TypeEnv, ty: &TypeExpr) -> Type {
                 params: param_types,
                 ret: Box::new(ret_type),
             }
+        }
+        TypeExprKind::Sparse(inner) => {
+            let _inner_ty = resolve_type_expr(env, inner);
+            Type::Named("Sparse".to_string())
+        }
+        TypeExprKind::SparseIndex { .. } => {
+            Type::Named("SparseIndex".to_string())
         }
     }
 }

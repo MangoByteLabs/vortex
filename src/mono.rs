@@ -101,6 +101,12 @@ impl MonoPass {
                 self.visit_block(body);
             }
             StmtKind::Break | StmtKind::Continue => {}
+            StmtKind::Dispatch { index, args, .. } => {
+                self.visit_expr(index);
+                for arg in args {
+                    self.visit_expr(arg);
+                }
+            }
         }
     }
 
@@ -243,6 +249,7 @@ impl MonoPass {
             ret_type: func.ret_type.clone(),
             where_clause: func.where_clause.clone(),
             body: self.rewrite_block(&func.body),
+            annotations: func.annotations.clone(),
         }
     }
 
@@ -424,6 +431,8 @@ fn mangle_type(ty: &TypeExpr) -> String {
             parts.join("x")
         }
         TypeExprKind::Fn { .. } => "fn".to_string(),
+        TypeExprKind::Sparse(inner) => format!("sparse_{}", mangle_type(inner)),
+        TypeExprKind::SparseIndex { .. } => "sparse_index".to_string(),
     }
 }
 
@@ -470,6 +479,7 @@ pub fn specialize_function(func: &Function, type_args: &[TypeArg]) -> Function {
         ret_type: func.ret_type.as_ref().map(|t| subst_type(t, &type_subst)),
         where_clause: vec![],
         body: subst_block(&func.body, &type_subst, &const_subst),
+        annotations: func.annotations.clone(),
     }
 }
 
@@ -709,6 +719,7 @@ mod tests {
                 expr: None,
                 span: dummy_span(),
             },
+            annotations: vec![],
         }
     }
 
@@ -773,6 +784,7 @@ mod tests {
                 expr: None,
                 span: dummy_span(),
             },
+            annotations: vec![],
         };
 
         let program = Program {
@@ -840,6 +852,7 @@ mod tests {
                 expr: None,
                 span: dummy_span(),
             },
+            annotations: vec![],
         };
 
         let type_args = vec![

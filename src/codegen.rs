@@ -459,6 +459,35 @@ impl CodeGen {
             StmtKind::Break | StmtKind::Continue => {
                 self.emit_line(&format!("// {}", if matches!(stmt.kind, StmtKind::Break) { "break" } else { "continue" }));
             }
+
+            StmtKind::Dispatch { index, targets, args } => {
+                let (idx_ssa, _) = self.gen_expr(index);
+                // Generate args
+                let mut arg_ssas = Vec::new();
+                let mut arg_types = Vec::new();
+                for arg in args {
+                    let (ssa, ty) = self.gen_expr(arg);
+                    arg_ssas.push(ssa);
+                    arg_types.push(ty);
+                }
+                let args_str = arg_ssas.join(", ");
+                let types_str = arg_types.iter().map(|t| format!("{}", t)).collect::<Vec<_>>().join(", ");
+                // Emit chain of scf.if blocks
+                for (i, target) in targets.iter().enumerate() {
+                    let expected = self.fresh_ssa();
+                    self.emit_line(&format!("{} = arith.constant {} : i64", expected, i));
+                    let cmp = self.fresh_ssa();
+                    self.emit_line(&format!("{} = arith.cmpi eq, {}, {} : i64", cmp, idx_ssa, expected));
+                    self.emit_line(&format!("scf.if {} {{", cmp));
+                    self.indent += 1;
+                    self.emit_line(&format!(
+                        "func.call @{}({}) : ({}) -> ()",
+                        target.name, args_str, types_str
+                    ));
+                    self.indent -= 1;
+                    self.emit_line("}");
+                }
+            }
         }
     }
 

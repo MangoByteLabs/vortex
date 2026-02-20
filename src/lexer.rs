@@ -102,6 +102,14 @@ pub enum TokenKind {
     #[token("stage")]
     Stage,
 
+    // Keywords - sparse / dispatch
+    #[token("Sparse")]
+    Sparse,
+    #[token("SparseIndex")]
+    SparseIndex,
+    #[token("dispatch")]
+    Dispatch,
+
     // Arithmetic operators
     #[token("+")]
     Plus,
@@ -270,6 +278,9 @@ impl fmt::Display for TokenKind {
             TokenKind::Comptime => write!(f, "comptime"),
             TokenKind::Pipeline => write!(f, "pipeline"),
             TokenKind::Stage => write!(f, "stage"),
+            TokenKind::Sparse => write!(f, "Sparse"),
+            TokenKind::SparseIndex => write!(f, "SparseIndex"),
+            TokenKind::Dispatch => write!(f, "dispatch"),
             TokenKind::Plus => write!(f, "+"),
             TokenKind::Minus => write!(f, "-"),
             TokenKind::Star => write!(f, "*"),

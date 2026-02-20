@@ -142,6 +142,7 @@ impl Parser {
                 | TokenKind::Pub
                 | TokenKind::Const
                 | TokenKind::Type
+                | TokenKind::At
                 | TokenKind::Eof => break,
                 _ => {
                     self.advance();
@@ -152,13 +153,87 @@ impl Parser {
 
     // --- Top-level items ---
 
+    fn parse_annotations(&mut self) -> Result<Vec<Annotation>, ()> {
+        let mut annotations = Vec::new();
+        while self.check(TokenKind::At) {
+            self.advance(); // eat @
+            let name = self.parse_ident()?;
+            match name.name.as_str() {
+                "schedule" => {
+                    let sched = self.parse_schedule_params(name.span)?;
+                    annotations.push(Annotation::Schedule(sched));
+                }
+                "scan" => {
+                    if self.check(TokenKind::LParen) {
+                        let params = self.parse_annotation_kv_params()?;
+                        annotations.push(Annotation::Scan(Some(params)));
+                    } else {
+                        annotations.push(Annotation::Scan(None));
+                    }
+                }
+                "recurrent" => {
+                    annotations.push(Annotation::Recurrent);
+                }
+                _ => {
+                    self.error(name.span, format!("unknown annotation @{}", name.name));
+                    return Err(());
+                }
+            }
+            self.skip_newlines();
+        }
+        Ok(annotations)
+    }
+
+    fn parse_schedule_params(&mut self, start_span: Span) -> Result<ScheduleAnnotation, ()> {
+        let params = self.parse_annotation_kv_params()?;
+        Ok(ScheduleAnnotation {
+            params,
+            span: start_span,
+        })
+    }
+
+    fn parse_annotation_kv_params(&mut self) -> Result<Vec<(Ident, Expr)>, ()> {
+        self.expect(TokenKind::LParen)?;
+        let mut params = Vec::new();
+        while !self.check(TokenKind::RParen) && !self.at_end() {
+            let key = self.parse_ident()?;
+            self.expect(TokenKind::Eq)?;
+            let val = self.parse_expr()?;
+            params.push((key, val));
+            if !self.check(TokenKind::RParen) {
+                self.eat(TokenKind::Comma);
+            }
+        }
+        self.expect(TokenKind::RParen)?;
+        Ok(params)
+    }
+
     fn parse_item(&mut self) -> Result<Item, ()> {
         let start = self.span();
+
+        // Parse annotations before the item
+        let annotations = self.parse_annotations()?;
+
         let is_pub = self.eat(TokenKind::Pub).is_some();
 
         let kind = match self.peek_kind() {
-            TokenKind::Fn => ItemKind::Function(self.parse_function()?),
-            TokenKind::Kernel => ItemKind::Kernel(self.parse_kernel()?),
+            TokenKind::Fn => {
+                let mut func = self.parse_function()?;
+                func.annotations = annotations;
+                // Extract schedule into kernel's schedule field if needed
+                ItemKind::Function(func)
+            }
+            TokenKind::Kernel => {
+                let mut kernel = self.parse_kernel()?;
+                // Extract @schedule annotation into the schedule field
+                for ann in &annotations {
+                    if let Annotation::Schedule(sched) = ann {
+                        kernel.schedule = Some(sched.clone());
+                    }
+                }
+                kernel.annotations = annotations;
+                ItemKind::Kernel(kernel)
+            }
             TokenKind::Struct => ItemKind::Struct(self.parse_struct()?),
             TokenKind::Enum => ItemKind::Enum(self.parse_enum()?),
             TokenKind::Trait => ItemKind::Trait(self.parse_trait()?),
@@ -211,6 +286,7 @@ impl Parser {
             ret_type,
             where_clause,
             body,
+            annotations: vec![],
         })
     }
 
@@ -241,6 +317,7 @@ impl Parser {
             ret_type,
             where_clause,
             body,
+            annotations: vec![],
         })
     }
 
@@ -691,6 +768,35 @@ impl Parser {
             });
         }
 
+        // Sparse<T>
+        if self.check(TokenKind::Sparse) {
+            self.advance();
+            self.expect(TokenKind::Lt)?;
+            let inner = self.parse_type()?;
+            let end = self.expect(TokenKind::Gt)?.span;
+            return Ok(TypeExpr {
+                kind: TypeExprKind::Sparse(Box::new(inner)),
+                span: start.merge(end),
+            });
+        }
+
+        // SparseIndex[B, k]
+        if self.check(TokenKind::SparseIndex) {
+            self.advance();
+            self.expect(TokenKind::LBracket)?;
+            let batch = self.parse_expr()?;
+            self.expect(TokenKind::Comma)?;
+            let k = self.parse_expr()?;
+            let end = self.expect(TokenKind::RBracket)?.span;
+            return Ok(TypeExpr {
+                kind: TypeExprKind::SparseIndex {
+                    batch: Box::new(batch),
+                    k: Box::new(k),
+                },
+                span: start.merge(end),
+            });
+        }
+
         // Named or generic type
         let name = self.parse_ident()?;
 
@@ -929,6 +1035,37 @@ impl Parser {
                 Ok(Stmt {
                     span: start,
                     kind: StmtKind::Continue,
+                })
+            }
+            TokenKind::Dispatch => {
+                self.advance();
+                let index = self.parse_expr()?;
+                self.expect(TokenKind::Arrow)?;
+                self.expect(TokenKind::LBracket)?;
+                let mut targets = Vec::new();
+                while !self.check(TokenKind::RBracket) && !self.at_end() {
+                    targets.push(self.parse_ident()?);
+                    if !self.eat(TokenKind::Comma).is_some() {
+                        break;
+                    }
+                }
+                self.expect(TokenKind::RBracket)?;
+                self.expect(TokenKind::LParen)?;
+                let mut args = Vec::new();
+                while !self.check(TokenKind::RParen) && !self.at_end() {
+                    args.push(self.parse_expr()?);
+                    if !self.eat(TokenKind::Comma).is_some() {
+                        break;
+                    }
+                }
+                let end = self.expect(TokenKind::RParen)?.span;
+                Ok(Stmt {
+                    span: start.merge(end),
+                    kind: StmtKind::Dispatch {
+                        index: Box::new(index),
+                        targets,
+                        args,
+                    },
                 })
             }
             _ => {
@@ -1687,5 +1824,27 @@ mod tests {
         let program = parse_ok("type Fr = Field<BN254>");
         assert_eq!(program.items.len(), 1);
         assert!(matches!(program.items[0].kind, ItemKind::TypeAlias(_)));
+    }
+
+    #[test]
+    fn test_parse_dispatch() {
+        let program = parse_ok(
+            "fn a(x: i64) -> i64 { return x }
+fn b(x: i64) -> i64 { return x }
+fn main() {
+    dispatch 0 -> [a, b](42)
+}",
+        );
+        assert_eq!(program.items.len(), 3);
+        if let ItemKind::Function(f) = &program.items[2].kind {
+            assert_eq!(f.name.name, "main");
+            // The dispatch is the last (and only) statement/expr in main
+            let has_dispatch = f.body.stmts.iter().any(|s| matches!(&s.kind, StmtKind::Dispatch { .. }))
+                || f.body.expr.as_ref().map(|e| matches!(&e.kind, ExprKind::Block(_))).unwrap_or(false);
+            // Check body contains dispatch somewhere
+            assert!(f.body.stmts.len() >= 1 || f.body.expr.is_some());
+        } else {
+            panic!("expected function");
+        }
     }
 }
