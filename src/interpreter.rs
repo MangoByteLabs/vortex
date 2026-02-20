@@ -1,4 +1,5 @@
 use crate::ast::*;
+use crate::autodiff;
 use crate::crypto;
 use crate::memory;
 use crate::spiking;
@@ -47,6 +48,18 @@ pub enum Value {
     SparseTensor(crate::sparse::SparseTensor),
     /// A sparse index
     SparseIdx(crate::sparse::SparseIndex),
+    /// A closure (lambda) with captured environment
+    Closure {
+        params: Vec<String>,
+        body: Expr,
+        env: HashMap<String, Value>,
+    },
+    /// Option type: Some(v) or None
+    Option(Option<Box<Value>>),
+    /// Result type: Ok(v) or Err(e)
+    Result(std::result::Result<Box<Value>, Box<Value>>),
+    /// HashMap/dictionary
+    HashMap(std::collections::HashMap<String, Value>),
     /// Return signal (used internally)
     Return(Box<Value>),
 }
@@ -102,7 +115,20 @@ impl fmt::Display for Value {
             Value::SparseTensor(st) => write!(f, "SparseTensor(nnz={})", st.values.len()),
             Value::SparseIdx(si) => write!(f, "SparseIndex(batch={}, k={})", si.batch_size, si.k),
             Value::Void => write!(f, "()"),
+            Value::Closure { params, .. } => write!(f, "<closure({})>", params.join(", ")),
             Value::Function { name, .. } => write!(f, "<fn {}>", name),
+            Value::Option(Some(v)) => write!(f, "Some({})", v),
+            Value::Option(None) => write!(f, "None"),
+            Value::Result(Ok(v)) => write!(f, "Ok({})", v),
+            Value::Result(Err(e)) => write!(f, "Err({})", e),
+            Value::HashMap(map) => {
+                write!(f, "{{")?;
+                for (i, (k, v)) in map.iter().enumerate() {
+                    if i > 0 { write!(f, ", ")?; }
+                    write!(f, "{}: {}", k, v)?;
+                }
+                write!(f, "}}")
+            }
             Value::Return(v) => write!(f, "{}", v),
         }
     }
@@ -115,6 +141,9 @@ struct Env {
     /// Struct definitions: name -> field names (in order)
     struct_defs: HashMap<String, Vec<String>>,
     output: Vec<String>,
+    /// AD tapes stored by integer id
+    tapes: HashMap<usize, autodiff::Tape>,
+    next_tape_id: usize,
 }
 
 #[derive(Clone)]
@@ -133,6 +162,8 @@ impl Env {
             functions: HashMap::new(),
             struct_defs: HashMap::new(),
             output: Vec::new(),
+            tapes: HashMap::new(),
+            next_tape_id: 0,
         };
         env.register_builtins();
         env
@@ -298,6 +329,90 @@ impl Env {
         self.functions.insert("compact".to_string(), FnDef::Builtin(builtin_compact));
         self.functions.insert("pad".to_string(), FnDef::Builtin(builtin_pad));
         self.functions.insert("stream_compact".to_string(), FnDef::Builtin(builtin_stream_compact));
+
+        // Higher-order array functions
+        self.functions.insert("map".to_string(), FnDef::Builtin(builtin_map));
+        self.functions.insert("filter".to_string(), FnDef::Builtin(builtin_filter));
+        self.functions.insert("fold".to_string(), FnDef::Builtin(builtin_fold));
+        self.functions.insert("zip".to_string(), FnDef::Builtin(builtin_zip));
+        self.functions.insert("enumerate".to_string(), FnDef::Builtin(builtin_enumerate));
+        self.functions.insert("sort".to_string(), FnDef::Builtin(builtin_sort));
+        self.functions.insert("reverse".to_string(), FnDef::Builtin(builtin_reverse));
+        self.functions.insert("sum".to_string(), FnDef::Builtin(builtin_sum));
+        self.functions.insert("any".to_string(), FnDef::Builtin(builtin_any));
+        self.functions.insert("all".to_string(), FnDef::Builtin(builtin_all));
+        self.functions.insert("flat_map".to_string(), FnDef::Builtin(builtin_flat_map));
+
+        // File I/O builtins
+        self.functions.insert("read_file".to_string(), FnDef::Builtin(builtin_read_file));
+        self.functions.insert("write_file".to_string(), FnDef::Builtin(builtin_write_file));
+        self.functions.insert("append_file".to_string(), FnDef::Builtin(builtin_append_file));
+        self.functions.insert("file_exists".to_string(), FnDef::Builtin(builtin_file_exists));
+        self.functions.insert("read_lines".to_string(), FnDef::Builtin(builtin_read_lines));
+        self.functions.insert("read_bytes".to_string(), FnDef::Builtin(builtin_read_bytes));
+        self.functions.insert("write_bytes".to_string(), FnDef::Builtin(builtin_write_bytes));
+
+        // Automatic differentiation builtins
+        self.functions.insert("tape_new".to_string(), FnDef::Builtin(builtin_tape_new));
+        self.functions.insert("tape_var".to_string(), FnDef::Builtin(builtin_tape_var));
+        self.functions.insert("tape_add".to_string(), FnDef::Builtin(builtin_tape_add));
+        self.functions.insert("tape_mul".to_string(), FnDef::Builtin(builtin_tape_mul));
+        self.functions.insert("tape_sub".to_string(), FnDef::Builtin(builtin_tape_sub));
+        self.functions.insert("tape_div".to_string(), FnDef::Builtin(builtin_tape_div));
+        self.functions.insert("tape_exp".to_string(), FnDef::Builtin(builtin_tape_exp));
+        self.functions.insert("tape_log".to_string(), FnDef::Builtin(builtin_tape_log));
+        self.functions.insert("tape_tanh".to_string(), FnDef::Builtin(builtin_tape_tanh));
+        self.functions.insert("tape_relu".to_string(), FnDef::Builtin(builtin_tape_relu));
+        self.functions.insert("tape_sigmoid".to_string(), FnDef::Builtin(builtin_tape_sigmoid));
+        self.functions.insert("tape_sin".to_string(), FnDef::Builtin(builtin_tape_sin));
+        self.functions.insert("tape_cos".to_string(), FnDef::Builtin(builtin_tape_cos));
+        self.functions.insert("tape_backward".to_string(), FnDef::Builtin(builtin_tape_backward));
+        self.functions.insert("tape_grad".to_string(), FnDef::Builtin(builtin_tape_grad));
+        self.functions.insert("tape_value".to_string(), FnDef::Builtin(builtin_tape_value));
+        self.functions.insert("ad_sgd_step".to_string(), FnDef::Builtin(builtin_ad_sgd_step));
+        self.functions.insert("ad_adam_step".to_string(), FnDef::Builtin(builtin_ad_adam_step));
+        self.functions.insert("ad_mse_loss".to_string(), FnDef::Builtin(builtin_ad_mse_loss));
+        self.functions.insert("ad_cross_entropy_loss".to_string(), FnDef::Builtin(builtin_ad_cross_entropy_loss));
+
+        // Option builtins
+        self.functions.insert("some".to_string(), FnDef::Builtin(builtin_some));
+        self.functions.insert("none".to_string(), FnDef::Builtin(builtin_none));
+        self.functions.insert("unwrap".to_string(), FnDef::Builtin(builtin_unwrap));
+        self.functions.insert("unwrap_or".to_string(), FnDef::Builtin(builtin_unwrap_or));
+        self.functions.insert("is_some".to_string(), FnDef::Builtin(builtin_is_some));
+        self.functions.insert("is_none".to_string(), FnDef::Builtin(builtin_is_none));
+
+        // Result builtins
+        self.functions.insert("ok".to_string(), FnDef::Builtin(builtin_ok));
+        self.functions.insert("err".to_string(), FnDef::Builtin(builtin_err));
+        self.functions.insert("is_ok".to_string(), FnDef::Builtin(builtin_is_ok));
+        self.functions.insert("is_err".to_string(), FnDef::Builtin(builtin_is_err));
+
+        // String operation builtins
+        self.functions.insert("split".to_string(), FnDef::Builtin(builtin_split));
+        self.functions.insert("join".to_string(), FnDef::Builtin(builtin_join));
+        self.functions.insert("trim".to_string(), FnDef::Builtin(builtin_trim));
+        self.functions.insert("starts_with".to_string(), FnDef::Builtin(builtin_starts_with));
+        self.functions.insert("ends_with".to_string(), FnDef::Builtin(builtin_ends_with));
+        self.functions.insert("contains_str".to_string(), FnDef::Builtin(builtin_contains_str));
+        self.functions.insert("replace".to_string(), FnDef::Builtin(builtin_replace));
+        self.functions.insert("to_upper".to_string(), FnDef::Builtin(builtin_to_upper));
+        self.functions.insert("to_lower".to_string(), FnDef::Builtin(builtin_to_lower));
+        self.functions.insert("substr".to_string(), FnDef::Builtin(builtin_substr));
+        self.functions.insert("char_at".to_string(), FnDef::Builtin(builtin_char_at));
+        self.functions.insert("parse_int".to_string(), FnDef::Builtin(builtin_parse_int));
+        self.functions.insert("parse_float".to_string(), FnDef::Builtin(builtin_parse_float));
+        self.functions.insert("string_len".to_string(), FnDef::Builtin(builtin_string_len));
+
+        // HashMap builtins
+        self.functions.insert("hashmap".to_string(), FnDef::Builtin(builtin_hashmap));
+        self.functions.insert("hashmap_insert".to_string(), FnDef::Builtin(builtin_hashmap_insert));
+        self.functions.insert("hashmap_get".to_string(), FnDef::Builtin(builtin_hashmap_get));
+        self.functions.insert("hashmap_remove".to_string(), FnDef::Builtin(builtin_hashmap_remove));
+        self.functions.insert("hashmap_contains".to_string(), FnDef::Builtin(builtin_hashmap_contains));
+        self.functions.insert("hashmap_keys".to_string(), FnDef::Builtin(builtin_hashmap_keys));
+        self.functions.insert("hashmap_values".to_string(), FnDef::Builtin(builtin_hashmap_values));
+        self.functions.insert("hashmap_len".to_string(), FnDef::Builtin(builtin_hashmap_len));
     }
 }
 
@@ -1750,11 +1865,33 @@ fn eval_expr(env: &mut Env, expr: &Expr) -> Result<Value, String> {
                 .map(|a| eval_expr(env, a))
                 .collect::<Result<Vec<_>, _>>()?;
 
-            // Get function name
+            // Check if callee is a variable holding a closure/function value
             let func_name = match &func.kind {
                 ExprKind::Ident(id) => id.name.clone(),
                 _ => return Err("not a callable expression".to_string()),
             };
+
+            // Check if this is a closure or function value in the environment
+            if let Some(val) = env.get(&func_name) {
+                match val {
+                    Value::Closure { params, body, env: captured_env } => {
+                        return call_closure(env, &params, &body, &captured_env, arg_vals);
+                    }
+                    Value::Function { params, body, .. } => {
+                        env.push_scope();
+                        for (param, val) in params.iter().zip(arg_vals.iter()) {
+                            env.define(param, val.clone());
+                        }
+                        let result = eval_block(env, &body)?;
+                        env.pop_scope();
+                        return match result {
+                            Value::Return(v) => Ok(*v),
+                            other => Ok(other),
+                        };
+                    }
+                    _ => {} // not callable, fall through to function lookup
+                }
+            }
 
             // Check if this is an enum variant constructor
             for (key, _) in env.struct_defs.iter() {
@@ -1909,6 +2046,51 @@ fn eval_expr(env: &mut Env, expr: &Expr) -> Result<Value, String> {
             }
             Err(format!("no matching arm for value: {}", val))
         }
+
+        ExprKind::Closure { params, body } => {
+            // Capture the current environment
+            let mut captured = HashMap::new();
+            for scope in env.scopes.iter() {
+                for (k, v) in scope {
+                    captured.insert(k.clone(), v.clone());
+                }
+            }
+            let param_names: Vec<String> = params.iter().map(|p| p.name.name.clone()).collect();
+            Ok(Value::Closure {
+                params: param_names,
+                body: (**body).clone(),
+                env: captured,
+            })
+        }
+
+        ExprKind::Try(inner) => {
+            let val = eval_expr(env, inner)?;
+            match val {
+                Value::Option(Some(v)) => Ok(*v),
+                Value::Option(None) => Ok(Value::Return(Box::new(Value::Option(None)))),
+                Value::Result(Ok(v)) => Ok(*v),
+                Value::Result(Err(e)) => Ok(Value::Return(Box::new(Value::Result(Err(e))))),
+                _ => Err("? operator requires Option or Result value".to_string()),
+            }
+        }
+    }
+}
+
+fn call_closure(env: &mut Env, params: &[String], body: &Expr, captured_env: &HashMap<String, Value>, arg_vals: Vec<Value>) -> Result<Value, String> {
+    env.push_scope();
+    // Load captured environment
+    for (k, v) in captured_env {
+        env.define(k, v.clone());
+    }
+    // Bind parameters
+    for (param, val) in params.iter().zip(arg_vals.iter()) {
+        env.define(param, val.clone());
+    }
+    let result = eval_expr(env, body)?;
+    env.pop_scope();
+    match result {
+        Value::Return(v) => Ok(*v),
+        other => Ok(other),
     }
 }
 
@@ -2503,6 +2685,633 @@ fn builtin_stream_compact(_env: &mut Env, args: Vec<Value>) -> Result<Value, Str
     Ok(f64_vec_to_value(&result))
 }
 
+// --- Option builtins ---
+
+fn builtin_some(_env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    if args.len() != 1 { return Err("some expects 1 argument".to_string()); }
+    Ok(Value::Option(Some(Box::new(args.into_iter().next().unwrap()))))
+}
+
+fn builtin_none(_env: &mut Env, _args: Vec<Value>) -> Result<Value, String> {
+    Ok(Value::Option(None))
+}
+
+fn builtin_unwrap(_env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    if args.len() != 1 { return Err("unwrap expects 1 argument".to_string()); }
+    match &args[0] {
+        Value::Option(Some(v)) => Ok(*v.clone()),
+        Value::Option(None) => Err("unwrap called on None".to_string()),
+        Value::Result(Ok(v)) => Ok(*v.clone()),
+        Value::Result(Err(e)) => Err(format!("unwrap called on Err({})", e)),
+        _ => Err("unwrap: argument must be Option or Result".to_string()),
+    }
+}
+
+fn builtin_unwrap_or(_env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    if args.len() != 2 { return Err("unwrap_or expects 2 arguments".to_string()); }
+    match &args[0] {
+        Value::Option(Some(v)) => Ok(*v.clone()),
+        Value::Option(None) => Ok(args[1].clone()),
+        Value::Result(Ok(v)) => Ok(*v.clone()),
+        Value::Result(Err(_)) => Ok(args[1].clone()),
+        _ => Err("unwrap_or: first argument must be Option or Result".to_string()),
+    }
+}
+
+fn builtin_is_some(_env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    if args.len() != 1 { return Err("is_some expects 1 argument".to_string()); }
+    match &args[0] {
+        Value::Option(Some(_)) => Ok(Value::Bool(true)),
+        Value::Option(None) => Ok(Value::Bool(false)),
+        _ => Err("is_some: argument must be Option".to_string()),
+    }
+}
+
+fn builtin_is_none(_env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    if args.len() != 1 { return Err("is_none expects 1 argument".to_string()); }
+    match &args[0] {
+        Value::Option(None) => Ok(Value::Bool(true)),
+        Value::Option(Some(_)) => Ok(Value::Bool(false)),
+        _ => Err("is_none: argument must be Option".to_string()),
+    }
+}
+
+// --- Result builtins ---
+
+fn builtin_ok(_env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    if args.len() != 1 { return Err("ok expects 1 argument".to_string()); }
+    Ok(Value::Result(Ok(Box::new(args.into_iter().next().unwrap()))))
+}
+
+fn builtin_err(_env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    if args.len() != 1 { return Err("err expects 1 argument".to_string()); }
+    Ok(Value::Result(Err(Box::new(args.into_iter().next().unwrap()))))
+}
+
+fn builtin_is_ok(_env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    if args.len() != 1 { return Err("is_ok expects 1 argument".to_string()); }
+    match &args[0] {
+        Value::Result(Ok(_)) => Ok(Value::Bool(true)),
+        Value::Result(Err(_)) => Ok(Value::Bool(false)),
+        _ => Err("is_ok: argument must be Result".to_string()),
+    }
+}
+
+fn builtin_is_err(_env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    if args.len() != 1 { return Err("is_err expects 1 argument".to_string()); }
+    match &args[0] {
+        Value::Result(Err(_)) => Ok(Value::Bool(true)),
+        Value::Result(Ok(_)) => Ok(Value::Bool(false)),
+        _ => Err("is_err: argument must be Result".to_string()),
+    }
+}
+
+// --- String operation builtins ---
+
+fn builtin_split(_env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    if args.len() != 2 { return Err("split expects 2 arguments: (string, delimiter)".to_string()); }
+    let s = match &args[0] { Value::String(s) => s.clone(), _ => return Err("split: first argument must be a string".to_string()) };
+    let delim = match &args[1] { Value::String(s) => s.clone(), _ => return Err("split: second argument must be a string".to_string()) };
+    let parts: Vec<Value> = s.split(&delim).map(|p| Value::String(p.to_string())).collect();
+    Ok(Value::Array(parts))
+}
+
+fn builtin_join(_env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    if args.len() != 2 { return Err("join expects 2 arguments: (array, delimiter)".to_string()); }
+    let arr = match &args[0] {
+        Value::Array(a) => a.iter().map(|v| format!("{}", v)).collect::<Vec<_>>(),
+        _ => return Err("join: first argument must be an array".to_string()),
+    };
+    let delim = match &args[1] { Value::String(s) => s.clone(), _ => return Err("join: second argument must be a string".to_string()) };
+    Ok(Value::String(arr.join(&delim)))
+}
+
+fn builtin_trim(_env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    if args.len() != 1 { return Err("trim expects 1 argument".to_string()); }
+    match &args[0] {
+        Value::String(s) => Ok(Value::String(s.trim().to_string())),
+        _ => Err("trim: argument must be a string".to_string()),
+    }
+}
+
+fn builtin_starts_with(_env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    if args.len() != 2 { return Err("starts_with expects 2 arguments".to_string()); }
+    let s = match &args[0] { Value::String(s) => s, _ => return Err("starts_with: first argument must be a string".to_string()) };
+    let prefix = match &args[1] { Value::String(s) => s, _ => return Err("starts_with: second argument must be a string".to_string()) };
+    Ok(Value::Bool(s.starts_with(prefix.as_str())))
+}
+
+fn builtin_ends_with(_env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    if args.len() != 2 { return Err("ends_with expects 2 arguments".to_string()); }
+    let s = match &args[0] { Value::String(s) => s, _ => return Err("ends_with: first argument must be a string".to_string()) };
+    let suffix = match &args[1] { Value::String(s) => s, _ => return Err("ends_with: second argument must be a string".to_string()) };
+    Ok(Value::Bool(s.ends_with(suffix.as_str())))
+}
+
+fn builtin_contains_str(_env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    if args.len() != 2 { return Err("contains_str expects 2 arguments".to_string()); }
+    let s = match &args[0] { Value::String(s) => s, _ => return Err("contains_str: first argument must be a string".to_string()) };
+    let substr = match &args[1] { Value::String(s) => s, _ => return Err("contains_str: second argument must be a string".to_string()) };
+    Ok(Value::Bool(s.contains(substr.as_str())))
+}
+
+fn builtin_replace(_env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    if args.len() != 3 { return Err("replace expects 3 arguments: (string, from, to)".to_string()); }
+    let s = match &args[0] { Value::String(s) => s.clone(), _ => return Err("replace: first argument must be a string".to_string()) };
+    let from = match &args[1] { Value::String(s) => s.clone(), _ => return Err("replace: second argument must be a string".to_string()) };
+    let to = match &args[2] { Value::String(s) => s.clone(), _ => return Err("replace: third argument must be a string".to_string()) };
+    Ok(Value::String(s.replace(&from, &to)))
+}
+
+fn builtin_to_upper(_env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    if args.len() != 1 { return Err("to_upper expects 1 argument".to_string()); }
+    match &args[0] {
+        Value::String(s) => Ok(Value::String(s.to_uppercase())),
+        _ => Err("to_upper: argument must be a string".to_string()),
+    }
+}
+
+fn builtin_to_lower(_env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    if args.len() != 1 { return Err("to_lower expects 1 argument".to_string()); }
+    match &args[0] {
+        Value::String(s) => Ok(Value::String(s.to_lowercase())),
+        _ => Err("to_lower: argument must be a string".to_string()),
+    }
+}
+
+fn builtin_substr(_env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    if args.len() != 3 { return Err("substr expects 3 arguments: (string, start, len)".to_string()); }
+    let s = match &args[0] { Value::String(s) => s.clone(), _ => return Err("substr: first argument must be a string".to_string()) };
+    let start = value_to_int(&args[1])? as usize;
+    let len = value_to_int(&args[2])? as usize;
+    let chars: Vec<char> = s.chars().collect();
+    let end = (start + len).min(chars.len());
+    let result: String = chars[start..end].iter().collect();
+    Ok(Value::String(result))
+}
+
+fn builtin_char_at(_env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    if args.len() != 2 { return Err("char_at expects 2 arguments: (string, index)".to_string()); }
+    let s = match &args[0] { Value::String(s) => s.clone(), _ => return Err("char_at: first argument must be a string".to_string()) };
+    let idx = value_to_int(&args[1])? as usize;
+    let chars: Vec<char> = s.chars().collect();
+    if idx >= chars.len() {
+        return Err(format!("char_at: index {} out of bounds (len {})", idx, chars.len()));
+    }
+    Ok(Value::String(chars[idx].to_string()))
+}
+
+fn builtin_parse_int(_env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    if args.len() != 1 { return Err("parse_int expects 1 argument".to_string()); }
+    match &args[0] {
+        Value::String(s) => match s.trim().parse::<i128>() {
+            std::result::Result::Ok(n) => Ok(Value::Result(Ok(Box::new(Value::Int(n))))),
+            std::result::Result::Err(e) => Ok(Value::Result(Err(Box::new(Value::String(format!("parse_int: {}", e)))))),
+        },
+        _ => Err("parse_int: argument must be a string".to_string()),
+    }
+}
+
+fn builtin_parse_float(_env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    if args.len() != 1 { return Err("parse_float expects 1 argument".to_string()); }
+    match &args[0] {
+        Value::String(s) => match s.trim().parse::<f64>() {
+            std::result::Result::Ok(n) => Ok(Value::Result(Ok(Box::new(Value::Float(n))))),
+            std::result::Result::Err(e) => Ok(Value::Result(Err(Box::new(Value::String(format!("parse_float: {}", e)))))),
+        },
+        _ => Err("parse_float: argument must be a string".to_string()),
+    }
+}
+
+fn builtin_string_len(_env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    if args.len() != 1 { return Err("string_len expects 1 argument".to_string()); }
+    match &args[0] {
+        Value::String(s) => Ok(Value::Int(s.chars().count() as i128)),
+        _ => Err("string_len: argument must be a string".to_string()),
+    }
+}
+
+// --- HashMap builtins ---
+
+fn builtin_hashmap(_env: &mut Env, _args: Vec<Value>) -> Result<Value, String> {
+    Ok(Value::HashMap(HashMap::new()))
+}
+
+fn builtin_hashmap_insert(_env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    if args.len() != 3 { return Err("hashmap_insert expects 3 arguments: (map, key, value)".to_string()); }
+    let mut map = match &args[0] {
+        Value::HashMap(m) => m.clone(),
+        _ => return Err("hashmap_insert: first argument must be a HashMap".to_string()),
+    };
+    let key = match &args[1] {
+        Value::String(s) => s.clone(),
+        other => format!("{}", other),
+    };
+    map.insert(key, args[2].clone());
+    Ok(Value::HashMap(map))
+}
+
+fn builtin_hashmap_get(_env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    if args.len() != 2 { return Err("hashmap_get expects 2 arguments: (map, key)".to_string()); }
+    let map = match &args[0] {
+        Value::HashMap(m) => m,
+        _ => return Err("hashmap_get: first argument must be a HashMap".to_string()),
+    };
+    let key = match &args[1] {
+        Value::String(s) => s.clone(),
+        other => format!("{}", other),
+    };
+    match map.get(&key) {
+        Some(v) => Ok(Value::Option(Some(Box::new(v.clone())))),
+        None => Ok(Value::Option(None)),
+    }
+}
+
+fn builtin_hashmap_remove(_env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    if args.len() != 2 { return Err("hashmap_remove expects 2 arguments: (map, key)".to_string()); }
+    let mut map = match &args[0] {
+        Value::HashMap(m) => m.clone(),
+        _ => return Err("hashmap_remove: first argument must be a HashMap".to_string()),
+    };
+    let key = match &args[1] {
+        Value::String(s) => s.clone(),
+        other => format!("{}", other),
+    };
+    map.remove(&key);
+    Ok(Value::HashMap(map))
+}
+
+fn builtin_hashmap_contains(_env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    if args.len() != 2 { return Err("hashmap_contains expects 2 arguments: (map, key)".to_string()); }
+    let map = match &args[0] {
+        Value::HashMap(m) => m,
+        _ => return Err("hashmap_contains: first argument must be a HashMap".to_string()),
+    };
+    let key = match &args[1] {
+        Value::String(s) => s.clone(),
+        other => format!("{}", other),
+    };
+    Ok(Value::Bool(map.contains_key(&key)))
+}
+
+fn builtin_hashmap_keys(_env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    if args.len() != 1 { return Err("hashmap_keys expects 1 argument".to_string()); }
+    let map = match &args[0] {
+        Value::HashMap(m) => m,
+        _ => return Err("hashmap_keys: argument must be a HashMap".to_string()),
+    };
+    let keys: Vec<Value> = map.keys().map(|k| Value::String(k.clone())).collect();
+    Ok(Value::Array(keys))
+}
+
+fn builtin_hashmap_values(_env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    if args.len() != 1 { return Err("hashmap_values expects 1 argument".to_string()); }
+    let map = match &args[0] {
+        Value::HashMap(m) => m,
+        _ => return Err("hashmap_values: argument must be a HashMap".to_string()),
+    };
+    let values: Vec<Value> = map.values().cloned().collect();
+    Ok(Value::Array(values))
+}
+
+fn builtin_hashmap_len(_env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    if args.len() != 1 { return Err("hashmap_len expects 1 argument".to_string()); }
+    let map = match &args[0] {
+        Value::HashMap(m) => m,
+        _ => return Err("hashmap_len: argument must be a HashMap".to_string()),
+    };
+    Ok(Value::Int(map.len() as i128))
+}
+
+// --- Higher-order array function builtins ---
+
+fn apply_closure(env: &mut Env, closure: &Value, args: Vec<Value>) -> Result<Value, String> {
+    match closure {
+        Value::Closure { params, body, env: captured_env } => {
+            call_closure(env, params, body, captured_env, args)
+        }
+        Value::Function { params, body, .. } => {
+            env.push_scope();
+            for (param, val) in params.iter().zip(args.iter()) {
+                env.define(param, val.clone());
+            }
+            let result = eval_block(env, body)?;
+            env.pop_scope();
+            match result {
+                Value::Return(v) => Ok(*v),
+                other => Ok(other),
+            }
+        }
+        _ => Err("expected a closure or function".to_string()),
+    }
+}
+
+fn builtin_map(env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    if args.len() != 2 { return Err("map expects 2 arguments: (array, closure)".to_string()); }
+    let arr = match &args[0] { Value::Array(a) => a.clone(), _ => return Err("map: first argument must be an array".to_string()) };
+    let closure = args[1].clone();
+    let mut result = Vec::new();
+    for elem in arr { result.push(apply_closure(env, &closure, vec![elem])?); }
+    Ok(Value::Array(result))
+}
+
+fn builtin_filter(env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    if args.len() != 2 { return Err("filter expects 2 arguments: (array, closure)".to_string()); }
+    let arr = match &args[0] { Value::Array(a) => a.clone(), _ => return Err("filter: first argument must be an array".to_string()) };
+    let closure = args[1].clone();
+    let mut result = Vec::new();
+    for elem in arr { if value_to_bool(&apply_closure(env, &closure, vec![elem.clone()])?)? { result.push(elem); } }
+    Ok(Value::Array(result))
+}
+
+fn builtin_fold(env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    if args.len() != 3 { return Err("fold expects 3 arguments: (array, init, closure)".to_string()); }
+    let arr = match &args[0] { Value::Array(a) => a.clone(), _ => return Err("fold: first argument must be an array".to_string()) };
+    let mut acc = args[1].clone();
+    let closure = args[2].clone();
+    for elem in arr { acc = apply_closure(env, &closure, vec![acc, elem])?; }
+    Ok(acc)
+}
+
+fn builtin_zip(_env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    if args.len() != 2 { return Err("zip expects 2 arguments".to_string()); }
+    let a1 = match &args[0] { Value::Array(a) => a.clone(), _ => return Err("zip: arguments must be arrays".to_string()) };
+    let a2 = match &args[1] { Value::Array(a) => a.clone(), _ => return Err("zip: arguments must be arrays".to_string()) };
+    Ok(Value::Array(a1.into_iter().zip(a2).map(|(a, b)| Value::Tuple(vec![a, b])).collect()))
+}
+
+fn builtin_enumerate(_env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    if args.len() != 1 { return Err("enumerate expects 1 argument".to_string()); }
+    let arr = match &args[0] { Value::Array(a) => a.clone(), _ => return Err("enumerate: argument must be an array".to_string()) };
+    Ok(Value::Array(arr.into_iter().enumerate().map(|(i, v)| Value::Tuple(vec![Value::Int(i as i128), v])).collect()))
+}
+
+fn builtin_sort(_env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    if args.len() != 1 { return Err("sort expects 1 argument".to_string()); }
+    let mut arr = match &args[0] { Value::Array(a) => a.clone(), _ => return Err("sort: argument must be an array".to_string()) };
+    arr.sort_by(|a, b| match (a, b) { (Value::Int(x), Value::Int(y)) => x.cmp(y), (Value::Float(x), Value::Float(y)) => x.partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal), _ => std::cmp::Ordering::Equal });
+    Ok(Value::Array(arr))
+}
+
+fn builtin_reverse(_env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    if args.len() != 1 { return Err("reverse expects 1 argument".to_string()); }
+    let mut arr = match &args[0] { Value::Array(a) => a.clone(), _ => return Err("reverse: argument must be an array".to_string()) };
+    arr.reverse();
+    Ok(Value::Array(arr))
+}
+
+fn builtin_sum(_env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    if args.len() != 1 { return Err("sum expects 1 argument".to_string()); }
+    let arr = match &args[0] { Value::Array(a) => a.clone(), _ => return Err("sum: argument must be an array".to_string()) };
+    if arr.is_empty() { return Ok(Value::Int(0)); }
+    let mut acc = arr[0].clone();
+    for elem in &arr[1..] { acc = eval_binop(&acc, crate::ast::BinOp::Add, elem)?; }
+    Ok(acc)
+}
+
+fn builtin_any(env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    if args.len() != 2 { return Err("any expects 2 arguments: (array, closure)".to_string()); }
+    let arr = match &args[0] { Value::Array(a) => a.clone(), _ => return Err("any: first argument must be an array".to_string()) };
+    let closure = args[1].clone();
+    for elem in arr { if value_to_bool(&apply_closure(env, &closure, vec![elem])?)? { return Ok(Value::Bool(true)); } }
+    Ok(Value::Bool(false))
+}
+
+fn builtin_all(env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    if args.len() != 2 { return Err("all expects 2 arguments: (array, closure)".to_string()); }
+    let arr = match &args[0] { Value::Array(a) => a.clone(), _ => return Err("all: first argument must be an array".to_string()) };
+    let closure = args[1].clone();
+    for elem in arr { if !value_to_bool(&apply_closure(env, &closure, vec![elem])?)? { return Ok(Value::Bool(false)); } }
+    Ok(Value::Bool(true))
+}
+
+fn builtin_flat_map(env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    if args.len() != 2 { return Err("flat_map expects 2 arguments: (array, closure)".to_string()); }
+    let arr = match &args[0] { Value::Array(a) => a.clone(), _ => return Err("flat_map: first argument must be an array".to_string()) };
+    let closure = args[1].clone();
+    let mut result = Vec::new();
+    for elem in arr { match apply_closure(env, &closure, vec![elem])? { Value::Array(inner) => result.extend(inner), other => result.push(other) } }
+    Ok(Value::Array(result))
+}
+
+// --- File I/O builtins ---
+
+fn builtin_read_file(_env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    if args.len() != 1 { return Err("read_file expects 1 argument: (path)".into()); }
+    let path = match &args[0] { Value::String(s) => s.clone(), _ => return Err("read_file: path must be a string".into()) };
+    match std::fs::read_to_string(&path) {
+        Ok(content) => Ok(Value::Result(Ok(Box::new(Value::String(content))))),
+        Err(e) => Ok(Value::Result(Err(Box::new(Value::String(e.to_string()))))),
+    }
+}
+
+fn builtin_write_file(_env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    if args.len() != 2 { return Err("write_file expects 2 arguments: (path, content)".into()); }
+    let path = match &args[0] { Value::String(s) => s.clone(), _ => return Err("write_file: path must be a string".into()) };
+    let content = match &args[1] { Value::String(s) => s.clone(), _ => return Err("write_file: content must be a string".into()) };
+    match std::fs::write(&path, &content) {
+        Ok(()) => Ok(Value::Result(Ok(Box::new(Value::Void)))),
+        Err(e) => Ok(Value::Result(Err(Box::new(Value::String(e.to_string()))))),
+    }
+}
+
+fn builtin_append_file(_env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    if args.len() != 2 { return Err("append_file expects 2 arguments: (path, content)".into()); }
+    let path = match &args[0] { Value::String(s) => s.clone(), _ => return Err("append_file: path must be a string".into()) };
+    let content = match &args[1] { Value::String(s) => s.clone(), _ => return Err("append_file: content must be a string".into()) };
+    use std::io::Write;
+    match std::fs::OpenOptions::new().append(true).create(true).open(&path) {
+        Ok(mut f) => match f.write_all(content.as_bytes()) {
+            Ok(()) => Ok(Value::Result(Ok(Box::new(Value::Void)))),
+            Err(e) => Ok(Value::Result(Err(Box::new(Value::String(e.to_string()))))),
+        },
+        Err(e) => Ok(Value::Result(Err(Box::new(Value::String(e.to_string()))))),
+    }
+}
+
+fn builtin_file_exists(_env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    if args.len() != 1 { return Err("file_exists expects 1 argument: (path)".into()); }
+    let path = match &args[0] { Value::String(s) => s.clone(), _ => return Err("file_exists: path must be a string".into()) };
+    Ok(Value::Bool(std::path::Path::new(&path).exists()))
+}
+
+fn builtin_read_lines(_env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    if args.len() != 1 { return Err("read_lines expects 1 argument: (path)".into()); }
+    let path = match &args[0] { Value::String(s) => s.clone(), _ => return Err("read_lines: path must be a string".into()) };
+    match std::fs::read_to_string(&path) {
+        Ok(content) => {
+            let lines: Vec<Value> = content.lines().map(|l| Value::String(l.to_string())).collect();
+            Ok(Value::Array(lines))
+        }
+        Err(e) => Err(format!("read_lines: {}", e)),
+    }
+}
+
+fn builtin_read_bytes(_env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    if args.len() != 1 { return Err("read_bytes expects 1 argument: (path)".into()); }
+    let path = match &args[0] { Value::String(s) => s.clone(), _ => return Err("read_bytes: path must be a string".into()) };
+    match std::fs::read(&path) {
+        Ok(bytes) => {
+            let vals: Vec<Value> = bytes.into_iter().map(|b| Value::Int(b as i128)).collect();
+            Ok(Value::Array(vals))
+        }
+        Err(e) => Err(format!("read_bytes: {}", e)),
+    }
+}
+
+fn builtin_write_bytes(_env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    if args.len() != 2 { return Err("write_bytes expects 2 arguments: (path, bytes)".into()); }
+    let path = match &args[0] { Value::String(s) => s.clone(), _ => return Err("write_bytes: path must be a string".into()) };
+    let bytes = match &args[1] {
+        Value::Array(arr) => {
+            let mut out = Vec::new();
+            for v in arr {
+                match v { Value::Int(n) => out.push(*n as u8), _ => return Err("write_bytes: array must contain integers".into()) }
+            }
+            out
+        }
+        _ => return Err("write_bytes: second argument must be an array".into()),
+    };
+    match std::fs::write(&path, &bytes) {
+        Ok(()) => Ok(Value::Result(Ok(Box::new(Value::Void)))),
+        Err(e) => Ok(Value::Result(Err(Box::new(Value::String(e.to_string()))))),
+    }
+}
+
+// --- Automatic differentiation builtins ---
+
+fn builtin_tape_new(env: &mut Env, _args: Vec<Value>) -> Result<Value, String> {
+    let id = env.next_tape_id;
+    env.next_tape_id += 1;
+    env.tapes.insert(id, autodiff::Tape::new());
+    Ok(Value::Int(id as i128))
+}
+
+fn get_tape_and_ints(env: &mut Env, args: &[Value], name: &str, expected: usize) -> Result<(usize, Vec<usize>), String> {
+    if args.len() != expected { return Err(format!("{} expects {} arguments", name, expected)); }
+    let tape_id = match &args[0] { Value::Int(n) => *n as usize, _ => return Err(format!("{}: first arg must be tape id", name)) };
+    if !env.tapes.contains_key(&tape_id) { return Err(format!("{}: invalid tape id", name)); }
+    let ints: Vec<usize> = args[1..].iter().map(|v| match v {
+        Value::Int(n) => Ok(*n as usize),
+        Value::Float(f) => Ok(*f as usize),
+        _ => Err(format!("{}: arguments must be integers", name)),
+    }).collect::<Result<_, _>>()?;
+    Ok((tape_id, ints))
+}
+
+fn builtin_tape_var(env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    if args.len() != 2 { return Err("tape_var expects 2 arguments: (tape, value)".into()); }
+    let tape_id = match &args[0] { Value::Int(n) => *n as usize, _ => return Err("tape_var: first arg must be tape id".into()) };
+    let val = match &args[1] { Value::Float(f) => *f, Value::Int(n) => *n as f64, _ => return Err("tape_var: second arg must be a number".into()) };
+    let tape = env.tapes.get_mut(&tape_id).ok_or("tape_var: invalid tape id")?;
+    let idx = tape.var(val);
+    Ok(Value::Int(idx as i128))
+}
+
+macro_rules! tape_binop {
+    ($name:ident, $method:ident, $label:expr) => {
+        fn $name(env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+            let (tape_id, ints) = get_tape_and_ints(env, &args, $label, 3)?;
+            let tape = env.tapes.get_mut(&tape_id).unwrap();
+            let idx = tape.$method(ints[0], ints[1]);
+            Ok(Value::Int(idx as i128))
+        }
+    };
+}
+
+tape_binop!(builtin_tape_add, add, "tape_add");
+tape_binop!(builtin_tape_mul, mul, "tape_mul");
+tape_binop!(builtin_tape_sub, sub, "tape_sub");
+tape_binop!(builtin_tape_div, div, "tape_div");
+
+macro_rules! tape_unaryop {
+    ($name:ident, $method:ident, $label:expr) => {
+        fn $name(env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+            let (tape_id, ints) = get_tape_and_ints(env, &args, $label, 2)?;
+            let tape = env.tapes.get_mut(&tape_id).unwrap();
+            let idx = tape.$method(ints[0]);
+            Ok(Value::Int(idx as i128))
+        }
+    };
+}
+
+tape_unaryop!(builtin_tape_exp, exp, "tape_exp");
+tape_unaryop!(builtin_tape_log, log, "tape_log");
+tape_unaryop!(builtin_tape_tanh, tanh, "tape_tanh");
+tape_unaryop!(builtin_tape_relu, relu, "tape_relu");
+tape_unaryop!(builtin_tape_sigmoid, sigmoid, "tape_sigmoid");
+tape_unaryop!(builtin_tape_sin, sin, "tape_sin");
+tape_unaryop!(builtin_tape_cos, cos, "tape_cos");
+
+fn builtin_tape_backward(env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    let (tape_id, ints) = get_tape_and_ints(env, &args, "tape_backward", 2)?;
+    let tape = env.tapes.get_mut(&tape_id).unwrap();
+    tape.backward(ints[0]);
+    Ok(Value::Void)
+}
+
+fn builtin_tape_grad(env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    let (tape_id, ints) = get_tape_and_ints(env, &args, "tape_grad", 2)?;
+    let tape = env.tapes.get(&tape_id).unwrap();
+    Ok(Value::Float(tape.grad(ints[0])))
+}
+
+fn builtin_tape_value(env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    let (tape_id, ints) = get_tape_and_ints(env, &args, "tape_value", 2)?;
+    let tape = env.tapes.get(&tape_id).unwrap();
+    Ok(Value::Float(tape.value(ints[0])))
+}
+
+fn builtin_ad_sgd_step(_env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    if args.len() != 3 { return Err("ad_sgd_step expects 3 arguments: (params, grads, lr)".into()); }
+    let mut params = values_to_f64_vec(&args[0])?;
+    let grads = values_to_f64_vec(&args[1])?;
+    let lr = match &args[2] { Value::Float(f) => *f, Value::Int(n) => *n as f64, _ => return Err("ad_sgd_step: lr must be a number".into()) };
+    autodiff::sgd_step(&mut params, &grads, lr);
+    Ok(f64_vec_to_value(&params))
+}
+
+fn builtin_ad_adam_step(_env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    if args.len() != 9 { return Err("ad_adam_step expects 9 arguments: (params, grads, m, v, lr, beta1, beta2, eps, t)".into()); }
+    let mut params = values_to_f64_vec(&args[0])?;
+    let grads = values_to_f64_vec(&args[1])?;
+    let mut m = values_to_f64_vec(&args[2])?;
+    let mut v = values_to_f64_vec(&args[3])?;
+    let lr = match &args[4] { Value::Float(f) => *f, Value::Int(n) => *n as f64, _ => return Err("lr must be a number".into()) };
+    let beta1 = match &args[5] { Value::Float(f) => *f, Value::Int(n) => *n as f64, _ => return Err("beta1 must be a number".into()) };
+    let beta2 = match &args[6] { Value::Float(f) => *f, Value::Int(n) => *n as f64, _ => return Err("beta2 must be a number".into()) };
+    let eps = match &args[7] { Value::Float(f) => *f, Value::Int(n) => *n as f64, _ => return Err("eps must be a number".into()) };
+    let t = match &args[8] { Value::Int(n) => *n as usize, Value::Float(f) => *f as usize, _ => return Err("t must be an integer".into()) };
+    autodiff::adam_step(&mut params, &grads, &mut m, &mut v, lr, beta1, beta2, eps, t);
+    Ok(Value::Tuple(vec![f64_vec_to_value(&params), f64_vec_to_value(&m), f64_vec_to_value(&v)]))
+}
+
+fn builtin_ad_mse_loss(env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    if args.len() != 3 { return Err("ad_mse_loss expects 3 arguments: (tape_id, predictions, targets)".into()); }
+    let tape_id = match &args[0] { Value::Int(n) => *n as usize, _ => return Err("ad_mse_loss: first arg must be tape id".into()) };
+    let preds: Vec<usize> = match &args[1] {
+        Value::Array(arr) => arr.iter().map(|v| match v { Value::Int(n) => Ok(*n as usize), _ => Err("predictions must be ints".to_string()) }).collect::<Result<_,_>>()?,
+        _ => return Err("ad_mse_loss: predictions must be an array".into()),
+    };
+    let targets = values_to_f64_vec(&args[2])?;
+    let tape = env.tapes.get_mut(&tape_id).ok_or("ad_mse_loss: invalid tape id")?;
+    let loss_idx = autodiff::mse_loss(tape, &preds, &targets);
+    Ok(Value::Int(loss_idx as i128))
+}
+
+fn builtin_ad_cross_entropy_loss(env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    if args.len() != 3 { return Err("ad_cross_entropy_loss expects 3 arguments: (tape_id, logits, target_idx)".into()); }
+    let tape_id = match &args[0] { Value::Int(n) => *n as usize, _ => return Err("first arg must be tape id".into()) };
+    let logits: Vec<usize> = match &args[1] {
+        Value::Array(arr) => arr.iter().map(|v| match v { Value::Int(n) => Ok(*n as usize), _ => Err("logits must be ints".to_string()) }).collect::<Result<_,_>>()?,
+        _ => return Err("logits must be an array".into()),
+    };
+    let target_idx = match &args[2] { Value::Int(n) => *n as usize, _ => return Err("target_idx must be an int".into()) };
+    let tape = env.tapes.get_mut(&tape_id).ok_or("invalid tape id")?;
+    let loss_idx = autodiff::cross_entropy_loss(tape, &logits, target_idx);
+    Ok(Value::Int(loss_idx as i128))
+}
+
 #[cfg(test)]
 mod interpreter_tests {
     use crate::lexer;
@@ -2536,5 +3345,85 @@ println(r)
 }");
         assert!(!o.is_empty());
         assert!(o[0].contains("15"), "{}", o[0]);
+    }
+
+    #[test]
+    fn test_option_some_none() {
+        let o = rv("fn main() {
+let x = some(42)
+let y = none()
+println(is_some(x))
+println(is_none(y))
+println(unwrap(x))
+println(unwrap_or(y, 99))
+}");
+        assert_eq!(o, vec!["true", "true", "42", "99"]);
+    }
+
+    #[test]
+    fn test_result_ok_err() {
+        let o = rv("fn main() {
+let x = ok(10)
+let y = err(\"bad\")
+println(is_ok(x))
+println(is_err(y))
+println(unwrap(x))
+println(unwrap_or(y, 0))
+}");
+        assert_eq!(o, vec!["true", "true", "10", "0"]);
+    }
+
+    #[test]
+    fn test_string_operations() {
+        let o = rv("fn main() {
+let parts = split(\"a,b,c\", \",\")
+println(join(parts, \"-\"))
+println(trim(\"  hello  \"))
+println(starts_with(\"hello\", \"hel\"))
+println(ends_with(\"hello\", \"llo\"))
+println(contains_str(\"hello world\", \"world\"))
+println(replace(\"foo bar\", \"bar\", \"baz\"))
+println(to_upper(\"hello\"))
+println(to_lower(\"HELLO\"))
+println(substr(\"abcdef\", 1, 3))
+println(char_at(\"abc\", 2))
+println(string_len(\"hello\"))
+}");
+        assert_eq!(o, vec!["a-b-c", "hello", "true", "true", "true", "foo baz", "HELLO", "hello", "bcd", "c", "5"]);
+    }
+
+    #[test]
+    fn test_hashmap_operations() {
+        let o = rv("fn main() {
+var m = hashmap()
+m = hashmap_insert(m, \"a\", 1)
+m = hashmap_insert(m, \"b\", 2)
+println(hashmap_len(m))
+println(hashmap_contains(m, \"a\"))
+println(unwrap(hashmap_get(m, \"a\")))
+println(is_none(hashmap_get(m, \"z\")))
+m = hashmap_remove(m, \"a\")
+println(hashmap_len(m))
+}");
+        assert_eq!(o, vec!["2", "true", "1", "true", "1"]);
+    }
+
+    #[test]
+    fn test_try_operator() {
+        let o = rv("fn maybe_get(x: i64) -> i64 {
+if x > 0 { return ok(x * 10) }
+return err(\"negative\")
+}
+fn process() -> i64 {
+let a = maybe_get(5)?
+let b = maybe_get(3)?
+return ok(a + b)
+}
+fn main() {
+let r = process()
+println(is_ok(r))
+println(unwrap(r))
+}");
+        assert_eq!(o, vec!["true", "80"]);
     }
 }

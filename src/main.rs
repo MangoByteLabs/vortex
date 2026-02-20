@@ -1,4 +1,5 @@
 mod ast;
+mod autodiff;
 mod codegen;
 mod ctcheck;
 pub mod crypto;
