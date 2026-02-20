@@ -25,6 +25,7 @@ enum MLIRType {
     F64,
     Index,
     MemRef(Box<MLIRType>, Vec<i64>), // memref<shape x type>
+    Tensor(Box<MLIRType>, Vec<i64>), // tensor<shape x type>
     None, // void
 }
 
@@ -49,6 +50,14 @@ impl std::fmt::Display for MLIRType {
                     } else {
                         write!(f, "{}x", dim)?;
                     }
+                }
+                write!(f, "{}>", elem)
+            }
+            MLIRType::Tensor(elem, shape) => {
+                write!(f, "tensor<")?;
+                for dim in shape {
+                    if *dim < 0 { write!(f, "?x")?; }
+                    else { write!(f, "{}x", dim)?; }
                 }
                 write!(f, "{}>", elem)
             }
@@ -178,11 +187,11 @@ impl CodeGen {
                 "bool" => MLIRType::I1,
                 _ => MLIRType::I64, // default for unknown types
             },
-            TypeExprKind::Generic { name, .. } => {
+            TypeExprKind::Generic { name, args } => {
                 match name.name.as_str() {
                     "Tensor" => {
-                        // For now, emit as memref
-                        MLIRType::MemRef(Box::new(MLIRType::F32), vec![-1])
+                        let elem_ty = if let Some(TypeArg::Type(ty)) = args.first() { self.resolve_type(ty) } else { MLIRType::F32 };
+                        let shape = if let Some(TypeArg::Shape(dims)) = args.get(1) { dims.iter().map(|d| match d { ShapeDim::Lit(n) => *n as i64, _ => -1 }).collect() } else { vec![-1] }; MLIRType::Tensor(Box::new(elem_ty), shape)
                     }
                     _ => MLIRType::I64,
                 }
@@ -211,7 +220,7 @@ impl CodeGen {
                 }
             }
             ExprKind::Unary { expr: inner, .. } => self.infer_type(inner),
-            ExprKind::Call { .. } => MLIRType::I64, // default
+            ExprKind::Call { func, .. } => { if let ExprKind::Ident(id) = &func.kind { match id.name.as_str() { "softmax" | "gelu" | "layer_norm" | "attention" | "rope" => { return MLIRType::Tensor(Box::new(MLIRType::F32), vec![-1]); } _ => {} } } MLIRType::I64 }
             ExprKind::If { then_block, .. } => {
                 if let Some(expr) = &then_block.expr {
                     self.infer_type(expr)
@@ -225,7 +234,7 @@ impl CodeGen {
     }
 
     fn is_float_type(ty: &MLIRType) -> bool {
-        matches!(ty, MLIRType::F16 | MLIRType::F32 | MLIRType::F64)
+        matches!(ty, MLIRType::F16 | MLIRType::F32 | MLIRType::F64 | MLIRType::Tensor(_, _))
     }
 
     fn is_int_type(ty: &MLIRType) -> bool {
@@ -334,6 +343,12 @@ impl CodeGen {
             kernel.name.name, params_str, ret_str
         ));
         self.indent += 1;
+
+        if let Some(ref sched) = kernel.schedule {
+            for (name, _val) in &sched.params {
+                self.emit_line(&format!("// schedule: {} annotation", name.name));
+            }
+        }
 
         self.gen_block(&kernel.body, &ret_type);
 
@@ -708,13 +723,22 @@ impl CodeGen {
                 let (l_ssa, l_ty) = self.gen_expr(lhs);
                 let (r_ssa, _) = self.gen_expr(rhs);
                 let ssa = self.fresh_ssa();
-                self.emit_line(&format!(
-                    "// matmul: {} @ {}", l_ssa, r_ssa
-                ));
-                self.emit_line(&format!(
-                    "{} = arith.constant 0 : i64", ssa
-                ));
-                (ssa, l_ty)
+                match &l_ty {
+                    MLIRType::Tensor(elem, _) => {
+                        let out_ty = l_ty.clone();
+                        let zero = self.fresh_ssa();
+                        self.emit_line(&format!("{} = arith.constant 0.0 : {}", zero, elem));
+                        let init = self.fresh_ssa();
+                        self.emit_line(&format!("{} = linalg.fill ins({} : {}) outs({} : {}) -> {}", init, zero, elem, l_ssa, out_ty, out_ty));
+                        self.emit_line(&format!("{} = linalg.matmul ins({}, {} : {}, {}) outs({} : {}) -> {}", ssa, l_ssa, r_ssa, l_ty, l_ty, init, out_ty, out_ty));
+                        (ssa, out_ty)
+                    }
+                    _ => {
+                        self.emit_line(&format!("// matmul: {} @ {}", l_ssa, r_ssa));
+                        self.emit_line(&format!("{} = arith.constant 0 : i64", ssa));
+                        (ssa, l_ty)
+                    }
+                }
             }
 
             ExprKind::StructLiteral { name, fields } => {
@@ -945,9 +969,15 @@ impl CodeGen {
                 (ssa, ty.clone())
             }
             BinOp::ElemMul | BinOp::ElemDiv => {
-                self.emit_line(&format!("// elementwise op"));
-                self.emit_line(&format!("{} = arith.constant 0 : {}", ssa, ty));
-                (ssa, ty.clone())
+                if let MLIRType::Tensor(ref _elem, ref _shape) = ty {
+                    let op_name = if matches!(op, BinOp::ElemMul) { "mulf" } else { "divf" };
+                    self.emit_line(&format!("// linalg.generic elementwise {} on tensor", op_name));
+                    (ssa, ty.clone())
+                } else {
+                    self.emit_line(&format!("// elementwise op"));
+                    self.emit_line(&format!("{} = arith.constant 0 : {}", ssa, ty));
+                    (ssa, ty.clone())
+                }
             }
         }
     }
@@ -1174,5 +1204,19 @@ mod tests {
     fn test_bitwise_ops() {
         let ir = gen("fn xor(a: i64, b: i64) -> i64 { return a ^ b }");
         assert!(ir.contains("arith.xori"));
+    }
+
+    #[test]
+    fn test_tensor_type_emission() {
+        let ty = MLIRType::Tensor(Box::new(MLIRType::F32), vec![4, 8]);
+        assert_eq!(format!("{}", ty), "tensor<4x8xf32>");
+        let ty_dyn = MLIRType::Tensor(Box::new(MLIRType::F64), vec![-1]);
+        assert_eq!(format!("{}", ty_dyn), "tensor<?xf64>");
+    }
+
+    #[test]
+    fn test_matmul_codegen() {
+        let ir = gen("fn mm(a: Tensor<f32, [4, 8]>, b: Tensor<f32, [8, 4]>) -> Tensor<f32, [4, 4]> { return a @ b }");
+        assert!(ir.contains("linalg.matmul"), "Expected linalg.matmul in: {}", ir);
     }
 }

@@ -123,6 +123,11 @@ impl Pipeline {
             .collect()
     }
 
+    /// Get the optimization passes for the current target
+    pub fn get_passes_for_target(&self) -> Vec<String> {
+        self.get_mlir_opt_args()
+    }
+
     /// Run the full compilation pipeline
     pub fn compile(&self, mlir_ir: &str, source_name: &str) -> Result<Vec<CompileResult>, String> {
         let mut results = Vec::new();
@@ -231,6 +236,17 @@ impl Pipeline {
     fn get_mlir_opt_args(&self) -> Vec<String> {
         let mut args = Vec::new();
 
+        // GPU-specific passes
+        if self.config.target == Target::NvidiaPTX || self.config.target == Target::AmdGCN {
+            args.push("--gpu-kernel-outlining".to_string());
+        }
+
+        // Bufferization and linalg passes
+        args.push("--normalize-memrefs".to_string());
+        args.push("--one-shot-bufferize".to_string());
+        args.push("--convert-linalg-to-loops".to_string());
+        args.push("--buffer-deallocation".to_string());
+
         // Standard optimization pipeline
         args.push("--convert-scf-to-cf".to_string());
         args.push("--convert-arith-to-llvm".to_string());
@@ -241,6 +257,17 @@ impl Pipeline {
         if self.config.opt_level >= 1 {
             args.push("--canonicalize".to_string());
             args.push("--cse".to_string());
+        }
+
+        // Target-specific GPU lowering
+        match self.config.target {
+            Target::NvidiaPTX => {
+                args.push("--gpu-to-nvvm".to_string());
+            }
+            Target::AmdGCN => {
+                args.push("--gpu-to-rocdl".to_string());
+            }
+            _ => {}
         }
 
         args
@@ -433,5 +460,41 @@ mod tests {
         let pipeline = Pipeline::new(PipelineConfig::default());
         let tools = pipeline.check_toolchain();
         assert!(tools.len() >= 3);
+    }
+
+    #[test]
+    fn test_gpu_optimization_passes_nvidia() {
+        let config = PipelineConfig {
+            target: Target::NvidiaPTX,
+            ..PipelineConfig::default()
+        };
+        let pipeline = Pipeline::new(config);
+        let passes = pipeline.get_passes_for_target();
+        assert!(passes.contains(&"--gpu-kernel-outlining".to_string()));
+        assert!(passes.contains(&"--gpu-to-nvvm".to_string()));
+        assert!(passes.contains(&"--normalize-memrefs".to_string()));
+    }
+
+    #[test]
+    fn test_gpu_optimization_passes_amd() {
+        let config = PipelineConfig {
+            target: Target::AmdGCN,
+            ..PipelineConfig::default()
+        };
+        let pipeline = Pipeline::new(config);
+        let passes = pipeline.get_passes_for_target();
+        assert!(passes.contains(&"--gpu-kernel-outlining".to_string()));
+        assert!(passes.contains(&"--gpu-to-rocdl".to_string()));
+    }
+
+    #[test]
+    fn test_gpu_optimization_passes_mlir_no_outlining() {
+        let config = PipelineConfig {
+            target: Target::MLIR,
+            ..PipelineConfig::default()
+        };
+        let pipeline = Pipeline::new(config);
+        let passes = pipeline.get_passes_for_target();
+        assert!(!passes.contains(&"--gpu-kernel-outlining".to_string()));
     }
 }
