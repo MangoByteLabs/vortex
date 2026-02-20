@@ -1,0 +1,36 @@
+{
+  "name": "vortex-lang",
+  "displayName": "Vortex GPU Language",
+  "description": "Language support for Vortex - GPU programming for LLM and Crypto",
+  "version": "0.1.0",
+  "publisher": "MangoByteLabs",
+  "engines": { "vscode": "^1.80.0" },
+  "categories": ["Programming Languages", "Snippets"],
+  "activationEvents": ["onLanguage:vortex"],
+  "main": "./out/extension.js",
+  "contributes": {
+    "languages": [{
+      "id": "vortex",
+      "aliases": ["Vortex", "vortex"],
+      "extensions": [".vx"],
+      "configuration": "./language-configuration.json"
+    }],
+    "grammars": [{
+      "language": "vortex",
+      "scopeName": "source.vortex",
+      "path": "./syntaxes/vortex.tmLanguage.json"
+    }],
+    "snippets": [{
+      "language": "vortex",
+      "path": "./snippets/vortex.json"
+    }],
+    "commands": [
+      { "command": "vortex.run", "title": "Vortex: Run Current File" },
+      { "command": "vortex.check", "title": "Vortex: Type Check Current File" },
+      { "command": "vortex.codegen", "title": "Vortex: Generate MLIR" }
+    ],
+    "keybindings": [
+      { "command": "vortex.run", "key": "ctrl+shift+r", "when": "editorLangId == vortex" }
+    ]
+  }
+}

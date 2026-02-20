@@ -1,0 +1,137 @@
+{
+  "Function": {
+    "prefix": "fn",
+    "body": [
+      "fn ${1:name}(${2:params}) -> ${3:ReturnType} {",
+      "    ${0}",
+      "}"
+    ],
+    "description": "Function definition"
+  },
+  "Kernel": {
+    "prefix": "kernel",
+    "body": [
+      "kernel ${1:name}(${2:a}: Tensor<${3:f32}, [${4:N}]>) -> Tensor<${3}, [${4}]> {",
+      "    let idx = thread_idx()",
+      "    ${0}",
+      "}"
+    ],
+    "description": "GPU kernel definition"
+  },
+  "Struct": {
+    "prefix": "struct",
+    "body": [
+      "struct ${1:Name} {",
+      "    ${2:field}: ${3:Type}",
+      "}"
+    ],
+    "description": "Struct definition"
+  },
+  "Enum": {
+    "prefix": "enum",
+    "body": [
+      "enum ${1:Name} {",
+      "    ${2:Variant1}",
+      "    ${3:Variant2}",
+      "}"
+    ],
+    "description": "Enum definition"
+  },
+  "Impl": {
+    "prefix": "impl",
+    "body": [
+      "impl ${1:Type} {",
+      "    fn ${2:method}(self${3:, params}) -> ${4:ReturnType} {",
+      "        ${0}",
+      "    }",
+      "}"
+    ],
+    "description": "Impl block"
+  },
+  "Match": {
+    "prefix": "match",
+    "body": [
+      "match ${1:expr} {",
+      "    ${2:pattern} => ${3:result}",
+      "    ${4:_} => ${5:default}",
+      "}"
+    ],
+    "description": "Match expression"
+  },
+  "For Loop": {
+    "prefix": "for",
+    "body": [
+      "for ${1:i} in ${2:range(0, n)} {",
+      "    ${0}",
+      "}"
+    ],
+    "description": "For loop"
+  },
+  "Import": {
+    "prefix": "import",
+    "body": [
+      "import ${1:module}"
+    ],
+    "description": "Import statement"
+  },
+  "Mixture of Experts": {
+    "prefix": "moe",
+    "body": [
+      "fn ${1:moe_layer}(x: Tensor<f32, [B, D]>, experts: [Tensor<f32, [D, D]>; ${2:N}]) -> Tensor<f32, [B, D]> {",
+      "    let gates = softmax(x @ ${3:gate_weights})",
+      "    dispatch gates {",
+      "        ${0}",
+      "    }",
+      "}"
+    ],
+    "description": "Mixture of Experts dispatch pattern"
+  },
+  "SSM Scan": {
+    "prefix": "ssm",
+    "body": [
+      "@scan",
+      "fn ${1:ssm_step}(h: Tensor<f32, [D]>, x: Tensor<f32, [D]>) -> Tensor<f32, [D]> {",
+      "    let h_new = ssm_scan(${2:A}, ${3:B}, h, x)",
+      "    ${0}",
+      "    h_new",
+      "}"
+    ],
+    "description": "SSM scan pattern"
+  },
+  "LIF Spiking Layer": {
+    "prefix": "lif",
+    "body": [
+      "fn ${1:lif_layer}(input: Tensor<f32, [B, T, D]>) -> SpikeTrain {",
+      "    let spikes = spike_train(input, ${2:0.5})",
+      "    ${0}",
+      "    spikes",
+      "}"
+    ],
+    "description": "LIF spiking neuron layer"
+  },
+  "Forward-Forward Layer": {
+    "prefix": "ff",
+    "body": [
+      "@local_loss",
+      "fn ${1:ff_block}(x: Tensor<f32, [B, D]>) -> Tensor<f32, [B, D]> {",
+      "    let g = goodness(x)",
+      "    let out = ff_layer(x, ${2:weights})",
+      "    ${0}",
+      "    out",
+      "}"
+    ],
+    "description": "Forward-Forward layer pattern"
+  },
+  "Liquid Neural Network Cell": {
+    "prefix": "liquid",
+    "body": [
+      "@ode_solve",
+      "fn ${1:liquid_step}(h: Tensor<f32, [D]>, x: Tensor<f32, [D]>, dt: f32) -> Tensor<f32, [D]> {",
+      "    let h_new = liquid_cell(h, x, ${2:weights}, dt)",
+      "    ${0}",
+      "    h_new",
+      "}"
+    ],
+    "description": "Liquid neural network cell pattern"
+  }
+}
