@@ -1293,6 +1293,408 @@ pub fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
     sha256(&outer_input)
 }
 
+// ============================================================
+// BigUint384 — 384-bit unsigned integer (12 x 32-bit limbs, little-endian)
+// ============================================================
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct BigUint384 {
+    pub limbs: [u32; 12],
+}
+
+impl BigUint384 {
+    pub const ZERO: BigUint384 = BigUint384 { limbs: [0; 12] };
+    pub const ONE: BigUint384 = BigUint384 {
+        limbs: [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    };
+
+    pub fn new(limbs: [u32; 12]) -> Self {
+        Self { limbs }
+    }
+
+    pub fn from_u64(val: u64) -> Self {
+        let mut limbs = [0u32; 12];
+        limbs[0] = val as u32;
+        limbs[1] = (val >> 32) as u32;
+        Self { limbs }
+    }
+
+    pub fn from_hex(hex: &str) -> Option<Self> {
+        let hex = hex
+            .strip_prefix("0x")
+            .or_else(|| hex.strip_prefix("0X"))
+            .unwrap_or(hex);
+        let hex = hex.trim_start_matches('0');
+        if hex.is_empty() {
+            return Some(Self::ZERO);
+        }
+        if hex.len() > 96 {
+            return None; // Too large for 384 bits
+        }
+        let padded = format!("{:0>96}", hex);
+        let mut limbs = [0u32; 12];
+        for i in 0..12 {
+            let start = 96 - (i + 1) * 8;
+            let end = start + 8;
+            limbs[i] = u32::from_str_radix(&padded[start..end], 16).ok()?;
+        }
+        Some(Self { limbs })
+    }
+
+    pub fn is_zero(&self) -> bool {
+        self.limbs.iter().all(|&l| l == 0)
+    }
+
+    pub fn bit(&self, n: u32) -> bool {
+        if n >= 384 {
+            return false;
+        }
+        let limb_idx = (n / 32) as usize;
+        let bit_idx = n % 32;
+        (self.limbs[limb_idx] >> bit_idx) & 1 == 1
+    }
+
+    pub fn bits(&self) -> u32 {
+        for i in (0..12).rev() {
+            if self.limbs[i] != 0 {
+                return i as u32 * 32 + (32 - self.limbs[i].leading_zeros());
+            }
+        }
+        0
+    }
+
+    pub fn is_even(&self) -> bool {
+        self.limbs[0] & 1 == 0
+    }
+
+    pub fn shr1(&self) -> BigUint384 {
+        let mut result = [0u32; 12];
+        for i in 0..11 {
+            result[i] = (self.limbs[i] >> 1) | (self.limbs[i + 1] << 31);
+        }
+        result[11] = self.limbs[11] >> 1;
+        BigUint384 { limbs: result }
+    }
+
+    pub fn cmp(&self, other: &BigUint384) -> std::cmp::Ordering {
+        for i in (0..12).rev() {
+            match self.limbs[i].cmp(&other.limbs[i]) {
+                std::cmp::Ordering::Equal => continue,
+                ord => return ord,
+            }
+        }
+        std::cmp::Ordering::Equal
+    }
+
+    pub fn add_with_carry(&self, other: &BigUint384) -> (BigUint384, bool) {
+        let mut result = [0u32; 12];
+        let mut carry: u64 = 0;
+        for i in 0..12 {
+            let sum = self.limbs[i] as u64 + other.limbs[i] as u64 + carry;
+            result[i] = sum as u32;
+            carry = sum >> 32;
+        }
+        (BigUint384 { limbs: result }, carry != 0)
+    }
+
+    pub fn sub_with_borrow(&self, other: &BigUint384) -> (BigUint384, bool) {
+        let mut result = [0u32; 12];
+        let mut borrow: i64 = 0;
+        for i in 0..12 {
+            let diff = self.limbs[i] as i64 - other.limbs[i] as i64 - borrow;
+            if diff < 0 {
+                result[i] = (diff + (1i64 << 32)) as u32;
+                borrow = 1;
+            } else {
+                result[i] = diff as u32;
+                borrow = 0;
+            }
+        }
+        (BigUint384 { limbs: result }, borrow != 0)
+    }
+}
+
+impl fmt::Display for BigUint384 {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut started = false;
+        for i in (0..12).rev() {
+            if self.limbs[i] != 0 || started || i == 0 {
+                if started {
+                    write!(f, "{:08x}", self.limbs[i])?;
+                } else {
+                    write!(f, "{:x}", self.limbs[i])?;
+                    started = true;
+                }
+            }
+        }
+        if !started {
+            write!(f, "0")?;
+        }
+        Ok(())
+    }
+}
+
+impl fmt::Debug for BigUint384 {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "BigUint384(0x{})", self)
+    }
+}
+
+impl PartialOrd for BigUint384 {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for BigUint384 {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        BigUint384::cmp(self, other)
+    }
+}
+
+// ============================================================
+// Montgomery Multiplication (256-bit)
+// ============================================================
+
+#[derive(Clone, Debug)]
+pub struct MontgomeryParams {
+    /// The modulus N
+    pub n: BigUint256,
+    /// -N^(-1) mod 2^32
+    pub n_prime: u64,
+    /// R^2 mod N, where R = 2^256
+    pub r_squared: BigUint256,
+    /// R^(-1) mod N
+    pub r_inv: BigUint256,
+}
+
+/// Compute -N^(-1) mod 2^32 using Hensel lifting.
+fn compute_n_prime(n0: u32) -> u64 {
+    let n0 = n0 as u64;
+    let mut inv: u64 = 1;
+    for _ in 0..31 {
+        inv = inv.wrapping_mul(2u64.wrapping_sub(n0.wrapping_mul(inv)));
+    }
+    // inv is N^(-1) mod 2^32 at this point
+    // n_prime = -inv mod 2^32
+    ((1u64 << 32) - (inv & 0xFFFFFFFF)) & 0xFFFFFFFF
+}
+
+/// Precompute Montgomery parameters for a given modulus.
+pub fn montgomery_params(modulus: &BigUint256) -> MontgomeryParams {
+    let n_prime = compute_n_prime(modulus.limbs[0]);
+
+    // Compute R mod N where R = 2^256.
+    // Start with 1 and double 256 times mod N.
+    let mut r_mod_n = BigUint256::from_u64(1);
+    for _ in 0..256 {
+        let (doubled, carry) = r_mod_n.add_with_carry(&r_mod_n);
+        r_mod_n = if carry || doubled.cmp(modulus) != std::cmp::Ordering::Less {
+            let (sub, _) = doubled.sub_with_borrow(modulus);
+            sub
+        } else {
+            doubled
+        };
+    }
+
+    // R^2 mod N = (R mod N)^2 mod N
+    let r_squared = mod_mul(&r_mod_n, &r_mod_n, modulus);
+    let r_inv = mod_inv(&r_mod_n, modulus);
+
+    MontgomeryParams {
+        n: modulus.clone(),
+        n_prime,
+        r_squared,
+        r_inv,
+    }
+}
+
+/// Convert a normal value into Montgomery form: aR mod N.
+pub fn to_montgomery(a: &BigUint256, params: &MontgomeryParams) -> BigUint256 {
+    montgomery_mul(a, &params.r_squared, params)
+}
+
+/// Convert from Montgomery form back to normal: a * R^(-1) mod N.
+pub fn from_montgomery(a: &BigUint256, params: &MontgomeryParams) -> BigUint256 {
+    montgomery_mul(a, &BigUint256::ONE, params)
+}
+
+/// Montgomery REDC: given a 512-bit value T (as lo,hi), compute T * R^{-1} mod N.
+///
+/// Uses the word-by-word approach: for each of the 8 low limbs, compute
+/// m_i = T[i] * n_prime mod 2^32, then add m_i * N at position i.
+fn montgomery_redc(lo: &BigUint256, hi: &BigUint256, params: &MontgomeryParams) -> BigUint256 {
+    let n = &params.n;
+    // We need full 256-bit n_prime for the whole-word REDC.
+    // Instead, use the limb-by-limb approach with n_prime_0 = -N^{-1} mod 2^32.
+    let n_prime_0 = params.n_prime as u32;
+
+    // Work with 18 limbs to be safe (512 bits = 16 limbs + 2 overflow)
+    let mut t = [0u32; 18];
+    for i in 0..8 {
+        t[i] = lo.limbs[i];
+        t[i + 8] = hi.limbs[i];
+    }
+
+    for i in 0..8 {
+        // m_i = t[i] * n_prime_0 mod 2^32
+        let m_i = t[i].wrapping_mul(n_prime_0);
+        // Add m_i * N at position i, using u64 arithmetic
+        let mut carry: u64 = 0;
+        for j in 0..8 {
+            let prod = (m_i as u128) * (n.limbs[j] as u128) + (t[i + j] as u128) + (carry as u128);
+            t[i + j] = prod as u32;
+            carry = (prod >> 32) as u64;
+        }
+        // Propagate carry through ALL remaining limbs
+        for k in (i + 8)..18 {
+            let sum = (t[k] as u64) + carry;
+            t[k] = sum as u32;
+            carry = sum >> 32;
+        }
+    }
+
+    // Result = T >> 256, i.e., t[8..16], plus possible overflow in t[16]
+    let mut result = [0u32; 8];
+    for i in 0..8 {
+        result[i] = t[i + 8];
+    }
+    let res = BigUint256 { limbs: result };
+    let overflow = t[16] != 0;
+
+    // Final subtraction if result >= N (including overflow)
+    if overflow || res.cmp(n) != std::cmp::Ordering::Less {
+        let (sub, _) = res.sub_with_borrow(n);
+        sub
+    } else {
+        res
+    }
+}
+
+/// Montgomery multiplication: computes a*b*R^(-1) mod N for 8x32-bit limbs.
+/// Uses REDC (Montgomery reduction) on the full product.
+pub fn montgomery_mul(a: &BigUint256, b: &BigUint256, params: &MontgomeryParams) -> BigUint256 {
+    let (lo, hi) = a.mul_wide(b);
+    montgomery_redc(&lo, &hi, params)
+}
+
+/// Montgomery squaring: montgomery_mul(a, a, params).
+pub fn montgomery_square(a: &BigUint256, params: &MontgomeryParams) -> BigUint256 {
+    montgomery_mul(a, a, params)
+}
+
+// ============================================================
+// MontFieldElement — field element with cached Montgomery params
+// ============================================================
+
+#[derive(Clone, Debug)]
+pub struct MontFieldElement {
+    /// Value in Montgomery form (aR mod N)
+    pub value: BigUint256,
+    pub params: MontgomeryParams,
+}
+
+impl MontFieldElement {
+    /// Create a new field element from a normal (non-Montgomery) value.
+    pub fn new(val: &BigUint256, params: MontgomeryParams) -> Self {
+        let value = to_montgomery(val, &params);
+        Self { value, params }
+    }
+
+    pub fn zero(params: MontgomeryParams) -> Self {
+        Self {
+            value: BigUint256::ZERO,
+            params,
+        }
+    }
+
+    pub fn one(params: MontgomeryParams) -> Self {
+        // 1 in Montgomery form = R mod N = to_montgomery(1, params)
+        let value = to_montgomery(&BigUint256::ONE, &params);
+        Self { value, params }
+    }
+
+    pub fn is_zero(&self) -> bool {
+        self.value.is_zero()
+    }
+
+    /// Convert back to normal (non-Montgomery) representation.
+    pub fn from_mont(&self) -> BigUint256 {
+        from_montgomery(&self.value, &self.params)
+    }
+
+    pub fn mul(&self, other: &MontFieldElement) -> MontFieldElement {
+        MontFieldElement {
+            value: montgomery_mul(&self.value, &other.value, &self.params),
+            params: self.params.clone(),
+        }
+    }
+
+    pub fn square(&self) -> MontFieldElement {
+        MontFieldElement {
+            value: montgomery_square(&self.value, &self.params),
+            params: self.params.clone(),
+        }
+    }
+
+    pub fn add(&self, other: &MontFieldElement) -> MontFieldElement {
+        let (sum, carry) = self.value.add_with_carry(&other.value);
+        let value = if carry || sum.cmp(&self.params.n) != std::cmp::Ordering::Less {
+            let (sub, _) = sum.sub_with_borrow(&self.params.n);
+            sub
+        } else {
+            sum
+        };
+        MontFieldElement {
+            value,
+            params: self.params.clone(),
+        }
+    }
+
+    pub fn sub(&self, other: &MontFieldElement) -> MontFieldElement {
+        let value = if self.value.cmp(&other.value) == std::cmp::Ordering::Less {
+            // self < other, so add N first
+            let (sum, _) = self.value.add_with_carry(&self.params.n);
+            let (sub, _) = sum.sub_with_borrow(&other.value);
+            sub
+        } else {
+            let (sub, _) = self.value.sub_with_borrow(&other.value);
+            sub
+        };
+        MontFieldElement {
+            value,
+            params: self.params.clone(),
+        }
+    }
+
+    pub fn neg(&self) -> MontFieldElement {
+        if self.is_zero() {
+            return self.clone();
+        }
+        let (value, _) = self.params.n.sub_with_borrow(&self.value);
+        MontFieldElement {
+            value,
+            params: self.params.clone(),
+        }
+    }
+
+    /// Modular inverse using Fermat's little theorem: a^(-1) = a^(p-2) mod p.
+    pub fn inv(&self) -> MontFieldElement {
+        // Compute a^(p-2) via square-and-multiply
+        let (p_minus_2, _) = self.params.n.sub_with_borrow(&BigUint256::from_u64(2));
+        let mut result = MontFieldElement::one(self.params.clone());
+        let mut base = self.clone();
+        let bits = p_minus_2.bits();
+        for i in 0..bits {
+            if p_minus_2.bit(i) {
+                result = result.mul(&base);
+            }
+            base = base.square();
+        }
+        result
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1688,5 +2090,136 @@ mod tests {
         let bytes = bigint_to_bytes32(&n);
         let recovered = bytes32_to_bigint(&bytes);
         assert_eq!(n, recovered);
+    }
+
+    // --- Montgomery multiplication tests ---
+
+    #[test]
+    fn test_montgomery_roundtrip() {
+        let p = secp256k1_field_prime();
+        let params = montgomery_params(&p);
+
+        let a = BigUint256::from_hex("DEADBEEFCAFEBABE1234567890ABCDEF").unwrap();
+        let a_mont = to_montgomery(&a, &params);
+        let a_back = from_montgomery(&a_mont, &params);
+        assert_eq!(a, a_back);
+
+        // Also test with a value close to but less than p
+        let b = BigUint256::from_hex("ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789").unwrap();
+        let b_mont = to_montgomery(&b, &params);
+        let b_back = from_montgomery(&b_mont, &params);
+        assert_eq!(b, b_back);
+    }
+
+    #[test]
+    fn test_montgomery_mul_matches_schoolbook() {
+        let p = secp256k1_field_prime();
+        let params = montgomery_params(&p);
+
+        let a = BigUint256::from_hex("123456789ABCDEF0").unwrap();
+        let b = BigUint256::from_hex("FEDCBA9876543210").unwrap();
+
+        // Schoolbook
+        let expected = mod_mul(&a, &b, &p);
+
+        // Montgomery: to_mont(a) * to_mont(b) then from_mont
+        let a_m = to_montgomery(&a, &params);
+        let b_m = to_montgomery(&b, &params);
+        let c_m = montgomery_mul(&a_m, &b_m, &params);
+        let c = from_montgomery(&c_m, &params);
+        assert_eq!(expected, c);
+
+        // Another pair
+        let x = BigUint256::from_u64(7);
+        let y = BigUint256::from_u64(13);
+        let expected2 = mod_mul(&x, &y, &p);
+        let x_m = to_montgomery(&x, &params);
+        let y_m = to_montgomery(&y, &params);
+        let z_m = montgomery_mul(&x_m, &y_m, &params);
+        let z = from_montgomery(&z_m, &params);
+        assert_eq!(expected2, z);
+    }
+
+    #[test]
+    fn test_montgomery_square() {
+        let p = secp256k1_field_prime();
+        let params = montgomery_params(&p);
+
+        let a = BigUint256::from_hex("ABCDEF0123456789").unwrap();
+        let a_m = to_montgomery(&a, &params);
+        let sq = montgomery_square(&a_m, &params);
+        let mul_aa = montgomery_mul(&a_m, &a_m, &params);
+        assert_eq!(sq, mul_aa);
+
+        // Also verify against schoolbook
+        let expected = mod_mul(&a, &a, &p);
+        let result = from_montgomery(&sq, &params);
+        assert_eq!(expected, result);
+    }
+
+    #[test]
+    fn test_biguint384_basic() {
+        let a = BigUint384::from_u64(100);
+        let b = BigUint384::from_u64(200);
+        let (sum, carry) = a.add_with_carry(&b);
+        assert!(!carry);
+        assert_eq!(format!("{}", sum), "12c"); // 300 = 0x12c
+
+        let (diff, borrow) = b.sub_with_borrow(&a);
+        assert!(!borrow);
+        assert_eq!(format!("{}", diff), "64"); // 100 = 0x64
+
+        // Test from_hex with a large value
+        let big = BigUint384::from_hex(
+            "1a0111ea397fe69a4b1ba7b6434bacd764774b84f38512bf6730d2a0f6b0f6241eabfffeb153ffffb9feffffffffaaab",
+        )
+        .unwrap();
+        assert!(!big.is_zero());
+        assert_eq!(big.bits(), 381);
+
+        // Test shr1
+        let two = BigUint384::from_u64(2);
+        let one = two.shr1();
+        assert_eq!(format!("{}", one), "1");
+    }
+
+    #[test]
+    fn test_mont_field_element() {
+        let p = secp256k1_field_prime();
+        let params = montgomery_params(&p);
+
+        let a = MontFieldElement::new(&BigUint256::from_u64(7), params.clone());
+        let b = MontFieldElement::new(&BigUint256::from_u64(13), params.clone());
+
+        // mul
+        let c = a.mul(&b);
+        assert_eq!(c.from_mont(), BigUint256::from_u64(91));
+
+        // add
+        let d = a.add(&b);
+        assert_eq!(d.from_mont(), BigUint256::from_u64(20));
+
+        // sub
+        let e = b.sub(&a);
+        assert_eq!(e.from_mont(), BigUint256::from_u64(6));
+
+        // neg
+        let neg_a = a.neg();
+        let should_be_zero = a.add(&neg_a);
+        assert!(should_be_zero.is_zero());
+
+        // Test repeated squaring stays consistent with schoolbook
+        let mut mont_val = a.clone();
+        let mut normal_val = BigUint256::from_u64(7);
+        for i in 0..20 {
+            mont_val = mont_val.square();
+            normal_val = mod_mul(&normal_val, &normal_val, &p);
+            assert_eq!(mont_val.from_mont(), normal_val, "Montgomery squaring diverged at iter {}", i);
+        }
+
+        // inv: a * a^(-1) = 1
+        let a_inv = a.inv();
+        let one = a.mul(&a_inv);
+        assert_eq!(one.from_mont(), BigUint256::ONE);
     }
 }
