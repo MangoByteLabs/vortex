@@ -1,5 +1,7 @@
 use crate::ast::*;
 use crate::crypto;
+use crate::memory;
+use crate::spiking;
 use std::collections::HashMap;
 use std::fmt;
 
@@ -18,6 +20,10 @@ pub enum Value {
     FieldElem(crypto::FieldElement),
     /// Elliptic curve point
     ECPoint(crypto::ECPoint),
+    /// Spike train (neuromorphic)
+    SpikeTrain(spiking::SpikeTrain),
+    /// Differentiable memory bank
+    DiffMemory(Box<memory::DiffMemory>),
     /// Void / unit
     Void,
     /// A struct instance
@@ -37,6 +43,10 @@ pub enum Value {
         params: Vec<String>,
         body: Block,
     },
+    /// A sparse tensor
+    SparseTensor(crate::sparse::SparseTensor),
+    /// A sparse index
+    SparseIdx(crate::sparse::SparseIndex),
     /// Return signal (used internally)
     Return(Box<Value>),
 }
@@ -87,6 +97,10 @@ impl fmt::Display for Value {
             Value::BigInt(n) => write!(f, "0x{}", n),
             Value::FieldElem(fe) => write!(f, "{}", fe),
             Value::ECPoint(p) => write!(f, "{}", p),
+            Value::SpikeTrain(st) => write!(f, "<SpikeTrain {}x{}>", st.timesteps, st.neurons),
+            Value::DiffMemory(m) => write!(f, "<Memory C={} K={} V={}>", m.capacity, m.key_dim, m.val_dim),
+            Value::SparseTensor(st) => write!(f, "SparseTensor(nnz={})", st.values.len()),
+            Value::SparseIdx(si) => write!(f, "SparseIndex(batch={}, k={})", si.batch_size, si.k),
             Value::Void => write!(f, "()"),
             Value::Function { name, .. } => write!(f, "<fn {}>", name),
             Value::Return(v) => write!(f, "{}", v),
@@ -234,6 +248,13 @@ impl Env {
         self.functions.insert("g2_generator".to_string(), FnDef::Builtin(builtin_g2_generator));
         self.functions.insert("g1_scalar_mul".to_string(), FnDef::Builtin(builtin_g1_scalar_mul));
 
+        // Sparse builtins
+        self.functions.insert("sparse_topk".to_string(), FnDef::Builtin(builtin_sparse_topk));
+        self.functions.insert("sparse_gather".to_string(), FnDef::Builtin(builtin_sparse_gather));
+        self.functions.insert("sparse_scatter".to_string(), FnDef::Builtin(builtin_sparse_scatter));
+        self.functions.insert("sparse_matmul".to_string(), FnDef::Builtin(builtin_sparse_matmul));
+        self.functions.insert("to_sparse".to_string(), FnDef::Builtin(builtin_to_sparse));
+
         // String / utility builtins
         self.functions.insert("len".to_string(), FnDef::Builtin(builtin_len));
         self.functions.insert("to_string".to_string(), FnDef::Builtin(builtin_to_string));
@@ -241,6 +262,31 @@ impl Env {
         self.functions.insert("push".to_string(), FnDef::Builtin(builtin_push));
         self.functions.insert("assert".to_string(), FnDef::Builtin(builtin_assert));
         self.functions.insert("assert_eq".to_string(), FnDef::Builtin(builtin_assert_eq));
+
+        // Spiking / neuromorphic builtins
+        self.functions.insert("spike_train".to_string(), FnDef::Builtin(builtin_spike_train));
+        self.functions.insert("spike_from_dense".to_string(), FnDef::Builtin(builtin_spike_from_dense));
+        self.functions.insert("spike_overlap".to_string(), FnDef::Builtin(builtin_spike_overlap));
+        self.functions.insert("lif_layer".to_string(), FnDef::Builtin(builtin_lif_layer));
+        self.functions.insert("spike_to_dense".to_string(), FnDef::Builtin(builtin_spike_to_dense));
+
+        // Differentiable memory builtins
+        self.functions.insert("memory_new".to_string(), FnDef::Builtin(builtin_memory_new));
+        self.functions.insert("memory_read".to_string(), FnDef::Builtin(builtin_memory_read));
+        self.functions.insert("memory_write".to_string(), FnDef::Builtin(builtin_memory_write));
+        self.functions.insert("memory_content_lookup".to_string(), FnDef::Builtin(builtin_memory_content_lookup));
+
+        // Local learning builtins
+        self.functions.insert("goodness".to_string(), FnDef::Builtin(builtin_goodness));
+        self.functions.insert("hebbian_update".to_string(), FnDef::Builtin(builtin_hebbian_update));
+        self.functions.insert("ff_layer".to_string(), FnDef::Builtin(builtin_ff_layer));
+        self.functions.insert("predictive_coding_update".to_string(), FnDef::Builtin(builtin_predictive_coding_update));
+
+        // ODE / Liquid NN builtins
+        self.functions.insert("ode_solve_euler".to_string(), FnDef::Builtin(builtin_ode_solve_euler));
+        self.functions.insert("ode_solve_rk4".to_string(), FnDef::Builtin(builtin_ode_solve_rk4));
+        self.functions.insert("liquid_cell".to_string(), FnDef::Builtin(builtin_liquid_cell));
+        self.functions.insert("cfc_cell".to_string(), FnDef::Builtin(builtin_cfc_cell));
     }
 }
 
@@ -832,6 +878,106 @@ fn builtin_assert_eq(_env: &mut Env, args: Vec<Value>) -> Result<Value, String> 
         return Err(format!("assertion failed: {} != {}", args[0], args[1]));
     }
     Ok(Value::Void)
+}
+
+// --- Spiking / neuromorphic builtins ---
+
+fn builtin_spike_train(_env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    if args.len() != 2 { return Err("spike_train expects 2 arguments: (timesteps, neurons)".to_string()); }
+    let timesteps = match &args[0] { Value::Int(n) => *n as usize, _ => return Err("spike_train: timesteps must be int".to_string()) };
+    let neurons = match &args[1] { Value::Int(n) => *n as usize, _ => return Err("spike_train: neurons must be int".to_string()) };
+    Ok(Value::SpikeTrain(spiking::SpikeTrain::new(timesteps, neurons)))
+}
+
+fn builtin_spike_from_dense(_env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    if args.len() != 4 { return Err("spike_from_dense expects 4 arguments: (data, timesteps, neurons, threshold)".to_string()); }
+    let data = match &args[0] {
+        Value::Array(arr) => arr.iter().map(|v| match v {
+            Value::Float(f) => Ok(*f), Value::Int(i) => Ok(*i as f64),
+            _ => Err("spike_from_dense: data must be numeric array".to_string()),
+        }).collect::<Result<Vec<f64>, String>>()?,
+        _ => return Err("spike_from_dense: first argument must be array".to_string()),
+    };
+    let timesteps = match &args[1] { Value::Int(n) => *n as usize, _ => return Err("timesteps must be int".to_string()) };
+    let neurons = match &args[2] { Value::Int(n) => *n as usize, _ => return Err("neurons must be int".to_string()) };
+    let threshold = match &args[3] { Value::Float(f) => *f, Value::Int(i) => *i as f64, _ => return Err("threshold must be numeric".to_string()) };
+    Ok(Value::SpikeTrain(spiking::SpikeTrain::from_dense(&data, timesteps, neurons, threshold)))
+}
+
+fn builtin_spike_overlap(_env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    if args.len() != 2 { return Err("spike_overlap expects 2 arguments".to_string()); }
+    let a = match &args[0] { Value::SpikeTrain(st) => st, _ => return Err("spike_overlap: first arg must be SpikeTrain".to_string()) };
+    let b = match &args[1] { Value::SpikeTrain(st) => st, _ => return Err("spike_overlap: second arg must be SpikeTrain".to_string()) };
+    Ok(Value::Int(spiking::spike_overlap(a, b) as i128))
+}
+
+fn builtin_lif_layer(_env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    if args.len() != 6 { return Err("lif_layer expects 6 arguments: (spikes, weights, n_in, n_out, threshold, tau)".to_string()); }
+    let input = match &args[0] { Value::SpikeTrain(st) => st, _ => return Err("lif_layer: first arg must be SpikeTrain".to_string()) };
+    let weights = match &args[1] {
+        Value::Array(arr) => arr.iter().map(|v| match v {
+            Value::Float(f) => Ok(*f), Value::Int(i) => Ok(*i as f64),
+            _ => Err("lif_layer: weights must be numeric".to_string()),
+        }).collect::<Result<Vec<f64>, String>>()?,
+        _ => return Err("lif_layer: weights must be array".to_string()),
+    };
+    let n_in = match &args[2] { Value::Int(n) => *n as usize, _ => return Err("n_in must be int".to_string()) };
+    let n_out = match &args[3] { Value::Int(n) => *n as usize, _ => return Err("n_out must be int".to_string()) };
+    let threshold = match &args[4] { Value::Float(f) => *f, Value::Int(i) => *i as f64, _ => return Err("threshold must be numeric".to_string()) };
+    let tau = match &args[5] { Value::Float(f) => *f, Value::Int(i) => *i as f64, _ => return Err("tau must be numeric".to_string()) };
+    Ok(Value::SpikeTrain(spiking::lif_layer(input, &weights, n_in, n_out, threshold, tau)))
+}
+
+fn builtin_spike_to_dense(_env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    if args.len() != 1 { return Err("spike_to_dense expects 1 argument".to_string()); }
+    let train = match &args[0] { Value::SpikeTrain(st) => st, _ => return Err("spike_to_dense: arg must be SpikeTrain".to_string()) };
+    Ok(Value::Array(train.to_dense().into_iter().map(Value::Float).collect()))
+}
+
+// --- Differentiable memory builtins ---
+
+fn builtin_memory_new(_env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    if args.len() != 3 { return Err("memory_new expects 3 arguments: (capacity, key_dim, val_dim)".to_string()); }
+    let capacity = match &args[0] { Value::Int(n) => *n as usize, _ => return Err("capacity must be int".to_string()) };
+    let key_dim = match &args[1] { Value::Int(n) => *n as usize, _ => return Err("key_dim must be int".to_string()) };
+    let val_dim = match &args[2] { Value::Int(n) => *n as usize, _ => return Err("val_dim must be int".to_string()) };
+    Ok(Value::DiffMemory(Box::new(memory::DiffMemory::new(capacity, key_dim, val_dim))))
+}
+
+fn extract_f64_array(v: &Value) -> Result<Vec<f64>, String> {
+    match v {
+        Value::Array(arr) => arr.iter().map(|v| match v {
+            Value::Float(f) => Ok(*f), Value::Int(i) => Ok(*i as f64),
+            _ => Err("expected numeric array".to_string()),
+        }).collect(),
+        _ => Err("expected array".to_string()),
+    }
+}
+
+fn builtin_memory_read(_env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    if args.len() != 2 { return Err("memory_read expects 2 arguments: (mem, query)".to_string()); }
+    let mem = match &args[0] { Value::DiffMemory(m) => m, _ => return Err("memory_read: first arg must be Memory".to_string()) };
+    let query = extract_f64_array(&args[1])?;
+    let result = mem.read(&query);
+    Ok(Value::Array(result.into_iter().map(Value::Float).collect()))
+}
+
+fn builtin_memory_write(_env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    if args.len() != 3 { return Err("memory_write expects 3 arguments: (mem, key, value)".to_string()); }
+    let mut mem = match &args[0] { Value::DiffMemory(m) => (**m).clone(), _ => return Err("memory_write: first arg must be Memory".to_string()) };
+    let key = extract_f64_array(&args[1])?;
+    let value = extract_f64_array(&args[2])?;
+    mem.write(&key, &value);
+    Ok(Value::DiffMemory(Box::new(mem)))
+}
+
+fn builtin_memory_content_lookup(_env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    if args.len() != 3 { return Err("memory_content_lookup expects 3 arguments: (mem, query, beta)".to_string()); }
+    let mem = match &args[0] { Value::DiffMemory(m) => m, _ => return Err("first arg must be Memory".to_string()) };
+    let query = extract_f64_array(&args[1])?;
+    let beta = match &args[2] { Value::Float(f) => *f, Value::Int(i) => *i as f64, _ => return Err("beta must be numeric".to_string()) };
+    let weights = mem.content_lookup(&query, beta);
+    Ok(Value::Array(weights.into_iter().map(Value::Float).collect()))
 }
 
 // --- LLM operation builtins (stubs) ---
@@ -1456,6 +1602,34 @@ fn eval_stmt(env: &mut Env, stmt: &Stmt) -> Result<Value, String> {
         }
         StmtKind::Break => Err("break outside loop".to_string()),
         StmtKind::Continue => Err("continue outside loop".to_string()),
+        StmtKind::Dispatch { index, targets, args } => {
+            let idx_val = eval_expr(env, index)?;
+            let idx = value_to_int(&idx_val)? as usize;
+            if idx >= targets.len() {
+                return Err(format!("dispatch index {} out of bounds (have {} targets)", idx, targets.len()));
+            }
+            let target_name = targets[idx].name.clone();
+            let arg_vals: Vec<Value> = args.iter()
+                .map(|a| eval_expr(env, a))
+                .collect::<Result<Vec<_>, _>>()?;
+            let func_def = env.functions.get(&target_name).cloned()
+                .ok_or_else(|| format!("undefined function in dispatch: {}", target_name))?;
+            match func_def {
+                FnDef::Builtin(f) => f(env, arg_vals),
+                FnDef::User { params, body } => {
+                    env.push_scope();
+                    for (param, val) in params.iter().zip(arg_vals.iter()) {
+                        env.define(param, val.clone());
+                    }
+                    let result = eval_block(env, &body)?;
+                    env.pop_scope();
+                    match result {
+                        Value::Return(v) => Ok(*v),
+                        other => Ok(other),
+                    }
+                }
+            }
+        }
     }
 }
 
