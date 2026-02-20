@@ -80,6 +80,8 @@ impl fmt::Display for Value {
 struct Env {
     scopes: Vec<HashMap<String, Value>>,
     functions: HashMap<String, FnDef>,
+    /// Struct definitions: name -> field names (in order)
+    struct_defs: HashMap<String, Vec<String>>,
     output: Vec<String>,
 }
 
@@ -97,6 +99,7 @@ impl Env {
         let mut env = Self {
             scopes: vec![HashMap::new()],
             functions: HashMap::new(),
+            struct_defs: HashMap::new(),
             output: Vec::new(),
         };
         env.register_builtins();
@@ -410,6 +413,31 @@ pub fn interpret(program: &Program) -> Result<Vec<String>, String> {
                 let val = eval_expr(&mut env, &c.value)?;
                 env.define(&c.name.name, val);
             }
+            ItemKind::Struct(s) => {
+                let field_names: Vec<String> = s.fields.iter().map(|f| f.name.name.clone()).collect();
+                env.struct_defs.insert(s.name.name.clone(), field_names);
+            }
+            ItemKind::Impl(impl_block) => {
+                // Get the target type name
+                let type_name = match &impl_block.target.kind {
+                    crate::ast::TypeExprKind::Named(id) => id.name.clone(),
+                    _ => continue,
+                };
+                // Register each method as TypeName::method_name
+                for method_item in &impl_block.methods {
+                    if let ItemKind::Function(func) = &method_item.kind {
+                        let params: Vec<String> = func.params.iter().map(|p| p.name.name.clone()).collect();
+                        let qualified_name = format!("{}::{}", type_name, func.name.name);
+                        env.functions.insert(
+                            qualified_name,
+                            FnDef::User {
+                                params,
+                                body: func.body.clone(),
+                            },
+                        );
+                    }
+                }
+            }
             _ => {}
         }
     }
@@ -598,6 +626,69 @@ fn eval_expr(env: &mut Env, expr: &Expr) -> Result<Value, String> {
         }
 
         ExprKind::Call { func, args } => {
+            // Check for method call: base.method(args)
+            if let ExprKind::FieldAccess { base, field } = &func.kind {
+                let base_val = eval_expr(env, base)?;
+                let method_name = &field.name;
+
+                // Try to find Type::method in the function registry
+                let type_name = match &base_val {
+                    Value::Struct { name, .. } => Some(name.clone()),
+                    _ => None,
+                };
+
+                if let Some(ref tn) = type_name {
+                    let qualified = format!("{}::{}", tn, method_name);
+                    if let Some(func_def) = env.functions.get(&qualified).cloned() {
+                        let mut arg_vals = vec![base_val];
+                        for a in args {
+                            arg_vals.push(eval_expr(env, a)?);
+                        }
+                        return match func_def {
+                            FnDef::Builtin(f) => f(env, arg_vals),
+                            FnDef::User { params, body } => {
+                                env.push_scope();
+                                for (param, val) in params.iter().zip(arg_vals.iter()) {
+                                    env.define(param, val.clone());
+                                }
+                                let result = eval_block(env, &body)?;
+                                env.pop_scope();
+                                match result {
+                                    Value::Return(v) => Ok(*v),
+                                    other => Ok(other),
+                                }
+                            }
+                        };
+                    }
+                }
+
+                // Not a method call on a struct — treat as a plain function name
+                // (e.g., module.func style)
+                let func_name = format!("{}", base).replace("(", "").replace(")", "") + "." + method_name;
+                let arg_vals: Vec<Value> = args.iter()
+                    .map(|a| eval_expr(env, a))
+                    .collect::<Result<Vec<_>, _>>()?;
+
+                let func_def = env.functions.get(&func_name).cloned()
+                    .ok_or_else(|| format!("undefined function: {}", func_name))?;
+
+                return match func_def {
+                    FnDef::Builtin(f) => f(env, arg_vals),
+                    FnDef::User { params, body } => {
+                        env.push_scope();
+                        for (param, val) in params.iter().zip(arg_vals.iter()) {
+                            env.define(param, val.clone());
+                        }
+                        let result = eval_block(env, &body)?;
+                        env.pop_scope();
+                        match result {
+                            Value::Return(v) => Ok(*v),
+                            other => Ok(other),
+                        }
+                    }
+                };
+            }
+
             let arg_vals: Vec<Value> = args.iter()
                 .map(|a| eval_expr(env, a))
                 .collect::<Result<Vec<_>, _>>()?;
@@ -605,10 +696,6 @@ fn eval_expr(env: &mut Env, expr: &Expr) -> Result<Value, String> {
             // Get function name
             let func_name = match &func.kind {
                 ExprKind::Ident(id) => id.name.clone(),
-                ExprKind::FieldAccess { base, field } => {
-                    // Handle module.function calls like crypto.foo
-                    format!("{}", base).replace("(", "").replace(")", "") + "." + &field.name
-                }
                 _ => return Err("not a callable expression".to_string()),
             };
 

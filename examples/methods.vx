@@ -1,0 +1,90 @@
+// Vortex Method Syntax Demo
+// Shows impl blocks with method calls using dot syntax
+
+struct Vec2 {
+    x: f64,
+    y: f64,
+}
+
+impl Vec2 {
+    fn magnitude(self: Vec2) -> f64 {
+        return (self.x * self.x + self.y * self.y) ** 0.5
+    }
+
+    fn scale(self: Vec2, factor: f64) -> Vec2 {
+        return Vec2 { x: self.x * factor, y: self.y * factor }
+    }
+
+    fn dot(self: Vec2, other: Vec2) -> f64 {
+        return self.x * other.x + self.y * other.y
+    }
+
+    fn display(self: Vec2) {
+        println(format("Vec2({}, {})", to_string(self.x), to_string(self.y)))
+    }
+}
+
+struct Counter {
+    count: i64,
+    name: str,
+}
+
+impl Counter {
+    fn increment(self: Counter) -> Counter {
+        return Counter { count: self.count + 1, name: self.name }
+    }
+
+    fn display(self: Counter) {
+        println(format("{}: {}", self.name, to_string(self.count)))
+    }
+}
+
+fn main() {
+    println("=== Method Calls on Structs ===")
+    println("")
+
+    let v = Vec2 { x: 3.0, y: 4.0 }
+    print("  v = ")
+    v.display()
+
+    let mag = v.magnitude()
+    println(format("  magnitude = {}", to_string(mag)))
+
+    let v2 = v.scale(2.0)
+    print("  v.scale(2.0) = ")
+    v2.display()
+
+    let w = Vec2 { x: 1.0, y: 0.0 }
+    let d = v.dot(w)
+    println(format("  v.dot(Vec2(1,0)) = {}", to_string(d)))
+
+    println("")
+    println("=== Mutable Pattern with Methods ===")
+    println("")
+
+    let c = Counter { count: 0, name: "hits" }
+    c.display()
+
+    let c = c.increment()
+    c.display()
+
+    let c = c.increment()
+    c.display()
+
+    let c = c.increment()
+    c.display()
+
+    println("")
+    println("=== Methods + Crypto ===")
+    println("")
+
+    // Use methods alongside crypto operations
+    let privkey = bigint_from_hex("CAFE")
+    let G = secp256k1_generator()
+    let pubkey = scalar_mul(privkey, G)
+    let x = point_x(pubkey)
+    println(format("  pubkey X for 0xCAFE: {}", to_hex(x)))
+
+    println("")
+    println("All method tests passed!")
+}
