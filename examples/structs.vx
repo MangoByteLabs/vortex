@@ -1,0 +1,77 @@
+// Vortex Struct and Match Expression Demo
+
+struct Point {
+    x: f64,
+    y: f64,
+}
+
+fn main() {
+    println("=== Struct Literals ===")
+
+    let origin = Point { x: 0.0, y: 0.0 }
+    let p = Point { x: 3.0, y: 4.0 }
+
+    print("  Origin: ")
+    println(origin)
+    print("  Point:  ")
+    println(p)
+
+    // Field access
+    print("  p.x = ")
+    println(to_string(p.x))
+    print("  p.y = ")
+    println(to_string(p.y))
+
+    println("")
+    println("=== Match Expressions ===")
+
+    let x = 42
+    let result = match x {
+        0 => "zero",
+        1 => "one",
+        42 => "the answer",
+        _ => "something else"
+    }
+    print("  match 42 = ")
+    println(result)
+
+    let flag = true
+    let msg = match flag {
+        true => "enabled",
+        false => "disabled"
+    }
+    print("  match true = ")
+    println(msg)
+
+    println("")
+    println("=== Format Strings ===")
+
+    let name = "Vortex"
+    let version = 1
+    let greeting = format("Hello from {} v{}!", name, version)
+    println(greeting)
+
+    let a = 10
+    let b = 20
+    let sum_msg = format("{} + {} = {}", a, b, a + b)
+    println(sum_msg)
+
+    println("")
+    println("=== Utility Builtins ===")
+
+    let arr = [10, 20, 30, 40, 50]
+    print("  len([10,20,30,40,50]) = ")
+    println(to_string(len(arr)))
+
+    let s = "hello world"
+    print("  len(\"hello world\") = ")
+    println(to_string(len(s)))
+
+    // assert
+    assert(1 + 1 == 2, "math is broken")
+    assert_eq(6 * 7, 42)
+    println("  assertions passed!")
+
+    println("")
+    println("=== All struct/match features working! ===")
+}

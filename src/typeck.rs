@@ -672,6 +672,23 @@ fn infer_expr(env: &mut TypeEnv, expr: &Expr) -> Type {
             let _ = infer_expr(env, inner);
             resolve_type_expr(env, ty)
         }
+
+        ExprKind::StructLiteral { fields, .. } => {
+            for (_, fexpr) in fields {
+                infer_expr(env, fexpr);
+            }
+            env.fresh_var() // TODO: resolve to actual struct type
+        }
+
+        ExprKind::Match { expr: match_expr, arms } => {
+            infer_expr(env, match_expr);
+            let mut result_ty = env.fresh_var();
+            for arm in arms {
+                let arm_ty = infer_expr(env, &arm.body);
+                result_ty = arm_ty;
+            }
+            result_ty
+        }
     }
 }
 

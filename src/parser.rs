@@ -1194,6 +1194,38 @@ impl Parser {
             }
             TokenKind::Ident => {
                 let ident = self.parse_ident()?;
+                // Check for struct literal: Name { field: value, ... }
+                // Only if the { is on the same line (to distinguish from blocks)
+                if self.check(TokenKind::LBrace) {
+                    // Look ahead to see if this is Name { field: value } (struct)
+                    // vs just an identifier before a block
+                    let saved_pos = self.pos;
+                    self.advance(); // consume {
+                    // If next token is Ident followed by :, it's a struct literal
+                    if self.check(TokenKind::Ident) {
+                        let peek_pos = self.pos;
+                        let _ = self.advance();
+                        if self.check(TokenKind::Colon) {
+                            // It's a struct literal — rewind and parse properly
+                            self.pos = saved_pos;
+                            return self.parse_struct_literal(ident);
+                        }
+                        self.pos = peek_pos;
+                    }
+                    // Check for empty struct: Name {}
+                    if self.check(TokenKind::RBrace) {
+                        let end = self.advance().span;
+                        return Ok(Expr {
+                            kind: ExprKind::StructLiteral {
+                                name: ident,
+                                fields: Vec::new(),
+                            },
+                            span: start.merge(end),
+                        });
+                    }
+                    // Not a struct literal, restore position
+                    self.pos = saved_pos;
+                }
                 Ok(Expr {
                     span: ident.span,
                     kind: ExprKind::Ident(ident),
@@ -1248,8 +1280,106 @@ impl Parser {
                 })
             }
             TokenKind::If => self.parse_if_expr(),
+            TokenKind::Match => self.parse_match_expr(),
             _ => {
                 self.error(start, format!("expected expression, found `{}`", tok.kind));
+                Err(())
+            }
+        }
+    }
+
+    fn parse_struct_literal(&mut self, name: Ident) -> Result<Expr, ()> {
+        let start = name.span;
+        self.expect(TokenKind::LBrace)?;
+
+        let mut fields = Vec::new();
+        while !self.check(TokenKind::RBrace) && !self.at_end() {
+            let field_name = self.parse_ident()?;
+            self.expect(TokenKind::Colon)?;
+            let value = self.parse_expr()?;
+            fields.push((field_name, value));
+            if !self.eat(TokenKind::Comma).is_some() {
+                break;
+            }
+        }
+
+        let end = self.expect(TokenKind::RBrace)?.span;
+        Ok(Expr {
+            kind: ExprKind::StructLiteral { name, fields },
+            span: start.merge(end),
+        })
+    }
+
+    fn parse_match_expr(&mut self) -> Result<Expr, ()> {
+        let start = self.span();
+        self.expect(TokenKind::Match)?;
+        let expr = self.parse_expr()?;
+        self.expect(TokenKind::LBrace)?;
+
+        let mut arms = Vec::new();
+        while !self.check(TokenKind::RBrace) && !self.at_end() {
+            let arm_start = self.span();
+            let pattern = self.parse_pattern()?;
+            self.expect(TokenKind::FatArrow)?;
+            let body = self.parse_expr()?;
+            let arm_end = body.span;
+            arms.push(MatchArm {
+                pattern,
+                body,
+                span: arm_start.merge(arm_end),
+            });
+            // Allow optional comma between arms
+            self.eat(TokenKind::Comma);
+        }
+
+        let end = self.expect(TokenKind::RBrace)?.span;
+        Ok(Expr {
+            kind: ExprKind::Match {
+                expr: Box::new(expr),
+                arms,
+            },
+            span: start.merge(end),
+        })
+    }
+
+    fn parse_pattern(&mut self) -> Result<Pattern, ()> {
+        match self.peek_kind() {
+            TokenKind::Ident => {
+                let ident = self.parse_ident()?;
+                if ident.name == "_" {
+                    return Ok(Pattern::Wildcard);
+                }
+                // Check for variant pattern: Name(fields...)
+                if self.check(TokenKind::LParen) {
+                    self.advance();
+                    let mut fields = Vec::new();
+                    while !self.check(TokenKind::RParen) && !self.at_end() {
+                        fields.push(self.parse_pattern()?);
+                        if !self.eat(TokenKind::Comma).is_some() {
+                            break;
+                        }
+                    }
+                    self.expect(TokenKind::RParen)?;
+                    Ok(Pattern::Variant { name: ident, fields })
+                } else {
+                    Ok(Pattern::Ident(ident))
+                }
+            }
+            TokenKind::IntLiteral | TokenKind::HexLiteral => {
+                let expr = self.parse_primary()?;
+                Ok(Pattern::Literal(expr))
+            }
+            TokenKind::StringLiteral => {
+                let expr = self.parse_primary()?;
+                Ok(Pattern::Literal(expr))
+            }
+            TokenKind::True | TokenKind::False => {
+                let expr = self.parse_primary()?;
+                Ok(Pattern::Literal(expr))
+            }
+            _ => {
+                let tok = self.peek().clone();
+                self.error(tok.span, format!("expected pattern, found `{}`", tok.kind));
                 Err(())
             }
         }

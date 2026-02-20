@@ -309,6 +309,16 @@ pub enum ExprKind {
         expr: Box<Expr>,
         ty: TypeExpr,
     },
+    /// Struct literal: Point { x: 1.0, y: 2.0 }
+    StructLiteral {
+        name: Ident,
+        fields: Vec<(Ident, Expr)>,
+    },
+    /// Match expression
+    Match {
+        expr: Box<Expr>,
+        arms: Vec<MatchArm>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -422,6 +432,26 @@ pub enum ShapeDim {
     Expr(Expr),
     /// Dynamic/unknown: ?
     Dynamic,
+}
+
+/// A match arm: pattern => body
+#[derive(Debug, Clone)]
+pub struct MatchArm {
+    pub pattern: Pattern,
+    pub body: Expr,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone)]
+pub enum Pattern {
+    /// Wildcard: _
+    Wildcard,
+    /// Literal: 42, "hello", true
+    Literal(Expr),
+    /// Identifier binding: x
+    Ident(Ident),
+    /// Enum variant: Some(x), None
+    Variant { name: Ident, fields: Vec<Pattern> },
 }
 
 // --- Block ---
@@ -836,6 +866,21 @@ impl fmt::Display for Expr {
                 write!(f, ")")
             }
             ExprKind::Cast { expr, ty } => write!(f, "({} as {})", expr, ty),
+            ExprKind::StructLiteral { name, fields } => {
+                write!(f, "{} {{ ", name.name)?;
+                for (i, (fname, fval)) in fields.iter().enumerate() {
+                    if i > 0 { write!(f, ", ")?; }
+                    write!(f, "{}: {}", fname.name, fval)?;
+                }
+                write!(f, " }}")
+            }
+            ExprKind::Match { expr, arms } => {
+                writeln!(f, "match {} {{", expr)?;
+                for arm in arms {
+                    writeln!(f, "    {} => {},", arm.pattern, arm.body)?;
+                }
+                write!(f, "}}")
+            }
         }
     }
 }
@@ -960,6 +1005,28 @@ impl fmt::Display for ShapeDim {
             ShapeDim::Ident(id) => write!(f, "{}", id.name),
             ShapeDim::Expr(e) => write!(f, "{}", e),
             ShapeDim::Dynamic => write!(f, "?"),
+        }
+    }
+}
+
+impl fmt::Display for Pattern {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Pattern::Wildcard => write!(f, "_"),
+            Pattern::Literal(expr) => write!(f, "{}", expr),
+            Pattern::Ident(id) => write!(f, "{}", id.name),
+            Pattern::Variant { name, fields } => {
+                write!(f, "{}", name.name)?;
+                if !fields.is_empty() {
+                    write!(f, "(")?;
+                    for (i, p) in fields.iter().enumerate() {
+                        if i > 0 { write!(f, ", ")?; }
+                        write!(f, "{}", p)?;
+                    }
+                    write!(f, ")")?;
+                }
+                Ok(())
+            }
         }
     }
 }

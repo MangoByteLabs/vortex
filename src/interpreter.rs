@@ -1,6 +1,5 @@
 use crate::ast::*;
 use crate::crypto;
-use crate::lexer::Span;
 use std::collections::HashMap;
 use std::fmt;
 
@@ -21,6 +20,11 @@ pub enum Value {
     ECPoint(crypto::ECPoint),
     /// Void / unit
     Void,
+    /// A struct instance
+    Struct {
+        name: String,
+        fields: HashMap<String, Value>,
+    },
     /// A function value (closure)
     Function {
         name: String,
@@ -53,6 +57,14 @@ impl fmt::Display for Value {
                     write!(f, "{}", e)?;
                 }
                 write!(f, ")")
+            }
+            Value::Struct { name, fields } => {
+                write!(f, "{} {{ ", name)?;
+                for (i, (k, v)) in fields.iter().enumerate() {
+                    if i > 0 { write!(f, ", ")?; }
+                    write!(f, "{}: {}", k, v)?;
+                }
+                write!(f, " }}")
             }
             Value::BigInt(n) => write!(f, "0x{}", n),
             Value::FieldElem(fe) => write!(f, "{}", fe),
@@ -141,6 +153,14 @@ impl Env {
         self.functions.insert("point_y".to_string(), FnDef::Builtin(builtin_point_y));
         self.functions.insert("bigint_from_hex".to_string(), FnDef::Builtin(builtin_bigint_from_hex));
         self.functions.insert("to_hex".to_string(), FnDef::Builtin(builtin_to_hex));
+
+        // String / utility builtins
+        self.functions.insert("len".to_string(), FnDef::Builtin(builtin_len));
+        self.functions.insert("to_string".to_string(), FnDef::Builtin(builtin_to_string));
+        self.functions.insert("format".to_string(), FnDef::Builtin(builtin_format));
+        self.functions.insert("push".to_string(), FnDef::Builtin(builtin_push));
+        self.functions.insert("assert".to_string(), FnDef::Builtin(builtin_assert));
+        self.functions.insert("assert_eq".to_string(), FnDef::Builtin(builtin_assert_eq));
     }
 }
 
@@ -284,6 +304,80 @@ fn builtin_to_hex(_env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
     }
 }
 
+fn builtin_len(_env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    if args.len() != 1 { return Err("len expects 1 argument".to_string()); }
+    match &args[0] {
+        Value::Array(arr) => Ok(Value::Int(arr.len() as i128)),
+        Value::String(s) => Ok(Value::Int(s.len() as i128)),
+        _ => Err(format!("len: unsupported type {}", args[0])),
+    }
+}
+
+fn builtin_to_string(_env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    if args.len() != 1 { return Err("to_string expects 1 argument".to_string()); }
+    Ok(Value::String(format!("{}", args[0])))
+}
+
+fn builtin_format(_env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    if args.is_empty() { return Err("format expects at least 1 argument".to_string()); }
+    let template = match &args[0] {
+        Value::String(s) => s.clone(),
+        _ => return Err("format: first argument must be a string".to_string()),
+    };
+    // Simple {} placeholder replacement
+    let mut result = String::new();
+    let mut arg_idx = 1;
+    let mut chars = template.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '{' && chars.peek() == Some(&'}') {
+            chars.next(); // consume }
+            if arg_idx < args.len() {
+                result.push_str(&format!("{}", args[arg_idx]));
+                arg_idx += 1;
+            } else {
+                result.push_str("{}");
+            }
+        } else {
+            result.push(c);
+        }
+    }
+    Ok(Value::String(result))
+}
+
+fn builtin_push(_env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    if args.len() != 2 { return Err("push expects 2 arguments (array, value)".to_string()); }
+    match &args[0] {
+        Value::Array(arr) => {
+            let mut new_arr = arr.clone();
+            new_arr.push(args[1].clone());
+            Ok(Value::Array(new_arr))
+        }
+        _ => Err("push: first argument must be an array".to_string()),
+    }
+}
+
+fn builtin_assert(_env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    if args.is_empty() { return Err("assert expects at least 1 argument".to_string()); }
+    let cond = value_to_bool(&args[0])?;
+    if !cond {
+        let msg = if args.len() > 1 {
+            format!("{}", args[1])
+        } else {
+            "assertion failed".to_string()
+        };
+        return Err(msg);
+    }
+    Ok(Value::Void)
+}
+
+fn builtin_assert_eq(_env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    if args.len() < 2 { return Err("assert_eq expects 2 arguments".to_string()); }
+    if !values_equal(&args[0], &args[1]) {
+        return Err(format!("assertion failed: {} != {}", args[0], args[1]));
+    }
+    Ok(Value::Void)
+}
+
 // --- Interpreter entry point ---
 
 pub fn interpret(program: &Program) -> Result<Vec<String>, String> {
@@ -390,6 +484,25 @@ fn eval_stmt(env: &mut Env, stmt: &Stmt) -> Result<Value, String> {
                         }
                     }
                     return Err("unsupported assignment target".to_string());
+                }
+                ExprKind::FieldAccess { base, field } => {
+                    // Struct field assignment: s.field = value
+                    if let ExprKind::Ident(id) = &base.kind {
+                        if let Some(Value::Struct { name, mut fields }) = env.get(&id.name) {
+                            let old = fields.get(&field.name).cloned().unwrap_or(Value::Void);
+                            let new_val = match op {
+                                AssignOp::Assign => rhs,
+                                AssignOp::AddAssign => value_add(&old, &rhs)?,
+                                AssignOp::SubAssign => value_sub(&old, &rhs)?,
+                                AssignOp::MulAssign => value_mul(&old, &rhs)?,
+                                _ => return Err("unsupported assign op for struct field".to_string()),
+                            };
+                            fields.insert(field.name.clone(), new_val);
+                            env.set(&id.name, Value::Struct { name, fields });
+                            return Ok(Value::Void);
+                        }
+                    }
+                    return Err("unsupported field assignment target".to_string());
                 }
                 _ => return Err("unsupported assignment target".to_string()),
             };
@@ -527,8 +640,28 @@ fn eval_expr(env: &mut Env, expr: &Expr) -> Result<Value, String> {
 
         ExprKind::FieldAccess { base, field } => {
             let base_val = eval_expr(env, base)?;
-            match (&base_val, field.name.as_str()) {
-                (Value::Array(arr), "len") => Ok(Value::Int(arr.len() as i128)),
+            match &base_val {
+                Value::Array(arr) => match field.name.as_str() {
+                    "len" => Ok(Value::Int(arr.len() as i128)),
+                    _ => Err(format!("array has no field .{}", field.name)),
+                },
+                Value::String(s) => match field.name.as_str() {
+                    "len" => Ok(Value::Int(s.len() as i128)),
+                    _ => Err(format!("string has no field .{}", field.name)),
+                },
+                Value::Struct { fields, .. } => {
+                    fields.get(&field.name).cloned()
+                        .ok_or_else(|| format!("struct has no field .{}", field.name))
+                }
+                Value::Tuple(elems) => {
+                    // Support .0, .1, etc. for tuples
+                    if let Ok(idx) = field.name.parse::<usize>() {
+                        elems.get(idx).cloned()
+                            .ok_or_else(|| format!("tuple index {} out of bounds", idx))
+                    } else {
+                        Err(format!("tuple has no field .{}", field.name))
+                    }
+                }
                 _ => Err(format!("cannot access field .{} on {}", field.name, base_val)),
             }
         }
@@ -591,6 +724,70 @@ fn eval_expr(env: &mut Env, expr: &Expr) -> Result<Value, String> {
         ExprKind::TypeCall { .. } => {
             Err("type method calls not yet supported in interpreter".to_string())
         }
+
+        ExprKind::StructLiteral { name, fields } => {
+            let mut field_map = HashMap::new();
+            for (fname, fexpr) in fields {
+                let val = eval_expr(env, fexpr)?;
+                field_map.insert(fname.name.clone(), val);
+            }
+            Ok(Value::Struct {
+                name: name.name.clone(),
+                fields: field_map,
+            })
+        }
+
+        ExprKind::Match { expr: match_expr, arms } => {
+            let val = eval_expr(env, match_expr)?;
+            for arm in arms {
+                if pattern_matches(&arm.pattern, &val) {
+                    env.push_scope();
+                    bind_pattern(env, &arm.pattern, &val);
+                    let result = eval_expr(env, &arm.body)?;
+                    env.pop_scope();
+                    return Ok(result);
+                }
+            }
+            Err(format!("no matching arm for value: {}", val))
+        }
+    }
+}
+
+fn pattern_matches(pattern: &Pattern, value: &Value) -> bool {
+    match pattern {
+        Pattern::Wildcard => true,
+        Pattern::Ident(_) => true, // Ident always matches (it's a binding)
+        Pattern::Literal(expr) => {
+            // Compare literal values
+            match &expr.kind {
+                ExprKind::IntLiteral(n) => {
+                    if let Value::Int(v) = value { *v == *n as i128 } else { false }
+                }
+                ExprKind::FloatLiteral(n) => {
+                    if let Value::Float(v) = value { *v == *n } else { false }
+                }
+                ExprKind::StringLiteral(s) => {
+                    if let Value::String(v) = value { v == s } else { false }
+                }
+                ExprKind::BoolLiteral(b) => {
+                    if let Value::Bool(v) = value { *v == *b } else { false }
+                }
+                _ => false,
+            }
+        }
+        Pattern::Variant { .. } => {
+            // Enum variants not fully implemented yet
+            false
+        }
+    }
+}
+
+fn bind_pattern(env: &mut Env, pattern: &Pattern, value: &Value) {
+    match pattern {
+        Pattern::Ident(id) => {
+            env.define(&id.name, value.clone());
+        }
+        Pattern::Wildcard | Pattern::Literal(_) | Pattern::Variant { .. } => {}
     }
 }
 
