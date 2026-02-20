@@ -1,0 +1,110 @@
+// Vortex Complete secp256k1 Demo
+// ECDSA sign/verify, Schnorr sign/verify, point compression, SHA-256
+
+fn main() {
+    println("=== secp256k1 Full Crypto Suite ===")
+    println("")
+
+    // --- SHA-256 ---
+    println("--- SHA-256 ---")
+    let hash = sha256("Hello, Vortex!")
+    println(format("SHA-256('Hello, Vortex!') = {}", hash))
+
+    let hash2 = sha256d("Bitcoin double hash")
+    println(format("SHA-256d('Bitcoin double hash') = {}", hash2))
+    println("")
+
+    // --- Key Generation ---
+    println("--- Key Generation ---")
+    let privkey = "2a" // private key = 42
+    let G = secp256k1_generator()
+    let privkey_bigint = bigint_from_hex(privkey)
+    let pubkey = scalar_mul(privkey_bigint, G)
+    println(format("Private key: 0x{}", privkey))
+    println(format("Public key:  {}", pubkey))
+
+    // Point validation
+    let valid = point_validate(pubkey)
+    println(format("Point on curve: {}", to_string(valid)))
+    assert(valid, "public key must be on curve")
+    println("")
+
+    // --- Point Compression ---
+    println("--- Point Compression ---")
+    let compressed = point_compress(pubkey)
+    println(format("Compressed:   {}", compressed))
+
+    let decompressed = point_decompress(compressed)
+    let px_orig = point_x(pubkey)
+    let px_decomp = point_x(decompressed)
+    println(format("Decompressed matches: {}", to_string(to_hex(px_orig) == to_hex(px_decomp))))
+    assert(to_hex(px_orig) == to_hex(px_decomp), "decompress must recover original point")
+    println("")
+
+    // --- Point Negation ---
+    println("--- Point Operations ---")
+    let neg_pubkey = point_negate(pubkey)
+    let sum = point_add(pubkey, neg_pubkey)
+    println(format("P + (-P) = {}", sum))
+
+    // Point subtraction: 3G - G = 2G
+    let three_g = scalar_mul(bigint_from_hex("3"), G)
+    let two_g = point_sub(three_g, G)
+    let two_g_direct = scalar_mul(bigint_from_hex("2"), G)
+    let sub_x = point_x(two_g)
+    let direct_x = point_x(two_g_direct)
+    println(format("3G - G == 2G: {}", to_string(to_hex(sub_x) == to_hex(direct_x))))
+    assert(to_hex(sub_x) == to_hex(direct_x), "point subtraction failed")
+    println("")
+
+    // --- Scalar (mod N) Arithmetic ---
+    println("--- Scalar Field (mod N) ---")
+    let s1 = scalar_new(42)
+    let s2 = scalar_new(7)
+    let s_prod = field_mul(s1, s2)
+    println(format("42 * 7 mod n = {}", s_prod))
+
+    let s_inv = scalar_inv(s1)
+    let s_check = field_mul(s1, s_inv)
+    println(format("42 * 42^-1 mod n = {}", s_check))
+    println("")
+
+    // --- ECDSA ---
+    println("--- ECDSA Sign/Verify ---")
+    let message = "Hello from Vortex!"
+    let sig = ecdsa_sign(privkey, message)
+    println(format("Message: {}", message))
+    println(format("ECDSA r: {}", sig.r))
+    println(format("ECDSA s: {}", sig.s))
+
+    let verified = ecdsa_verify(pubkey, message, sig)
+    println(format("Signature valid: {}", to_string(verified)))
+    assert(verified, "ECDSA verification failed")
+
+    // Verify fails with wrong message
+    let wrong_verify = ecdsa_verify(pubkey, "wrong message", sig)
+    println(format("Wrong message verify: {}", to_string(wrong_verify)))
+    assert(wrong_verify == false, "wrong message should fail verification")
+    println("")
+
+    // --- Schnorr (BIP-340) ---
+    println("--- Schnorr (BIP-340) Sign/Verify ---")
+    let schnorr_msg = "Schnorr signature test"
+    let schnorr_sig = schnorr_sign(privkey, schnorr_msg)
+    println(format("Message: {}", schnorr_msg))
+    println(format("Schnorr R.x: {}", schnorr_sig.rx))
+    println(format("Schnorr s:   {}", schnorr_sig.s))
+
+    // For Schnorr verify, we need the x-only public key
+    let pubkey_x = to_hex(point_x(pubkey))
+    let schnorr_valid = schnorr_verify(pubkey_x, schnorr_msg, schnorr_sig)
+    println(format("Schnorr valid: {}", to_string(schnorr_valid)))
+    assert(schnorr_valid, "Schnorr verification failed")
+
+    // Wrong message
+    let schnorr_wrong = schnorr_verify(pubkey_x, "wrong", schnorr_sig)
+    assert(schnorr_wrong == false, "wrong message should fail Schnorr")
+    println("")
+
+    println("=== All secp256k1 crypto tests passed! ===")
+}
