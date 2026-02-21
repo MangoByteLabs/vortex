@@ -15,6 +15,7 @@ mod fields;
 mod interpreter;
 mod lexer;
 mod local_learn;
+mod lsp;
 mod memory;
 mod memory_safety;
 pub mod modmath;
@@ -48,7 +49,7 @@ fn main() {
 
     if args.len() < 2 {
         eprintln!("Usage: vortex <command> [file.vx] [options]");
-        eprintln!("Commands: run, check, parse, lex, codegen, compile, toolchain");
+        eprintln!("Commands: run, check, parse, lex, codegen, compile, toolchain, bridge");
         std::process::exit(1);
     }
 
@@ -57,6 +58,12 @@ fn main() {
     // Commands that don't need a file argument
     if command == "toolchain" {
         pipeline::print_toolchain_status();
+        return;
+    }
+
+    if command == "bridge" {
+        let mut bridge = python_bridge::PythonBridge::new();
+        bridge.serve();
         return;
     }
 
@@ -252,9 +259,108 @@ fn main() {
                 }
             }
         }
+        "diagnose" => {
+            let format = if args.iter().any(|a| a == "--json") {
+                "json"
+            } else if args.iter().any(|a| a == "--gcc") {
+                "gcc"
+            } else {
+                "pretty"
+            };
+            let mut analyzer = lsp::VortexAnalyzer::new();
+            analyzer.analyze(&source, filename);
+            match format {
+                "json" => print!("{}", analyzer.to_json()),
+                "gcc" => print!("{}", analyzer.to_gcc_format()),
+                _ => print!("{}", analyzer.to_pretty()),
+            }
+            if analyzer.diagnostics.iter().any(|d| d.severity == lsp::Severity::Error) {
+                std::process::exit(1);
+            }
+        }
+        "symbols" => {
+            let tokens = lexer::lex(&source);
+            match parser::parse(tokens, file_id) {
+                Ok(program) => {
+                    let table = lsp::SymbolTable::from_program(&program.items, &source, filename);
+                    if args.iter().any(|a| a == "--json") {
+                        println!("{}", table.to_json());
+                    } else {
+                        for sym in table.all_symbols() {
+                            let detail = sym.detail.as_deref().unwrap_or("");
+                            println!("{}:{}:{}: {} {} {}",
+                                sym.file, sym.line, sym.col, sym.kind, sym.name, detail);
+                        }
+                    }
+                }
+                Err(diagnostics) => {
+                    for diag in &diagnostics {
+                        term::emit(&mut writer.lock(), &config, &files, diag).unwrap();
+                    }
+                    std::process::exit(1);
+                }
+            }
+        }
+        "hover" => {
+            if args.len() < 5 {
+                eprintln!("Usage: vortex hover <file> <line> <col>");
+                std::process::exit(1);
+            }
+            let target_line: usize = args[3].parse().unwrap_or(1);
+            let target_col: usize = args[4].parse().unwrap_or(1);
+            let tokens = lexer::lex(&source);
+            match parser::parse(tokens, file_id) {
+                Ok(program) => {
+                    let table = lsp::SymbolTable::from_program(&program.items, &source, filename);
+                    match table.symbol_at(&source, target_line, target_col) {
+                        Some(sym) => {
+                            let detail = sym.detail.as_deref().unwrap_or("");
+                            println!("{} {} {}", sym.kind, sym.name, detail);
+                        }
+                        None => {
+                            println!("No symbol at {}:{}", target_line, target_col);
+                        }
+                    }
+                }
+                Err(diagnostics) => {
+                    for diag in &diagnostics {
+                        term::emit(&mut writer.lock(), &config, &files, diag).unwrap();
+                    }
+                    std::process::exit(1);
+                }
+            }
+        }
+        "definition" => {
+            if args.len() < 4 {
+                eprintln!("Usage: vortex definition <file> <symbol_name>");
+                std::process::exit(1);
+            }
+            let sym_name = &args[3];
+            let tokens = lexer::lex(&source);
+            match parser::parse(tokens, file_id) {
+                Ok(program) => {
+                    let table = lsp::SymbolTable::from_program(&program.items, &source, filename);
+                    match table.find_definition(sym_name) {
+                        Some(sym) => {
+                            println!("{}:{}:{}", sym.file, sym.line, sym.col);
+                        }
+                        None => {
+                            eprintln!("Symbol `{}` not found", sym_name);
+                            std::process::exit(1);
+                        }
+                    }
+                }
+                Err(diagnostics) => {
+                    for diag in &diagnostics {
+                        term::emit(&mut writer.lock(), &config, &files, diag).unwrap();
+                    }
+                    std::process::exit(1);
+                }
+            }
+        }
         _ => {
             eprintln!("Unknown command: {}", command);
-            eprintln!("Commands: run, check, parse, lex, codegen, compile, toolchain");
+            eprintln!("Commands: run, check, parse, lex, codegen, compile, toolchain, bridge, diagnose, symbols, hover, definition");
             std::process::exit(1);
         }
     }
