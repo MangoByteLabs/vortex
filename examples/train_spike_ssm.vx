@@ -1,0 +1,220 @@
+// Train SpikeSSMFormer — A Novel Hybrid LLM Architecture
+// Combines: SSM (O(N) sequence processing) + Spiking Gates (sparse attention)
+//          + Forward-Forward (local learning) + Liquid Dynamics (adaptive)
+
+fn build_vocab(text: string) -> [i64] {
+    var char_to_id = hashmap()
+    var id_to_char = hashmap()
+    var next_id = 0
+    var i = 0
+    while i < string_len(text) {
+        let c = char_at(text, i)
+        if !hashmap_contains(char_to_id, c) {
+            char_to_id = hashmap_insert(char_to_id, c, next_id)
+            id_to_char = hashmap_insert(id_to_char, to_string(next_id), c)
+            next_id = next_id + 1
+        }
+        i = i + 1
+    }
+    return [char_to_id, id_to_char, next_id]
+}
+
+fn tokenize(text: string, vocab: i64) -> [i64] {
+    var tokens = []
+    var i = 0
+    while i < string_len(text) {
+        let c = char_at(text, i)
+        tokens = push(tokens, unwrap(hashmap_get(vocab, c)))
+        i = i + 1
+    }
+    return tokens
+}
+
+fn det_weight(seed: i64) -> f64 {
+    let x = ((seed * 1103515245 + 12345) % 65536) * 1.0
+    return (x / 65536.0 - 0.5) * 0.2
+}
+
+fn random_embeddings(vocab_size: i64, d_model: i64) -> [f64] {
+    var emb = []
+    var i = 0
+    while i < vocab_size {
+        var row = []
+        var j = 0
+        while j < d_model {
+            row = push(row, det_weight(i * 37 + j * 13 + 7))
+            j = j + 1
+        }
+        emb = push(emb, row)
+        i = i + 1
+    }
+    return emb
+}
+
+fn lookup_embeddings(token_ids: [i64], emb_table: [f64]) -> [f64] {
+    var result = []
+    var i = 0
+    while i < len(token_ids) {
+        result = push(result, emb_table[token_ids[i]])
+        i = i + 1
+    }
+    return result
+}
+
+fn main() {
+    println("========================================")
+    println("  SpikeSSMFormer Training Demo")
+    println("========================================")
+    println("")
+
+    // --- Training Data ---
+    let corpus = "the quick brown fox jumps over the lazy dog. the dog barked at the fox. the fox ran away quickly."
+
+    let vocab_result = build_vocab(corpus)
+    let char_to_id = vocab_result[0]
+    let id_to_char = vocab_result[1]
+    let vocab_size = vocab_result[2]
+    let tokens = tokenize(corpus, char_to_id)
+
+    println(format("Vocab size: {}", vocab_size))
+    println(format("Corpus length: {} characters", len(tokens)))
+    println("")
+
+    // --- Model ---
+    let d_model = 32
+    let d_state = 8
+    let n_ff_layers = 1
+    let n_ssm_layers = 2
+    let seq_len = 16
+
+    let model = spike_ssm_new(d_model, d_state, n_ff_layers, n_ssm_layers, vocab_size)
+
+    // --- Embeddings ---
+    let embeddings = random_embeddings(vocab_size, d_model)
+
+    // --- Initial stats ---
+    let init_stats = spike_ssm_stats(model)
+    println(format("Model parameters: {}", init_stats[0]))
+    println("")
+
+    // --- Training Loop ---
+    let lr = 0.01
+    let num_epochs = 20
+    var first_loss = 0.0
+    var last_loss = 0.0
+
+    println("--- Training ---")
+    var epoch = 0
+    while epoch < num_epochs {
+        var total_loss = 0.0
+        var num_batches = 0
+
+        // Sliding window over corpus
+        var i = 0
+        while i + seq_len + 1 < len(tokens) {
+            // Input: tokens[i..i+seq_len]
+            var input_tokens = []
+            var target_tokens = []
+            var j = 0
+            while j < seq_len {
+                input_tokens = push(input_tokens, tokens[i + j])
+                target_tokens = push(target_tokens, tokens[i + j + 1])
+                j = j + 1
+            }
+
+            // Lookup embeddings for input tokens
+            let input_emb = lookup_embeddings(input_tokens, embeddings)
+
+            // Train step
+            let loss = spike_ssm_train_step(model, input_tokens, input_emb, target_tokens, lr)
+            total_loss = total_loss + loss
+            num_batches = num_batches + 1
+            i = i + seq_len
+        }
+
+        let avg_loss = total_loss / (1.0 * num_batches)
+        if epoch == 0 {
+            first_loss = avg_loss
+        }
+        last_loss = avg_loss
+
+        if epoch % 5 == 0 {
+            let stats = spike_ssm_stats(model)
+            println(format("Epoch {} | Loss: {} | Sparsity: {} | Tau: {}", epoch, avg_loss, stats[1], stats[3]))
+        }
+        epoch = epoch + 1
+    }
+
+    println("")
+    println(format("Training complete: loss {} -> {}", first_loss, last_loss))
+    assert(last_loss < first_loss, "Loss should decrease during training!")
+    println("Loss decrease VALIDATED")
+    println("")
+
+    // --- Generate Text ---
+    println("--- Text Generation ---")
+    var seed = tokenize("the ", char_to_id)
+    var generated = []
+    var si = 0
+    while si < len(seed) {
+        generated = push(generated, seed[si])
+        si = si + 1
+    }
+
+    var step = 0
+    while step < 40 {
+        var start = 0
+        if len(generated) > seq_len {
+            start = len(generated) - seq_len
+        }
+        var input = []
+        var gi = start
+        while gi < len(generated) {
+            input = push(input, generated[gi])
+            gi = gi + 1
+        }
+
+        let input_emb = lookup_embeddings(input, embeddings)
+        let logits = spike_ssm_forward(model, input, input_emb)
+
+        // Greedy: pick highest logit from last position
+        let last_logits = logits[len(logits) - 1]
+        var best_id = 0
+        var best_score = last_logits[0]
+        var k = 1
+        while k < len(last_logits) {
+            if last_logits[k] > best_score {
+                best_score = last_logits[k]
+                best_id = k
+            }
+            k = k + 1
+        }
+
+        generated = push(generated, best_id)
+        step = step + 1
+    }
+
+    // Decode
+    var output_parts = []
+    var ti = 0
+    while ti < len(generated) {
+        let c = unwrap(hashmap_get(id_to_char, to_string(generated[ti])))
+        output_parts = push(output_parts, c)
+        ti = ti + 1
+    }
+    let output = join(output_parts, "")
+    println(format("Generated: '{}'", output))
+    println("")
+
+    // --- Final Stats ---
+    let final_stats = spike_ssm_stats(model)
+    println("--- Final Statistics ---")
+    println(format("  Total parameters: {}", final_stats[0]))
+    println(format("  Attention sparsity: {}", final_stats[1]))
+    println(format("  FF goodness: {}", final_stats[2]))
+    println(format("  Avg time constant: {}", final_stats[3]))
+    println("")
+    println("========================================")
+    println("  SpikeSSMFormer Training: COMPLETE")
+    println("========================================")
+}

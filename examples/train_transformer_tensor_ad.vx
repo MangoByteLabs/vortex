@@ -1,0 +1,239 @@
+// Train a tiny transformer with tensor autodiff
+// Demonstrates: matmul, softmax, layer_norm, cross_entropy, backward, SGD
+
+fn det_weight(seed: i64) -> f64 {
+    let x = ((seed * 1103515245 + 12345) % 65536) * 1.0
+    return (x / 65536.0 - 0.5) * 0.2
+}
+
+fn init_weights(rows: i64, cols: i64, seed: i64) -> [f64] {
+    var data = []
+    var i = 0
+    while i < rows * cols {
+        data = push(data, det_weight(seed + i))
+        i = i + 1
+    }
+    return data
+}
+
+fn main() {
+    println("========================================")
+    println("  Tiny Transformer with Tensor Autodiff")
+    println("========================================")
+    println("")
+
+    // Hyperparameters
+    let seq_len = 4
+    let d_model = 8
+    let vocab_size = 6
+    let num_epochs = 30
+    let lr = 0.05
+
+    // Training data: 3 sequences of length 4, targets are next tokens
+    // Represents simple patterns: 0,1,2,3 -> 4; 1,2,3,4 -> 5; etc.
+    let input_data = [
+        [0.1, -0.2, 0.3, 0.1, -0.1, 0.2, -0.3, 0.0,
+         0.2, 0.1, -0.1, 0.3, 0.0, -0.2, 0.1, -0.1,
+         -0.1, 0.3, 0.2, -0.2, 0.1, 0.0, -0.1, 0.3,
+         0.3, -0.1, 0.0, 0.2, -0.3, 0.1, 0.2, -0.2],
+        [0.2, 0.1, -0.1, 0.3, 0.0, -0.2, 0.1, -0.1,
+         -0.1, 0.3, 0.2, -0.2, 0.1, 0.0, -0.1, 0.3,
+         0.3, -0.1, 0.0, 0.2, -0.3, 0.1, 0.2, -0.2,
+         0.0, 0.2, -0.3, 0.1, 0.2, -0.1, 0.0, 0.3],
+        [-0.1, 0.3, 0.2, -0.2, 0.1, 0.0, -0.1, 0.3,
+         0.3, -0.1, 0.0, 0.2, -0.3, 0.1, 0.2, -0.2,
+         0.0, 0.2, -0.3, 0.1, 0.2, -0.1, 0.0, 0.3,
+         0.1, -0.2, 0.3, 0.1, -0.1, 0.2, -0.3, 0.0]
+    ]
+    let targets = [[4, 5, 0, 1], [5, 0, 1, 2], [0, 1, 2, 3]]
+
+    // Initialize weight data (will be re-used across epochs)
+    var wq_data = init_weights(d_model, d_model, 100)
+    var wk_data = init_weights(d_model, d_model, 200)
+    var wv_data = init_weights(d_model, d_model, 300)
+    var wo_data = init_weights(d_model, d_model, 400)
+    var ff1_data = init_weights(d_model, d_model, 500)
+    var ff2_data = init_weights(d_model, d_model, 600)
+    var out_data = init_weights(d_model, vocab_size, 700)
+    var gamma_data = [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+    var beta_data = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+
+    let total_params = d_model * d_model * 6 + d_model * vocab_size + d_model * 2
+    println(format("Model: seq_len={}, d_model={}, vocab={}", seq_len, d_model, vocab_size))
+    println(format("Total parameters: {}", total_params))
+    println("")
+
+    var first_loss = 0.0
+    var last_loss = 0.0
+
+    println("--- Training ---")
+    var epoch = 0
+    while epoch < num_epochs {
+        // Fresh tape each epoch
+        tensor_tape_new()
+
+        // Create parameter tensors
+        let wq = tensor_param(wq_data, [d_model, d_model])
+        let wk = tensor_param(wk_data, [d_model, d_model])
+        let wv = tensor_param(wv_data, [d_model, d_model])
+        let wo = tensor_param(wo_data, [d_model, d_model])
+        let ff1 = tensor_param(ff1_data, [d_model, d_model])
+        let ff2 = tensor_param(ff2_data, [d_model, d_model])
+        let out_proj = tensor_param(out_data, [d_model, vocab_size])
+        let gamma = tensor_param(gamma_data, [d_model])
+        let beta = tensor_param(beta_data, [d_model])
+
+        var total_loss_val = 0.0
+
+        // Process each training example
+        var s = 0
+        while s < len(input_data) {
+            let x = tensor_input(input_data[s], [seq_len, d_model])
+
+            // Self-attention: Q = X@Wq, K = X@Wk, V = X@Wv
+            let q = tensor_matmul(x, wq)
+            let k = tensor_matmul(x, wk)
+            let v = tensor_matmul(x, wv)
+
+            // Attention scores: softmax(Q @ K^T / sqrt(d))
+            let kt = tensor_transpose(k)
+            let scores = tensor_matmul(q, kt)
+
+            // Scale (create a scalar tensor to multiply)
+            let scale_val = 1.0 / 2.8284271247
+            var scale_data = []
+            var si2 = 0
+            while si2 < seq_len * seq_len {
+                scale_data = push(scale_data, scale_val)
+                si2 = si2 + 1
+            }
+            let scale = tensor_input(scale_data, [seq_len, seq_len])
+            let scaled = tensor_mul(scores, scale)
+            let attn = tensor_softmax(scaled, 1)
+
+            // Attention output
+            let attn_out = tensor_matmul(attn, v)
+            let projected = tensor_matmul(attn_out, wo)
+
+            // Residual + layer norm
+            let residual = tensor_add(x, projected)
+            let normed = tensor_layer_norm(residual, gamma, beta, 0.00001)
+
+            // Feed-forward: GELU(X @ FF1) @ FF2
+            let ff_hidden = tensor_matmul(normed, ff1)
+            let ff_act = tensor_gelu(ff_hidden)
+            let ff_out = tensor_matmul(ff_act, ff2)
+
+            // Residual + output projection
+            let ff_residual = tensor_add(normed, ff_out)
+            let logits = tensor_matmul(ff_residual, out_proj)
+
+            // Cross-entropy loss
+            let loss = tensor_cross_entropy(logits, targets[s])
+            let loss_val = tensor_data(loss)
+            total_loss_val = total_loss_val + loss_val[0]
+
+            // Backward
+            tensor_backward(loss)
+
+            s = s + 1
+        }
+
+        let avg_loss = total_loss_val / (1.0 * len(input_data))
+
+        if epoch == 0 {
+            first_loss = avg_loss
+        }
+        last_loss = avg_loss
+
+        if epoch % 5 == 0 {
+            println(format("  Epoch {}: loss = {}", epoch, avg_loss))
+        }
+
+        // SGD update
+        let all_params = [wq, wk, wv, wo, ff1, ff2, out_proj, gamma, beta]
+        tensor_sgd(all_params, lr)
+
+        // Extract updated weights for next epoch
+        wq_data = tensor_data(wq)
+        wk_data = tensor_data(wk)
+        wv_data = tensor_data(wv)
+        wo_data = tensor_data(wo)
+        ff1_data = tensor_data(ff1)
+        ff2_data = tensor_data(ff2)
+        out_data = tensor_data(out_proj)
+        gamma_data = tensor_data(gamma)
+        beta_data = tensor_data(beta)
+
+        epoch = epoch + 1
+    }
+
+    println("")
+    println(format("Training complete: loss {} -> {}", first_loss, last_loss))
+    assert(last_loss < first_loss, "Loss should decrease during training!")
+    println("Loss decrease VALIDATED")
+    println("")
+
+    // --- Inference ---
+    println("--- Inference ---")
+    tensor_tape_new()
+    let wq_f = tensor_input(wq_data, [d_model, d_model])
+    let wk_f = tensor_input(wk_data, [d_model, d_model])
+    let wv_f = tensor_input(wv_data, [d_model, d_model])
+    let wo_f = tensor_input(wo_data, [d_model, d_model])
+    let ff1_f = tensor_input(ff1_data, [d_model, d_model])
+    let ff2_f = tensor_input(ff2_data, [d_model, d_model])
+    let out_f = tensor_input(out_data, [d_model, vocab_size])
+    let gamma_f = tensor_input(gamma_data, [d_model])
+    let beta_f = tensor_input(beta_data, [d_model])
+
+    let x_f = tensor_input(input_data[0], [seq_len, d_model])
+    let q_f = tensor_matmul(x_f, wq_f)
+    let k_f = tensor_matmul(x_f, wk_f)
+    let v_f = tensor_matmul(x_f, wv_f)
+    let kt_f = tensor_transpose(k_f)
+    let sc_f = tensor_matmul(q_f, kt_f)
+
+    let scale_val2 = 1.0 / 2.8284271247
+    var scale_data2 = []
+    var si3 = 0
+    while si3 < seq_len * seq_len {
+        scale_data2 = push(scale_data2, scale_val2)
+        si3 = si3 + 1
+    }
+    let sc2 = tensor_input(scale_data2, [seq_len, seq_len])
+    let scaled_f = tensor_mul(sc_f, sc2)
+    let attn_f = tensor_softmax(scaled_f, 1)
+    let av_f = tensor_matmul(attn_f, v_f)
+    let proj_f = tensor_matmul(av_f, wo_f)
+    let res_f = tensor_add(x_f, proj_f)
+    let norm_f = tensor_layer_norm(res_f, gamma_f, beta_f, 0.00001)
+    let ffh_f = tensor_matmul(norm_f, ff1_f)
+    let ffa_f = tensor_gelu(ffh_f)
+    let ffo_f = tensor_matmul(ffa_f, ff2_f)
+    let ffr_f = tensor_add(norm_f, ffo_f)
+    let logits_f = tensor_matmul(ffr_f, out_f)
+
+    let logits_data = tensor_data(logits_f)
+    // Show predictions for each position
+    var pos = 0
+    while pos < seq_len {
+        var best = 0
+        var best_val = logits_data[pos * vocab_size]
+        var vi = 1
+        while vi < vocab_size {
+            if logits_data[pos * vocab_size + vi] > best_val {
+                best_val = logits_data[pos * vocab_size + vi]
+                best = vi
+            }
+            vi = vi + 1
+        }
+        println(format("  Position {}: predicted token {} (target {})", pos, best, targets[0][pos]))
+        pos = pos + 1
+    }
+
+    println("")
+    println("========================================")
+    println("  Transformer Tensor AD: COMPLETE")
+    println("========================================")
+}
