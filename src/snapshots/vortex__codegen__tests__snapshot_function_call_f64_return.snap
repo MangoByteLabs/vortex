@@ -1,0 +1,17 @@
+---
+source: src/codegen.rs
+expression: ir
+---
+module {
+  func.func @square(%0: f64) -> f64 {
+    %1 = arith.mulf %0, %0 : f64
+    func.return %1
+  }
+  
+  func.func @main() -> f64 {
+    %2 = arith.constant 3.0 : f64
+    %3 = func.call @square(%2) : (f64) -> f64
+    func.return %3
+  }
+  
+}

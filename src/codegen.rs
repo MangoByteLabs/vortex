@@ -26,8 +26,6 @@ enum MLIRType {
     Index,
     MemRef(Box<MLIRType>, Vec<i64>), // memref<shape x type>
     Tensor(Box<MLIRType>, Vec<i64>), // tensor<shape x type>
-    /// Field element: 4 x i64 limbs in Montgomery form
-    Field256,
     None, // void
 }
 
@@ -63,10 +61,16 @@ impl std::fmt::Display for MLIRType {
                 }
                 write!(f, "{}>", elem)
             }
-            MLIRType::Field256 => write!(f, "!vortex.field256"),
             MLIRType::None => write!(f, "()"),
         }
     }
+}
+
+/// Stored function signature info
+#[derive(Debug, Clone)]
+struct FnSig {
+    ret_type: MLIRType,
+    _param_types: Vec<MLIRType>,
 }
 
 /// Code generator state
@@ -79,6 +83,12 @@ pub struct CodeGen {
     var_map: Vec<HashMap<String, (String, MLIRType)>>,
     /// Enum variant tag assignments: "EnumName::Variant" -> tag (i32)
     enum_tags: HashMap<String, i32>,
+    /// Function signatures: name -> return type
+    fn_signatures: HashMap<String, FnSig>,
+    /// Whether we are currently inside a GPU kernel
+    in_kernel: bool,
+    /// Track which variables have unsigned source types
+    unsigned_vars: HashMap<String, bool>,
 }
 
 impl CodeGen {
@@ -89,6 +99,9 @@ impl CodeGen {
             ssa_counter: 0,
             var_map: vec![HashMap::new()],
             enum_tags: HashMap::new(),
+            fn_signatures: HashMap::new(),
+            in_kernel: false,
+            unsigned_vars: HashMap::new(),
         }
     }
 
@@ -98,13 +111,40 @@ impl CodeGen {
         self.emit_line("module {");
         self.indent += 1;
 
-        // First pass: register enum tags
+        // First pass: register enum tags and function signatures
         for item in &program.items {
-            if let ItemKind::Enum(e) = &item.kind {
-                for (i, variant) in e.variants.iter().enumerate() {
-                    let key = format!("{}::{}", e.name.name, variant.name.name);
-                    self.enum_tags.insert(key, i as i32);
+            match &item.kind {
+                ItemKind::Enum(e) => {
+                    for (i, variant) in e.variants.iter().enumerate() {
+                        let key = format!("{}::{}", e.name.name, variant.name.name);
+                        self.enum_tags.insert(key, i as i32);
+                    }
                 }
+                ItemKind::Function(func) => {
+                    let ret_type = func.ret_type.as_ref()
+                        .map(|t| self.resolve_type(t))
+                        .unwrap_or(MLIRType::None);
+                    let param_types: Vec<MLIRType> = func.params.iter()
+                        .map(|p| self.resolve_type(&p.ty))
+                        .collect();
+                    self.fn_signatures.insert(func.name.name.clone(), FnSig {
+                        ret_type,
+                        _param_types: param_types,
+                    });
+                }
+                ItemKind::Kernel(kernel) => {
+                    let ret_type = kernel.ret_type.as_ref()
+                        .map(|t| self.resolve_type(t))
+                        .unwrap_or(MLIRType::None);
+                    let param_types: Vec<MLIRType> = kernel.params.iter()
+                        .map(|p| self.resolve_type(&p.ty))
+                        .collect();
+                    self.fn_signatures.insert(kernel.name.name.clone(), FnSig {
+                        ret_type,
+                        _param_types: param_types,
+                    });
+                }
+                _ => {}
             }
         }
 
@@ -170,6 +210,20 @@ impl CodeGen {
         None
     }
 
+    /// Check if a Vortex type name is unsigned
+    fn is_unsigned_type_name(name: &str) -> bool {
+        matches!(name, "u8" | "u16" | "u32" | "u64" | "u128")
+    }
+
+    /// Check if a type expression is unsigned
+    fn is_unsigned_type_expr(ty: &TypeExpr) -> bool {
+        if let TypeExprKind::Named(id) = &ty.kind {
+            Self::is_unsigned_type_name(&id.name)
+        } else {
+            false
+        }
+    }
+
     /// Convert Vortex type expression to MLIR type
     fn resolve_type(&self, ty: &TypeExpr) -> MLIRType {
         match &ty.kind {
@@ -209,7 +263,7 @@ impl CodeGen {
             ExprKind::IntLiteral(_) => MLIRType::I64,
             ExprKind::FloatLiteral(_) => MLIRType::F64,
             ExprKind::BoolLiteral(_) => MLIRType::I1,
-            ExprKind::StringLiteral(_) => MLIRType::I64, // placeholder
+            ExprKind::StringLiteral(_) => MLIRType::I64,
             ExprKind::Ident(id) => {
                 self.lookup_var(&id.name)
                     .map(|(_, ty)| ty)
@@ -223,7 +277,21 @@ impl CodeGen {
                 }
             }
             ExprKind::Unary { expr: inner, .. } => self.infer_type(inner),
-            ExprKind::Call { func, .. } => { if let ExprKind::Ident(id) = &func.kind { match id.name.as_str() { "softmax" | "gelu" | "layer_norm" | "attention" | "rope" => { return MLIRType::Tensor(Box::new(MLIRType::F32), vec![-1]); } _ => {} } } MLIRType::I64 }
+            ExprKind::Call { func, .. } => {
+                if let ExprKind::Ident(id) = &func.kind {
+                    match id.name.as_str() {
+                        "softmax" | "gelu" | "layer_norm" | "attention" | "rope" => {
+                            return MLIRType::Tensor(Box::new(MLIRType::F32), vec![-1]);
+                        }
+                        _ => {
+                            if let Some(sig) = self.fn_signatures.get(&id.name) {
+                                return sig.ret_type.clone();
+                            }
+                        }
+                    }
+                }
+                MLIRType::I64
+            }
             ExprKind::If { then_block, .. } => {
                 if let Some(expr) = &then_block.expr {
                     self.infer_type(expr)
@@ -232,12 +300,25 @@ impl CodeGen {
                 }
             }
             ExprKind::Cast { ty, .. } => self.resolve_type(ty),
+            ExprKind::ArrayLiteral(elems) => {
+                if let Some(first) = elems.first() {
+                    let elem_ty = self.infer_type(first);
+                    MLIRType::MemRef(Box::new(elem_ty), vec![elems.len() as i64])
+                } else {
+                    MLIRType::MemRef(Box::new(MLIRType::I64), vec![0])
+                }
+            }
             _ => MLIRType::I64,
         }
     }
 
     fn is_float_type(ty: &MLIRType) -> bool {
-        matches!(ty, MLIRType::F16 | MLIRType::F32 | MLIRType::F64 | MLIRType::Tensor(_, _))
+        match ty {
+            MLIRType::F16 | MLIRType::F32 | MLIRType::F64 => true,
+            MLIRType::Tensor(elem, _) => Self::is_float_type(elem),
+            MLIRType::MemRef(elem, _) => Self::is_float_type(elem),
+            _ => false,
+        }
     }
 
     fn is_int_type(ty: &MLIRType) -> bool {
@@ -245,11 +326,32 @@ impl CodeGen {
             | MLIRType::I32 | MLIRType::I64 | MLIRType::I128)
     }
 
+    /// Get the element type of a memref or tensor, or the type itself
+    fn elem_type(ty: &MLIRType) -> &MLIRType {
+        match ty {
+            MLIRType::MemRef(elem, _) | MLIRType::Tensor(elem, _) => elem,
+            _ => ty,
+        }
+    }
+
+    /// Emit the appropriate return for the current context (gpu.return vs func.return)
+    fn emit_return(&mut self, value: Option<&str>) {
+        if self.in_kernel {
+            if let Some(v) = value {
+                self.emit_line(&format!("gpu.return {}", v));
+            } else {
+                self.emit_line("gpu.return");
+            }
+        } else if let Some(v) = value {
+            self.emit_line(&format!("func.return {}", v));
+        } else {
+            self.emit_line("func.return");
+        }
+    }
+
     // --- Enum generation ---
 
     fn gen_enum(&mut self, e: &EnumDef) {
-        // Emit enum as a tagged union comment + type alias
-        // In MLIR, enums are represented as a struct { tag: i32, payload: i64 }
         self.emit_line(&format!("// enum {} {{", e.name.name));
         for (i, variant) in e.variants.iter().enumerate() {
             let fields_str = match &variant.kind {
@@ -274,23 +376,23 @@ impl CodeGen {
     fn gen_function(&mut self, func: &Function) {
         self.push_scope();
 
-        // Build parameter list
         let mut param_strs = Vec::new();
         let mut param_types = Vec::new();
         for param in &func.params {
             let ty = self.resolve_type(&param.ty);
             let ssa = self.fresh_ssa();
             self.define_var(&param.name.name, &ssa, ty.clone());
+            if Self::is_unsigned_type_expr(&param.ty) {
+                self.unsigned_vars.insert(param.name.name.clone(), true);
+            }
             param_strs.push(format!("{}: {}", ssa, ty));
             param_types.push(ty);
         }
 
-        // Return type
         let ret_type = func.ret_type.as_ref()
             .map(|t| self.resolve_type(t))
             .unwrap_or(MLIRType::None);
 
-        // Emit function signature
         let params_str = param_strs.join(", ");
         let ret_str = if ret_type == MLIRType::None {
             String::new()
@@ -304,7 +406,6 @@ impl CodeGen {
         ));
         self.indent += 1;
 
-        // Generate body
         self.gen_block(&func.body, &ret_type);
 
         self.indent -= 1;
@@ -316,8 +417,8 @@ impl CodeGen {
 
     fn gen_kernel(&mut self, kernel: &Kernel) {
         self.push_scope();
+        self.in_kernel = true;
 
-        // Build parameter list
         let mut param_strs = Vec::new();
         for param in &kernel.params {
             let ty = self.resolve_type(&param.ty);
@@ -326,7 +427,6 @@ impl CodeGen {
             param_strs.push(format!("{}: {}", ssa, ty));
         }
 
-        // Return type
         let ret_type = kernel.ret_type.as_ref()
             .map(|t| self.resolve_type(t))
             .unwrap_or(MLIRType::None);
@@ -338,7 +438,6 @@ impl CodeGen {
             format!(" -> {}", ret_type)
         };
 
-        // Emit as gpu.func inside a gpu.module
         self.emit_line(&format!("gpu.module @{}_module {{", kernel.name.name));
         self.indent += 1;
         self.emit_line(&format!(
@@ -364,6 +463,7 @@ impl CodeGen {
         self.emit_line("}");
         self.emit_line("");
 
+        self.in_kernel = false;
         self.pop_scope();
     }
 
@@ -377,7 +477,7 @@ impl CodeGen {
         if let Some(expr) = &block.expr {
             let (ssa, _ty) = self.gen_expr(expr);
             if *expected_ret != MLIRType::None {
-                self.emit_line(&format!("func.return {}", ssa));
+                self.emit_return(Some(&ssa));
             }
         }
     }
@@ -391,15 +491,20 @@ impl CodeGen {
                 let actual_ty = ty.as_ref()
                     .map(|t| self.resolve_type(t))
                     .unwrap_or(inferred_ty);
+                if let Some(t) = ty {
+                    if Self::is_unsigned_type_expr(t) {
+                        self.unsigned_vars.insert(name.name.clone(), true);
+                    }
+                }
                 self.define_var(&name.name, &ssa, actual_ty);
             }
 
             StmtKind::Return(Some(expr)) => {
                 let (ssa, _ty) = self.gen_expr(expr);
-                self.emit_line(&format!("func.return {}", ssa));
+                self.emit_return(Some(&ssa));
             }
             StmtKind::Return(None) => {
-                self.emit_line("func.return");
+                self.emit_return(None);
             }
 
             StmtKind::Expr(expr) => {
@@ -444,8 +549,56 @@ impl CodeGen {
                         };
                         self.define_var(&id.name, &final_ssa, rhs_ty);
                     }
+                    ExprKind::Index { base, indices } => {
+                        let (base_ssa, base_ty) = self.gen_expr(base);
+                        let (idx_ssa, _) = self.gen_expr(&indices[0]);
+                        let idx_index = self.fresh_ssa();
+                        self.emit_line(&format!(
+                            "{} = arith.index_cast {} : i64 to index",
+                            idx_index, idx_ssa
+                        ));
+
+                        let final_rhs = match op {
+                            AssignOp::Assign => rhs_ssa,
+                            _ => {
+                                let cur = self.fresh_ssa();
+                                self.emit_line(&format!(
+                                    "{} = memref.load {}[{}] : {}",
+                                    cur, base_ssa, idx_index, base_ty
+                                ));
+                                let elem_ty = Self::elem_type(&base_ty).clone();
+                                match op {
+                                    AssignOp::AddAssign => self.emit_arith_op("add", &cur, &rhs_ssa, &elem_ty),
+                                    AssignOp::SubAssign => self.emit_arith_op("sub", &cur, &rhs_ssa, &elem_ty),
+                                    AssignOp::MulAssign => self.emit_arith_op("mul", &cur, &rhs_ssa, &elem_ty),
+                                    AssignOp::DivAssign => self.emit_arith_op("div", &cur, &rhs_ssa, &elem_ty),
+                                    _ => rhs_ssa,
+                                }
+                            }
+                        };
+                        self.emit_line(&format!(
+                            "memref.store {}, {}[{}] : {}",
+                            final_rhs, base_ssa, idx_index, base_ty
+                        ));
+                    }
+                    ExprKind::FieldAccess { base, field } => {
+                        let (base_ssa, base_ty) = self.gen_expr(base);
+                        let field_idx = self.fresh_ssa();
+                        self.emit_line(&format!(
+                            "// field store: {}.{} = {}",
+                            base_ssa, field.name, rhs_ssa
+                        ));
+                        let idx: usize = field.name.bytes().map(|b| b as usize).sum::<usize>() % 16;
+                        self.emit_line(&format!(
+                            "{} = arith.constant {} : index",
+                            field_idx, idx
+                        ));
+                        self.emit_line(&format!(
+                            "memref.store {}, {}[{}] : {}",
+                            rhs_ssa, base_ssa, field_idx, base_ty
+                        ));
+                    }
                     _ => {
-                        // Complex assignment targets (index, field) — emit as comment
                         self.emit_line(&format!("// TODO: complex assignment target"));
                     }
                 }
@@ -463,9 +616,9 @@ impl CodeGen {
                 // Emit as scf.while with constant true condition
                 self.emit_line("scf.while : () -> () {");
                 self.indent += 1;
-                let true_ssa = self.fresh_ssa();
-                self.emit_line(&format!("{} = arith.constant true", true_ssa));
-                self.emit_line(&format!("scf.condition({})", true_ssa));
+                let cond_ssa = self.fresh_ssa();
+                self.emit_line(&format!("{} = arith.constant 1 : i1", cond_ssa));
+                self.emit_line(&format!("scf.condition({})", cond_ssa));
                 self.indent -= 1;
                 self.emit_line("} do {");
                 self.indent += 1;
@@ -485,7 +638,6 @@ impl CodeGen {
 
             StmtKind::Dispatch { index, targets, args } => {
                 let (idx_ssa, _) = self.gen_expr(index);
-                // Generate args
                 let mut arg_ssas = Vec::new();
                 let mut arg_types = Vec::new();
                 for arg in args {
@@ -495,7 +647,6 @@ impl CodeGen {
                 }
                 let args_str = arg_ssas.join(", ");
                 let types_str = arg_types.iter().map(|t| format!("{}", t)).collect::<Vec<_>>().join(", ");
-                // Emit chain of scf.if blocks
                 for (i, target) in targets.iter().enumerate() {
                     let expected = self.fresh_ssa();
                     self.emit_line(&format!("{} = arith.constant {} : i64", expected, i));
@@ -529,7 +680,6 @@ impl CodeGen {
 
             ExprKind::FloatLiteral(n) => {
                 let ssa = self.fresh_ssa();
-                // Format float properly for MLIR
                 let float_str = if n.fract() == 0.0 {
                     format!("{:.1}", n)
                 } else {
@@ -553,7 +703,6 @@ impl CodeGen {
             }
 
             ExprKind::StringLiteral(s) => {
-                // Strings are emitted as a comment + constant for now
                 let ssa = self.fresh_ssa();
                 self.emit_line(&format!(
                     "// string literal: \"{}\"", s
@@ -569,7 +718,6 @@ impl CodeGen {
                 if let Some((ssa, ty)) = self.lookup_var(&id.name) {
                     (ssa, ty)
                 } else {
-                    // Undefined variable — emit a placeholder
                     let ssa = self.fresh_ssa();
                     self.emit_line(&format!(
                         "// undefined: {}", id.name
@@ -585,7 +733,12 @@ impl CodeGen {
             ExprKind::Binary { lhs, op, rhs } => {
                 let (l_ssa, l_ty) = self.gen_expr(lhs);
                 let (r_ssa, _r_ty) = self.gen_expr(rhs);
-                self.gen_binop(&l_ssa, *op, &r_ssa, &l_ty)
+                let is_unsigned = if let ExprKind::Ident(id) = &lhs.kind {
+                    self.unsigned_vars.contains_key(&id.name)
+                } else {
+                    false
+                };
+                self.gen_binop(&l_ssa, *op, &r_ssa, &l_ty, is_unsigned)
             }
 
             ExprKind::Unary { op, expr: inner } => {
@@ -599,7 +752,6 @@ impl CodeGen {
                                 ssa, inner_ssa, inner_ty
                             ));
                         } else {
-                            // Integer negation: 0 - x
                             let zero = self.fresh_ssa();
                             self.emit_line(&format!(
                                 "{} = arith.constant 0 : {}", zero, inner_ty
@@ -611,7 +763,6 @@ impl CodeGen {
                         }
                     }
                     UnaryOp::Not => {
-                        // Boolean not: xor with true
                         let one = self.fresh_ssa();
                         self.emit_line(&format!(
                             "{} = arith.constant 1 : i1", one
@@ -622,7 +773,6 @@ impl CodeGen {
                         ));
                     }
                     UnaryOp::BitNot => {
-                        // Bitwise not: xor with -1
                         let ones = self.fresh_ssa();
                         self.emit_line(&format!(
                             "{} = arith.constant -1 : {}", ones, inner_ty
@@ -637,7 +787,6 @@ impl CodeGen {
             }
 
             ExprKind::Call { func, args } => {
-                // Generate arguments
                 let mut arg_ssas = Vec::new();
                 let mut arg_types = Vec::new();
                 for arg in args {
@@ -651,17 +800,28 @@ impl CodeGen {
                     _ => "unknown".to_string(),
                 };
 
-                let ssa = self.fresh_ssa();
-                // Emit as func.call with i64 return type (simplified)
-                self.emit_line(&format!(
-                    "{} = func.call @{}({}) : ({}) -> i64",
-                    ssa,
-                    func_name,
-                    arg_ssas.join(", "),
-                    arg_types.iter().map(|t| format!("{}", t)).collect::<Vec<_>>().join(", ")
-                ));
+                let ret_type = self.fn_signatures.get(&func_name)
+                    .map(|sig| sig.ret_type.clone())
+                    .unwrap_or(MLIRType::I64);
 
-                (ssa, MLIRType::I64)
+                let ssa = self.fresh_ssa();
+                let args_str = arg_ssas.join(", ");
+                let types_str = arg_types.iter().map(|t| format!("{}", t)).collect::<Vec<_>>().join(", ");
+
+                if ret_type == MLIRType::None {
+                    self.emit_line(&format!(
+                        "func.call @{}({}) : ({}) -> ()",
+                        func_name, args_str, types_str
+                    ));
+                    self.emit_line(&format!("{} = arith.constant 0 : i64", ssa));
+                    (ssa, MLIRType::I64)
+                } else {
+                    self.emit_line(&format!(
+                        "{} = func.call @{}({}) : ({}) -> {}",
+                        ssa, func_name, args_str, types_str, ret_type
+                    ));
+                    (ssa, ret_type)
+                }
             }
 
             ExprKind::If { cond, then_block, else_block } => {
@@ -685,28 +845,48 @@ impl CodeGen {
             }
 
             ExprKind::Range { start, end } => {
-                // Ranges are handled by for loop generation
                 let (s_ssa, s_ty) = self.gen_expr(start);
                 let (_e_ssa, _e_ty) = self.gen_expr(end);
                 (s_ssa, s_ty)
             }
 
             ExprKind::ArrayLiteral(elems) => {
-                // Emit each element
-                let mut last_ssa = String::new();
+                if elems.is_empty() {
+                    let ssa = self.fresh_ssa();
+                    self.emit_line(&format!("{} = arith.constant 0 : i64", ssa));
+                    return (ssa, MLIRType::I64);
+                }
+
+                let mut elem_ssas = Vec::new();
                 let mut elem_ty = MLIRType::I64;
                 for elem in elems {
                     let (ssa, ty) = self.gen_expr(elem);
-                    last_ssa = ssa;
+                    elem_ssas.push(ssa);
                     elem_ty = ty;
                 }
-                if last_ssa.is_empty() {
-                    let ssa = self.fresh_ssa();
-                    self.emit_line(&format!("{} = arith.constant 0 : i64", ssa));
-                    (ssa, MLIRType::I64)
-                } else {
-                    (last_ssa, elem_ty)
+
+                let len = elems.len() as i64;
+                let memref_ty = MLIRType::MemRef(Box::new(elem_ty.clone()), vec![len]);
+
+                let arr_ssa = self.fresh_ssa();
+                self.emit_line(&format!(
+                    "{} = memref.alloc() : {}",
+                    arr_ssa, memref_ty
+                ));
+
+                for (i, elem_ssa) in elem_ssas.iter().enumerate() {
+                    let idx = self.fresh_ssa();
+                    self.emit_line(&format!(
+                        "{} = arith.constant {} : index",
+                        idx, i
+                    ));
+                    self.emit_line(&format!(
+                        "memref.store {}, {}[{}] : {}",
+                        elem_ssa, arr_ssa, idx, memref_ty
+                    ));
                 }
+
+                (arr_ssa, memref_ty)
             }
 
             ExprKind::Cast { expr: inner, ty } => {
@@ -718,7 +898,6 @@ impl CodeGen {
                     return (inner_ssa, inner_ty);
                 }
 
-                // Generate appropriate cast
                 if Self::is_int_type(&inner_ty) && Self::is_float_type(&target_ty) {
                     self.emit_line(&format!(
                         "{} = arith.sitofp {} : {} to {}",
@@ -730,13 +909,11 @@ impl CodeGen {
                         ssa, inner_ssa, inner_ty, target_ty
                     ));
                 } else if Self::is_float_type(&inner_ty) && Self::is_float_type(&target_ty) {
-                    // Float to float (extend or truncate)
                     self.emit_line(&format!(
                         "{} = arith.extf {} : {} to {}",
                         ssa, inner_ssa, inner_ty, target_ty
                     ));
                 } else {
-                    // Int to int (extend or truncate)
                     self.emit_line(&format!(
                         "{} = arith.extsi {} : {} to {}",
                         ssa, inner_ssa, inner_ty, target_ty
@@ -749,31 +926,84 @@ impl CodeGen {
             ExprKind::Index { base, indices } => {
                 let (base_ssa, base_ty) = self.gen_expr(base);
                 let (idx_ssa, _) = self.gen_expr(&indices[0]);
+
+                let idx_index = self.fresh_ssa();
+                self.emit_line(&format!(
+                    "{} = arith.index_cast {} : i64 to index",
+                    idx_index, idx_ssa
+                ));
+
                 let ssa = self.fresh_ssa();
-                self.emit_line(&format!(
-                    "// index: {}[{}]", base_ssa, idx_ssa
-                ));
-                self.emit_line(&format!(
-                    "{} = arith.constant 0 : i64", ssa
-                ));
-                (ssa, base_ty)
+                let elem_ty = match &base_ty {
+                    MLIRType::MemRef(elem, _) => (**elem).clone(),
+                    MLIRType::Tensor(elem, _) => (**elem).clone(),
+                    _ => base_ty.clone(),
+                };
+
+                match &base_ty {
+                    MLIRType::MemRef(_, _) => {
+                        self.emit_line(&format!(
+                            "{} = memref.load {}[{}] : {}",
+                            ssa, base_ssa, idx_index, base_ty
+                        ));
+                    }
+                    MLIRType::Tensor(_, _) => {
+                        self.emit_line(&format!(
+                            "{} = tensor.extract {}[{}] : {}",
+                            ssa, base_ssa, idx_index, base_ty
+                        ));
+                    }
+                    _ => {
+                        self.emit_line(&format!(
+                            "// index: {}[{}]", base_ssa, idx_ssa
+                        ));
+                        self.emit_line(&format!(
+                            "{} = arith.constant 0 : i64", ssa
+                        ));
+                    }
+                }
+                (ssa, elem_ty)
             }
 
             ExprKind::FieldAccess { base, field } => {
-                let (base_ssa, _) = self.gen_expr(base);
+                let (base_ssa, base_ty) = self.gen_expr(base);
                 let ssa = self.fresh_ssa();
+                let field_idx_val: usize = field.name.bytes().map(|b| b as usize).sum::<usize>() % 16;
+                let field_idx = self.fresh_ssa();
                 self.emit_line(&format!(
-                    "// field access: {}.{}", base_ssa, field.name
+                    "// field access: {}.{}",
+                    base_ssa, field.name
                 ));
                 self.emit_line(&format!(
-                    "{} = arith.constant 0 : i64", ssa
+                    "{} = arith.constant {} : index",
+                    field_idx, field_idx_val
                 ));
-                (ssa, MLIRType::I64)
+
+                let elem_ty = match &base_ty {
+                    MLIRType::MemRef(elem, _) => (**elem).clone(),
+                    _ => MLIRType::I64,
+                };
+
+                match &base_ty {
+                    MLIRType::MemRef(_, _) => {
+                        self.emit_line(&format!(
+                            "{} = memref.load {}[{}] : {}",
+                            ssa, base_ssa, field_idx, base_ty
+                        ));
+                    }
+                    _ => {
+                        self.emit_line(&format!(
+                            "{} = llvm.extractvalue {}[{}] : !llvm.struct<({})>",
+                            ssa, base_ssa, field_idx_val, elem_ty
+                        ));
+                    }
+                }
+                (ssa, elem_ty)
             }
 
             ExprKind::MatMul { lhs, rhs } => {
                 let (l_ssa, l_ty) = self.gen_expr(lhs);
-                let (r_ssa, _) = self.gen_expr(rhs);
+                let (r_ssa, r_ty) = self.gen_expr(rhs);
                 let ssa = self.fresh_ssa();
                 match &l_ty {
                     MLIRType::Tensor(elem, _) => {
@@ -782,7 +1012,7 @@ impl CodeGen {
                         self.emit_line(&format!("{} = arith.constant 0.0 : {}", zero, elem));
                         let init = self.fresh_ssa();
                         self.emit_line(&format!("{} = linalg.fill ins({} : {}) outs({} : {}) -> {}", init, zero, elem, l_ssa, out_ty, out_ty));
-                        self.emit_line(&format!("{} = linalg.matmul ins({}, {} : {}, {}) outs({} : {}) -> {}", ssa, l_ssa, r_ssa, l_ty, l_ty, init, out_ty, out_ty));
+                        self.emit_line(&format!("{} = linalg.matmul ins({}, {} : {}, {}) outs({} : {}) -> {}", ssa, l_ssa, r_ssa, l_ty, r_ty, init, out_ty, out_ty));
                         (ssa, out_ty)
                     }
                     _ => {
@@ -808,12 +1038,10 @@ impl CodeGen {
                 let (val_ssa, _val_ty) = self.gen_expr(match_expr);
                 self.emit_line(&format!("// match on {}", val_ssa));
 
-                // Extract tag from the matched value (assume first i32 is the tag)
                 let tag_ssa = self.fresh_ssa();
                 self.emit_line(&format!("// extract tag from enum value"));
                 self.emit_line(&format!("{} = arith.constant 0 : i32", tag_ssa));
 
-                // Emit arms as a chain of scf.if comparisons on the tag
                 let mut result_ssa = String::new();
                 let mut result_ty = MLIRType::I64;
 
@@ -821,15 +1049,12 @@ impl CodeGen {
                     let is_wildcard = matches!(&arm.pattern, Pattern::Wildcard | Pattern::Ident(_));
 
                     if is_wildcard {
-                        // Default arm: just emit the body
                         self.emit_line("// wildcard arm");
                         let (ssa, ty) = self.gen_expr(&arm.body);
                         result_ssa = ssa;
                         result_ty = ty;
                     } else {
-                        // Get the tag value for this variant pattern
                         let tag_val = if let Pattern::Variant { name: _, .. } = &arm.pattern {
-                            // Look up the tag for this variant
                             self.enum_tags.values().next().copied().unwrap_or(i as i32)
                         } else {
                             i as i32
@@ -843,11 +1068,9 @@ impl CodeGen {
                             cmp_ssa, tag_ssa, expected_tag
                         ));
 
-                        // Emit the body inside scf.if
                         self.emit_line(&format!("scf.if {} {{", cmp_ssa));
                         self.indent += 1;
 
-                        // Bind pattern variables
                         if let Pattern::Variant { name: _, fields } = &arm.pattern {
                             for (fi, field_pat) in fields.iter().enumerate() {
                                 if let Pattern::Ident(id) = field_pat {
@@ -893,7 +1116,7 @@ impl CodeGen {
 
     // --- Binary operation generation ---
 
-    fn gen_binop(&mut self, lhs: &str, op: BinOp, rhs: &str, ty: &MLIRType) -> (String, MLIRType) {
+    fn gen_binop(&mut self, lhs: &str, op: BinOp, rhs: &str, ty: &MLIRType, is_unsigned: bool) -> (String, MLIRType) {
         let ssa = self.fresh_ssa();
         let is_float = Self::is_float_type(ty);
 
@@ -925,17 +1148,22 @@ impl CodeGen {
             BinOp::Div => {
                 if is_float {
                     self.emit_line(&format!("{} = arith.divf {}, {} : {}", ssa, lhs, rhs, ty));
+                } else if is_unsigned {
+                    self.emit_line(&format!("{} = arith.divui {}, {} : {}", ssa, lhs, rhs, ty));
                 } else {
                     self.emit_line(&format!("{} = arith.divsi {}, {} : {}", ssa, lhs, rhs, ty));
                 }
                 (ssa, ty.clone())
             }
             BinOp::Mod => {
-                self.emit_line(&format!("{} = arith.remsi {}, {} : {}", ssa, lhs, rhs, ty));
+                if is_unsigned {
+                    self.emit_line(&format!("{} = arith.remui {}, {} : {}", ssa, lhs, rhs, ty));
+                } else {
+                    self.emit_line(&format!("{} = arith.remsi {}, {} : {}", ssa, lhs, rhs, ty));
+                }
                 (ssa, ty.clone())
             }
             BinOp::Pow => {
-                // No direct MLIR pow for integers — emit as call to math.powf for floats
                 if is_float {
                     self.emit_line(&format!("{} = math.powf {}, {} : {}", ssa, lhs, rhs, ty));
                 } else {
@@ -963,6 +1191,8 @@ impl CodeGen {
             BinOp::Lt => {
                 if is_float {
                     self.emit_line(&format!("{} = arith.cmpf olt, {}, {} : {}", ssa, lhs, rhs, ty));
+                } else if is_unsigned {
+                    self.emit_line(&format!("{} = arith.cmpi ult, {}, {} : {}", ssa, lhs, rhs, ty));
                 } else {
                     self.emit_line(&format!("{} = arith.cmpi slt, {}, {} : {}", ssa, lhs, rhs, ty));
                 }
@@ -971,6 +1201,8 @@ impl CodeGen {
             BinOp::Gt => {
                 if is_float {
                     self.emit_line(&format!("{} = arith.cmpf ogt, {}, {} : {}", ssa, lhs, rhs, ty));
+                } else if is_unsigned {
+                    self.emit_line(&format!("{} = arith.cmpi ugt, {}, {} : {}", ssa, lhs, rhs, ty));
                 } else {
                     self.emit_line(&format!("{} = arith.cmpi sgt, {}, {} : {}", ssa, lhs, rhs, ty));
                 }
@@ -979,6 +1211,8 @@ impl CodeGen {
             BinOp::LtEq => {
                 if is_float {
                     self.emit_line(&format!("{} = arith.cmpf ole, {}, {} : {}", ssa, lhs, rhs, ty));
+                } else if is_unsigned {
+                    self.emit_line(&format!("{} = arith.cmpi ule, {}, {} : {}", ssa, lhs, rhs, ty));
                 } else {
                     self.emit_line(&format!("{} = arith.cmpi sle, {}, {} : {}", ssa, lhs, rhs, ty));
                 }
@@ -987,6 +1221,8 @@ impl CodeGen {
             BinOp::GtEq => {
                 if is_float {
                     self.emit_line(&format!("{} = arith.cmpf oge, {}, {} : {}", ssa, lhs, rhs, ty));
+                } else if is_unsigned {
+                    self.emit_line(&format!("{} = arith.cmpi uge, {}, {} : {}", ssa, lhs, rhs, ty));
                 } else {
                     self.emit_line(&format!("{} = arith.cmpi sge, {}, {} : {}", ssa, lhs, rhs, ty));
                 }
@@ -1017,17 +1253,44 @@ impl CodeGen {
                 (ssa, ty.clone())
             }
             BinOp::Shr => {
-                self.emit_line(&format!("{} = arith.shrsi {}, {} : {}", ssa, lhs, rhs, ty));
+                if is_unsigned {
+                    self.emit_line(&format!("{} = arith.shrui {}, {} : {}", ssa, lhs, rhs, ty));
+                } else {
+                    self.emit_line(&format!("{} = arith.shrsi {}, {} : {}", ssa, lhs, rhs, ty));
+                }
                 (ssa, ty.clone())
             }
             BinOp::ElemMul | BinOp::ElemDiv => {
-                if let MLIRType::Tensor(ref _elem, ref _shape) = ty {
-                    let op_name = if matches!(op, BinOp::ElemMul) { "mulf" } else { "divf" };
-                    self.emit_line(&format!("// linalg.generic elementwise {} on tensor", op_name));
+                if let MLIRType::Tensor(ref elem, ref _shape) = ty {
+                    let is_elem_float = Self::is_float_type(elem);
+                    let arith_op = if matches!(op, BinOp::ElemMul) {
+                        if is_elem_float { "arith.mulf" } else { "arith.muli" }
+                    } else {
+                        if is_elem_float { "arith.divf" } else { "arith.divsi" }
+                    };
+
+                    let out = self.fresh_ssa();
+                    self.emit_line(&format!("{} = linalg.generic {{", out));
+                    self.indent += 1;
+                    self.emit_line("indexing_maps = [affine_map<(d0) -> (d0)>, affine_map<(d0) -> (d0)>, affine_map<(d0) -> (d0)>],");
+                    self.emit_line("iterator_types = [\"parallel\"]");
+                    self.indent -= 1;
+                    self.emit_line(&format!("}} ins({}, {} : {}, {}) outs({} : {}) {{", lhs, rhs, ty, ty, lhs, ty));
+                    self.indent += 1;
+                    self.emit_line(&format!("^bb0(%a: {}, %b: {}, %out: {}):", elem, elem, elem));
+                    self.indent += 1;
+                    self.emit_line(&format!("%result = {} %a, %b : {}", arith_op, elem));
+                    self.emit_line(&format!("linalg.yield %result : {}", elem));
+                    self.indent -= 2;
+                    self.emit_line(&format!("}} -> {}", ty));
+                    return (out, ty.clone());
+                } else if Self::is_float_type(ty) {
+                    let arith_op = if matches!(op, BinOp::ElemMul) { "mulf" } else { "divf" };
+                    self.emit_line(&format!("{} = arith.{} {}, {} : {}", ssa, arith_op, lhs, rhs, ty));
                     (ssa, ty.clone())
                 } else {
-                    self.emit_line(&format!("// elementwise op"));
-                    self.emit_line(&format!("{} = arith.constant 0 : {}", ssa, ty));
+                    let arith_op = if matches!(op, BinOp::ElemMul) { "muli" } else { "divsi" };
+                    self.emit_line(&format!("{} = arith.{} {}, {} : {}", ssa, arith_op, lhs, rhs, ty));
                     (ssa, ty.clone())
                 }
             }
@@ -1050,7 +1313,6 @@ impl CodeGen {
     fn gen_if_expr(&mut self, cond: &Expr, then_block: &Block, else_block: &Option<Block>) -> (String, MLIRType) {
         let (cond_ssa, _) = self.gen_expr(cond);
 
-        // Determine result type
         let result_ty = if let Some(expr) = &then_block.expr {
             self.infer_type(expr)
         } else {
@@ -1058,7 +1320,6 @@ impl CodeGen {
         };
 
         if result_ty == MLIRType::None {
-            // Statement-level if (no result)
             self.emit_line(&format!("scf.if {} {{", cond_ssa));
             self.indent += 1;
             self.push_scope();
@@ -1084,7 +1345,6 @@ impl CodeGen {
             self.emit_line(&format!("{} = arith.constant 0 : i64", ssa));
             (ssa, MLIRType::I64)
         } else {
-            // Expression-level if (produces a result via scf.if ... -> type)
             let ssa = self.fresh_ssa();
             self.emit_line(&format!("{} = scf.if {} -> ({}) {{", ssa, cond_ssa, result_ty));
             self.indent += 1;
@@ -1120,12 +1380,10 @@ impl CodeGen {
     }
 
     fn gen_for_loop(&mut self, var: &Ident, iter: &Expr, body: &Block) {
-        // Check if iter is a range expression
         if let ExprKind::Range { start, end } = &iter.kind {
             let (start_ssa, _) = self.gen_expr(start);
             let (end_ssa, _) = self.gen_expr(end);
 
-            // Cast to index type
             let start_idx = self.fresh_ssa();
             let end_idx = self.fresh_ssa();
             let step_idx = self.fresh_ssa();
@@ -1142,7 +1400,6 @@ impl CodeGen {
             self.indent += 1;
 
             self.push_scope();
-            // Cast induction variable back to i64 for use in body
             let iv_i64 = self.fresh_ssa();
             self.emit_line(&format!("{} = arith.index_cast {} : index to i64", iv_i64, iv));
             self.define_var(&var.name, &iv_i64, MLIRType::I64);
@@ -1193,6 +1450,7 @@ mod tests {
     use super::*;
     use crate::lexer;
     use crate::parser;
+    use insta::assert_snapshot;
 
     fn gen(source: &str) -> String {
         let tokens = lexer::lex(source);
@@ -1236,6 +1494,8 @@ mod tests {
         assert!(ir.contains("gpu.func @vadd"));
         assert!(ir.contains("kernel"));
         assert!(ir.contains("gpu.return"));
+        // Should NOT contain func.return inside a kernel
+        assert!(!ir.contains("func.return"), "Kernel should not contain func.return, got: {}", ir);
     }
 
     #[test]
@@ -1270,5 +1530,73 @@ mod tests {
     fn test_matmul_codegen() {
         let ir = gen("fn mm(a: Tensor<f32, [4, 8]>, b: Tensor<f32, [8, 4]>) -> Tensor<f32, [4, 4]> { return a @ b }");
         assert!(ir.contains("linalg.matmul"), "Expected linalg.matmul in: {}", ir);
+    }
+
+    // --- New snapshot tests ---
+
+    #[test]
+    fn test_snapshot_array_literal() {
+        let ir = gen("fn make_arr() -> i64 { let a = [1, 2, 3]\n return 0 }");
+        assert_snapshot!(ir);
+    }
+
+    #[test]
+    fn test_snapshot_indexing() {
+        let ir = gen("fn get(a: i64) -> i64 { let arr = [10, 20, 30]\n let v = arr[1]\n return v }");
+        assert_snapshot!(ir);
+    }
+
+    #[test]
+    fn test_snapshot_field_access() {
+        let ir = gen("fn get_field(s: i64) -> i64 { let v = s.x\n return v }");
+        assert_snapshot!(ir);
+    }
+
+    #[test]
+    fn test_snapshot_function_call_f64_return() {
+        let ir = gen("fn square(x: f64) -> f64 { return x * x }\nfn main() -> f64 { return square(3.0) }");
+        assert_snapshot!(ir);
+    }
+
+    #[test]
+    fn test_snapshot_elementwise_ops() {
+        let ir = gen("fn ew(a: Tensor<f32, [4]>, b: Tensor<f32, [4]>) -> Tensor<f32, [4]> { return a .* b }");
+        assert_snapshot!(ir);
+    }
+
+    #[test]
+    fn test_unsigned_ops() {
+        let ir = gen("fn udiv(a: u64, b: u64) -> u64 { return a / b }");
+        assert!(ir.contains("arith.divui"), "Expected arith.divui in: {}", ir);
+    }
+
+    #[test]
+    fn test_unsigned_comparison() {
+        let ir = gen("fn ucmp(a: u64, b: u64) -> bool { return a < b }");
+        assert!(ir.contains("arith.cmpi ult"), "Expected arith.cmpi ult in: {}", ir);
+    }
+
+    #[test]
+    fn test_unsigned_remainder() {
+        let ir = gen("fn urem(a: u32, b: u32) -> u32 { return a % b }");
+        assert!(ir.contains("arith.remui"), "Expected arith.remui in: {}", ir);
+    }
+
+    #[test]
+    fn test_is_float_type_tensor_i32() {
+        let ty = MLIRType::Tensor(Box::new(MLIRType::I32), vec![4]);
+        assert!(!CodeGen::is_float_type(&ty), "Tensor<i32> should not be float");
+    }
+
+    #[test]
+    fn test_is_float_type_tensor_f32() {
+        let ty = MLIRType::Tensor(Box::new(MLIRType::F32), vec![4]);
+        assert!(CodeGen::is_float_type(&ty), "Tensor<f32> should be float");
+    }
+
+    #[test]
+    fn test_matmul_independent_operand_types() {
+        let ir = gen("fn mm(a: Tensor<f32, [4, 8]>, b: Tensor<f32, [8, 4]>) -> Tensor<f32, [4, 4]> { return a @ b }");
+        assert!(ir.contains("tensor<4x8xf32>, tensor<8x4xf32>"), "Expected independent operand types in: {}", ir);
     }
 }

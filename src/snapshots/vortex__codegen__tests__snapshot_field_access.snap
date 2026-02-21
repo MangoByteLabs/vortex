@@ -1,0 +1,13 @@
+---
+source: src/codegen.rs
+expression: ir
+---
+module {
+  func.func @get_field(%0: i64) -> i64 {
+    // field access: %0.x
+    %2 = arith.constant 8 : index
+    %1 = llvm.extractvalue %0[8] : !llvm.struct<(i64)>
+    func.return %1
+  }
+  
+}

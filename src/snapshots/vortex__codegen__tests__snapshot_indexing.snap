@@ -1,0 +1,23 @@
+---
+source: src/codegen.rs
+expression: ir
+---
+module {
+  func.func @get(%0: i64) -> i64 {
+    %1 = arith.constant 10 : i64
+    %2 = arith.constant 20 : i64
+    %3 = arith.constant 30 : i64
+    %4 = memref.alloc() : memref<3xi64>
+    %5 = arith.constant 0 : index
+    memref.store %1, %4[%5] : memref<3xi64>
+    %6 = arith.constant 1 : index
+    memref.store %2, %4[%6] : memref<3xi64>
+    %7 = arith.constant 2 : index
+    memref.store %3, %4[%7] : memref<3xi64>
+    %8 = arith.constant 1 : i64
+    %9 = arith.index_cast %8 : i64 to index
+    %10 = memref.load %4[%9] : memref<3xi64>
+    func.return %10
+  }
+  
+}
