@@ -12,7 +12,9 @@ use crate::tensor_autodiff;
 use crate::architectures;
 use crate::continuous_learning;
 use crate::self_modify;
+use crate::multiscale;
 use crate::tiered_experts;
+use crate::heterogeneous;
 use std::collections::HashMap;
 use std::fmt;
 
@@ -179,6 +181,10 @@ pub(crate) struct Env {
     next_cl_id: usize,
     dynamic_models: HashMap<usize, (self_modify::DynamicModel, self_modify::ArchitectureSearcher)>,
     next_dm_id: usize,
+    pub(crate) multiscale_models: HashMap<usize, multiscale::MultiscaleModel>,
+    pub(crate) next_multiscale_id: usize,
+    hetero_layers: HashMap<usize, heterogeneous::HeterogeneousLayer>,
+    next_hetero_id: usize,
 }
 
 #[derive(Clone)]
@@ -211,6 +217,10 @@ impl Env {
             next_cl_id: 0,
             dynamic_models: HashMap::new(),
             next_dm_id: 0,
+            multiscale_models: HashMap::new(),
+            next_multiscale_id: 0,
+            hetero_layers: HashMap::new(),
+            next_hetero_id: 0,
         };
         env.register_builtins();
         env
@@ -560,6 +570,11 @@ impl Env {
         self.functions.insert("tiered_moe_forward".to_string(), FnDef::Builtin(builtin_tiered_moe_forward));
         self.functions.insert("tiered_moe_stats".to_string(), FnDef::Builtin(builtin_tiered_moe_stats));
 
+        // Heterogeneous computation builtins
+        self.functions.insert("hetero_layer_new".to_string(), FnDef::Builtin(builtin_hetero_layer_new));
+        self.functions.insert("hetero_layer_forward".to_string(), FnDef::Builtin(builtin_hetero_layer_forward));
+        self.functions.insert("hetero_layer_stats".to_string(), FnDef::Builtin(builtin_hetero_layer_stats));
+
         // Continuous learning builtins
         self.functions.insert("continuous_learner_new".to_string(), FnDef::Builtin(|_env, _args| {
             Ok(Value::Int(0))
@@ -589,6 +604,16 @@ impl Env {
         self.functions.insert("dynamic_model_remove_layer".to_string(), FnDef::Builtin(builtin_dynamic_model_remove_layer));
         self.functions.insert("dynamic_model_search_step".to_string(), FnDef::Builtin(builtin_dynamic_model_search_step));
         self.functions.insert("dynamic_model_stats".to_string(), FnDef::Builtin(builtin_dynamic_model_stats));
+
+        // Multiscale clock-domain builtins
+        self.functions.insert("multiscale_model_new".to_string(), FnDef::Builtin(multiscale::builtin_multiscale_model_new));
+        self.functions.insert("multiscale_model_forward".to_string(), FnDef::Builtin(multiscale::builtin_multiscale_model_forward));
+        self.functions.insert("multiscale_model_stats".to_string(), FnDef::Builtin(multiscale::builtin_multiscale_model_stats));
+
+        // Symbolic reasoning builtins
+        self.functions.insert("symbolic_eval".to_string(), FnDef::Builtin(crate::symbolic_reasoning::builtin_symbolic_eval));
+        self.functions.insert("hybrid_layer_new".to_string(), FnDef::Builtin(crate::symbolic_reasoning::builtin_hybrid_layer_new));
+        self.functions.insert("hybrid_layer_forward".to_string(), FnDef::Builtin(crate::symbolic_reasoning::builtin_hybrid_layer_forward));
     }
 }
 
@@ -5215,5 +5240,53 @@ fn builtin_dynamic_model_stats(env: &mut Env, args: Vec<Value>) -> Result<Value,
         Value::Int(m.active_layer_count() as i128),
         Value::Int(m.total_params() as i128),
         Value::Int(m.architecture_hash() as i128),
+    ]))
+}
+
+fn builtin_hetero_layer_new(env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err("hetero_layer_new expects 2 arguments: (n_experts_per_type, width)".into());
+    }
+    let n_per_type = value_to_usize(&args[0])?;
+    let width = value_to_usize(&args[1])?;
+    let layer = heterogeneous::create_hetero_layer(n_per_type, width);
+    let id = env.next_hetero_id;
+    env.next_hetero_id += 1;
+    env.hetero_layers.insert(id, layer);
+    Ok(Value::Int(id as i128))
+}
+
+fn builtin_hetero_layer_forward(env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err("hetero_layer_forward expects 2 arguments: (id, input)".into());
+    }
+    let id = value_to_usize(&args[0])?;
+    let input = match &args[1] {
+        Value::Array(arr) => arr.iter().map(|v| match v {
+            Value::Float(f) => Ok(*f),
+            Value::Int(n) => Ok(*n as f64),
+            _ => Err("hetero_layer_forward: input elements must be numeric".to_string()),
+        }).collect::<Result<Vec<f64>, String>>()?,
+        _ => return Err("hetero_layer_forward: second argument must be array".into()),
+    };
+    let layer = env.hetero_layers.get_mut(&id)
+        .ok_or_else(|| format!("No heterogeneous layer with id {}", id))?;
+    let output = layer.forward(&input);
+    Ok(Value::Array(output.into_iter().map(Value::Float).collect()))
+}
+
+fn builtin_hetero_layer_stats(env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err("hetero_layer_stats expects 1 argument: (id)".into());
+    }
+    let id = value_to_usize(&args[0])?;
+    let layer = env.hetero_layers.get(&id)
+        .ok_or_else(|| format!("No heterogeneous layer with id {}", id))?;
+    let stats = layer.stats();
+    // Return [total_experts, total_params, n_types]
+    Ok(Value::Array(vec![
+        Value::Int(stats.total_experts as i128),
+        Value::Int(stats.total_params as i128),
+        Value::Int(stats.type_counts.len() as i128),
     ]))
 }

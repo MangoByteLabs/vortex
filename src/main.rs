@@ -13,17 +13,21 @@ mod ctcheck;
 mod ct_verify;
 mod flash_attention;
 mod fusion;
+mod heterogeneous;
 pub mod crypto;
 mod dyntensor;
+mod energy_models;
 mod fields;
 mod interpreter;
 mod lexer;
 mod local_learn;
 mod lsp;
 mod memory;
+mod mcp_server;
 mod memory_safety;
 pub mod modmath;
 mod module;
+mod multiscale;
 mod msm;
 mod ntt;
 mod ode;
@@ -44,6 +48,7 @@ mod gpu_runtime;
 mod server;
 mod shape_check;
 mod typeck;
+mod symbolic_reasoning;
 mod verifiable_inference;
 
 use codespan_reporting::files::SimpleFiles;
@@ -73,6 +78,12 @@ fn main() {
     if command == "bridge" {
         let mut bridge = python_bridge::PythonBridge::new();
         bridge.serve();
+        return;
+    }
+
+    if command == "mcp" {
+        let mut server = mcp_server::MCPServer::new();
+        server.run();
         return;
     }
 

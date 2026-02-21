@@ -10,6 +10,9 @@ nccl = []
 [dependencies]
 logos = "0.14"
 codespan-reporting = "0.11"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+lazy_static = "1"
 
 [dev-dependencies]
 insta = "1.39"
