@@ -131,6 +131,10 @@ struct TypeEnv {
     enum_variants: HashMap<String, Vec<String>>,
     /// Variant info: variant_name -> EnumVariantInfo
     variant_info: HashMap<String, EnumVariantInfo>,
+    /// Struct field definitions: struct_name -> [(field_name, field_type)]
+    struct_fields: HashMap<String, Vec<(String, Type)>>,
+    /// Substitution map for type variable unification
+    substitutions: HashMap<usize, Type>,
 }
 
 impl TypeEnv {
@@ -145,6 +149,8 @@ impl TypeEnv {
             next_var: 0,
             enum_variants: HashMap::new(),
             variant_info: HashMap::new(),
+            struct_fields: HashMap::new(),
+            substitutions: HashMap::new(),
         }
     }
 
@@ -175,6 +181,29 @@ impl TypeEnv {
         let v = self.next_var;
         self.next_var += 1;
         Type::Var(v)
+    }
+
+    fn resolve(&self, ty: &Type) -> Type {
+        match ty {
+            Type::Var(id) => {
+                if let Some(resolved) = self.substitutions.get(id) {
+                    self.resolve(resolved)
+                } else {
+                    ty.clone()
+                }
+            }
+            _ => ty.clone(),
+        }
+    }
+
+    fn unify_var(&mut self, id: usize, ty: &Type) {
+        // Don't bind a var to itself
+        if let Type::Var(other) = ty {
+            if *other == id {
+                return;
+            }
+        }
+        self.substitutions.insert(id, ty.clone());
     }
 
     fn error(&mut self, span: Span, msg: String) {
@@ -248,6 +277,12 @@ fn collect_item_signature(env: &mut TypeEnv, item: &Item) {
         ItemKind::TypeAlias(alias) => {
             let resolved = resolve_type_expr(env, &alias.value);
             env.type_defs.insert(alias.name.name.clone(), resolved);
+        }
+        ItemKind::Struct(s) => {
+            let fields: Vec<(String, Type)> = s.fields.iter()
+                .map(|f| (f.name.name.clone(), resolve_type_expr(env, &f.ty)))
+                .collect();
+            env.struct_fields.insert(s.name.name.clone(), fields);
         }
         ItemKind::Enum(e) => {
             let enum_name = e.name.name.clone();
@@ -464,6 +499,11 @@ fn check_stmt(env: &mut TypeEnv, stmt: &Stmt, expected_ret: &Type) {
             check_block(env, body, &Type::Void);
             env.pop_scope();
         }
+        StmtKind::Loop { body } => {
+            env.push_scope();
+            check_block(env, body, &Type::Void);
+            env.pop_scope();
+        }
         StmtKind::Break | StmtKind::Continue => {}
         StmtKind::Dispatch { index, targets: _, args } => {
             let _ = infer_expr(env, index);
@@ -649,9 +689,17 @@ fn infer_expr(env: &mut TypeEnv, expr: &Expr) -> Type {
             }
         }
 
-        ExprKind::FieldAccess { base, field: _ } => {
-            let _ = infer_expr(env, base);
-            // For now we don't resolve struct fields; return unknown
+        ExprKind::FieldAccess { base, field } => {
+            let base_ty = infer_expr(env, base);
+            let resolved = env.resolve(&base_ty);
+            if let Type::Named(ref struct_name) = resolved {
+                if let Some(fields) = env.struct_fields.get(struct_name).cloned() {
+                    if let Some((_, fty)) = fields.iter().find(|(n, _)| n == &field.name) {
+                        return fty.clone();
+                    }
+                }
+            }
+            // Fall back to fresh var for unknown structs/fields
             env.fresh_var()
         }
 
@@ -772,11 +820,11 @@ fn infer_expr(env: &mut TypeEnv, expr: &Expr) -> Type {
             resolve_type_expr(env, ty)
         }
 
-        ExprKind::StructLiteral { fields, .. } => {
+        ExprKind::StructLiteral { name, fields } => {
             for (_, fexpr) in fields {
                 infer_expr(env, fexpr);
             }
-            env.fresh_var() // TODO: resolve to actual struct type
+            Type::Named(name.name.clone())
         }
 
         ExprKind::Match { expr: match_expr, arms } => {
@@ -835,13 +883,26 @@ fn infer_expr(env: &mut TypeEnv, expr: &Expr) -> Type {
                 }
             }
 
-            // Infer result type from arms
-            let mut result_ty = env.fresh_var();
+            // Infer result type from arms — all must be compatible
+            let mut arm_types: Vec<Type> = Vec::new();
             for arm in arms {
                 let arm_ty = infer_expr(env, &arm.body);
-                result_ty = arm_ty;
+                arm_types.push(arm_ty);
             }
-            result_ty
+            if arm_types.is_empty() {
+                env.fresh_var()
+            } else {
+                let first = &arm_types[0];
+                for (i, arm_ty) in arm_types[1..].iter().enumerate() {
+                    if !types_compatible(first, arm_ty) {
+                        env.error(
+                            arms[i + 1].span,
+                            format!("match arm type mismatch: expected `{}`, found `{}`", first, arm_ty),
+                        );
+                    }
+                }
+                arm_types.into_iter().next().unwrap()
+            }
         }
 
         ExprKind::Closure { .. } => env.fresh_var(),
@@ -904,7 +965,7 @@ fn is_numeric(ty: &Type) -> bool {
 }
 
 fn types_compatible(expected: &Type, got: &Type) -> bool {
-    // Type variables are compatible with anything
+    // Type variables are compatible with anything (unification deferred)
     if matches!(expected, Type::Var(_)) || matches!(got, Type::Var(_)) {
         return true;
     }
@@ -912,12 +973,12 @@ fn types_compatible(expected: &Type, got: &Type) -> bool {
     if matches!(expected, Type::Error) || matches!(got, Type::Error) {
         return true;
     }
-    // Named types that match generic type parameters are compatible
-    if matches!(expected, Type::Named(_)) || matches!(got, Type::Named(_)) {
-        return true; // Lenient for now — full resolution in Phase 1
-    }
 
     match (expected, got) {
+        // Named types: compare by name
+        (Type::Named(a), Type::Named(b)) => a == b,
+        // Named vs non-Named: incompatible (except Var/Error handled above)
+        (Type::Named(_), _) | (_, Type::Named(_)) => false,
         (Type::Scalar(a), Type::Scalar(b)) => {
             a == b || are_numeric_compatible(a, b)
         }
