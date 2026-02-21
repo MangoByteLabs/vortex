@@ -460,6 +460,12 @@ impl Env {
         self.functions.insert("gpu_softmax".to_string(), FnDef::Builtin(builtin_gpu_softmax));
         self.functions.insert("gpu_copy_to_host".to_string(), FnDef::Builtin(builtin_gpu_copy_to_host));
         self.functions.insert("gpu_copy_to_device".to_string(), FnDef::Builtin(builtin_gpu_copy_to_device));
+
+        // Quantization builtins
+        self.functions.insert("quantize".to_string(), FnDef::Builtin(builtin_quantize));
+        self.functions.insert("dequantize".to_string(), FnDef::Builtin(builtin_dequantize));
+        self.functions.insert("quantized_matmul".to_string(), FnDef::Builtin(builtin_quantized_matmul));
+        self.functions.insert("compression_ratio".to_string(), FnDef::Builtin(builtin_compression_ratio));
     }
 }
 
@@ -4156,4 +4162,119 @@ fn builtin_gpu_copy_to_device(env: &mut Env, args: Vec<Value>) -> Result<Value, 
     let id = env.gpu_rt.alloc(&shape, gpu_runtime::DType::F64);
     env.gpu_rt.write_data(id, &data);
     Ok(Value::Int(id as i128))
+}
+
+// --- Quantization builtins ---
+
+fn builtin_quantize(_env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    if args.len() < 3 {
+        return Err("quantize requires at least 3 args: data, shape, format".into());
+    }
+    let data = match &args[0] {
+        Value::Array(arr) => arr.iter().map(|v| match v {
+            Value::Float(f) => Ok(*f),
+            Value::Int(i) => Ok(*i as f64),
+            _ => Err("quantize: data must be array of numbers".to_string()),
+        }).collect::<Result<Vec<f64>, _>>()?,
+        _ => return Err("quantize: first arg must be array".into()),
+    };
+    let shape = match &args[1] {
+        Value::Array(arr) => arr.iter().map(|v| match v {
+            Value::Int(i) => Ok(*i as usize),
+            _ => Err("quantize: shape must be array of ints".to_string()),
+        }).collect::<Result<Vec<usize>, _>>()?,
+        _ => return Err("quantize: second arg must be array (shape)".into()),
+    };
+    let format_str = match &args[2] {
+        Value::String(s) => s.clone(),
+        _ => return Err("quantize: third arg must be format string".into()),
+    };
+    let format = crate::quantize::QuantFormat::from_str(&format_str)
+        .ok_or_else(|| format!("quantize: unknown format '{}'", format_str))?;
+    let group_size = if args.len() > 3 {
+        match &args[3] {
+            Value::Int(i) if *i > 0 => Some(*i as usize),
+            _ => None,
+        }
+    } else { None };
+
+    let qt = crate::quantize::QuantTensor::quantize(&data, &shape, format, group_size);
+    let mut fields = HashMap::new();
+    fields.insert("format".to_string(), Value::String(format_str));
+    fields.insert("shape".to_string(), Value::Array(shape.iter().map(|&s| Value::Int(s as i128)).collect()));
+    fields.insert("compression_ratio".to_string(), Value::Float(qt.compression_ratio()));
+    fields.insert("_data".to_string(), Value::Array(qt.data.iter().map(|&b| Value::Int(b as i128)).collect()));
+    fields.insert("_scale".to_string(), Value::Float(qt.get_scale_pub()));
+    fields.insert("_zero_point".to_string(), Value::Int(qt.get_zp_pub() as i128));
+    Ok(Value::Struct { name: "QuantTensor".to_string(), fields })
+}
+
+fn builtin_dequantize(_env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    if args.is_empty() {
+        return Err("dequantize requires 1 arg: qtensor".into());
+    }
+    let qt = value_to_quant_tensor(&args[0])?;
+    let deq = qt.dequantize();
+    Ok(Value::Array(deq.into_iter().map(Value::Float).collect()))
+}
+
+fn builtin_quantized_matmul(_env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    if args.len() < 2 {
+        return Err("quantized_matmul requires 2 args: a_q, b_q".into());
+    }
+    let a = value_to_quant_tensor(&args[0])?;
+    let b = value_to_quant_tensor(&args[1])?;
+    let result = a.matmul(&b);
+    Ok(Value::Array(result.into_iter().map(Value::Float).collect()))
+}
+
+fn builtin_compression_ratio(_env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    if args.is_empty() {
+        return Err("compression_ratio requires 1 arg: qtensor".into());
+    }
+    let qt = value_to_quant_tensor(&args[0])?;
+    Ok(Value::Float(qt.compression_ratio()))
+}
+
+fn value_to_quant_tensor(val: &Value) -> Result<crate::quantize::QuantTensor, String> {
+    match val {
+        Value::Struct { name, fields } if name == "QuantTensor" => {
+            let format_str = match fields.get("format") {
+                Some(Value::String(s)) => s.clone(),
+                _ => return Err("QuantTensor missing format field".into()),
+            };
+            let format = crate::quantize::QuantFormat::from_str(&format_str)
+                .ok_or_else(|| format!("unknown format '{}'", format_str))?;
+            let shape = match fields.get("shape") {
+                Some(Value::Array(arr)) => arr.iter().map(|v| match v {
+                    Value::Int(i) => Ok(*i as usize),
+                    _ => Err("bad shape".to_string()),
+                }).collect::<Result<Vec<usize>, _>>()?,
+                _ => return Err("QuantTensor missing shape".into()),
+            };
+            let data = match fields.get("_data") {
+                Some(Value::Array(arr)) => arr.iter().map(|v| match v {
+                    Value::Int(i) => Ok(*i as u8),
+                    _ => Err("bad data".to_string()),
+                }).collect::<Result<Vec<u8>, _>>()?,
+                _ => return Err("QuantTensor missing _data".into()),
+            };
+            let scale = match fields.get("_scale") {
+                Some(Value::Float(f)) => *f,
+                _ => 1.0,
+            };
+            let zp = match fields.get("_zero_point") {
+                Some(Value::Int(i)) => *i as i64,
+                _ => 0,
+            };
+            Ok(crate::quantize::QuantTensor {
+                data,
+                shape,
+                format,
+                scheme: crate::quantize::QuantScheme::PerTensor { scale, zero_point: zp },
+                original_dtype: "f64".into(),
+            })
+        }
+        _ => Err("expected QuantTensor struct".into()),
+    }
 }
