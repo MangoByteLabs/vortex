@@ -1695,6 +1695,192 @@ impl MontFieldElement {
     }
 }
 
+// ============================================================
+// Montgomery-accelerated EC operations (using modmath.rs)
+// ============================================================
+
+use crate::modmath::{self, ModField, FieldParams, SECP256K1_FIELD};
+
+/// A Jacobian EC point with coordinates in Montgomery form.
+/// Used internally by the fast scalar multiplication path.
+struct MontPoint {
+    x: [u64; 4],
+    y: [u64; 4],
+    z: [u64; 4],
+}
+
+impl MontPoint {
+    fn identity(params: &'static FieldParams) -> Self {
+        MontPoint {
+            x: ModField::one(params).limbs,
+            y: ModField::one(params).limbs,
+            z: [0; 4],
+        }
+    }
+
+    fn is_identity(&self) -> bool {
+        self.z == [0; 4]
+    }
+
+    /// Convert from BigUint256 ECPoint to Montgomery form.
+    fn from_ecpoint(p: &ECPoint, params: &'static FieldParams) -> Self {
+        if p.is_identity() {
+            return Self::identity(params);
+        }
+        MontPoint {
+            x: ModField::new(modmath::from_biguint256(&p.x), params).limbs,
+            y: ModField::new(modmath::from_biguint256(&p.y), params).limbs,
+            z: ModField::new(modmath::from_biguint256(&p.z), params).limbs,
+        }
+    }
+
+    /// Convert back to BigUint256 ECPoint from Montgomery form.
+    fn to_ecpoint(&self, params: &'static FieldParams) -> ECPoint {
+        if self.is_identity() {
+            return ECPoint::identity();
+        }
+        let x = ModField::from_mont_limbs(self.x, params).to_normal();
+        let y = ModField::from_mont_limbs(self.y, params).to_normal();
+        let z = ModField::from_mont_limbs(self.z, params).to_normal();
+        ECPoint {
+            x: modmath::to_biguint256(&x),
+            y: modmath::to_biguint256(&y),
+            z: modmath::to_biguint256(&z),
+        }
+    }
+}
+
+/// Montgomery-form field multiply helper (operates on raw limbs).
+#[inline]
+fn mont_mul(a: &[u64; 4], b: &[u64; 4], params: &'static FieldParams) -> [u64; 4] {
+    modmath::montgomery_mul(a, b, &params.modulus, params.inv)
+}
+
+/// Montgomery-form field add helper.
+#[inline]
+fn mont_add(a: &[u64; 4], b: &[u64; 4], params: &'static FieldParams) -> [u64; 4] {
+    let f_a = ModField::from_mont_limbs(*a, params);
+    let f_b = ModField::from_mont_limbs(*b, params);
+    f_a.add(&f_b).limbs
+}
+
+/// Montgomery-form field sub helper.
+#[inline]
+fn mont_sub(a: &[u64; 4], b: &[u64; 4], params: &'static FieldParams) -> [u64; 4] {
+    let f_a = ModField::from_mont_limbs(*a, params);
+    let f_b = ModField::from_mont_limbs(*b, params);
+    f_a.sub(&f_b).limbs
+}
+
+/// Point doubling in Montgomery form for secp256k1 (a=0).
+fn point_double_mont(p: &MontPoint, params: &'static FieldParams) -> MontPoint {
+    if p.is_identity() || p.y == [0; 4] {
+        return MontPoint::identity(params);
+    }
+
+    // Precompute small constants in Montgomery form
+    let two = ModField::new([2, 0, 0, 0], params).limbs;
+    let three = ModField::new([3, 0, 0, 0], params).limbs;
+    let four = ModField::new([4, 0, 0, 0], params).limbs;
+    let eight = ModField::new([8, 0, 0, 0], params).limbs;
+
+    let ysq = mont_mul(&p.y, &p.y, params);
+    let s = mont_mul(&four, &mont_mul(&p.x, &ysq, params), params);
+    let xsq = mont_mul(&p.x, &p.x, params);
+    let m = mont_mul(&three, &xsq, params);
+
+    let msq = mont_mul(&m, &m, params);
+    let x3 = mont_sub(&msq, &mont_mul(&two, &s, params), params);
+
+    let s_minus_x3 = mont_sub(&s, &x3, params);
+    let ysq_sq = mont_mul(&ysq, &ysq, params);
+    let y3 = mont_sub(
+        &mont_mul(&m, &s_minus_x3, params),
+        &mont_mul(&eight, &ysq_sq, params),
+        params,
+    );
+
+    let z3 = mont_mul(&two, &mont_mul(&p.y, &p.z, params), params);
+
+    MontPoint { x: x3, y: y3, z: z3 }
+}
+
+/// Point addition in Montgomery form for secp256k1.
+fn point_add_mont(p: &MontPoint, q: &MontPoint, params: &'static FieldParams) -> MontPoint {
+    if p.is_identity() {
+        return MontPoint { x: q.x, y: q.y, z: q.z };
+    }
+    if q.is_identity() {
+        return MontPoint { x: p.x, y: p.y, z: p.z };
+    }
+
+    let two = ModField::new([2, 0, 0, 0], params).limbs;
+
+    let z1sq = mont_mul(&p.z, &p.z, params);
+    let z2sq = mont_mul(&q.z, &q.z, params);
+    let u1 = mont_mul(&p.x, &z2sq, params);
+    let u2 = mont_mul(&q.x, &z1sq, params);
+    let s1 = mont_mul(&p.y, &mont_mul(&q.z, &z2sq, params), params);
+    let s2 = mont_mul(&q.y, &mont_mul(&p.z, &z1sq, params), params);
+
+    if u1 == u2 {
+        if s1 == s2 {
+            return point_double_mont(p, params);
+        } else {
+            return MontPoint::identity(params);
+        }
+    }
+
+    let h = mont_sub(&u2, &u1, params);
+    let i = mont_mul(&two, &h, params);
+    let i = mont_mul(&i, &i, params);
+    let j = mont_mul(&h, &i, params);
+    let r = mont_mul(&two, &mont_sub(&s2, &s1, params), params);
+    let v = mont_mul(&u1, &i, params);
+
+    let rsq = mont_mul(&r, &r, params);
+    let x3 = mont_sub(&mont_sub(&rsq, &j, params), &mont_mul(&two, &v, params), params);
+
+    let v_minus_x3 = mont_sub(&v, &x3, params);
+    let y3 = mont_sub(
+        &mont_mul(&r, &v_minus_x3, params),
+        &mont_mul(&two, &mont_mul(&s1, &j, params), params),
+        params,
+    );
+
+    let z1z2 = mont_mul(&p.z, &q.z, params);
+    let z3 = mont_mul(&mont_mul(&two, &z1z2, params), &h, params);
+
+    MontPoint { x: x3, y: y3, z: z3 }
+}
+
+/// Fast scalar multiplication using Montgomery arithmetic throughout.
+///
+/// Converts the point to Montgomery form once at the start, performs all
+/// double-and-add iterations in Montgomery form (avoiding per-operation
+/// modular reduction via long division), then converts back at the end.
+///
+/// This is ~4x faster than `scalar_mul` which uses schoolbook mod_mul.
+pub fn scalar_mul_fast(k: &BigUint256, p: &ECPoint) -> ECPoint {
+    if k.is_zero() || p.is_identity() {
+        return ECPoint::identity();
+    }
+
+    let params: &'static FieldParams = &*SECP256K1_FIELD;
+    let mont_p = MontPoint::from_ecpoint(p, params);
+    let mut result = MontPoint::identity(params);
+    let bits = k.bits();
+
+    for i in (0..bits).rev() {
+        result = point_double_mont(&result, params);
+        if k.bit(i) {
+            result = point_add_mont(&result, &mont_p, params);
+        }
+    }
+
+    result.to_ecpoint(params)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2221,5 +2407,61 @@ mod tests {
         let a_inv = a.inv();
         let one = a.mul(&a_inv);
         assert_eq!(one.from_mont(), BigUint256::ONE);
+    }
+
+    #[test]
+    fn test_scalar_mul_fast_matches_old() {
+        let g = secp256k1_generator();
+        let scalar = BigUint256::from_hex("DEADBEEFCAFEBABE1234567890ABCDEF").unwrap();
+
+        let result_old = scalar_mul(&scalar, &g);
+        let result_fast = scalar_mul_fast(&scalar, &g);
+
+        // Convert both to affine and compare
+        let (ox, oy) = point_to_affine(&result_old);
+        let (fx, fy) = point_to_affine(&result_fast);
+        assert_eq!(ox, fx, "X coordinates differ between scalar_mul and scalar_mul_fast");
+        assert_eq!(oy, fy, "Y coordinates differ between scalar_mul and scalar_mul_fast");
+    }
+
+    #[test]
+    fn test_scalar_mul_fast_generator_multiples() {
+        let g = secp256k1_generator();
+        // Test small multiples
+        for k in 1u64..=5 {
+            let scalar = BigUint256::from_u64(k);
+            let old = scalar_mul(&scalar, &g);
+            let fast = scalar_mul_fast(&scalar, &g);
+            let (ox, oy) = point_to_affine(&old);
+            let (fx, fy) = point_to_affine(&fast);
+            assert_eq!(ox, fx, "X mismatch at k={}", k);
+            assert_eq!(oy, fy, "Y mismatch at k={}", k);
+        }
+    }
+
+    #[test]
+    fn test_montgomery_speedup() {
+        let g = secp256k1_generator();
+        let scalar = BigUint256::from_hex("FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364140").unwrap();
+
+        let start = std::time::Instant::now();
+        let result_old = scalar_mul(&scalar, &g);
+        let old_time = start.elapsed();
+
+        let start = std::time::Instant::now();
+        let result_fast = scalar_mul_fast(&scalar, &g);
+        let fast_time = start.elapsed();
+
+        // Results must match
+        let (ox, oy) = point_to_affine(&result_old);
+        let (fx, fy) = point_to_affine(&result_fast);
+        assert_eq!(ox, fx, "X mismatch in benchmark");
+        assert_eq!(oy, fy, "Y mismatch in benchmark");
+
+        println!("Old scalar_mul: {:?}", old_time);
+        println!("Fast scalar_mul_fast: {:?}", fast_time);
+        if fast_time.as_nanos() > 0 {
+            println!("Speedup: {:.2}x", old_time.as_nanos() as f64 / fast_time.as_nanos() as f64);
+        }
     }
 }
