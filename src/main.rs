@@ -4,6 +4,7 @@ mod autodiff;
 mod tensor_autodiff;
 mod codegen;
 mod ctcheck;
+mod fusion;
 pub mod crypto;
 mod dyntensor;
 mod fields;
@@ -24,6 +25,7 @@ mod sparse;
 mod spiking;
 mod ssm;
 mod runtime;
+mod gpu_runtime;
 mod typeck;
 
 use codespan_reporting::files::SimpleFiles;
