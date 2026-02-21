@@ -185,6 +185,8 @@ pub(crate) struct Env {
     pub(crate) next_multiscale_id: usize,
     hetero_layers: HashMap<usize, heterogeneous::HeterogeneousLayer>,
     next_hetero_id: usize,
+    pub(crate) ebm_models: HashMap<usize, crate::energy_models::EBMModel>,
+    pub(crate) next_ebm_id: usize,
 }
 
 #[derive(Clone)]
@@ -221,6 +223,8 @@ impl Env {
             next_multiscale_id: 0,
             hetero_layers: HashMap::new(),
             next_hetero_id: 0,
+            ebm_models: HashMap::new(),
+            next_ebm_id: 0,
         };
         env.register_builtins();
         env
@@ -614,6 +618,9 @@ impl Env {
         self.functions.insert("symbolic_eval".to_string(), FnDef::Builtin(crate::symbolic_reasoning::builtin_symbolic_eval));
         self.functions.insert("hybrid_layer_new".to_string(), FnDef::Builtin(crate::symbolic_reasoning::builtin_hybrid_layer_new));
         self.functions.insert("hybrid_layer_forward".to_string(), FnDef::Builtin(crate::symbolic_reasoning::builtin_hybrid_layer_forward));
+
+        // Energy-based model builtins
+        crate::energy_models::register_builtins(self);
     }
 }
 
