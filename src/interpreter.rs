@@ -187,6 +187,8 @@ pub(crate) struct Env {
     next_hetero_id: usize,
     pub(crate) ebm_models: HashMap<usize, crate::energy_models::EBMModel>,
     pub(crate) next_ebm_id: usize,
+    pub(crate) mot_servers: HashMap<usize, crate::matrix_of_thought::MatrixOfThoughtServer>,
+    pub(crate) next_mot_id: usize,
 }
 
 #[derive(Clone)]
@@ -225,6 +227,8 @@ impl Env {
             next_hetero_id: 0,
             ebm_models: HashMap::new(),
             next_ebm_id: 0,
+            mot_servers: HashMap::new(),
+            next_mot_id: 0,
         };
         env.register_builtins();
         env
@@ -621,6 +625,9 @@ impl Env {
 
         // Energy-based model builtins
         crate::energy_models::register_builtins(self);
+
+        // Matrix-of-Thought reasoning builtins
+        crate::matrix_of_thought::register_builtins(self);
     }
 }
 

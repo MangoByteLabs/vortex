@@ -48,6 +48,7 @@ mod gpu_runtime;
 mod server;
 mod shape_check;
 mod typeck;
+mod matrix_of_thought;
 mod symbolic_reasoning;
 mod verifiable_inference;
 
