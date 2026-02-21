@@ -1,0 +1,203 @@
+// Forward-Forward Learning: Each layer learns independently — no backprop
+// IMPOSSIBLE to express cleanly in PyTorch autograd:
+// - PyTorch autograd builds a global computation graph for backward()
+// - FF algorithm has NO global loss and NO backward pass
+// - Each layer is self-supervised with a local goodness metric
+// In Vortex: direct imperative code, no autograd to fight against
+
+fn abs_f(x: f64) -> f64 {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn print_array(name: str, arr: [f64]) {
+    let n = len(arr)
+    var s = format("{}: [", name)
+    for i in 0..n {
+        if i > 0 { s = format("{}, ", s) }
+        s = format("{}{}", s, to_string(arr[i]))
+    }
+    s = format("{}]", s)
+    println(s)
+}
+
+// --- ReLU forward pass through one layer ---
+fn relu_forward(input: [f64], weights: [f64], bias: [f64], n_in: int, n_out: int) -> [f64] {
+    var act = []
+    for j in 0..n_out {
+        var s = bias[j]
+        for i in 0..n_in {
+            s = s + input[i] * weights[j * n_in + i]
+        }
+        if s < 0.0 { s = 0.0 }
+        act = push(act, s)
+    }
+    return act
+}
+
+// --- Local goodness metric: sum of squared activations ---
+fn local_goodness(activations: [f64]) -> f64 {
+    let n = len(activations)
+    var g = 0.0
+    for i in 0..n {
+        g = g + activations[i] * activations[i]
+    }
+    return g
+}
+
+// --- Normalize activations (layer norm approximation) ---
+fn normalize(arr: [f64]) -> [f64] {
+    let n = len(arr)
+    var s = 0.0
+    for i in 0..n {
+        s = s + arr[i] * arr[i]
+    }
+    let norm = s + 0.0001
+    var result = []
+    for i in 0..n {
+        result = push(result, arr[i] / norm)
+    }
+    return result
+}
+
+// --- One step of local FF learning ---
+// Returns updated weights after seeing positive and negative examples
+fn ff_local_update(
+    weights: [f64], bias: [f64],
+    pos_input: [f64], neg_input: [f64],
+    n_in: int, n_out: int, lr: f64, threshold: f64
+) -> [f64] {
+    // Forward pass for positive example
+    let pos_act = relu_forward(pos_input, weights, bias, n_in, n_out)
+    let pos_g = local_goodness(pos_act)
+
+    // Forward pass for negative example
+    let neg_act = relu_forward(neg_input, weights, bias, n_in, n_out)
+    let neg_g = local_goodness(neg_act)
+
+    // Local gradient: push positive goodness UP, negative DOWN
+    var new_weights = []
+    for j in 0..n_out {
+        for i in 0..n_in {
+            let idx = j * n_in + i
+            let w = weights[idx]
+            // Gradient for positive: increase goodness -> strengthen active connections
+            let pos_grad = pos_act[j] * pos_input[i]
+            // Gradient for negative: decrease goodness -> weaken active connections
+            let neg_grad = neg_act[j] * neg_input[i]
+            // Combined: push apart
+            let delta = lr * (pos_grad - neg_grad)
+            new_weights = push(new_weights, w + delta)
+        }
+    }
+    return new_weights
+}
+
+fn main() {
+    println("========================================")
+    println("  Forward-Forward Learning Demo")
+    println("========================================")
+    println("")
+    println("Hinton's Forward-Forward algorithm: each layer learns locally.")
+    println("No backward pass. No global loss. No computation graph.")
+    println("PyTorch autograd actively fights this paradigm.")
+    println("")
+
+    let n_in = 4
+    let n_h1 = 3
+    let n_h2 = 2
+    let lr = 0.05
+    let threshold = 2.0
+
+    // --- Positive and negative examples ---
+    println("--- Data ---")
+    let pos1 = [1.0, 0.5, 0.8, 0.3]
+    let neg1 = [0.1, 0.9, 0.2, 0.7]
+    let pos2 = [0.9, 0.6, 0.7, 0.4]
+    let neg2 = [0.2, 0.8, 0.1, 0.6]
+    println("  2 positive examples, 2 negative examples")
+    println("")
+
+    // --- Layer 1 weights ---
+    var w1 = [0.1, 0.2, -0.1, 0.3, -0.2, 0.1, 0.2, -0.3, 0.1, -0.1, 0.2, 0.3]
+    let b1 = [0.0, 0.0, 0.0]
+
+    // --- Layer 2 weights ---
+    var w2 = [0.2, -0.1, 0.3, -0.2, 0.1, 0.2]
+    let b2 = [0.0, 0.0]
+
+    // --- Initial goodness measurements ---
+    println("--- Before Training ---")
+    let pos_act_init = relu_forward(pos1, w1, b1, n_in, n_h1)
+    let neg_act_init = relu_forward(neg1, w1, b1, n_in, n_h1)
+    let pos_g_init = local_goodness(pos_act_init)
+    let neg_g_init = local_goodness(neg_act_init)
+    println(format("  Layer 1 pos goodness: {}", to_string(pos_g_init)))
+    println(format("  Layer 1 neg goodness: {}", to_string(neg_g_init)))
+    println(format("  Gap (pos - neg): {}", to_string(pos_g_init - neg_g_init)))
+    println("")
+
+    // --- Train Layer 1 locally ---
+    println("--- Training Layer 1 (20 epochs, local updates only) ---")
+    for epoch in 0..20 {
+        // Alternate between examples
+        w1 = ff_local_update(w1, b1, pos1, neg1, n_in, n_h1, lr, threshold)
+        w1 = ff_local_update(w1, b1, pos2, neg2, n_in, n_h1, lr, threshold)
+
+        if epoch % 5 == 0 {
+            let pa = relu_forward(pos1, w1, b1, n_in, n_h1)
+            let na = relu_forward(neg1, w1, b1, n_in, n_h1)
+            let pg = local_goodness(pa)
+            let ng = local_goodness(na)
+            println(format("  Epoch {}: pos_g={}, neg_g={}, gap={}",
+                epoch, to_string(pg), to_string(ng), to_string(pg - ng)))
+        }
+    }
+    println("")
+
+    // --- Layer 1 output becomes Layer 2 input ---
+    println("--- Training Layer 2 (uses Layer 1 output as input) ---")
+    let h1_pos = normalize(relu_forward(pos1, w1, b1, n_in, n_h1))
+    let h1_neg = normalize(relu_forward(neg1, w1, b1, n_in, n_h1))
+    print_array("  L1 pos output (normalized)", h1_pos)
+    print_array("  L1 neg output (normalized)", h1_neg)
+
+    for epoch in 0..20 {
+        let h1_p1 = normalize(relu_forward(pos1, w1, b1, n_in, n_h1))
+        let h1_n1 = normalize(relu_forward(neg1, w1, b1, n_in, n_h1))
+        w2 = ff_local_update(w2, b2, h1_p1, h1_n1, n_h1, n_h2, lr, threshold)
+
+        let h1_p2 = normalize(relu_forward(pos2, w1, b1, n_in, n_h1))
+        let h1_n2 = normalize(relu_forward(neg2, w1, b1, n_in, n_h1))
+        w2 = ff_local_update(w2, b2, h1_p2, h1_n2, n_h1, n_h2, lr, threshold)
+    }
+    println("")
+
+    // --- Final evaluation ---
+    println("--- After Training ---")
+    let pa_final = relu_forward(pos1, w1, b1, n_in, n_h1)
+    let na_final = relu_forward(neg1, w1, b1, n_in, n_h1)
+    let pg_final = local_goodness(pa_final)
+    let ng_final = local_goodness(na_final)
+    println(format("  Layer 1 pos goodness: {}", to_string(pg_final)))
+    println(format("  Layer 1 neg goodness: {}", to_string(ng_final)))
+    println(format("  Gap: {}", to_string(pg_final - ng_final)))
+
+    let l2_pos = relu_forward(normalize(pa_final), w2, b2, n_h1, n_h2)
+    let l2_neg = relu_forward(normalize(na_final), w2, b2, n_h1, n_h2)
+    let l2_pg = local_goodness(l2_pos)
+    let l2_ng = local_goodness(l2_neg)
+    println(format("  Layer 2 pos goodness: {}", to_string(l2_pg)))
+    println(format("  Layer 2 neg goodness: {}", to_string(l2_ng)))
+    println(format("  Gap: {}", to_string(l2_pg - l2_ng)))
+    println("")
+
+    let improved = (pg_final - ng_final) > (pos_g_init - neg_g_init)
+    println(format("  Goodness gap improved: {}", improved))
+    println("  Each layer learned independently — no backward pass needed!")
+    println("")
+
+    println("========================================")
+    println("  Forward-Forward learning demo complete!")
+    println("========================================")
+}

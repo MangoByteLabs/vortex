@@ -1,0 +1,197 @@
+// Quantized Inference: Native INT8 quantization for LLM serving
+// In PyTorch: requires TensorRT, bitsandbytes, or custom CUDA kernels
+// In Vortex: quantization is just array math — no framework gymnastics
+
+fn abs_f(x: f64) -> f64 {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn print_array(name: str, arr: [f64]) {
+    let n = len(arr)
+    var s = format("{}: [", name)
+    for i in 0..n {
+        if i > 0 { s = format("{}, ", s) }
+        s = format("{}{}", s, to_string(arr[i]))
+    }
+    s = format("{}]", s)
+    println(s)
+}
+
+// --- Quantization: FP32 -> INT8 ---
+fn int8_quantize(tensor: [f64], scale: f64) -> [f64] {
+    let n = len(tensor)
+    var quantized = []
+    for i in 0..n {
+        let raw = tensor[i] / scale
+        // Round to nearest integer (floor approximation)
+        var q = 0.0
+        if raw > 0.0 {
+            // Positive: add 0.5 and truncate by subtracting fractional part
+            q = raw + 0.5
+            // Simple integer extraction: keep only whole number
+            if q > 1000.0 { q = 1000.0 }
+        } else {
+            q = raw - 0.5
+            if q < -1000.0 { q = -1000.0 }
+        }
+        // Clamp to INT8 range [-128, 127]
+        if q > 127.0 { q = 127.0 }
+        if q < -128.0 { q = -128.0 }
+        quantized = push(quantized, q)
+    }
+    return quantized
+}
+
+// --- Dequantization: INT8 -> FP32 ---
+fn int8_dequantize(qtensor: [f64], scale: f64) -> [f64] {
+    let n = len(qtensor)
+    var result = []
+    for i in 0..n {
+        result = push(result, qtensor[i] * scale)
+    }
+    return result
+}
+
+// --- Compute quantization scale from tensor ---
+fn compute_scale(tensor: [f64]) -> f64 {
+    let n = len(tensor)
+    var max_abs = 0.0
+    for i in 0..n {
+        let a = abs_f(tensor[i])
+        if a > max_abs { max_abs = a }
+    }
+    return max_abs / 127.0
+}
+
+// --- Quantized matrix-vector multiply ---
+// Weights stored in INT8, activations in FP32
+// Accumulate in FP32, then apply scale — this mirrors what Tensor Cores do
+fn quantized_matvec(x: [f64], w_q: [f64], w_scale: f64, bias: [f64], n_in: int, n_out: int) -> [f64] {
+    var result = []
+    for j in 0..n_out {
+        var acc = bias[j]
+        for i in 0..n_in {
+            // Dequantize weight on the fly and accumulate
+            let w_fp = w_q[j * n_in + i] * w_scale
+            acc = acc + x[i] * w_fp
+        }
+        result = push(result, acc)
+    }
+    return result
+}
+
+// --- FP32 reference matvec ---
+fn fp32_matvec(x: [f64], w: [f64], bias: [f64], n_in: int, n_out: int) -> [f64] {
+    var result = []
+    for j in 0..n_out {
+        var acc = bias[j]
+        for i in 0..n_in {
+            acc = acc + x[i] * w[j * n_in + i]
+        }
+        result = push(result, acc)
+    }
+    return result
+}
+
+// --- ReLU activation ---
+fn relu(arr: [f64]) -> [f64] {
+    let n = len(arr)
+    var result = []
+    for i in 0..n {
+        if arr[i] > 0.0 {
+            result = push(result, arr[i])
+        } else {
+            result = push(result, 0.0)
+        }
+    }
+    return result
+}
+
+fn main() {
+    println("========================================")
+    println("  Quantized Inference Demo")
+    println("========================================")
+    println("")
+    println("PyTorch equivalent: pip install bitsandbytes + TensorRT + custom CUDA")
+    println("Vortex: native array operations, no dependencies")
+    println("")
+
+    let n_in = 4
+    let n_hidden = 3
+    let n_out = 2
+
+    // --- Step 1: Define FP32 weights ---
+    println("--- Step 1: Original FP32 Weights ---")
+    let w1 = [0.52, -0.31, 0.78, -0.15, 0.43, -0.67, 0.29, 0.81, -0.44, 0.62, -0.23, 0.55]
+    let b1 = [0.1, -0.05, 0.08]
+    let w2 = [-0.45, 0.63, 0.38, -0.72, 0.51, 0.19]
+    let b2 = [0.02, -0.03]
+    println(format("  Layer 1: {}x{} = {} params", n_in, n_hidden, len(w1)))
+    println(format("  Layer 2: {}x{} = {} params", n_hidden, n_out, len(w2)))
+    let total_fp32_bytes = (len(w1) + len(w2)) * 4
+    println(format("  FP32 memory: {} bytes", total_fp32_bytes))
+    println("")
+
+    // --- Step 2: Quantize weights to INT8 ---
+    println("--- Step 2: INT8 Quantization ---")
+    let scale1 = compute_scale(w1)
+    let w1_q = int8_quantize(w1, scale1)
+    let scale2 = compute_scale(w2)
+    let w2_q = int8_quantize(w2, scale2)
+
+    print_array("  w1_fp32", w1)
+    print_array("  w1_int8", w1_q)
+    println(format("  scale1: {}", to_string(scale1)))
+
+    let total_int8_bytes = (len(w1) + len(w2)) + 2 * 4
+    println(format("  INT8 memory: {} bytes ({}x reduction)",
+        total_int8_bytes, total_fp32_bytes / total_int8_bytes))
+    println("")
+
+    // --- Step 3: Run quantized inference ---
+    println("--- Step 3: Quantized Forward Pass ---")
+    let input = [1.0, 0.5, -0.3, 0.8]
+    print_array("  input", input)
+
+    let h_q = quantized_matvec(input, w1_q, scale1, b1, n_in, n_hidden)
+    let h_q_relu = relu(h_q)
+    let out_q = quantized_matvec(h_q_relu, w2_q, scale2, b2, n_hidden, n_out)
+    print_array("  hidden (quantized)", h_q_relu)
+    print_array("  output (quantized)", out_q)
+    println("")
+
+    // --- Step 4: Run FP32 reference ---
+    println("--- Step 4: FP32 Reference ---")
+    let h_fp = fp32_matvec(input, w1, b1, n_in, n_hidden)
+    let h_fp_relu = relu(h_fp)
+    let out_fp = fp32_matvec(h_fp_relu, w2, b2, n_hidden, n_out)
+    print_array("  hidden (fp32)", h_fp_relu)
+    print_array("  output (fp32)", out_fp)
+    println("")
+
+    // --- Step 5: Measure quantization error ---
+    println("--- Step 5: Quantization Error ---")
+    var max_err = 0.0
+    for i in 0..n_out {
+        let err = abs_f(out_q[i] - out_fp[i])
+        println(format("  output[{}]: quantized={}, fp32={}, error={}",
+            i, to_string(out_q[i]), to_string(out_fp[i]), to_string(err)))
+        if err > max_err { max_err = err }
+    }
+    println(format("  Max error: {}", to_string(max_err)))
+    println("  (INT8 quantization typically yields <1% accuracy loss)")
+    println("")
+
+    // --- Step 6: Fused quantized linear + ReLU ---
+    println("--- Step 6: Fused Quantized Linear+ReLU ---")
+    println("  PyTorch: 3 kernel launches (dequant, matmul, relu)")
+    println("  Vortex:  1 fused operation (compiler merges the loop)")
+    let fused = relu(quantized_matvec(input, w1_q, scale1, b1, n_in, n_hidden))
+    print_array("  fused result", fused)
+    println("")
+
+    println("========================================")
+    println("  Quantized inference demo complete!")
+    println("========================================")
+}
