@@ -1,0 +1,23 @@
+pub fn zeros(n: int) -> Array {
+    return __builtin_zeros(n)
+}
+
+pub fn ones(n: int) -> Array {
+    return __builtin_ones(n)
+}
+
+pub fn random_normal(rows: int, cols: int) -> Array {
+    return __builtin_random_normal(rows, cols)
+}
+
+pub fn random_uniform(rows: int, cols: int) -> Array {
+    return __builtin_random_uniform(rows, cols)
+}
+
+pub fn arange(start: int, end: int) -> Array {
+    return __builtin_arange(start, end)
+}
+
+pub fn linspace(start: float, end: float, steps: int) -> Array {
+    return __builtin_linspace(start, end, steps)
+}

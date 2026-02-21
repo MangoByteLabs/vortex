@@ -1,3 +1,4 @@
+mod architectures;
 mod ast;
 mod bytecarry;
 mod autodiff;
@@ -21,6 +22,7 @@ mod pairing;
 mod poly;
 mod parser;
 mod pipeline;
+mod quantize;
 mod sparse;
 mod spiking;
 mod ssm;

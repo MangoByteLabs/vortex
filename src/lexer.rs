@@ -53,6 +53,8 @@ pub enum TokenKind {
     Pub,
     #[token("import")]
     Import,
+    #[token("from")]
+    From,
 
     // Keywords - bindings
     #[token("let")]
@@ -258,6 +260,7 @@ impl fmt::Display for TokenKind {
             TokenKind::Const => write!(f, "const"),
             TokenKind::Pub => write!(f, "pub"),
             TokenKind::Import => write!(f, "import"),
+            TokenKind::From => write!(f, "from"),
             TokenKind::Let => write!(f, "let"),
             TokenKind::Var => write!(f, "var"),
             TokenKind::Mut => write!(f, "mut"),

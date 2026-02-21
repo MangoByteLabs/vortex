@@ -1,0 +1,11 @@
+pub fn generate_keypair() -> Array {
+    return __builtin_generate_keypair()
+}
+
+pub fn sign(message: Array, privkey: Array) -> Array {
+    return __builtin_sign(message, privkey)
+}
+
+pub fn verify(message: Array, signature: Array, pubkey: Array) -> bool {
+    return __builtin_verify(message, signature, pubkey)
+}

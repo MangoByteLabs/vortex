@@ -139,6 +139,7 @@ impl Parser {
                 | TokenKind::Trait
                 | TokenKind::Impl
                 | TokenKind::Import
+                | TokenKind::From
                 | TokenKind::Pub
                 | TokenKind::Const
                 | TokenKind::Type
@@ -239,6 +240,7 @@ impl Parser {
             TokenKind::Trait => ItemKind::Trait(self.parse_trait()?),
             TokenKind::Impl => ItemKind::Impl(self.parse_impl()?),
             TokenKind::Import => ItemKind::Import(self.parse_import()?),
+            TokenKind::From => ItemKind::Import(self.parse_from_import()?),
             TokenKind::Const => ItemKind::Const(self.parse_const()?),
             TokenKind::Type => ItemKind::TypeAlias(self.parse_type_alias()?),
             _ => {
@@ -549,6 +551,56 @@ impl Parser {
             }
         } else {
             ImportItems::Named(Vec::new())
+        };
+
+        let end = self.span();
+        Ok(ImportDecl {
+            path,
+            items,
+            span: start.merge(end),
+        })
+    }
+
+    /// Parse `from path.to.mod import Name1, Name2`
+    fn parse_from_import(&mut self) -> Result<ImportDecl, ()> {
+        let start = self.span();
+        self.expect(TokenKind::From)?;
+
+        // Parse the module path (supports relative `.foo` via leading dot)
+        let mut path = Vec::new();
+        let relative = self.eat(TokenKind::Dot).is_some();
+        if relative {
+            // Insert a sentinel for relative import
+            path.push(Ident { name: ".".to_string(), span: start });
+        }
+        path.push(self.parse_ident()?);
+        while self.eat(TokenKind::Dot).is_some() {
+            if self.check(TokenKind::Import) {
+                break;
+            }
+            path.push(self.parse_ident()?);
+        }
+
+        self.expect(TokenKind::Import)?;
+
+        // Parse names: `Name1, Name2` or `*`
+        let items = if self.eat(TokenKind::Star).is_some() {
+            ImportItems::Wildcard
+        } else {
+            let mut items = Vec::new();
+            loop {
+                let name = self.parse_ident()?;
+                let alias = if self.eat(TokenKind::As).is_some() {
+                    Some(self.parse_ident()?)
+                } else {
+                    None
+                };
+                items.push(ImportItem { name, alias });
+                if self.eat(TokenKind::Comma).is_none() {
+                    break;
+                }
+            }
+            ImportItems::Named(items)
         };
 
         let end = self.span();

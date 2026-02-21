@@ -36,10 +36,33 @@ impl ModuleResolver {
     pub fn new(root: PathBuf) -> Self {
         let mut search_paths = vec![root.clone()];
 
-        // Check for standard library location
+        // Check for standard library location relative to root
         let stdlib = root.join("stdlib");
-        let stdlib_path = if stdlib.exists() {
+        if stdlib.exists() {
             search_paths.push(stdlib.clone());
+        }
+
+        // Check for stdlib next to the executable
+        if let Ok(exe) = std::env::current_exe() {
+            if let Some(exe_dir) = exe.parent() {
+                let exe_stdlib = exe_dir.join("stdlib");
+                if exe_stdlib.exists() && !search_paths.contains(&exe_stdlib) {
+                    search_paths.push(exe_stdlib);
+                }
+            }
+        }
+
+        // Check VORTEX_PATH environment variable
+        if let Ok(vortex_path) = std::env::var("VORTEX_PATH") {
+            for p in vortex_path.split(':') {
+                let pb = PathBuf::from(p);
+                if pb.exists() && !search_paths.contains(&pb) {
+                    search_paths.push(pb);
+                }
+            }
+        }
+
+        let stdlib_path = if stdlib.exists() {
             Some(stdlib)
         } else {
             None
@@ -152,9 +175,16 @@ impl ModuleResolver {
 
         for item in &program.items {
             if let ItemKind::Import(import) = &item.kind {
-                let path: Vec<String> = import.path.iter()
+                let raw_path: Vec<String> = import.path.iter()
                     .map(|id| id.name.clone())
                     .collect();
+
+                // Handle relative imports: if path starts with ".", resolve relative to root
+                let path = if raw_path.first().map(|s| s.as_str()) == Some(".") {
+                    raw_path[1..].to_vec()
+                } else {
+                    raw_path
+                };
 
                 let module_name = path.last().cloned().unwrap_or_default();
                 let is_reexport = item.is_pub;
@@ -335,5 +365,98 @@ mod tests {
         let m = module.unwrap();
         assert!(m.program.items.iter().any(|item| item.is_pub && get_item_name(&item.kind).as_deref() == Some("secret")));
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn test_std_nn_resolution() {
+        let dir = std::env::temp_dir().join("vortex_test_std_nn");
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::create_dir_all(dir.join("stdlib/std"));
+        fs::write(dir.join("stdlib/std/nn.vx"), "pub struct Linear { x: int }").unwrap();
+        let resolver = ModuleResolver::new(dir.clone());
+        let path = resolver.resolve_path(&["std".to_string(), "nn".to_string()]);
+        assert!(path.is_some(), "std.nn should resolve via stdlib/std/nn.vx");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn test_from_import_parsing() {
+        let src = "from std.nn import Linear, LayerNorm";
+        let tokens = crate::lexer::lex(src);
+        let program = crate::parser::parse(tokens, 0).unwrap();
+        assert_eq!(program.items.len(), 1);
+        if let ItemKind::Import(i) = &program.items[0].kind {
+            assert_eq!(i.path.len(), 2);
+            assert_eq!(i.path[0].name, "std");
+            assert_eq!(i.path[1].name, "nn");
+            if let ImportItems::Named(items) = &i.items {
+                assert_eq!(items.len(), 2);
+                assert_eq!(items[0].name.name, "Linear");
+                assert_eq!(items[1].name.name, "LayerNorm");
+            } else {
+                panic!("expected named imports");
+            }
+        } else {
+            panic!("expected import item");
+        }
+    }
+
+    #[test]
+    fn test_from_import_wildcard() {
+        let src = "from std.nn import *";
+        let tokens = crate::lexer::lex(src);
+        let program = crate::parser::parse(tokens, 0).unwrap();
+        if let ItemKind::Import(i) = &program.items[0].kind {
+            assert!(matches!(i.items, ImportItems::Wildcard));
+        } else {
+            panic!("expected import");
+        }
+    }
+
+    #[test]
+    fn test_relative_import_parsing() {
+        let src = "from .utils import helper";
+        let tokens = crate::lexer::lex(src);
+        let program = crate::parser::parse(tokens, 0).unwrap();
+        if let ItemKind::Import(i) = &program.items[0].kind {
+            assert_eq!(i.path[0].name, ".");
+            assert_eq!(i.path[1].name, "utils");
+        } else {
+            panic!("expected import");
+        }
+    }
+
+    #[test]
+    fn test_stdlib_vx_files_parse() {
+        // Verify all stdlib .vx files parse correctly
+        let stdlib_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("stdlib/std");
+        for entry in fs::read_dir(&stdlib_dir).expect("stdlib/std dir should exist") {
+            let entry = entry.unwrap();
+            let path = entry.path();
+            if path.extension().map(|e| e == "vx").unwrap_or(false) {
+                let src = fs::read_to_string(&path).unwrap();
+                let tokens = crate::lexer::lex(&src);
+                let result = crate::parser::parse(tokens, 0);
+                assert!(result.is_ok(), "Failed to parse {}: {:?}", path.display(), result.err());
+            }
+        }
+    }
+
+    #[test]
+    fn test_vortex_path_env() {
+        let dir = std::env::temp_dir().join("vortex_test_envpath");
+        let extra = std::env::temp_dir().join("vortex_test_envpath_extra");
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&extra);
+        let _ = fs::create_dir_all(&dir);
+        let _ = fs::create_dir_all(&extra);
+        fs::write(extra.join("extmod.vx"), "pub fn ext() -> int { return 1 }").unwrap();
+        std::env::set_var("VORTEX_PATH", extra.to_str().unwrap());
+        let resolver = ModuleResolver::new(dir.clone());
+        let path = resolver.resolve_path(&["extmod".to_string()]);
+        assert!(path.is_some(), "VORTEX_PATH module should be found");
+        std::env::remove_var("VORTEX_PATH");
+        let _ = fs::remove_dir_all(dir);
+        let _ = fs::remove_dir_all(extra);
     }
 }

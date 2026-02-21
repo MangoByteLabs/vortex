@@ -1,0 +1,15 @@
+pub struct SGD {
+    lr: float
+    momentum: float
+    velocity: Array
+}
+
+pub struct Adam {
+    lr: float
+    beta1: float
+    beta2: float
+    eps: float
+    t: int
+    m: Array
+    v: Array
+}
