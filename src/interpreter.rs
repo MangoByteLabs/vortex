@@ -293,6 +293,16 @@ impl Env {
         self.functions.insert("attention".to_string(), FnDef::Builtin(builtin_attention));
         self.functions.insert("rope".to_string(), FnDef::Builtin(builtin_rope));
 
+        // FlashAttention builtins
+        self.functions.insert("flash_attention".to_string(), FnDef::Builtin(|_env, args| {
+            // Stub: flash_attention(Q, K, V) -> output (same as V)
+            if args.len() >= 3 { Ok(args[2].clone()) } else { Err("flash_attention requires Q, K, V".to_string()) }
+        }));
+        self.functions.insert("flash_attention_backward".to_string(), FnDef::Builtin(|_env, args| {
+            // Stub: flash_attention_backward(dO, Q, K, V) -> dQ (same as Q)
+            if args.len() >= 2 { Ok(args[1].clone()) } else { Err("flash_attention_backward requires dO, Q, K, V".to_string()) }
+        }));
+
         // Phase 2: ZK primitives
         self.functions.insert("montgomery_mul".to_string(), FnDef::Builtin(builtin_montgomery_mul));
         self.functions.insert("ntt".to_string(), FnDef::Builtin(builtin_ntt));
@@ -1324,6 +1334,137 @@ fn builtin_attention(_env: &mut Env, args: Vec<Value>) -> Result<Value, String> 
     Ok(Value::Array(output.into_iter().map(|row| {
         Value::Array(row.into_iter().map(Value::Float).collect())
     }).collect()))
+}
+
+/// flash_attention(q, k, v, num_heads, causal) -> output
+/// q, k, v are 2D arrays [N, d]. num_heads is int, causal is bool.
+fn builtin_flash_attention(_env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    if args.len() < 3 {
+        return Err("flash_attention expects (q, k, v, [num_heads], [causal])".to_string());
+    }
+    let q_mat = value_to_2d_f64(&args[0], "Q")?;
+    let k_mat = value_to_2d_f64(&args[1], "K")?;
+    let v_mat = value_to_2d_f64(&args[2], "V")?;
+
+    if q_mat.is_empty() || k_mat.is_empty() || v_mat.is_empty() {
+        return Ok(Value::Array(vec![]));
+    }
+
+    let n = q_mat.len();
+    let total_dim = q_mat[0].len();
+    let num_heads: usize = match args.get(3) {
+        Some(Value::Int(h)) => *h as usize,
+        _ => 1,
+    };
+    let causal = match args.get(4) {
+        Some(Value::Bool(b)) => *b,
+        _ => false,
+    };
+
+    let head_dim = total_dim / num_heads;
+    if head_dim * num_heads != total_dim {
+        return Err(format!("flash_attention: dim {} not divisible by {} heads", total_dim, num_heads));
+    }
+
+    // Flatten to row-major
+    let q_flat: Vec<f64> = q_mat.iter().flat_map(|r| r.iter().copied()).collect();
+    let k_flat: Vec<f64> = k_mat.iter().flat_map(|r| r.iter().copied()).collect();
+    let v_flat: Vec<f64> = v_mat.iter().flat_map(|r| r.iter().copied()).collect();
+
+    let out = crate::flash_attention::multi_head_flash_attention(
+        &q_flat, &k_flat, &v_flat, num_heads, head_dim, causal,
+    );
+
+    // Reshape back to 2D Value
+    let result: Vec<Value> = (0..n)
+        .map(|i| {
+            Value::Array(
+                out[i * total_dim..(i + 1) * total_dim]
+                    .iter()
+                    .map(|&x| Value::Float(x))
+                    .collect(),
+            )
+        })
+        .collect();
+    Ok(Value::Array(result))
+}
+
+/// flash_attention_backward(q, k, v, output, grad_output, num_heads, causal) -> (grad_q, grad_k, grad_v)
+fn builtin_flash_attention_backward(_env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    if args.len() < 5 {
+        return Err("flash_attention_backward expects (q, k, v, output, grad_output, [num_heads], [causal])".to_string());
+    }
+    let q_mat = value_to_2d_f64(&args[0], "Q")?;
+    let k_mat = value_to_2d_f64(&args[1], "K")?;
+    let v_mat = value_to_2d_f64(&args[2], "V")?;
+    let out_mat = value_to_2d_f64(&args[3], "output")?;
+    let grad_mat = value_to_2d_f64(&args[4], "grad_output")?;
+
+    if q_mat.is_empty() {
+        return Ok(Value::Tuple(vec![Value::Array(vec![]), Value::Array(vec![]), Value::Array(vec![])]));
+    }
+
+    let n = q_mat.len();
+    let total_dim = q_mat[0].len();
+    let num_heads: usize = match args.get(5) {
+        Some(Value::Int(h)) => *h as usize,
+        _ => 1,
+    };
+    let causal = match args.get(6) {
+        Some(Value::Bool(b)) => *b,
+        _ => false,
+    };
+    let head_dim = total_dim / num_heads;
+
+    // For simplicity, run backward per-head
+    let q_flat: Vec<f64> = q_mat.iter().flat_map(|r| r.iter().copied()).collect();
+    let k_flat: Vec<f64> = k_mat.iter().flat_map(|r| r.iter().copied()).collect();
+    let v_flat: Vec<f64> = v_mat.iter().flat_map(|r| r.iter().copied()).collect();
+    let out_flat: Vec<f64> = out_mat.iter().flat_map(|r| r.iter().copied()).collect();
+    let grad_flat: Vec<f64> = grad_mat.iter().flat_map(|r| r.iter().copied()).collect();
+
+    let mut gq = vec![0.0; n * total_dim];
+    let mut gk = vec![0.0; n * total_dim];
+    let mut gv = vec![0.0; n * total_dim];
+
+    for h in 0..num_heads {
+        let mut qh = vec![0.0; n * head_dim];
+        let mut kh = vec![0.0; n * head_dim];
+        let mut vh = vec![0.0; n * head_dim];
+        let mut oh = vec![0.0; n * head_dim];
+        let mut doh = vec![0.0; n * head_dim];
+        for i in 0..n {
+            for dd in 0..head_dim {
+                qh[i * head_dim + dd] = q_flat[i * total_dim + h * head_dim + dd];
+                kh[i * head_dim + dd] = k_flat[i * total_dim + h * head_dim + dd];
+                vh[i * head_dim + dd] = v_flat[i * total_dim + h * head_dim + dd];
+                oh[i * head_dim + dd] = out_flat[i * total_dim + h * head_dim + dd];
+                doh[i * head_dim + dd] = grad_flat[i * total_dim + h * head_dim + dd];
+            }
+        }
+
+        let config = crate::flash_attention::FlashAttentionConfig::auto(n, head_dim, 1);
+        let (_, lse, _) = crate::flash_attention::flash_attention_forward(&qh, &kh, &vh, &config);
+        let (dq, dk, dv) = crate::flash_attention::flash_attention_backward(
+            &qh, &kh, &vh, &oh, &doh, &lse, &config,
+        );
+
+        for i in 0..n {
+            for dd in 0..head_dim {
+                gq[i * total_dim + h * head_dim + dd] = dq[i * head_dim + dd];
+                gk[i * total_dim + h * head_dim + dd] = dk[i * head_dim + dd];
+                gv[i * total_dim + h * head_dim + dd] = dv[i * head_dim + dd];
+            }
+        }
+    }
+
+    let to_2d = |flat: &[f64]| -> Value {
+        Value::Array((0..n).map(|i| {
+            Value::Array(flat[i * total_dim..(i + 1) * total_dim].iter().map(|&x| Value::Float(x)).collect())
+        }).collect())
+    };
+
+    Ok(Value::Tuple(vec![to_2d(&gq), to_2d(&gk), to_2d(&gv)]))
 }
 
 fn value_to_2d_f64(val: &Value, name: &str) -> Result<Vec<Vec<f64>>, String> {
@@ -4617,6 +4758,94 @@ fn builtin_tensor_zero_grad(env: &mut Env, args: Vec<Value>) -> Result<Value, St
     let tape = get_tensor_tape(env)?;
     tape.zero_grad(&params);
     Ok(Value::Void)
+}
+
+// ── SpikeSSMFormer builtins ─────────────────────────────────────────
+
+/// spike_ssm_new(d_model, d_state, n_ff_layers, n_ssm_layers, vocab_size) -> model_id
+fn builtin_spike_ssm_new(env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    if args.len() != 5 { return Err("spike_ssm_new expects 5 arguments: (d_model, d_state, n_ff_layers, n_ssm_layers, vocab_size)".into()); }
+    let d_model = value_to_usize(&args[0])?;
+    let d_state = value_to_usize(&args[1])?;
+    let n_ff = value_to_usize(&args[2])?;
+    let n_ssm = value_to_usize(&args[3])?;
+    let vocab = value_to_usize(&args[4])?;
+    let model = architectures::SpikeSSMFormer::new(d_model, d_state, n_ff, n_ssm, vocab);
+    let id = env.next_spike_model_id;
+    env.next_spike_model_id += 1;
+    env.spike_models.insert(id, model);
+    Ok(Value::Int(id as i128))
+}
+
+/// spike_ssm_forward(model_id, token_ids, embeddings) -> logits (array of arrays)
+fn builtin_spike_ssm_forward(env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    if args.len() != 3 { return Err("spike_ssm_forward expects 3 arguments: (model_id, token_ids, embeddings)".into()); }
+    let model_id = value_to_usize(&args[0])?;
+    let token_ids = value_to_usize_vec(&args[1])?;
+    let embeddings = value_to_f64_2d(&args[2])?;
+    let model = env.spike_models.get_mut(&model_id)
+        .ok_or_else(|| format!("No SpikeSSMFormer model with id {}", model_id))?;
+    let logits = model.forward(&token_ids, &embeddings);
+    // Convert to Value::Array of Value::Array
+    let result = logits.iter().map(|row| {
+        Value::Array(row.iter().map(|&v| Value::Float(v)).collect())
+    }).collect();
+    Ok(Value::Array(result))
+}
+
+/// spike_ssm_train_step(model_id, token_ids, embeddings, targets, lr) -> loss
+fn builtin_spike_ssm_train_step(env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    if args.len() != 5 { return Err("spike_ssm_train_step expects 5 arguments: (model_id, token_ids, embeddings, targets, lr)".into()); }
+    let model_id = value_to_usize(&args[0])?;
+    let token_ids = value_to_usize_vec(&args[1])?;
+    let embeddings = value_to_f64_2d(&args[2])?;
+    let targets = value_to_usize_vec(&args[3])?;
+    let lr = value_to_f64(&args[4])?;
+    let model = env.spike_models.get_mut(&model_id)
+        .ok_or_else(|| format!("No SpikeSSMFormer model with id {}", model_id))?;
+    let loss = model.train_step(&token_ids, &embeddings, &targets, lr);
+    Ok(Value::Float(loss))
+}
+
+/// spike_ssm_stats(model_id) -> [total_params, attention_sparsity, ff_goodness, avg_tau]
+fn builtin_spike_ssm_stats(env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    if args.len() != 1 { return Err("spike_ssm_stats expects 1 argument: (model_id)".into()); }
+    let model_id = value_to_usize(&args[0])?;
+    let model = env.spike_models.get(&model_id)
+        .ok_or_else(|| format!("No SpikeSSMFormer model with id {}", model_id))?;
+    let stats = model.stats();
+    Ok(Value::Array(vec![
+        Value::Int(stats.total_params as i128),
+        Value::Float(stats.attention_sparsity),
+        Value::Float(stats.ff_goodness),
+        Value::Float(stats.avg_tau),
+    ]))
+}
+
+fn value_to_usize(v: &Value) -> Result<usize, String> {
+    match v {
+        Value::Int(n) => Ok(*n as usize),
+        Value::Float(f) => Ok(*f as usize),
+        _ => Err(format!("Expected integer, got {:?}", v)),
+    }
+}
+
+fn value_to_f64_2d(v: &Value) -> Result<Vec<Vec<f64>>, String> {
+    match v {
+        Value::Array(rows) => {
+            rows.iter().map(|row| {
+                match row {
+                    Value::Array(cols) => cols.iter().map(|c| match c {
+                        Value::Float(f) => Ok(*f),
+                        Value::Int(n) => Ok(*n as f64),
+                        _ => Err("Expected number in 2D array".to_string()),
+                    }).collect(),
+                    _ => Err("Expected array of arrays for 2D data".to_string()),
+                }
+            }).collect()
+        }
+        _ => Err("Expected 2D array".to_string()),
+    }
 }
 
 #[cfg(test)]

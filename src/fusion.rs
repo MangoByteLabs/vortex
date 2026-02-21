@@ -351,6 +351,11 @@ impl FusionGraph {
         kernels
     }
 
+    /// Get a reference to all nodes in the graph.
+    pub fn get_nodes(&self) -> &[FusionNode] {
+        &self.nodes
+    }
+
     /// Convert an AST expression into a fusion graph.
     pub fn from_expr(expr: &Expr) -> Self {
         let mut graph = FusionGraph::new();
