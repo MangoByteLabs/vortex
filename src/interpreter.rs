@@ -4103,23 +4103,6 @@ fn builtin_modfield_batch_inv(_env: &mut Env, args: Vec<Value>) -> Result<Value,
     Ok(Value::Array(result.into_iter().map(Value::ModFieldElem).collect()))
 }
 
-// --- Continuous learning stubs ---
-
-fn builtin_continuous_learner_new(_env: &mut Env, _args: Vec<Value>) -> Result<Value, String> {
-    Ok(Value::Int(0))
-}
-
-fn builtin_continuous_learner_infer(_env: &mut Env, _args: Vec<Value>) -> Result<Value, String> {
-    Ok(Value::Array(vec![]))
-}
-
-fn builtin_continuous_learner_learn(_env: &mut Env, _args: Vec<Value>) -> Result<Value, String> {
-    Ok(Value::Void)
-}
-
-fn builtin_continuous_learner_stats(_env: &mut Env, _args: Vec<Value>) -> Result<Value, String> {
-    Ok(Value::String("continuous_learner_stats: stub".to_string()))
-}
 
 #[cfg(test)]
 mod interpreter_tests {
@@ -5054,6 +5037,68 @@ fn builtin_tiered_moe_stats(env: &mut Env, args: Vec<Value>) -> Result<Value, St
     ]))
 }
 
+fn builtin_continuous_learner_new(env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    if args.len() != 1 { return Err("continuous_learner_new expects 1 argument: (layer_sizes)".into()); }
+    let layer_sizes = match &args[0] {
+        Value::Array(arr) => arr.iter().map(|v| match v {
+            Value::Int(n) => Ok(*n as usize),
+            Value::Float(f) => Ok(*f as usize),
+            _ => Err("layer_sizes must contain integers".to_string()),
+        }).collect::<Result<Vec<usize>, String>>()?,
+        _ => return Err("continuous_learner_new expects an array of layer sizes".into()),
+    };
+    let trainer = continuous_learning::ServingTrainer::new(&layer_sizes, 4096.0);
+    let id = env.next_cl_id;
+    env.next_cl_id += 1;
+    env.continuous_learners.insert(id, trainer);
+    Ok(Value::Int(id as i128))
+}
+
+fn builtin_continuous_learner_infer(env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    if args.len() != 2 { return Err("continuous_learner_infer expects 2 args".into()); }
+    let id = value_to_usize(&args[0])?;
+    let input: Vec<f64> = match &args[1] {
+        Value::Array(arr) => arr.iter().map(|v| match v {
+            Value::Float(f) => Ok(*f), Value::Int(n) => Ok(*n as f64),
+            _ => Err("expected numeric".to_string()),
+        }).collect::<Result<Vec<f64>, String>>()?,
+        _ => return Err("arg must be array".into()),
+    };
+    let trainer = env.continuous_learners.get_mut(&id).ok_or("no such learner")?;
+    let output = trainer.infer(&input);
+    Ok(Value::Array(output.into_iter().map(Value::Float).collect()))
+}
+
+fn builtin_continuous_learner_learn(env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    if args.len() != 4 { return Err("continuous_learner_learn expects 4 args".into()); }
+    let id = value_to_usize(&args[0])?;
+    let input: Vec<f64> = match &args[1] {
+        Value::Array(a) => a.iter().map(|v| match v { Value::Float(f)=>Ok(*f), Value::Int(n)=>Ok(*n as f64), _=>Err("num".into()) }).collect::<Result<Vec<f64>,String>>()?,
+        _ => return Err("arg must be array".into()),
+    };
+    let target: Vec<f64> = match &args[2] {
+        Value::Array(a) => a.iter().map(|v| match v { Value::Float(f)=>Ok(*f), Value::Int(n)=>Ok(*n as f64), _=>Err("num".into()) }).collect::<Result<Vec<f64>,String>>()?,
+        _ => return Err("arg must be array".into()),
+    };
+    let lr = match &args[3] { Value::Float(f) => *f, Value::Int(n) => *n as f64, _ => return Err("lr must be numeric".into()) };
+    let trainer = env.continuous_learners.get_mut(&id).ok_or("no such learner")?;
+    let (_output, loss) = trainer.infer_and_learn(&input, &target, lr);
+    Ok(Value::Float(loss))
+}
+
+fn builtin_continuous_learner_stats(env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    if args.len() != 1 { return Err("continuous_learner_stats expects 1 arg".into()); }
+    let id = value_to_usize(&args[0])?;
+    let trainer = env.continuous_learners.get(&id).ok_or("no such learner")?;
+    let (loss_ema, drift, updates, mem) = trainer.get_stats();
+    Ok(Value::Array(vec![
+        Value::Float(loss_ema),
+        Value::Float(drift),
+        Value::Float(updates as f64),
+        Value::Float(mem),
+    ]))
+}
+
 #[cfg(test)]
 mod tensor_ad_tests {
     use crate::lexer;
@@ -5103,4 +5148,72 @@ mod tensor_ad_tests {
         let o = rv(code);
         assert_eq!(o, vec!["PASS"]);
     }
+}
+
+fn builtin_dynamic_model_new(env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    if args.len() != 1 { return Err("dynamic_model_new expects 1 argument".into()); }
+    let sizes = value_to_usize_vec(&args[0])?;
+    let model = self_modify::DynamicModel::from_layer_sizes(&sizes);
+    let searcher = self_modify::ArchitectureSearcher::new();
+    let id = env.next_dm_id;
+    env.next_dm_id += 1;
+    env.dynamic_models.insert(id, (model, searcher));
+    Ok(Value::Int(id as i128))
+}
+
+fn builtin_dynamic_model_forward(env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    if args.len() != 2 { return Err("dynamic_model_forward expects 2 arguments".into()); }
+    let id = value_to_usize(&args[0])?;
+    let input: Vec<f64> = match &args[1] {
+        Value::Array(a) => a.iter().map(|x| value_to_f64(x)).collect::<Result<_,_>>()?,
+        _ => return Err("expected array".into()),
+    };
+    let (m, _) = env.dynamic_models.get(&id).ok_or("no such dynamic model")?;
+    let out = m.forward(&input);
+    Ok(Value::Array(out.into_iter().map(Value::Float).collect()))
+}
+
+fn builtin_dynamic_model_add_layer(env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    if args.len() != 3 { return Err("expects 3 args".into()); }
+    let id = value_to_usize(&args[0])?;
+    let pos = value_to_usize(&args[1])?;
+    let w = value_to_usize(&args[2])?;
+    let (m, _) = env.dynamic_models.get_mut(&id).ok_or("no such dynamic model")?;
+    m.add_layer(pos, self_modify::DynamicLayer::Dense {
+        weights: vec![vec![0.01; w]; w], biases: vec![0.0; w],
+        activation: self_modify::Activation::ReLU,
+    });
+    Ok(Value::Int(m.total_params() as i128))
+}
+
+fn builtin_dynamic_model_remove_layer(env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    if args.len() != 2 { return Err("expects 2 args".into()); }
+    let id = value_to_usize(&args[0])?;
+    let pos = value_to_usize(&args[1])?;
+    let (m, _) = env.dynamic_models.get_mut(&id).ok_or("no such dynamic model")?;
+    m.remove_layer(pos);
+    Ok(Value::Int(m.total_params() as i128))
+}
+
+fn builtin_dynamic_model_search_step(env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    if args.len() != 3 { return Err("expects 3 args".into()); }
+    let id = value_to_usize(&args[0])?;
+    let tl = value_to_f64(&args[1])?;
+    let vl = value_to_f64(&args[2])?;
+    let (m, s) = env.dynamic_models.get_mut(&id).ok_or("no such dynamic model")?;
+    match s.search_step(m, tl, vl) {
+        Some(md) => Ok(Value::String(md.describe())),
+        None => Ok(Value::String("no modification".into())),
+    }
+}
+
+fn builtin_dynamic_model_stats(env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    if args.len() != 1 { return Err("expects 1 arg".into()); }
+    let id = value_to_usize(&args[0])?;
+    let (m, _) = env.dynamic_models.get(&id).ok_or("no such dynamic model")?;
+    Ok(Value::Array(vec![
+        Value::Int(m.active_layer_count() as i128),
+        Value::Int(m.total_params() as i128),
+        Value::Int(m.architecture_hash() as i128),
+    ]))
 }
