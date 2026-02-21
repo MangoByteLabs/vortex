@@ -2017,15 +2017,18 @@ fn eval_expr(env: &mut Env, expr: &Expr) -> Result<Value, String> {
         }
 
         ExprKind::Index { base, indices } => {
-            let base_val = eval_expr(env, base)?;
-            let idx = eval_expr(env, &indices[0])?;
-            let idx = value_to_int(&idx)? as usize;
-            match base_val {
-                Value::Array(arr) => {
-                    arr.get(idx).cloned().ok_or_else(|| format!("index {} out of bounds (len {})", idx, arr.len()))
-                }
-                _ => Err("cannot index this type".to_string()),
+            let mut current = eval_expr(env, base)?;
+            for index_expr in indices {
+                let idx = eval_expr(env, index_expr)?;
+                let idx = value_to_int(&idx)? as usize;
+                current = match current {
+                    Value::Array(arr) => {
+                        arr.get(idx).cloned().ok_or_else(|| format!("index {} out of bounds (len {})", idx, arr.len()))?
+                    }
+                    _ => return Err("cannot index this type".to_string()),
+                };
             }
+            Ok(current)
         }
 
         ExprKind::Block(block) => {
@@ -2394,6 +2397,10 @@ fn value_to_f64(v: &Value) -> Result<f64, String> {
         Value::Int(i) => Ok(*i as f64),
         _ => Err(format!("cannot convert {} to float", v)),
     }
+}
+
+fn value_to_float(v: &Value) -> Result<f64, String> {
+    value_to_f64(v)
 }
 
 fn matmul_values(a: &Value, b: &Value) -> Result<Value, String> {
@@ -3472,36 +3479,194 @@ fn builtin_ad_cross_entropy_loss(env: &mut Env, args: Vec<Value>) -> Result<Valu
     Ok(Value::Int(loss_idx as i128))
 }
 
-fn builtin_rk45_solve(_env: &mut Env, _args: Vec<Value>) -> Result<Value, String> {
-    Err("rk45_solve not yet implemented".to_string())
+fn builtin_rk45_solve(env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    if args.len() != 6 { return Err("rk45_solve expects 6 args: (f, y0, t_start, t_end, rtol, atol)".into()); }
+    let f_closure = args[0].clone();
+    let y0: Vec<f64> = match &args[1] { Value::Array(a) => a.iter().map(value_to_float).collect::<Result<Vec<_>,_>>()?, _ => return Err("rk45_solve: y0 must be array".into()) };
+    let t_start = value_to_float(&args[2])?;
+    let t_end = value_to_float(&args[3])?;
+    let rtol = value_to_float(&args[4])?;
+    let atol = value_to_float(&args[5])?;
+    let call_f = |e: &mut Env, t: f64, y: &[f64]| -> Result<Vec<f64>, String> {
+        let r = apply_closure(e, &f_closure, vec![Value::Float(t), Value::Array(y.iter().map(|&v| Value::Float(v)).collect())])?;
+        match r { Value::Array(a) => a.iter().map(value_to_float).collect::<Result<Vec<_>,_>>(), _ => Err("f must return array".into()) }
+    };
+    let n = y0.len(); let mut y = y0; let mut t = t_start;
+    let mut h = (t_end - t_start) / 100.0; let h_min = 1e-12; let h_max = t_end - t_start;
+    for _ in 0..100_000 {
+        if t >= t_end { break; }
+        if t + h > t_end { h = t_end - t; }
+        let k1 = call_f(env, t, &y)?;
+        let y2: Vec<f64> = (0..n).map(|i| y[i] + h*0.2*k1[i]).collect();
+        let k2 = call_f(env, t+h*0.2, &y2)?;
+        let y3: Vec<f64> = (0..n).map(|i| y[i] + h*(3.0/40.0*k1[i] + 9.0/40.0*k2[i])).collect();
+        let k3 = call_f(env, t+0.3*h, &y3)?;
+        let y4: Vec<f64> = (0..n).map(|i| y[i] + h*(44.0/45.0*k1[i] - 56.0/15.0*k2[i] + 32.0/9.0*k3[i])).collect();
+        let k4 = call_f(env, t+0.8*h, &y4)?;
+        let y5: Vec<f64> = (0..n).map(|i| y[i] + h*(19372.0/6561.0*k1[i] - 25360.0/2187.0*k2[i] + 64448.0/6561.0*k3[i] - 212.0/729.0*k4[i])).collect();
+        let k5 = call_f(env, t+8.0/9.0*h, &y5)?;
+        let y6: Vec<f64> = (0..n).map(|i| y[i] + h*(9017.0/3168.0*k1[i] - 355.0/33.0*k2[i] + 46732.0/5247.0*k3[i] + 49.0/176.0*k4[i] - 5103.0/18656.0*k5[i])).collect();
+        let k6 = call_f(env, t+h, &y6)?;
+        let y_new: Vec<f64> = (0..n).map(|i| y[i] + h*(35.0/384.0*k1[i] + 500.0/1113.0*k3[i] + 125.0/192.0*k4[i] - 2187.0/6784.0*k5[i] + 11.0/84.0*k6[i])).collect();
+        let k7 = call_f(env, t+h, &y_new)?;
+        let y_hat: Vec<f64> = (0..n).map(|i| y[i] + h*(5179.0/57600.0*k1[i] + 7571.0/16695.0*k3[i] + 393.0/640.0*k4[i] - 92097.0/339200.0*k5[i] + 187.0/2100.0*k6[i] + 1.0/40.0*k7[i])).collect();
+        let err: f64 = (0..n).map(|i| { let sc = atol + rtol*y_new[i].abs().max(y[i].abs()); ((y_new[i]-y_hat[i])/sc).powi(2) }).sum::<f64>().sqrt() / (n as f64).sqrt();
+        if err <= 1.0 || h <= h_min { t += h; y = y_new; }
+        let factor = if err > 0.0 { 0.9 * err.powf(-0.2) } else { 5.0 };
+        h *= factor.min(5.0).max(0.2); h = h.min(h_max).max(h_min);
+    }
+    Ok(Value::Array(y.into_iter().map(Value::Float).collect()))
 }
 
-fn builtin_spike_attention(_env: &mut Env, _args: Vec<Value>) -> Result<Value, String> {
-    Err("spike_attention not yet implemented".to_string())
+fn builtin_spike_attention(_env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    if args.len() != 4 { return Err("spike_attention expects 4 args: (q_spikes, k_spikes, v, d)".into()); }
+    let q = match &args[0] { Value::SpikeTrain(st) => st.clone(), _ => return Err("q must be SpikeTrain".into()) };
+    let k = match &args[1] { Value::SpikeTrain(st) => st.clone(), _ => return Err("k must be SpikeTrain".into()) };
+    let v: Vec<f64> = match &args[2] { Value::Array(a) => a.iter().map(value_to_float).collect::<Result<Vec<_>,_>>()?, _ => return Err("v must be array".into()) };
+    let d = match &args[3] { Value::Int(n) => *n as usize, _ => return Err("d must be int".into()) };
+    Ok(Value::Array(spiking::spike_attention(&q, &k, &v, d).into_iter().map(Value::Float).collect()))
 }
 
-fn builtin_oja_update(_env: &mut Env, _args: Vec<Value>) -> Result<Value, String> {
-    Err("oja_update not yet implemented".to_string())
+fn builtin_oja_update(_env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    if args.len() != 6 { return Err("oja_update expects 6 args: (pre, post, weights, n_pre, n_post, lr)".into()); }
+    let pre: Vec<f64> = match &args[0] { Value::Array(a) => a.iter().map(value_to_float).collect::<Result<Vec<_>,_>>()?, _ => return Err("pre must be array".into()) };
+    let post: Vec<f64> = match &args[1] { Value::Array(a) => a.iter().map(value_to_float).collect::<Result<Vec<_>,_>>()?, _ => return Err("post must be array".into()) };
+    let mut weights: Vec<f64> = match &args[2] { Value::Array(a) => a.iter().map(value_to_float).collect::<Result<Vec<_>,_>>()?, _ => return Err("weights must be array".into()) };
+    let n_pre = match &args[3] { Value::Int(n) => *n as usize, _ => return Err("n_pre must be int".into()) };
+    let n_post = match &args[4] { Value::Int(n) => *n as usize, _ => return Err("n_post must be int".into()) };
+    let lr = value_to_float(&args[5])?;
+    local_learn::oja_update(&pre, &post, &mut weights, n_pre, n_post, lr);
+    Ok(Value::Array(weights.into_iter().map(Value::Float).collect()))
 }
 
-fn builtin_chunked_scan(_env: &mut Env, _args: Vec<Value>) -> Result<Value, String> {
-    Err("chunked_scan not yet implemented".to_string())
+fn builtin_chunked_scan(_env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    if args.len() != 5 { return Err("chunked_scan expects 5 args: (x, a, b, c, chunk_size)".into()); }
+    let x: Vec<f64> = match &args[0] { Value::Array(a) => a.iter().map(value_to_float).collect::<Result<Vec<_>,_>>()?, _ => return Err("x must be array".into()) };
+    let a_arr: Vec<f64> = match &args[1] { Value::Array(a) => a.iter().map(value_to_float).collect::<Result<Vec<_>,_>>()?, _ => return Err("a must be array".into()) };
+    let b: Vec<f64> = match &args[2] { Value::Array(a) => a.iter().map(value_to_float).collect::<Result<Vec<_>,_>>()?, _ => return Err("b must be array".into()) };
+    let c: Vec<f64> = match &args[3] { Value::Array(a) => a.iter().map(value_to_float).collect::<Result<Vec<_>,_>>()?, _ => return Err("c must be array".into()) };
+    let chunk_size = match &args[4] { Value::Int(n) => *n as usize, _ => return Err("chunk_size must be int".into()) };
+    Ok(Value::Array(ssm::chunked_scan(&x, &a_arr, &b, &c, chunk_size).into_iter().map(Value::Float).collect()))
 }
 
-fn builtin_zero_grad(_env: &mut Env, _args: Vec<Value>) -> Result<Value, String> {
-    Err("zero_grad not yet implemented".to_string())
+fn builtin_zero_grad(env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    if args.len() != 1 { return Err("zero_grad expects 1 arg: (tape_id)".into()); }
+    let tape_id = match &args[0] { Value::Int(n) => *n as usize, _ => return Err("tape_id must be int".into()) };
+    let tape = env.tapes.get_mut(&tape_id).ok_or("zero_grad: invalid tape id")?;
+    tape.zero_grad();
+    Ok(Value::Void)
 }
 
-fn builtin_modfield_new(_env: &mut Env, _args: Vec<Value>) -> Result<Value, String> { Err("modfield_new not yet implemented".into()) }
-fn builtin_modfield_add(_env: &mut Env, _args: Vec<Value>) -> Result<Value, String> { Err("modfield_add not yet implemented".into()) }
-fn builtin_modfield_sub(_env: &mut Env, _args: Vec<Value>) -> Result<Value, String> { Err("modfield_sub not yet implemented".into()) }
-fn builtin_modfield_mul(_env: &mut Env, _args: Vec<Value>) -> Result<Value, String> { Err("modfield_mul not yet implemented".into()) }
-fn builtin_modfield_inv(_env: &mut Env, _args: Vec<Value>) -> Result<Value, String> { Err("modfield_inv not yet implemented".into()) }
-fn builtin_modfield_pow(_env: &mut Env, _args: Vec<Value>) -> Result<Value, String> { Err("modfield_pow not yet implemented".into()) }
-fn builtin_modfield_neg(_env: &mut Env, _args: Vec<Value>) -> Result<Value, String> { Err("modfield_neg not yet implemented".into()) }
-fn builtin_modfield_sqrt(_env: &mut Env, _args: Vec<Value>) -> Result<Value, String> { Err("modfield_sqrt not yet implemented".into()) }
-fn builtin_modfield_batch_mul(_env: &mut Env, _args: Vec<Value>) -> Result<Value, String> { Err("modfield_batch_mul not yet implemented".into()) }
-fn builtin_modfield_batch_inv(_env: &mut Env, _args: Vec<Value>) -> Result<Value, String> { Err("modfield_batch_inv not yet implemented".into()) }
+fn builtin_modfield_new(_env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err("modfield_new(prime_name, value_hex) requires 2 args".to_string());
+    }
+    let prime_name = match &args[0] {
+        Value::String(s) => s.clone(),
+        _ => return Err("modfield_new: first arg must be a string (prime name)".to_string()),
+    };
+    let params = modmath::field_by_name(&prime_name)
+        .ok_or_else(|| format!("modfield_new: unknown field '{}'", prime_name))?;
+    let value_hex = match &args[1] {
+        Value::String(s) => s.clone(),
+        Value::Int(n) => format!("{:x}", n),
+        _ => return Err("modfield_new: second arg must be a string (hex) or int".to_string()),
+    };
+    let elem = modmath::ModField::from_hex(&value_hex, params)
+        .ok_or_else(|| format!("modfield_new: invalid hex value '{}'", value_hex))?;
+    Ok(Value::ModFieldElem(elem))
+}
+
+fn builtin_modfield_add(_env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    match (&args[0], &args[1]) {
+        (Value::ModFieldElem(a), Value::ModFieldElem(b)) => Ok(Value::ModFieldElem(a.add(b))),
+        _ => Err("modfield_add: requires two ModFieldElem args".to_string()),
+    }
+}
+
+fn builtin_modfield_sub(_env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    match (&args[0], &args[1]) {
+        (Value::ModFieldElem(a), Value::ModFieldElem(b)) => Ok(Value::ModFieldElem(a.sub(b))),
+        _ => Err("modfield_sub: requires two ModFieldElem args".to_string()),
+    }
+}
+
+fn builtin_modfield_mul(_env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    match (&args[0], &args[1]) {
+        (Value::ModFieldElem(a), Value::ModFieldElem(b)) => Ok(Value::ModFieldElem(a.mul(b))),
+        _ => Err("modfield_mul: requires two ModFieldElem args".to_string()),
+    }
+}
+
+fn builtin_modfield_inv(_env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    match &args[0] {
+        Value::ModFieldElem(a) => Ok(Value::ModFieldElem(a.inv())),
+        _ => Err("modfield_inv: requires a ModFieldElem arg".to_string()),
+    }
+}
+
+fn builtin_modfield_pow(_env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err("modfield_pow(elem, exp) requires 2 args".to_string());
+    }
+    let a = match &args[0] {
+        Value::ModFieldElem(a) => a,
+        _ => return Err("modfield_pow: first arg must be ModFieldElem".to_string()),
+    };
+    let exp = match &args[1] {
+        Value::Int(n) => { let v = *n as u64; [v, 0, 0, 0] }
+        Value::String(s) => {
+            let tmp = modmath::ModField::from_hex(s, a.params)
+                .ok_or("modfield_pow: invalid hex exponent")?;
+            tmp.to_normal()
+        }
+        _ => return Err("modfield_pow: second arg must be int or hex string".to_string()),
+    };
+    Ok(Value::ModFieldElem(a.pow(&exp)))
+}
+
+fn builtin_modfield_neg(_env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    match &args[0] {
+        Value::ModFieldElem(a) => Ok(Value::ModFieldElem(a.neg())),
+        _ => Err("modfield_neg: requires a ModFieldElem arg".to_string()),
+    }
+}
+
+fn builtin_modfield_sqrt(_env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    match &args[0] {
+        Value::ModFieldElem(a) => {
+            match a.sqrt() {
+                Some(r) => Ok(Value::ModFieldElem(r)),
+                None => Err("modfield_sqrt: not a quadratic residue".to_string()),
+            }
+        }
+        _ => Err("modfield_sqrt: requires a ModFieldElem arg".to_string()),
+    }
+}
+
+fn builtin_modfield_batch_mul(_env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    if args.len() != 2 { return Err("modfield_batch_mul requires 2 array args".to_string()); }
+    let a_vec = match &args[0] { Value::Array(v) => v, _ => return Err("modfield_batch_mul: first arg must be array".to_string()) };
+    let b_vec = match &args[1] { Value::Array(v) => v, _ => return Err("modfield_batch_mul: second arg must be array".to_string()) };
+    let a: Vec<modmath::ModField> = a_vec.iter().map(|v| match v {
+        Value::ModFieldElem(m) => Ok(m.clone()), _ => Err("modfield_batch_mul: elements must be ModFieldElem".to_string()),
+    }).collect::<Result<_, _>>()?;
+    let b: Vec<modmath::ModField> = b_vec.iter().map(|v| match v {
+        Value::ModFieldElem(m) => Ok(m.clone()), _ => Err("modfield_batch_mul: elements must be ModFieldElem".to_string()),
+    }).collect::<Result<_, _>>()?;
+    let result = modmath::batch_mul(&a, &b);
+    Ok(Value::Array(result.into_iter().map(Value::ModFieldElem).collect()))
+}
+
+fn builtin_modfield_batch_inv(_env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    if args.len() != 1 { return Err("modfield_batch_inv requires 1 array arg".to_string()); }
+    let arr = match &args[0] { Value::Array(v) => v, _ => return Err("modfield_batch_inv: arg must be array".to_string()) };
+    let elems: Vec<modmath::ModField> = arr.iter().map(|v| match v {
+        Value::ModFieldElem(m) => Ok(m.clone()), _ => Err("modfield_batch_inv: elements must be ModFieldElem".to_string()),
+    }).collect::<Result<_, _>>()?;
+    let result = modmath::batch_inv(&elems);
+    Ok(Value::Array(result.into_iter().map(Value::ModFieldElem).collect()))
+}
 
 #[cfg(test)]
 mod interpreter_tests {
