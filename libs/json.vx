@@ -1,0 +1,213 @@
+// Simple JSON Parser/Serializer in Pure Vortex
+// Supports: strings, numbers, booleans, null, arrays, objects
+
+fn skip_whitespace(s: str, pos: int) -> int {
+    var p = pos
+    let n = string_len(s)
+    while p < n {
+        let c = char_at(s, p)
+        if c == " " {
+            p = p + 1
+        } else {
+            if c == "\n" {
+                p = p + 1
+            } else {
+                if c == "\t" {
+                    p = p + 1
+                } else {
+                    return p
+                }
+            }
+        }
+    }
+    return p
+}
+
+// Returns [value, end_position_as_string]
+fn parse_json_string(s: str, pos: int) -> [str] {
+    var p = pos + 1
+    var result = ""
+    let n = string_len(s)
+    while p < n {
+        let c = char_at(s, p)
+        if c == "\"" {
+            return [result, to_string(p + 1)]
+        }
+        result = format("{}{}", result, c)
+        p = p + 1
+    }
+    return [result, to_string(p)]
+}
+
+fn is_digit(c: str) -> bool {
+    if c == "0" { return true }
+    if c == "1" { return true }
+    if c == "2" { return true }
+    if c == "3" { return true }
+    if c == "4" { return true }
+    if c == "5" { return true }
+    if c == "6" { return true }
+    if c == "7" { return true }
+    if c == "8" { return true }
+    if c == "9" { return true }
+    return false
+}
+
+// Returns [number_as_string, end_position_as_string]
+fn parse_json_number(s: str, pos: int) -> [str] {
+    var p = pos
+    var num_str = ""
+    let n = string_len(s)
+    let first = char_at(s, p)
+    if first == "-" {
+        num_str = "-"
+        p = p + 1
+    }
+    while p < n {
+        let c = char_at(s, p)
+        if is_digit(c) {
+            num_str = format("{}{}", num_str, c)
+            p = p + 1
+        } else {
+            return [num_str, to_string(p)]
+        }
+    }
+    return [num_str, to_string(p)]
+}
+
+fn to_json_string(val: str) -> str {
+    return format("\"{}\"", val)
+}
+
+fn to_json_int(val: int) -> str {
+    return to_string(val)
+}
+
+fn to_json_bool(val: bool) -> str {
+    if val {
+        return "true"
+    }
+    return "false"
+}
+
+fn to_json_array(arr: [str]) -> str {
+    let n = len(arr)
+    if n == 0 {
+        return "[]"
+    }
+    var result = "["
+    for i in 0..n {
+        if i > 0 {
+            result = format("{}, ", result)
+        }
+        result = format("{}{}", result, arr[i])
+    }
+    result = format("{}]", result)
+    return result
+}
+
+fn to_json_object(keys: [str], values: [str]) -> str {
+    let n = len(keys)
+    if n == 0 {
+        return "{}"
+    }
+    var result = "{"
+    for i in 0..n {
+        if i > 0 {
+            result = format("{}, ", result)
+        }
+        result = format("{}{}: {}", result, to_json_string(keys[i]), values[i])
+    }
+    result = format("{}}", result)
+    return result
+}
+
+fn main() {
+    println("========================================")
+    println("  Vortex JSON Library Demo")
+    println("========================================")
+    println("")
+
+    // --- 1. Serialize values to JSON ---
+    println("--- JSON Serialization ---")
+    let s = to_json_string("hello world")
+    println(format("  String: {}", s))
+
+    let n = to_json_int(42)
+    println(format("  Number: {}", n))
+
+    let b = to_json_bool(true)
+    println(format("  Boolean: {}", b))
+
+    let arr = to_json_array(["1", "2", "3"])
+    println(format("  Array: {}", arr))
+
+    let obj = to_json_object(["name", "version"], [to_json_string("Vortex"), "1"])
+    println(format("  Object: {}", obj))
+    println("")
+
+    // --- 2. Parse a JSON number ---
+    println("--- JSON Number Parsing ---")
+    let json_num = "12345rest"
+    let parsed_num = parse_json_number(json_num, 0)
+    println(format("  Input: {}", json_num))
+    println(format("  Parsed value: {}", parsed_num[0]))
+    println(format("  End position: {}", parsed_num[1]))
+    assert(parsed_num[0] == "12345", "Number parse failed")
+    println("  Number parse: PASS")
+    println("")
+
+    // --- 3. Parse negative number ---
+    println("--- Negative Number ---")
+    let neg = "-99xyz"
+    let parsed_neg = parse_json_number(neg, 0)
+    println(format("  Input: {}", neg))
+    println(format("  Parsed value: {}", parsed_neg[0]))
+    assert(parsed_neg[0] == "-99", "Negative number parse failed")
+    println("  Negative parse: PASS")
+    println("")
+
+    // --- 4. Skip whitespace ---
+    println("--- Whitespace Handling ---")
+    let ws = "   hello"
+    let after_ws = skip_whitespace(ws, 0)
+    println(format("  Input: '{}', skip result pos: {}", ws, after_ws))
+    assert(after_ws == 3, "Whitespace skip failed")
+    println("  Whitespace skip: PASS")
+    println("")
+
+    // --- 5. Digit detection ---
+    println("--- Digit Detection ---")
+    assert(is_digit("0"), "0 is a digit")
+    assert(is_digit("9"), "9 is a digit")
+    assert(is_digit("a") == false, "a is not a digit")
+    println("  Digit detection: PASS")
+    println("")
+
+    // --- 6. Build a JSON object with hashmap ---
+    println("--- JSON Object via HashMap ---")
+    var hm = hashmap()
+    hm = hashmap_insert(hm, "name", to_json_string("Vortex"))
+    hm = hashmap_insert(hm, "version", to_json_int(1))
+    hm = hashmap_insert(hm, "gpu", to_json_bool(true))
+    let name_val = hashmap_get(hm, "name")
+    println(format("  name = {}", name_val))
+    let ver_val = hashmap_get(hm, "version")
+    println(format("  version = {}", ver_val))
+    let gpu_val = hashmap_get(hm, "gpu")
+    println(format("  gpu = {}", gpu_val))
+    println("")
+
+    // --- 7. Complex object serialization ---
+    println("--- Complex Serialization ---")
+    let nested_arr = to_json_array([to_json_int(1), to_json_int(2), to_json_array([to_json_int(3), to_json_int(4)])])
+    println(format("  Nested array: {}", nested_arr))
+
+    let person = to_json_object(["name", "age", "active"], [to_json_string("Alice"), to_json_int(30), to_json_bool(true)])
+    println(format("  Person object: {}", person))
+    println("")
+
+    println("========================================")
+    println("  JSON library demo complete!")
+    println("========================================")
+}

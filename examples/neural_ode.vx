@@ -1,0 +1,94 @@
+// Liquid Neural Network / Neural ODE Demo
+// Demonstrates ODE-based continuous-time neural networks with Euler, RK4,
+// and CfC (Closed-form Continuous-time) approximations.
+
+fn abs_f(x: f64) -> f64 {
+    if x < 0.0 {
+        return -x
+    }
+    return x
+}
+
+fn main() {
+    println("========================================")
+    println("  Liquid Neural Network / Neural ODE")
+    println("========================================")
+    println("")
+
+    // Network parameters
+    let n_hidden = 2
+    let n_input = 2
+
+    // Initial hidden state
+    let h0 = [0.0, 0.0]
+
+    // Input signal (simulating a time series sample)
+    let x = [1.0, 0.5]
+
+    // Weight matrices (flattened): w_h is n_hidden x n_hidden, w_x is n_hidden x n_input
+    // w_h: [[0.1, -0.2], [0.3, 0.1]]
+    let w_h = [0.1, -0.2, 0.3, 0.1]
+    // w_x: [[0.5, 0.3], [0.2, 0.4]]
+    let w_x = [0.5, 0.3, 0.2, 0.4]
+
+    // Time constants (tau) for each hidden unit
+    let tau = [1.0, 1.5]
+
+    // --- 1. Single liquid cell step ---
+    println("--- Liquid Cell (single step) ---")
+    let dh = liquid_cell(h0, x, w_h, w_x, tau, n_hidden, n_input)
+    println(format("  dh/dt at t=0: [{}, {}]", dh[0], dh[1]))
+    println("")
+
+    // --- 2. Euler ODE solver ---
+    println("--- Euler Integration (100 steps, t=0..1) ---")
+    let euler_result = ode_solve_euler(h0, 0.0, 1.0, 100, h0, x, w_h, w_x, tau, n_hidden, n_input)
+    println(format("  h_euler(1.0) = [{}, {}]", euler_result[0], euler_result[1]))
+    println("")
+
+    // --- 3. RK4 ODE solver ---
+    println("--- RK4 Integration (100 steps, t=0..1) ---")
+    let rk4_result = ode_solve_rk4(h0, 0.0, 1.0, 100, h0, x, w_h, w_x, tau, n_hidden, n_input)
+    println(format("  h_rk4(1.0)   = [{}, {}]", rk4_result[0], rk4_result[1]))
+    println("")
+
+    // --- 4. Compare Euler vs RK4 ---
+    println("--- Euler vs RK4 Comparison ---")
+    let diff0 = abs_f(euler_result[0] - rk4_result[0])
+    let diff1 = abs_f(euler_result[1] - rk4_result[1])
+    println(format("  |euler - rk4| unit 0: {}", diff0))
+    println(format("  |euler - rk4| unit 1: {}", diff1))
+    println("  (RK4 is more accurate; small difference expected)")
+    println("")
+
+    // --- 5. CfC (Closed-form Continuous-time) ---
+    println("--- CfC Approximation (dt=1.0) ---")
+    let cfc_result = cfc_cell(h0, x, w_h, w_x, tau, 1.0, n_hidden, n_input)
+    println(format("  h_cfc(1.0)   = [{}, {}]", cfc_result[0], cfc_result[1]))
+    println("")
+
+    // --- 6. Validate CfC vs ODE ---
+    println("--- CfC vs RK4 Validation ---")
+    let cfc_diff0 = abs_f(cfc_result[0] - rk4_result[0])
+    let cfc_diff1 = abs_f(cfc_result[1] - rk4_result[1])
+    println(format("  |cfc - rk4| unit 0: {}", cfc_diff0))
+    println(format("  |cfc - rk4| unit 1: {}", cfc_diff1))
+    // CfC is an approximation, so differences may be moderate
+    println("  CfC is a closed-form approximation (moderate error expected)")
+    println("")
+
+    // --- 7. Time series simulation ---
+    println("--- Time Series Processing ---")
+    let inputs = [[1.0, 0.5], [0.8, 0.3], [-0.2, 0.9], [0.5, -0.4], [0.1, 0.1]]
+    var h = [0.0, 0.0]
+    for i in 0..5 {
+        let xi = inputs[i]
+        h = cfc_cell(h, xi, w_h, w_x, tau, 0.1, n_hidden, n_input)
+        println(format("  t={}: input=[{}, {}] -> h=[{}, {}]", i, xi[0], xi[1], h[0], h[1]))
+    }
+    println("")
+
+    println("========================================")
+    println("  Neural ODE demo complete!")
+    println("========================================")
+}

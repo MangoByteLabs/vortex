@@ -1,0 +1,238 @@
+// Matrix Math Library in Pure Vortex
+// Represents matrices as structs with flat data array and shape.
+
+struct Mat {
+    data: [f64],
+    rows: int,
+    cols: int,
+}
+
+fn mat_new(data: [f64], rows: int, cols: int) -> Mat {
+    assert(len(data) == rows * cols, "mat_new: data length must equal rows*cols")
+    return Mat { data: data, rows: rows, cols: cols }
+}
+
+fn mat_zeros(rows: int, cols: int) -> Mat {
+    var data = []
+    for i in 0..rows * cols {
+        data = push(data, 0.0)
+    }
+    return Mat { data: data, rows: rows, cols: cols }
+}
+
+fn mat_eye(n: int) -> Mat {
+    var data = []
+    for i in 0..n {
+        for j in 0..n {
+            if i == j {
+                data = push(data, 1.0)
+            } else {
+                data = push(data, 0.0)
+            }
+        }
+    }
+    return Mat { data: data, rows: n, cols: n }
+}
+
+fn mat_get(m: Mat, r: int, c: int) -> f64 {
+    return m.data[r * m.cols + c]
+}
+
+fn mat_add(a: Mat, b: Mat) -> Mat {
+    assert(a.rows == b.rows, "mat_add: row mismatch")
+    assert(a.cols == b.cols, "mat_add: col mismatch")
+    var data = []
+    let n = a.rows * a.cols
+    for i in 0..n {
+        data = push(data, a.data[i] + b.data[i])
+    }
+    return Mat { data: data, rows: a.rows, cols: a.cols }
+}
+
+fn mat_mul(a: Mat, b: Mat) -> Mat {
+    assert(a.cols == b.rows, "mat_mul: inner dimensions must match")
+    var data = []
+    for i in 0..a.rows {
+        for j in 0..b.cols {
+            var sum = 0.0
+            for k in 0..a.cols {
+                sum = sum + a.data[i * a.cols + k] * b.data[k * b.cols + j]
+            }
+            data = push(data, sum)
+        }
+    }
+    return Mat { data: data, rows: a.rows, cols: b.cols }
+}
+
+fn mat_transpose(m: Mat) -> Mat {
+    var data = []
+    for j in 0..m.cols {
+        for i in 0..m.rows {
+            data = push(data, m.data[i * m.cols + j])
+        }
+    }
+    return Mat { data: data, rows: m.cols, cols: m.rows }
+}
+
+fn mat_trace(m: Mat) -> f64 {
+    assert(m.rows == m.cols, "mat_trace: must be square")
+    var t = 0.0
+    for i in 0..m.rows {
+        t = t + m.data[i * m.cols + i]
+    }
+    return t
+}
+
+fn mat_det2(m: Mat) -> f64 {
+    assert(m.rows == 2, "mat_det2: must be 2x2")
+    assert(m.cols == 2, "mat_det2: must be 2x2")
+    return m.data[0] * m.data[3] - m.data[1] * m.data[2]
+}
+
+fn mat_det3(m: Mat) -> f64 {
+    assert(m.rows == 3, "mat_det3: must be 3x3")
+    assert(m.cols == 3, "mat_det3: must be 3x3")
+    let d = m.data
+    let a = d[0] * (d[4] * d[8] - d[5] * d[7])
+    let b = d[1] * (d[3] * d[8] - d[5] * d[6])
+    let c = d[2] * (d[3] * d[7] - d[4] * d[6])
+    return a - b + c
+}
+
+fn mat_inv2(m: Mat) -> Mat {
+    let det = mat_det2(m)
+    assert(det != 0.0, "mat_inv2: singular matrix")
+    let d = m.data
+    let inv_det = 1.0 / det
+    let data = [d[3] * inv_det, -d[1] * inv_det, -d[2] * inv_det, d[0] * inv_det]
+    return Mat { data: data, rows: 2, cols: 2 }
+}
+
+fn mat_norm(m: Mat) -> f64 {
+    var sum = 0.0
+    let n = len(m.data)
+    for i in 0..n {
+        sum = sum + m.data[i] * m.data[i]
+    }
+    // Approximate sqrt via Newton's method
+    var guess = sum / 2.0
+    if guess == 0.0 {
+        return 0.0
+    }
+    for i in 0..20 {
+        guess = (guess + sum / guess) / 2.0
+    }
+    return guess
+}
+
+fn mat_print(label: str, m: Mat) {
+    println(format("  {} ({}x{}):", label, m.rows, m.cols))
+    for i in 0..m.rows {
+        var row_str = "    ["
+        for j in 0..m.cols {
+            if j > 0 {
+                row_str = format("{}, ", row_str)
+            }
+            row_str = format("{}{}", row_str, m.data[i * m.cols + j])
+        }
+        println(format("{}]", row_str))
+    }
+}
+
+fn abs_f(x: f64) -> f64 {
+    if x < 0.0 { return -x }
+    return x
+}
+
+fn main() {
+    println("========================================")
+    println("  Vortex Matrix Library")
+    println("========================================")
+    println("")
+
+    // --- 1. Create matrices ---
+    println("--- Matrix Creation ---")
+    let a = mat_new([1.0, 2.0, 3.0, 4.0], 2, 2)
+    mat_print("A", a)
+
+    let eye = mat_eye(3)
+    mat_print("I_3", eye)
+
+    let z = mat_zeros(2, 3)
+    mat_print("Zeros", z)
+    println("")
+
+    // --- 2. Matrix addition ---
+    println("--- Matrix Addition ---")
+    let b = mat_new([5.0, 6.0, 7.0, 8.0], 2, 2)
+    let s = mat_add(a, b)
+    mat_print("A + B", s)
+    assert(mat_get(s, 0, 0) == 6.0, "Addition failed")
+    println("  Addition: PASS")
+    println("")
+
+    // --- 3. Matrix multiplication ---
+    println("--- Matrix Multiplication ---")
+    let prod = mat_mul(a, b)
+    mat_print("A * B", prod)
+    // [1,2;3,4] * [5,6;7,8] = [19,22;43,50]
+    assert(mat_get(prod, 0, 0) == 19.0, "Mul [0,0] failed")
+    assert(mat_get(prod, 1, 1) == 50.0, "Mul [1,1] failed")
+    println("  Multiplication: PASS")
+    println("")
+
+    // --- 4. Transpose ---
+    println("--- Transpose ---")
+    let c = mat_new([1.0, 2.0, 3.0, 4.0, 5.0, 6.0], 2, 3)
+    let ct = mat_transpose(c)
+    mat_print("C", c)
+    mat_print("C^T", ct)
+    assert(mat_get(ct, 0, 0) == 1.0, "Transpose failed")
+    assert(mat_get(ct, 2, 1) == 6.0, "Transpose failed")
+    println("  Transpose: PASS")
+    println("")
+
+    // --- 5. Determinant ---
+    println("--- Determinant ---")
+    let det2 = mat_det2(a)
+    println(format("  det(A) = {} (expected -2)", det2))
+    assert(det2 == -2.0, "det2 failed")
+
+    let m3 = mat_new([1.0, 2.0, 3.0, 0.0, 1.0, 4.0, 5.0, 6.0, 0.0], 3, 3)
+    let det3 = mat_det3(m3)
+    println(format("  det(3x3) = {} (expected 1)", det3))
+    assert(det3 == 1.0, "det3 failed")
+    println("  Determinant: PASS")
+    println("")
+
+    // --- 6. Inverse ---
+    println("--- 2x2 Inverse ---")
+    let a_inv = mat_inv2(a)
+    mat_print("A^-1", a_inv)
+    let identity_check = mat_mul(a, a_inv)
+    mat_print("A * A^-1", identity_check)
+    assert(abs_f(mat_get(identity_check, 0, 0) - 1.0) < 0.0001, "Inverse check [0,0]")
+    assert(abs_f(mat_get(identity_check, 1, 1) - 1.0) < 0.0001, "Inverse check [1,1]")
+    println("  Inverse: PASS")
+    println("")
+
+    // --- 7. Trace ---
+    println("--- Trace ---")
+    let tr = mat_trace(a)
+    println(format("  trace(A) = {} (expected 5)", tr))
+    assert(tr == 5.0, "Trace failed")
+    println("  Trace: PASS")
+    println("")
+
+    // --- 8. Frobenius Norm ---
+    println("--- Frobenius Norm ---")
+    let norm = mat_norm(a)
+    println(format("  ||A||_F = {} (expected ~5.477)", norm))
+    assert(abs_f(norm - 5.477) < 0.01, "Norm check")
+    println("  Norm: PASS")
+    println("")
+
+    println("========================================")
+    println("  All matrix tests passed!")
+    println("========================================")
+}

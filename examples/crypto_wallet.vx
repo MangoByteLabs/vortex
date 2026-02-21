@@ -1,0 +1,92 @@
+// Vortex Crypto Wallet
+// Demonstrates keypair generation, ECDSA signing/verification,
+// Schnorr signing/verification, and Pedersen commitments.
+
+fn main() {
+    println("========================================")
+    println("  Vortex Crypto Wallet Demo")
+    println("========================================")
+    println("")
+
+    // --- 1. Generate keypair ---
+    println("--- Key Generation ---")
+    let privkey_hex = "DEADBEEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEFDEADBEEF"
+    let sk = bigint_from_hex(privkey_hex)
+    let G = secp256k1_generator()
+    let pubkey = scalar_mul(sk, G)
+    let pub_x = point_x(pubkey)
+    let pub_y = point_y(pubkey)
+    println(format("  Private key: {}", to_hex(sk)))
+    println(format("  Public key X: {}", to_hex(pub_x)))
+    println(format("  Public key Y: {}", to_hex(pub_y)))
+    println("")
+
+    // --- 2. ECDSA sign and verify ---
+    println("--- ECDSA Signature ---")
+    let message = "Hello from Vortex wallet!"
+    let ecdsa_sig = ecdsa_sign(privkey_hex, message)
+    println(format("  Message: {}", message))
+    println(format("  Signature r: {}", ecdsa_sig.r))
+    println(format("  Signature s: {}", ecdsa_sig.s))
+
+    let ecdsa_valid = ecdsa_verify(pubkey, message, ecdsa_sig)
+    println(format("  Verification: {}", ecdsa_valid))
+    assert(ecdsa_valid, "ECDSA verification failed!")
+    println("  ECDSA: PASS")
+    println("")
+
+    // --- 3. Schnorr sign and verify ---
+    println("--- Schnorr Signature (BIP-340) ---")
+    let schnorr_msg = "Schnorr signing with Vortex"
+    let schnorr_sig = schnorr_sign(privkey_hex, schnorr_msg)
+    println(format("  Message: {}", schnorr_msg))
+    println(format("  Signature rx: {}", schnorr_sig.rx))
+    println(format("  Signature s: {}", schnorr_sig.s))
+
+    let schnorr_valid = schnorr_verify(to_hex(pub_x), schnorr_msg, schnorr_sig)
+    println(format("  Verification: {}", schnorr_valid))
+    assert(schnorr_valid, "Schnorr verification failed!")
+    println("  Schnorr: PASS")
+    println("")
+
+    // --- 4. Pedersen commitment ---
+    println("--- Pedersen Commitment ---")
+    // Pedersen commitment: C = v*G + r*H where H = hash_to_curve(G)
+    // We approximate H by using a different scalar mul of G
+    let v_hex = "42"
+    let r_hex = "CAFEBABE"
+    let v = bigint_from_hex(v_hex)
+    let r = bigint_from_hex(r_hex)
+    let vG = scalar_mul(v, G)
+    // Use 2*G as a stand-in for H (a nothing-up-my-sleeve second generator)
+    let H = scalar_mul(bigint_from_hex("2"), G)
+    let rH = scalar_mul(r, H)
+    let commitment = point_add(vG, rH)
+    let cx = to_hex(point_x(commitment))
+    let cy = to_hex(point_y(commitment))
+    println(format("  Value: {}", v_hex))
+    println(format("  Blinding factor: {}", r_hex))
+    println(format("  Commitment X: {}", cx))
+    println(format("  Commitment Y: {}", cy))
+
+    // Verify commitment by recomputing
+    let vG2 = scalar_mul(v, G)
+    let rH2 = scalar_mul(r, H)
+    let check = point_add(vG2, rH2)
+    let check_x = to_hex(point_x(check))
+    assert(check_x == cx, "Pedersen commitment verification failed!")
+    println("  Pedersen commitment: PASS")
+    println("")
+
+    // --- 5. Hash a transaction ---
+    println("--- Transaction Hash ---")
+    let tx_data = format("send:{}:to:{}:amount:42", to_hex(pub_x), "recipient_address")
+    let tx_hash = sha256(tx_data)
+    println(format("  TX data: {}", tx_data))
+    println(format("  TX hash: {}", tx_hash))
+    println("")
+
+    println("========================================")
+    println("  All wallet operations passed!")
+    println("========================================")
+}

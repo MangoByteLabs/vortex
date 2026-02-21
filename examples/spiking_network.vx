@@ -1,0 +1,107 @@
+// Spiking Neural Network Demo
+// Demonstrates spike train generation, LIF (Leaky Integrate-and-Fire) layers,
+// spike overlap scoring, and sparsity analysis.
+
+fn main() {
+    println("========================================")
+    println("  Spiking Neural Network Demo")
+    println("========================================")
+    println("")
+
+    let timesteps = 10
+    let n_in = 4
+    let n_out = 3
+
+    // --- 1. Create spike trains from dense data ---
+    println("--- Create Spike Trains from Input Data ---")
+    // Dense input: timesteps * neurons values, threshold determines spikes
+    var dense_data = []
+    for i in 0..40 {
+        // Create a pattern: alternating high/low values
+        if i % 3 == 0 {
+            dense_data = push(dense_data, 0.8)
+        } else {
+            if i % 3 == 1 {
+                dense_data = push(dense_data, 0.2)
+            } else {
+                dense_data = push(dense_data, 0.6)
+            }
+        }
+    }
+    let spikes_in = spike_from_dense(dense_data, timesteps, n_in, 0.5)
+    println(format("  Input spike train: {} timesteps, {} neurons", timesteps, n_in))
+    let dense_out = spike_to_dense(spikes_in)
+    println(format("  Spike pattern (flat): {} values", len(dense_out)))
+    println("")
+
+    // --- 2. Define LIF layer weights ---
+    println("--- LIF Layer (Leaky Integrate-and-Fire) ---")
+    // Weights: n_in * n_out = 4 * 3 = 12
+    let weights = [0.5, 0.3, 0.1, 0.2, 0.4, 0.6, 0.3, 0.1, 0.5, 0.4, 0.2, 0.3]
+    let threshold = 1.0
+    let tau = 0.9
+
+    let spikes_out = lif_layer(spikes_in, weights, n_in, n_out, threshold, tau)
+    println(format("  Output spike train: {} timesteps, {} neurons", timesteps, n_out))
+    let dense_output = spike_to_dense(spikes_out)
+    println(format("  Output pattern (flat): {} values", len(dense_output)))
+    println("")
+
+    // --- 3. Spike overlap ---
+    println("--- Spike Overlap Score ---")
+    // Create a second spike train for comparison
+    var dense_data2 = []
+    for i in 0..40 {
+        if i % 2 == 0 {
+            dense_data2 = push(dense_data2, 0.7)
+        } else {
+            dense_data2 = push(dense_data2, 0.3)
+        }
+    }
+    let spikes2 = spike_from_dense(dense_data2, timesteps, n_in, 0.5)
+    let overlap = spike_overlap(spikes_in, spikes2)
+    println(format("  Overlap between train1 and train2: {}", overlap))
+    println("")
+
+    // --- 4. Self-overlap (should be maximal) ---
+    println("--- Self-Overlap (sanity check) ---")
+    let self_overlap = spike_overlap(spikes_in, spikes_in)
+    println(format("  Self-overlap of train1: {}", self_overlap))
+    assert(self_overlap >= overlap, "Self-overlap should be >= cross-overlap")
+    println("  Self-overlap >= cross-overlap: PASS")
+    println("")
+
+    // --- 5. Sparsity statistics ---
+    println("--- Sparsity Statistics ---")
+    let out_dense = spike_to_dense(spikes_out)
+    let total = len(out_dense)
+    var spike_count = 0
+    for i in 0..total {
+        if out_dense[i] > 0.5 {
+            spike_count = spike_count + 1
+        }
+    }
+    let sparsity_pct = 100 - (spike_count * 100 / total)
+    println(format("  Output spikes: {}/{} active", spike_count, total))
+    println(format("  Sparsity: ~{}%", sparsity_pct))
+    println("")
+
+    // --- 6. Second LIF layer (deeper network) ---
+    println("--- Second LIF Layer ---")
+    let weights2 = [0.4, 0.2, 0.3, 0.5, 0.1, 0.6, 0.2, 0.4, 0.3]
+    let spikes_deep = lif_layer(spikes_out, weights2, n_out, n_out, threshold, tau)
+    let deep_dense = spike_to_dense(spikes_deep)
+    var deep_count = 0
+    let deep_total = len(deep_dense)
+    for i in 0..deep_total {
+        if deep_dense[i] > 0.5 {
+            deep_count = deep_count + 1
+        }
+    }
+    println(format("  Deep layer spikes: {}/{} active", deep_count, deep_total))
+    println("")
+
+    println("========================================")
+    println("  Spiking network demo complete!")
+    println("========================================")
+}

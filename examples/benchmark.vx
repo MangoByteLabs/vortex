@@ -1,0 +1,93 @@
+// Vortex Benchmark Suite
+// Tests performance of key operations across field arithmetic, polynomials,
+// hashing, elliptic curves, and array higher-order functions.
+
+fn bench_field_arithmetic() {
+    println("--- Benchmark: Field Arithmetic (1000 multiplications) ---")
+    let p = field_prime("secp256k1")
+    var a = field_new(12345, p)
+    let b = field_new(67890, p)
+    for i in 0..1000 {
+        a = field_mul(a, b)
+    }
+    println(format("  Result after 1000 muls: {}", a))
+    println("  [DONE]")
+}
+
+fn bench_poly_mul() {
+    println("--- Benchmark: Polynomial Multiplication ---")
+    let a = [1, 2, 3, 4, 5, 6, 7, 8]
+    let b = [8, 7, 6, 5, 4, 3, 2, 1]
+    var result = [0]
+    for i in 0..100 {
+        result = poly_mul(a, b)
+    }
+    let n = len(result)
+    println(format("  100 poly_mul(deg-7 x deg-7): result has {} coefficients", n))
+    println("  [DONE]")
+}
+
+fn bench_sha256() {
+    println("--- Benchmark: SHA-256 Hashing ---")
+    var hash = "hello world"
+    for i in 0..100 {
+        hash = sha256(hash)
+    }
+    println(format("  100 chained SHA-256 hashes, final: {}", hash))
+    println("  [DONE]")
+}
+
+fn bench_ec_ops() {
+    println("--- Benchmark: EC Point Operations ---")
+    let G = secp256k1_generator()
+    var P = G
+    for i in 0..50 {
+        P = point_add(P, G)
+    }
+    let x = to_hex(point_x(P))
+    println(format("  50 point additions, final X: {}", substr(x, 0, 20)))
+    println("  [DONE]")
+}
+
+fn bench_array_ops() {
+    println("--- Benchmark: Array Higher-Order Functions ---")
+    var arr = []
+    for i in 0..200 {
+        arr = push(arr, i)
+    }
+
+    // map: square each element
+    let squared = map(arr, |x| x * x)
+    println(format("  map(200 elems): first={}, last={}", squared[0], squared[199]))
+
+    // filter: keep evens
+    let evens = filter(arr, |x| x % 2 == 0)
+    println(format("  filter(evens): {} elements", len(evens)))
+
+    // fold: sum
+    let total = fold(arr, 0, |acc, x| acc + x)
+    println(format("  fold(sum): {}", total))
+    println("  [DONE]")
+}
+
+fn main() {
+    println("========================================")
+    println("  Vortex Benchmark Suite")
+    println("========================================")
+    println("")
+
+    bench_field_arithmetic()
+    println("")
+    bench_poly_mul()
+    println("")
+    bench_sha256()
+    println("")
+    bench_ec_ops()
+    println("")
+    bench_array_ops()
+
+    println("")
+    println("========================================")
+    println("  All benchmarks complete!")
+    println("========================================")
+}

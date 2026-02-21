@@ -1,0 +1,107 @@
+// Forward-Forward Algorithm Demo
+// Implements Hinton's Forward-Forward algorithm for local learning
+// without backpropagation.
+
+fn relu_forward(input: [f64], weights: [f64], bias: [f64], n_in: int, n_out: int) -> [f64] {
+    var act = []
+    for j in 0..n_out {
+        var sum = bias[j]
+        for i in 0..n_in {
+            sum = sum + input[i] * weights[j * n_in + i]
+        }
+        if sum < 0.0 {
+            sum = 0.0
+        }
+        act = push(act, sum)
+    }
+    return act
+}
+
+fn main() {
+    println("========================================")
+    println("  Forward-Forward Algorithm Demo")
+    println("========================================")
+    println("")
+
+    let n_in = 4
+    let n_hidden = 3
+    let lr = 0.01
+    let threshold = 2.0
+
+    // --- 1. Create positive and negative data ---
+    println("--- Data Preparation ---")
+    let pos_data = [1.0, 0.5, 0.8, 0.3]
+    let neg_data = [0.1, 0.9, 0.2, 0.7]
+    println(format("  Positive input: [{}, {}, {}, {}]", pos_data[0], pos_data[1], pos_data[2], pos_data[3]))
+    println(format("  Negative input: [{}, {}, {}, {}]", neg_data[0], neg_data[1], neg_data[2], neg_data[3]))
+    println("")
+
+    // --- 2. Initialize weights ---
+    println("--- Initial Weights ---")
+    var weights = [0.1, 0.2, -0.1, 0.3, -0.2, 0.1, 0.2, -0.3, 0.1, -0.1, 0.2, 0.3]
+    var bias = [0.0, 0.0, 0.0]
+    println(format("  Weights count: {}", len(weights)))
+    println("")
+
+    // --- 3. Compute initial goodness ---
+    println("--- Initial Goodness (before training) ---")
+    let pos_act_init = relu_forward(pos_data, weights, bias, n_in, n_hidden)
+    let pos_good_init = goodness(pos_act_init)
+
+    let neg_act_init = relu_forward(neg_data, weights, bias, n_in, n_hidden)
+    let neg_good_init = goodness(neg_act_init)
+
+    println(format("  Positive goodness: {}", pos_good_init))
+    println(format("  Negative goodness: {}", neg_good_init))
+    println("")
+
+    // --- 4. Train with FF layer ---
+    println("--- Training (10 epochs) ---")
+    for epoch in 0..10 {
+        // ff_layer updates weights internally and returns (pos_act, neg_act) tuple
+        // We call it for the side effect of training, then measure goodness separately
+        ff_layer(pos_data, neg_data, weights, bias, n_in, n_hidden, lr, threshold)
+
+        // Measure goodness with current weights
+        let pa = relu_forward(pos_data, weights, bias, n_in, n_hidden)
+        let na = relu_forward(neg_data, weights, bias, n_in, n_hidden)
+        let pg = goodness(pa)
+        let ng = goodness(na)
+        if epoch % 3 == 0 {
+            println(format("  Epoch {}: pos_goodness={}, neg_goodness={}", epoch, pg, ng))
+        }
+    }
+    println("")
+
+    // --- 5. Hebbian learning ---
+    println("--- Hebbian Update ---")
+    let pre = [1.0, 0.5, 0.8, 0.3]
+    let post = [0.6, 0.4, 0.7]
+    let hebb_weights = hebbian_update(pre, post, weights, n_in, n_hidden, 0.01)
+    println(format("  Updated weights[0]: {}", hebb_weights[0]))
+    println(format("  Updated weights[5]: {}", hebb_weights[5]))
+    println("")
+
+    // --- 6. Final goodness after Hebbian update ---
+    println("--- Post-Hebbian Goodness ---")
+    let pos_act_final = relu_forward(pos_data, hebb_weights, bias, n_in, n_hidden)
+    let pos_good_final = goodness(pos_act_final)
+
+    let neg_act_final = relu_forward(neg_data, hebb_weights, bias, n_in, n_hidden)
+    let neg_good_final = goodness(neg_act_final)
+
+    println(format("  Positive goodness (final): {}", pos_good_final))
+    println(format("  Negative goodness (final): {}", neg_good_final))
+    println("")
+
+    // --- 7. Validate ---
+    println("--- Validation ---")
+    let pos_improved = pos_good_final > pos_good_init
+    println(format("  Positive goodness improved: {}", pos_improved))
+    println("  (Hebbian learning strengthens correlated activations)")
+    println("")
+
+    println("========================================")
+    println("  Forward-Forward demo complete!")
+    println("========================================")
+}
