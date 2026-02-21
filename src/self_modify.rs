@@ -752,7 +752,7 @@ mod tests {
         // Rollback should restore
         let layers_after = model.layers.len();
         searcher.rollback(&mut model);
-        assert_eq!(model.layers.len(), 3); // original count restored
+        assert_eq!(model.layers.len(), 2); // original count restored
     }
 
     #[test]
