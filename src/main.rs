@@ -1,4 +1,5 @@
 mod ast;
+mod bytecarry;
 mod autodiff;
 mod codegen;
 mod ctcheck;
