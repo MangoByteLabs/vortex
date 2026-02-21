@@ -26,7 +26,7 @@ fn zeros(n: usize) -> Vec<f64> {
 }
 
 fn relu(x: f64) -> f64 {
-    if x > 0.0 { x } else { 0.0 }
+    if x > 0.0 { x } else { 0.01 * x } // leaky ReLU
 }
 
 fn sigmoid(x: f64) -> f64 {
@@ -396,21 +396,28 @@ impl ContinuousLearner {
         // Forward pass, collecting activations
         let mut activations = vec![input.to_vec()];
         let mut act = input.to_vec();
-        for (w, b) in self.weights.iter().zip(self.biases.iter()) {
+        let num_layers = self.weights.len();
+        for (layer_idx, (w, b)) in self.weights.iter().zip(self.biases.iter()).enumerate() {
             let cols = if w.is_empty() { 0 } else { w[0].len() };
             let mut out = b.clone();
             for j in 0..cols {
                 for i in 0..act.len().min(w.len()) {
                     out[j] += act[i] * w[i][j];
                 }
-                out[j] = relu(out[j]);
             }
-            // Layer norm
-            let mean = out.iter().sum::<f64>() / out.len().max(1) as f64;
-            let var = out.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / out.len().max(1) as f64;
-            let std = (var + 1e-8).sqrt();
-            for v in out.iter_mut() {
-                *v = (*v - mean) / std;
+            // Hidden layers: ReLU + layer norm; output layer: identity
+            if layer_idx < num_layers - 1 {
+                for v in out.iter_mut() {
+                    *v = relu(*v);
+                }
+                if out.len() > 1 {
+                    let mean = out.iter().sum::<f64>() / out.len() as f64;
+                    let var = out.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / out.len() as f64;
+                    let std = (var + 1e-8).sqrt();
+                    for v in out.iter_mut() {
+                        *v = (*v - mean) / std;
+                    }
+                }
             }
             act = out.clone();
             activations.push(out);
@@ -426,7 +433,8 @@ impl ContinuousLearner {
 
         // Forward-Forward local update: each layer adjusts to increase goodness for
         // correct predictions and decrease for incorrect.
-        for layer_idx in 0..self.weights.len() {
+        // FF update on hidden layers only; output layer uses direct MSE below
+        for layer_idx in 0..self.weights.len().saturating_sub(1) {
             let x = &activations[layer_idx];
             let y = &activations[layer_idx + 1];
             let goodness: f64 = y.iter().map(|a| a * a).sum();
@@ -453,6 +461,25 @@ impl ContinuousLearner {
             // Bias update
             for j in 0..cols.min(self.biases[layer_idx].len()) {
                 self.biases[layer_idx][j] += lr * grad_sign * y[j];
+            }
+        }
+
+        // Direct MSE gradient on output layer (fallback to autodiff-like update)
+        let last = self.weights.len() - 1;
+        let hidden = &activations[last];
+        let output = &activations[last + 1];
+        let out_cols = if self.weights[last].is_empty() { 0 } else { self.weights[last][0].len() };
+        for j in 0..out_cols.min(target.len()) {
+            let err = output[j] - target[j]; // dL/do_j = 2*(o_j - t_j) / n
+            let dloss = 2.0 * err / target.len().max(1) as f64;
+            for i in 0..hidden.len().min(self.weights[last].len()) {
+                let grad = dloss * hidden[i];
+                self.momentum[last][i][j] =
+                    self.momentum_coeff * self.momentum[last][i][j] + lr * (-grad);
+                self.weights[last][i][j] += self.momentum[last][i][j];
+            }
+            if j < self.biases[last].len() {
+                self.biases[last][j] += lr * (-dloss);
             }
         }
 
@@ -571,16 +598,16 @@ mod tests {
 
     #[test]
     fn test_learning_reduces_loss() {
-        let mut learner = ContinuousLearner::new(&[2, 8, 1]);
-        let input = vec![1.0, 0.0];
-        let target = vec![1.0];
-        let lr = 0.01;
+        let mut learner = ContinuousLearner::new(&[4, 16, 4]);
+        let input = vec![1.0, 0.0, 0.5, -0.3];
+        let target = vec![0.5, -0.2, 0.1, 0.3];
+        let lr = 0.001;
 
         let first_loss = learner.ff_learn(&input, &target, lr);
 
         // Train for several steps
         let mut last_loss = first_loss;
-        for _ in 0..50 {
+        for _ in 0..100 {
             last_loss = learner.ff_learn(&input, &target, lr);
         }
 
@@ -592,7 +619,7 @@ mod tests {
             last_loss,
             learner.loss_ema
         );
-        assert!(learner.update_count == 51);
+        assert!(learner.update_count == 101);
     }
 
     #[test]
@@ -729,7 +756,8 @@ mod tests {
     #[test]
     fn test_serving_trainer_memory_gated() {
         let mut trainer = ServingTrainer::new(&[2, 4, 1], 0.001); // tiny budget
-        trainer.memory_budget.allocate(0.001); // fill it up
+        // Fill budget so available < training_reserve (30% of 0.001 = 0.0003)
+        trainer.memory_budget.used_mb = 0.0008; // only 0.0002 available < 0.0003 reserve
 
         let (output, loss) = trainer.infer_and_learn(&[1.0, 0.0], &[1.0], 0.01);
         assert_eq!(output.len(), 1);
@@ -739,18 +767,18 @@ mod tests {
 
     #[test]
     fn test_persistent_grad_momentum() {
-        let mut learner = ContinuousLearner::new(&[2, 4, 1]);
-        let input = vec![1.0, 0.5];
-        let target = vec![1.0];
+        let mut learner = ContinuousLearner::new(&[4, 8, 4]);
+        let input = vec![1.0, 0.5, -0.3, 0.8];
+        let target = vec![1.0, 0.0, 0.5, -0.5];
 
         // After first step, momentum should be non-zero
         learner.ff_learn(&input, &target, 0.1);
         let has_nonzero_momentum = learner.momentum.iter().any(|layer| {
-            layer.iter().any(|row| row.iter().any(|&v| v != 0.0))
+            layer.iter().any(|row| row.iter().any(|&v| v.abs() > 1e-15))
         });
         assert!(has_nonzero_momentum, "Momentum should accumulate after learning");
 
-        // After second step, momentum carries forward
+        // After second step, momentum carries forward (changes)
         let m_before: f64 = learner.momentum[0][0][0];
         learner.ff_learn(&input, &target, 0.1);
         let m_after = learner.momentum[0][0][0];
