@@ -62,6 +62,10 @@ pub enum Value {
     HashMap(std::collections::HashMap<String, Value>),
     /// Return signal (used internally)
     Return(Box<Value>),
+    /// Break signal (used internally for loop control flow)
+    Break,
+    /// Continue signal (used internally for loop control flow)
+    Continue,
 }
 
 impl fmt::Display for Value {
@@ -130,6 +134,8 @@ impl fmt::Display for Value {
                 write!(f, "}}")
             }
             Value::Return(v) => write!(f, "{}", v),
+            Value::Break => write!(f, "<break>"),
+            Value::Continue => write!(f, "<continue>"),
         }
     }
 }
@@ -1602,8 +1608,9 @@ pub fn interpret(program: &Program) -> Result<Vec<String>, String> {
 fn eval_block(env: &mut Env, block: &Block) -> Result<Value, String> {
     for stmt in &block.stmts {
         let val = eval_stmt(env, stmt)?;
-        if let Value::Return(v) = val {
-            return Ok(Value::Return(v));
+        match &val {
+            Value::Return(_) | Value::Break | Value::Continue => return Ok(val),
+            _ => {}
         }
     }
     if let Some(expr) = &block.expr {
@@ -1697,15 +1704,19 @@ fn eval_stmt(env: &mut Env, stmt: &Stmt) -> Result<Value, String> {
                     for elem in elems {
                         env.define(&var.name, elem);
                         let result = eval_block(env, body)?;
-                        if let Value::Return(_) = &result {
-                            env.pop_scope();
-                            return Ok(result);
+                        match &result {
+                            Value::Return(_) => {
+                                env.pop_scope();
+                                return Ok(result);
+                            }
+                            Value::Break => break,
+                            Value::Continue => continue,
+                            _ => {}
                         }
                     }
                     env.pop_scope();
                 }
                 _ => {
-                    // Assume it's a range-like thing, try to extract start..end
                     return Err("for loop requires an iterable (array or range)".to_string());
                 }
             }
@@ -1720,14 +1731,31 @@ fn eval_stmt(env: &mut Env, stmt: &Stmt) -> Result<Value, String> {
                 env.push_scope();
                 let result = eval_block(env, body)?;
                 env.pop_scope();
-                if let Value::Return(_) = &result {
-                    return Ok(result);
+                match &result {
+                    Value::Return(_) => return Ok(result),
+                    Value::Break => break,
+                    Value::Continue => continue,
+                    _ => {}
                 }
             }
             Ok(Value::Void)
         }
-        StmtKind::Break => Err("break outside loop".to_string()),
-        StmtKind::Continue => Err("continue outside loop".to_string()),
+        StmtKind::Loop { body } => {
+            loop {
+                env.push_scope();
+                let result = eval_block(env, body)?;
+                env.pop_scope();
+                match result {
+                    Value::Return(_) => return Ok(result),
+                    Value::Break => break,
+                    Value::Continue => continue,
+                    _ => {}
+                }
+            }
+            Ok(Value::Void)
+        }
+        StmtKind::Break => Ok(Value::Break),
+        StmtKind::Continue => Ok(Value::Continue),
         StmtKind::Dispatch { index, targets, args } => {
             let idx_val = eval_expr(env, index)?;
             let idx = value_to_int(&idx_val)? as usize;

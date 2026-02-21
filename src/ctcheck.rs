@@ -143,6 +143,9 @@ impl CTChecker {
                 self.check_expr(cond);
                 self.check_block(body);
             }
+            StmtKind::Loop { body } => {
+                self.check_block(body);
+            }
             StmtKind::Break | StmtKind::Continue => {}
             StmtKind::Dispatch { index, args, .. } => {
                 self.check_expr(index);
