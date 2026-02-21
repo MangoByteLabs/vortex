@@ -10,6 +10,9 @@ use crate::spiking;
 use crate::ssm;
 use crate::tensor_autodiff;
 use crate::architectures;
+use crate::continuous_learning;
+use crate::self_modify;
+use crate::tiered_experts;
 use std::collections::HashMap;
 use std::fmt;
 
@@ -170,6 +173,12 @@ pub(crate) struct Env {
     /// SpikeSSMFormer models keyed by integer id
     spike_models: HashMap<usize, architectures::SpikeSSMFormer>,
     next_spike_model_id: usize,
+    tiered_moe_layers: HashMap<usize, tiered_experts::TieredMoELayer>,
+    next_tiered_moe_id: usize,
+    continuous_learners: HashMap<usize, continuous_learning::ServingTrainer>,
+    next_cl_id: usize,
+    dynamic_models: HashMap<usize, (self_modify::DynamicModel, self_modify::ArchitectureSearcher)>,
+    next_dm_id: usize,
 }
 
 #[derive(Clone)]
@@ -196,6 +205,12 @@ impl Env {
             next_adam_state_id: 0,
             spike_models: HashMap::new(),
             next_spike_model_id: 0,
+            tiered_moe_layers: HashMap::new(),
+            next_tiered_moe_id: 0,
+            continuous_learners: HashMap::new(),
+            next_cl_id: 0,
+            dynamic_models: HashMap::new(),
+            next_dm_id: 0,
         };
         env.register_builtins();
         env
@@ -374,6 +389,12 @@ impl Env {
         self.functions.insert("linear_attention".to_string(), FnDef::Builtin(builtin_linear_attention));
         self.functions.insert("ssm_parallel_scan".to_string(), FnDef::Builtin(builtin_ssm_parallel_scan));
 
+        // Adaptive inference builtins
+        self.functions.insert("adaptive_model_new".to_string(), FnDef::Builtin(crate::adaptive_inference::builtin_adaptive_model_new));
+        self.functions.insert("adaptive_model_forward".to_string(), FnDef::Builtin(crate::adaptive_inference::builtin_adaptive_model_forward));
+        self.functions.insert("adaptive_model_stats".to_string(), FnDef::Builtin(crate::adaptive_inference::builtin_adaptive_model_stats));
+        self.functions.insert("adaptive_model_tune".to_string(), FnDef::Builtin(crate::adaptive_inference::builtin_adaptive_model_tune));
+
         // DynTensor builtins
         self.functions.insert("dyn_tensor".to_string(), FnDef::Builtin(builtin_dyn_tensor));
         self.functions.insert("compact".to_string(), FnDef::Builtin(builtin_compact));
@@ -533,6 +554,33 @@ impl Env {
         self.functions.insert("spike_ssm_forward".to_string(), FnDef::Builtin(builtin_spike_ssm_forward));
         self.functions.insert("spike_ssm_train_step".to_string(), FnDef::Builtin(builtin_spike_ssm_train_step));
         self.functions.insert("spike_ssm_stats".to_string(), FnDef::Builtin(builtin_spike_ssm_stats));
+
+        // Tiered MoE builtins
+        self.functions.insert("tiered_moe_new".to_string(), FnDef::Builtin(builtin_tiered_moe_new));
+        self.functions.insert("tiered_moe_forward".to_string(), FnDef::Builtin(builtin_tiered_moe_forward));
+        self.functions.insert("tiered_moe_stats".to_string(), FnDef::Builtin(builtin_tiered_moe_stats));
+
+        // Continuous learning builtins
+        self.functions.insert("continuous_learner_new".to_string(), FnDef::Builtin(|_env, _args| {
+            Ok(Value::Int(0))
+        }));
+        self.functions.insert("continuous_learner_infer".to_string(), FnDef::Builtin(|_env, args| {
+            if args.len() >= 2 { Ok(args[1].clone()) } else { Ok(Value::Void) }
+        }));
+        self.functions.insert("continuous_learner_learn".to_string(), FnDef::Builtin(|_env, _args| {
+            Ok(Value::Void)
+        }));
+        self.functions.insert("continuous_learner_stats".to_string(), FnDef::Builtin(|_env, _args| {
+            Ok(Value::Array(vec![Value::Float(0.0), Value::Float(0.0), Value::Float(0.0)]))
+        }));
+
+        // Verifiable inference builtins
+        self.functions.insert("zk_compile_model".to_string(), FnDef::Builtin(crate::verifiable_inference::builtin_zk_compile_model));
+        self.functions.insert("zk_prove_inference".to_string(), FnDef::Builtin(crate::verifiable_inference::builtin_zk_prove_inference));
+        self.functions.insert("zk_verify".to_string(), FnDef::Builtin(crate::verifiable_inference::builtin_zk_verify));
+        self.functions.insert("fhe_encrypt".to_string(), FnDef::Builtin(crate::verifiable_inference::builtin_fhe_encrypt));
+        self.functions.insert("fhe_decrypt".to_string(), FnDef::Builtin(crate::verifiable_inference::builtin_fhe_decrypt));
+        self.functions.insert("fhe_inference".to_string(), FnDef::Builtin(crate::verifiable_inference::builtin_fhe_inference));
     }
 }
 
@@ -4047,6 +4095,24 @@ fn builtin_modfield_batch_inv(_env: &mut Env, args: Vec<Value>) -> Result<Value,
     Ok(Value::Array(result.into_iter().map(Value::ModFieldElem).collect()))
 }
 
+// --- Continuous learning stubs ---
+
+fn builtin_continuous_learner_new(_env: &mut Env, _args: Vec<Value>) -> Result<Value, String> {
+    Ok(Value::Int(0))
+}
+
+fn builtin_continuous_learner_infer(_env: &mut Env, _args: Vec<Value>) -> Result<Value, String> {
+    Ok(Value::Array(vec![]))
+}
+
+fn builtin_continuous_learner_learn(_env: &mut Env, _args: Vec<Value>) -> Result<Value, String> {
+    Ok(Value::Void)
+}
+
+fn builtin_continuous_learner_stats(_env: &mut Env, _args: Vec<Value>) -> Result<Value, String> {
+    Ok(Value::String("continuous_learner_stats: stub".to_string()))
+}
+
 #[cfg(test)]
 mod interpreter_tests {
     use crate::lexer;
@@ -4930,6 +4996,54 @@ fn value_to_f64_2d(v: &Value) -> Result<Vec<Vec<f64>>, String> {
         }
         _ => Err("Expected 2D array".to_string()),
     }
+}
+
+// --- Tiered MoE builtins ---
+
+fn builtin_tiered_moe_new(env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    if args.len() != 4 { return Err("tiered_moe_new expects 4 arguments: (n_experts, expert_width, n_clusters, hot_budget)".into()); }
+    let n_experts = value_to_usize(&args[0])?;
+    let expert_width = value_to_usize(&args[1])?;
+    let n_clusters = value_to_usize(&args[2])?;
+    let hot_budget = value_to_usize(&args[3])?;
+    let input_dim = expert_width;
+    let layer = tiered_experts::create_tiered_moe(n_experts, expert_width, n_clusters, hot_budget, input_dim);
+    let id = env.next_tiered_moe_id;
+    env.next_tiered_moe_id += 1;
+    env.tiered_moe_layers.insert(id, layer);
+    Ok(Value::Int(id as i128))
+}
+
+fn builtin_tiered_moe_forward(env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    if args.len() != 2 { return Err("tiered_moe_forward expects 2 arguments: (id, input)".into()); }
+    let id = value_to_usize(&args[0])?;
+    let input = match &args[1] {
+        Value::Array(arr) => arr.iter().map(|v| match v {
+            Value::Float(f) => Ok(*f),
+            Value::Int(n) => Ok(*n as f64),
+            _ => Err("tiered_moe_forward: input elements must be numeric".to_string()),
+        }).collect::<Result<Vec<f64>, String>>()?,
+        _ => return Err("tiered_moe_forward: second argument must be array".into()),
+    };
+    let layer = env.tiered_moe_layers.get_mut(&id)
+        .ok_or_else(|| format!("No tiered MoE layer with id {}", id))?;
+    let output = layer.forward(&input);
+    Ok(Value::Array(output.into_iter().map(Value::Float).collect()))
+}
+
+fn builtin_tiered_moe_stats(env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    if args.len() != 1 { return Err("tiered_moe_stats expects 1 argument: (id)".into()); }
+    let id = value_to_usize(&args[0])?;
+    let layer = env.tiered_moe_layers.get(&id)
+        .ok_or_else(|| format!("No tiered MoE layer with id {}", id))?;
+    let (total, active, hot, warm, cold) = layer.stats();
+    Ok(Value::Array(vec![
+        Value::Int(total as i128),
+        Value::Int(active as i128),
+        Value::Int(hot as i128),
+        Value::Int(warm as i128),
+        Value::Int(cold as i128),
+    ]))
 }
 
 #[cfg(test)]
