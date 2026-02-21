@@ -258,6 +258,10 @@ pub enum StmtKind {
         cond: Expr,
         body: Block,
     },
+    /// loop { body }
+    Loop {
+        body: Block,
+    },
     /// break
     Break,
     /// continue
@@ -894,6 +898,9 @@ impl fmt::Display for Stmt {
             }
             StmtKind::While { cond, body } => {
                 write!(f, "while {} {}", cond, body)
+            }
+            StmtKind::Loop { body } => {
+                write!(f, "loop {}", body)
             }
             StmtKind::Break => write!(f, "break"),
             StmtKind::Continue => write!(f, "continue"),

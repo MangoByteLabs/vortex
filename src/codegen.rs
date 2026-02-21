@@ -456,6 +456,26 @@ impl CodeGen {
                 self.gen_while_loop(cond, body);
             }
 
+            StmtKind::Loop { body } => {
+                // Emit as scf.while with constant true condition
+                self.emit_line("scf.while : () -> () {");
+                self.indent += 1;
+                let true_ssa = self.fresh_ssa();
+                self.emit_line(&format!("{} = arith.constant true", true_ssa));
+                self.emit_line(&format!("scf.condition({})", true_ssa));
+                self.indent -= 1;
+                self.emit_line("} do {");
+                self.indent += 1;
+                self.push_scope();
+                for s in &body.stmts {
+                    self.gen_stmt(s);
+                }
+                self.pop_scope();
+                self.emit_line("scf.yield");
+                self.indent -= 1;
+                self.emit_line("}");
+            }
+
             StmtKind::Break | StmtKind::Continue => {
                 self.emit_line(&format!("// {}", if matches!(stmt.kind, StmtKind::Break) { "break" } else { "continue" }));
             }

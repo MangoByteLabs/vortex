@@ -1957,9 +1957,9 @@ fn eval_expr(env: &mut Env, expr: &Expr) -> Result<Value, String> {
         }
 
         ExprKind::MatMul { lhs, rhs } => {
-            let _l = eval_expr(env, lhs)?;
-            let _r = eval_expr(env, rhs)?;
-            Err("matrix multiply not yet supported in interpreter".to_string())
+            let l = eval_expr(env, lhs)?;
+            let r = eval_expr(env, rhs)?;
+            matmul_values(&l, &r)
         }
 
         ExprKind::FieldAccess { base, field } => {

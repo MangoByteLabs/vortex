@@ -1023,6 +1023,15 @@ impl Parser {
             }
             TokenKind::For => self.parse_for_stmt(),
             TokenKind::While => self.parse_while_stmt(),
+            TokenKind::Loop => {
+                self.advance();
+                let body = self.parse_block()?;
+                let end = body.span;
+                Ok(Stmt {
+                    span: start.merge(end),
+                    kind: StmtKind::Loop { body },
+                })
+            }
             TokenKind::Break => {
                 self.advance();
                 Ok(Stmt {
