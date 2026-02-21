@@ -30,8 +30,10 @@ mod quantize;
 mod sparse;
 mod spiking;
 mod ssm;
+mod python_bridge;
 mod runtime;
 mod gpu_runtime;
+mod shape_check;
 mod typeck;
 
 use codespan_reporting::files::SimpleFiles;

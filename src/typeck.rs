@@ -1,5 +1,6 @@
 use crate::ast::*;
 use crate::lexer::Span;
+use crate::shape_check::ShapeChecker;
 use codespan_reporting::diagnostic::{Diagnostic, Label};
 use std::collections::HashMap;
 
@@ -557,9 +558,26 @@ fn infer_expr(env: &mut TypeEnv, expr: &Expr) -> Type {
                     check_numeric_op(env, expr.span, &lhs_ty, &rhs_ty)
                 }
                 BinOp::ElemMul | BinOp::ElemDiv => {
-                    // Elementwise ops require tensor operands
+                    // Elementwise ops require tensor operands with compatible shapes
                     match (&lhs_ty, &rhs_ty) {
-                        (Type::Tensor { .. }, Type::Tensor { .. }) => lhs_ty,
+                        (
+                            Type::Tensor { elem: elem_l, shape: shape_l },
+                            Type::Tensor { elem: elem_r, shape: shape_r },
+                        ) => {
+                            if !types_compatible(elem_l, elem_r) {
+                                env.type_mismatch(expr.span, elem_l, elem_r);
+                            }
+                            match ShapeChecker::check_broadcast(shape_l, shape_r) {
+                                Ok(result_shape) => Type::Tensor {
+                                    elem: elem_l.clone(),
+                                    shape: result_shape,
+                                },
+                                Err(e) => {
+                                    env.error(expr.span, format!("{}", e));
+                                    Type::Error
+                                }
+                            }
+                        }
                         _ => {
                             env.error(expr.span, "elementwise operations require tensor operands".to_string());
                             Type::Error
@@ -671,15 +689,15 @@ fn infer_expr(env: &mut TypeEnv, expr: &Expr) -> Type {
                             format!("matmul element type mismatch: `{}` vs `{}`", elem_l, elem_r),
                         );
                     }
-                    // For 2D: [M, K] @ [K, N] -> [M, N]
-                    if shape_l.len() == 2 && shape_r.len() == 2 {
-                        Type::Tensor {
+                    match ShapeChecker::check_matmul(shape_l, shape_r) {
+                        Ok(result_shape) => Type::Tensor {
                             elem: elem_l.clone(),
-                            shape: vec![shape_l[0].clone(), shape_r[1].clone()],
+                            shape: result_shape,
+                        },
+                        Err(e) => {
+                            env.error(expr.span, format!("{}", e));
+                            Type::Error
                         }
-                    } else {
-                        // For now, just return a tensor with inferred shape
-                        lhs_ty
                     }
                 }
                 _ => {
@@ -911,12 +929,24 @@ fn infer_expr(env: &mut TypeEnv, expr: &Expr) -> Type {
 }
 
 fn check_numeric_op(env: &mut TypeEnv, span: Span, lhs: &Type, rhs: &Type) -> Type {
-    // Both tensors of same shape — elementwise op
-    if let (Type::Tensor { .. }, Type::Tensor { .. }) = (lhs, rhs) {
-        if !types_compatible(lhs, rhs) {
-            env.type_mismatch(span, lhs, rhs);
+    // Both tensors — use shape broadcasting
+    if let (
+        Type::Tensor { elem: elem_l, shape: shape_l },
+        Type::Tensor { elem: elem_r, shape: shape_r },
+    ) = (lhs, rhs) {
+        if !types_compatible(elem_l, elem_r) {
+            env.type_mismatch(span, elem_l, elem_r);
         }
-        return lhs.clone();
+        return match ShapeChecker::check_broadcast(shape_l, shape_r) {
+            Ok(result_shape) => Type::Tensor {
+                elem: elem_l.clone(),
+                shape: result_shape,
+            },
+            Err(e) => {
+                env.error(span, format!("{}", e));
+                Type::Error
+            }
+        };
     }
 
     // Both scalars
@@ -1228,6 +1258,80 @@ mod tests {
             fn test() -> i64 {
                 let x = Some(42)
                 return 0
+            }",
+        );
+    }
+
+    // --- Shape checking integration tests ---
+
+    #[test]
+    fn test_shape_matmul_batched() {
+        // [B, T, D] @ [D, H] -> [B, T, H]
+        check_ok(
+            "fn test(x: Tensor<f32, [B, T, D]>, w: Tensor<f32, [D, H]>) -> Tensor<f32, [B, T, H]> {
+                return x @ w
+            }",
+        );
+    }
+
+    #[test]
+    fn test_shape_matmul_mismatch() {
+        // [B, T, D] @ [H, D] -> error (inner dims D vs H)
+        let errs = check_err(
+            "fn test(x: Tensor<f32, [B, T, D]>, w: Tensor<f32, [H, D]>) -> Tensor<f32, [B, T, D]> {
+                return x @ w
+            }",
+        );
+        assert!(errs.iter().any(|d| d.message.contains("mismatch")));
+    }
+
+    #[test]
+    fn test_shape_broadcast_trailing() {
+        // [B, T, D] + [D] -> [B, T, D]
+        check_ok(
+            "fn test(x: Tensor<f32, [B, T, D]>, b: Tensor<f32, [D]>) -> Tensor<f32, [B, T, D]> {
+                return x + b
+            }",
+        );
+    }
+
+    #[test]
+    fn test_shape_broadcast_same() {
+        // [B, T, D] + [B, T, D] -> [B, T, D]
+        check_ok(
+            "fn test(a: Tensor<f32, [B, T, D]>, b: Tensor<f32, [B, T, D]>) -> Tensor<f32, [B, T, D]> {
+                return a + b
+            }",
+        );
+    }
+
+    #[test]
+    fn test_shape_broadcast_mismatch() {
+        // [B, T, D] + [B, T, H] -> error
+        let errs = check_err(
+            "fn test(a: Tensor<f32, [B, T, D]>, b: Tensor<f32, [B, T, H]>) -> Tensor<f32, [B, T, D]> {
+                return a + b
+            }",
+        );
+        assert!(errs.iter().any(|d| d.message.contains("mismatch")));
+    }
+
+    #[test]
+    fn test_shape_matmul_concrete() {
+        // [4, 128] @ [128, 64] -> [4, 64]
+        check_ok(
+            "fn test(a: Tensor<f32, [4, 128]>, b: Tensor<f32, [128, 64]>) -> Tensor<f32, [4, 64]> {
+                return a @ b
+            }",
+        );
+    }
+
+    #[test]
+    fn test_shape_matmul_mixed() {
+        // [B, 128] @ [128, D] -> [B, D]
+        check_ok(
+            "fn test(a: Tensor<f32, [B, 128]>, b: Tensor<f32, [128, D]>) -> Tensor<f32, [B, D]> {
+                return a @ b
             }",
         );
     }
