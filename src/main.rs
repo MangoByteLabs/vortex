@@ -4,6 +4,7 @@ mod bytecarry;
 mod autodiff;
 mod tensor_autodiff;
 mod codegen;
+mod distributed;
 mod ctcheck;
 mod fusion;
 pub mod crypto;
