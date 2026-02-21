@@ -1,0 +1,199 @@
+// Mini Mamba SSM Model in Vortex
+// Implements a simplified Mamba-style selective state space model
+// d_model=4, d_state=3, seq_len=8
+
+fn abs_val(x: f64) -> f64 {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+// Manual sequential SSM scan: h[t] = A*h[t-1] + B*x[t], y[t] = C*h[t]
+fn manual_sequential_scan(a_coeffs: [f64], b_coeffs: [f64], x: [f64]) -> [f64] {
+    let n = len(a_coeffs)
+    var h = 0.0
+    var result = []
+    for i in 0..n {
+        h = a_coeffs[i] * h + b_coeffs[i] * x[i]
+        result = push(result, h)
+    }
+    return result
+}
+
+// Simple linear projection: dot product of input with weights + bias
+fn linear_proj(input: [f64], weights: [f64], bias: f64) -> [f64] {
+    let n = len(input)
+    var out = []
+    for i in 0..n {
+        out = push(out, input[i] * weights[i] + bias)
+    }
+    return out
+}
+
+// Elementwise multiply two arrays
+fn elem_mul(a: [f64], b: [f64]) -> [f64] {
+    let n = len(a)
+    var out = []
+    for i in 0..n {
+        out = push(out, a[i] * b[i])
+    }
+    return out
+}
+
+// Elementwise add two arrays
+fn elem_add(a: [f64], b: [f64]) -> [f64] {
+    let n = len(a)
+    var out = []
+    for i in 0..n {
+        out = push(out, a[i] + b[i])
+    }
+    return out
+}
+
+// Simple sigmoid gate: 1/(1+exp(-x)) approximated
+fn sigmoid(x: f64) -> f64 {
+    if x > 5.0 { return 1.0 }
+    if x < -5.0 { return 0.0 }
+    // Piecewise linear approximation
+    return 0.5 + x * 0.2
+}
+
+fn sigmoid_arr(arr: [f64]) -> [f64] {
+    let n = len(arr)
+    var out = []
+    for i in 0..n {
+        out = push(out, sigmoid(arr[i]))
+    }
+    return out
+}
+
+fn print_array(name: str, arr: [f64]) {
+    let n = len(arr)
+    var s = format("{}: [", name)
+    for i in 0..n {
+        if i > 0 {
+            s = format("{}, ", s)
+        }
+        s = format("{}{}", s, to_string(arr[i]))
+    }
+    s = format("{}]", s)
+    println(s)
+}
+
+fn main() {
+    println("=== Mini Mamba SSM Model ===")
+    println("")
+
+    // --- Step 1: Input embedding ---
+    println("--- Step 1: Input Embedding ---")
+    let seq_len = 8
+    // Raw input tokens (simulated as floats)
+    let input = [0.5, 1.2, -0.3, 0.8, -1.0, 0.6, 1.5, -0.7]
+    print_array("  input", input)
+
+    // Simple embedding: scale by d_model factor
+    let embed_scale = 0.5
+    var embedded = []
+    for i in 0..seq_len {
+        embedded = push(embedded, input[i] * embed_scale)
+    }
+    print_array("  embedded", embedded)
+
+    // --- Step 2: Selective Gating (input-dependent A, B, C) ---
+    println("")
+    println("--- Step 2: Selective Gating ---")
+
+    // Project input to get input-dependent A, B, C parameters
+    // A_proj weights (controls decay/memory)
+    let w_a = [0.3, -0.2, 0.1, -0.4, 0.2, -0.1, 0.3, -0.2]
+    let a_proj = linear_proj(embedded, w_a, -1.0)
+    print_array("  A_proj (log-space)", a_proj)
+
+    // B_proj weights (controls input gating)
+    let w_b = [0.5, 0.3, 0.7, 0.2, 0.4, 0.6, 0.1, 0.8]
+    let b_proj = linear_proj(embedded, w_b, 0.5)
+    print_array("  B_proj", b_proj)
+
+    // C_proj weights (controls output gating)
+    let w_c = [0.2, 0.4, -0.1, 0.6, 0.3, -0.2, 0.5, 0.1]
+    let c_proj = linear_proj(embedded, w_c, 0.3)
+    print_array("  C_proj", c_proj)
+
+    // Delta (discretization step)
+    let w_delta = [0.1, 0.2, 0.15, 0.1, 0.2, 0.1, 0.15, 0.2]
+    let delta_raw = linear_proj(embedded, w_delta, 0.1)
+    let delta = sigmoid_arr(delta_raw)
+    print_array("  delta (gated)", delta)
+
+    // --- Step 3: SSM Scan (sequential) ---
+    println("")
+    println("--- Step 3: SSM Layer (Sequential Scan) ---")
+
+    // Manual sequential scan for transparency
+    let h_manual = manual_sequential_scan(a_proj, b_proj, embedded)
+    print_array("  h_manual (hidden states)", h_manual)
+
+    // Compute output: y[t] = C[t] * h[t]
+    let y_manual = elem_mul(c_proj, h_manual)
+    print_array("  y_manual (SSM output)", y_manual)
+
+    // --- Step 4: Verify with builtins ---
+    println("")
+    println("--- Step 4: Builtin Scan Comparison ---")
+
+    // ssm_scan(a, b, x) computes h[t] = a[t]*h[t-1] + b[t]*x[t]
+    let h_builtin = ssm_scan(a_proj, b_proj, embedded)
+    print_array("  h_builtin (ssm_scan)", h_builtin)
+
+    // parallel_scan should match ssm_scan
+    let h_parallel = parallel_scan(a_proj, b_proj, embedded)
+    print_array("  h_parallel (parallel_scan)", h_parallel)
+
+    // Validate: manual == builtin == parallel
+    println("")
+    println("--- Step 5: Validation ---")
+    var max_diff_seq = 0.0
+    var max_diff_par = 0.0
+    for i in 0..seq_len {
+        let diff_seq = abs_val(h_manual[i] - h_builtin[i])
+        let diff_par = abs_val(h_manual[i] - h_parallel[i])
+        if diff_seq > max_diff_seq {
+            max_diff_seq = diff_seq
+        }
+        if diff_par > max_diff_par {
+            max_diff_par = diff_par
+        }
+    }
+    println(format("  max |manual - ssm_scan|    = {}", to_string(max_diff_seq)))
+    println(format("  max |manual - parallel_scan| = {}", to_string(max_diff_par)))
+    assert(max_diff_seq < 0.0001, "Sequential scan mismatch!")
+    assert(max_diff_par < 0.0001, "Parallel scan mismatch!")
+    println("  PASS: All three scan methods agree!")
+
+    // --- Step 6: Selective SSM builtin ---
+    println("")
+    println("--- Step 6: Selective SSM (Mamba-style) ---")
+    let d_skip = 0.5
+    let y_selective = selective_ssm(embedded, a_proj, b_proj, c_proj, d_skip, delta)
+    print_array("  y_selective", y_selective)
+    println(format("  (includes skip connection D={} * x[t])", to_string(d_skip)))
+
+    // --- Step 7: Output projection ---
+    println("")
+    println("--- Step 7: Output Projection ---")
+    // Mix SSM output with skip connection
+    let skip_weight = 0.3
+    var output = []
+    for i in 0..seq_len {
+        let o = y_manual[i] + skip_weight * embedded[i]
+        output = push(output, o)
+    }
+    print_array("  final output", output)
+
+    // Summary statistics
+    let output_sum = sum(output)
+    println(format("  output sum = {}", to_string(output_sum)))
+
+    println("")
+    println("=== Mamba SSM Model Complete ===")
+    println("All validations passed!")
+}
