@@ -9,6 +9,7 @@ use crate::ode;
 use crate::spiking;
 use crate::ssm;
 use crate::tensor_autodiff;
+use crate::architectures;
 use std::collections::HashMap;
 use std::fmt;
 
@@ -166,6 +167,9 @@ struct Env {
     /// Adam optimizer state: (m_vecs, v_vecs) keyed by a state id
     adam_states: HashMap<usize, (Vec<Vec<f64>>, Vec<Vec<f64>>)>,
     next_adam_state_id: usize,
+    /// SpikeSSMFormer models keyed by integer id
+    spike_models: HashMap<usize, architectures::SpikeSSMFormer>,
+    next_spike_model_id: usize,
 }
 
 #[derive(Clone)]
@@ -190,6 +194,8 @@ impl Env {
             tensor_tape: None,
             adam_states: HashMap::new(),
             next_adam_state_id: 0,
+            spike_models: HashMap::new(),
+            next_spike_model_id: 0,
         };
         env.register_builtins();
         env
@@ -503,6 +509,12 @@ impl Env {
         self.functions.insert("tensor_sgd".to_string(), FnDef::Builtin(builtin_tensor_sgd));
         self.functions.insert("tensor_adam".to_string(), FnDef::Builtin(builtin_tensor_adam));
         self.functions.insert("tensor_zero_grad".to_string(), FnDef::Builtin(builtin_tensor_zero_grad));
+
+        // SpikeSSMFormer architecture builtins
+        self.functions.insert("spike_ssm_new".to_string(), FnDef::Builtin(builtin_spike_ssm_new));
+        self.functions.insert("spike_ssm_forward".to_string(), FnDef::Builtin(builtin_spike_ssm_forward));
+        self.functions.insert("spike_ssm_train_step".to_string(), FnDef::Builtin(builtin_spike_ssm_train_step));
+        self.functions.insert("spike_ssm_stats".to_string(), FnDef::Builtin(builtin_spike_ssm_stats));
     }
 }
 
@@ -4652,7 +4664,7 @@ mod tensor_ad_tests {
 
     #[test]
     fn test_tensor_xor_loss_decreases() {
-        let code = "fn main() {\ntensor_tape_new()\nlet w1 = tensor_param([0.5, -0.3, 0.8, -0.6, 0.4, 0.7, -0.5, 0.2], [2, 4])\nlet b1 = tensor_param([0.0, 0.0, 0.0, 0.0], [1, 4])\nlet w2 = tensor_param([0.6, -0.4, 0.3, 0.8], [4, 1])\nlet b2 = tensor_param([0.0], [1, 1])\nlet x = tensor_input([0.0, 0.0, 0.0, 1.0, 1.0, 0.0, 1.0, 1.0], [4, 2])\nlet targets = [0, 1, 1, 0]\nlet initial_loss = 0.0\nlet final_loss = 0.0\nfor epoch in range(0, 50) {\nlet h = tensor_matmul(x, w1)\nlet h2 = tensor_add(h, b1)\nlet h3 = tensor_relu(h2)\nlet logits = tensor_matmul(h3, w2)\nlet logits2 = tensor_add(logits, b2)\nlet loss = tensor_cross_entropy(logits2, targets)\nif epoch == 0 {\ninitial_loss = tensor_data(loss)[0]\n}\nif epoch == 49 {\nfinal_loss = tensor_data(loss)[0]\n}\ntensor_backward(loss)\ntensor_sgd([w1, b1, w2, b2], 0.5)\ntensor_zero_grad([w1, b1, w2, b2])\n}\nif final_loss < initial_loss {\nprintln(\"PASS\")\n} else {\nprintln(\"FAIL\")\n}\n}";
+        let code = "fn main() {\ntensor_tape_new()\nlet w1_data = [0.5, -0.3, 0.8, -0.6, 0.4, 0.7, -0.5, 0.2]\nlet b1_data = [0.0, 0.0, 0.0, 0.0]\nlet w2_data = [0.6, -0.4, 0.3, 0.8, 0.1, -0.2, 0.5, -0.3]\nlet b2_data = [0.0, 0.0]\nlet x_data = [0.0, 0.0, 0.0, 1.0, 1.0, 0.0, 1.0, 1.0]\nlet targets = [0, 1, 1, 0]\nlet initial_loss = 0.0\nlet final_loss = 0.0\nfor epoch in 0..50 {\ntensor_tape_new()\nlet w1 = tensor_param(w1_data, [2, 4])\nlet b1 = tensor_param(b1_data, [1, 4])\nlet w2 = tensor_param(w2_data, [4, 2])\nlet b2 = tensor_param(b2_data, [1, 2])\nlet x = tensor_input(x_data, [4, 2])\nlet h = tensor_matmul(x, w1)\nlet h2 = tensor_add(h, b1)\nlet h3 = tensor_relu(h2)\nlet logits = tensor_matmul(h3, w2)\nlet logits2 = tensor_add(logits, b2)\nlet loss = tensor_cross_entropy(logits2, targets)\nif epoch == 0 {\ninitial_loss = tensor_data(loss)[0]\n}\nif epoch == 49 {\nfinal_loss = tensor_data(loss)[0]\n}\ntensor_backward(loss)\ntensor_sgd([w1, b1, w2, b2], 0.5)\nw1_data = tensor_data(w1)\nb1_data = tensor_data(b1)\nw2_data = tensor_data(w2)\nb2_data = tensor_data(b2)\n}\nif final_loss < initial_loss {\nprintln(\"PASS\")\n} else {\nprintln(\"FAIL\")\n}\n}";
         let o = rv(code);
         assert_eq!(o, vec!["PASS"]);
     }

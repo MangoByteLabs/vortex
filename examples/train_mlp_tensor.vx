@@ -1,0 +1,52 @@
+// Train a 2-layer MLP on XOR using tensor autodiff
+// Each epoch creates a fresh tape, preserving parameter data between steps.
+
+tensor_tape_new()
+
+// Initial parameter data (2-input, 4-hidden, 2-output for cross-entropy)
+let w1_data = [0.5, -0.3, 0.8, -0.1, 0.2, 0.7, -0.5, 0.4]
+let b1_data = [0.0, 0.0, 0.0, 0.0]
+let w2_data = [0.3, -0.2, 0.5, -0.1, 0.1, 0.4, -0.3, 0.2]
+let b2_data = [0.0, 0.0]
+
+// XOR data
+let x_data = [0.0, 0.0, 0.0, 1.0, 1.0, 0.0, 1.0, 1.0]
+let targets = [0, 1, 1, 0]
+
+for epoch in 0..200 {
+    // Fresh tape each epoch
+    tensor_tape_new()
+
+    // Re-create tensors with current parameter values
+    let w1 = tensor_param(w1_data, [2, 4])
+    let b1 = tensor_param(b1_data, [1, 4])
+    let w2 = tensor_param(w2_data, [4, 2])
+    let b2 = tensor_param(b2_data, [1, 2])
+    let x = tensor_input(x_data, [4, 2])
+
+    // Forward pass
+    let h = tensor_matmul(x, w1)
+    let h = tensor_add(h, b1)
+    let h = tensor_relu(h)
+    let logits = tensor_matmul(h, w2)
+    let logits = tensor_add(logits, b2)
+    let loss = tensor_cross_entropy(logits, targets)
+
+    // Backward pass
+    tensor_backward(loss)
+
+    // SGD update
+    tensor_sgd([w1, b1, w2, b2], 0.1)
+
+    // Extract updated data for next epoch
+    w1_data = tensor_data(w1)
+    b1_data = tensor_data(b1)
+    w2_data = tensor_data(w2)
+    b2_data = tensor_data(b2)
+
+    if epoch % 20 == 0 {
+        println("Epoch " + to_string(epoch) + " loss: " + to_string(tensor_data(loss)))
+    }
+}
+
+println("Training complete!")
