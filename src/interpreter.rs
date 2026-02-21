@@ -581,6 +581,14 @@ impl Env {
         self.functions.insert("fhe_encrypt".to_string(), FnDef::Builtin(crate::verifiable_inference::builtin_fhe_encrypt));
         self.functions.insert("fhe_decrypt".to_string(), FnDef::Builtin(crate::verifiable_inference::builtin_fhe_decrypt));
         self.functions.insert("fhe_inference".to_string(), FnDef::Builtin(crate::verifiable_inference::builtin_fhe_inference));
+
+        // Dynamic self-modifying model builtins
+        self.functions.insert("dynamic_model_new".to_string(), FnDef::Builtin(builtin_dynamic_model_new));
+        self.functions.insert("dynamic_model_forward".to_string(), FnDef::Builtin(builtin_dynamic_model_forward));
+        self.functions.insert("dynamic_model_add_layer".to_string(), FnDef::Builtin(builtin_dynamic_model_add_layer));
+        self.functions.insert("dynamic_model_remove_layer".to_string(), FnDef::Builtin(builtin_dynamic_model_remove_layer));
+        self.functions.insert("dynamic_model_search_step".to_string(), FnDef::Builtin(builtin_dynamic_model_search_step));
+        self.functions.insert("dynamic_model_stats".to_string(), FnDef::Builtin(builtin_dynamic_model_stats));
     }
 }
 
