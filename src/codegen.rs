@@ -26,6 +26,8 @@ enum MLIRType {
     Index,
     MemRef(Box<MLIRType>, Vec<i64>), // memref<shape x type>
     Tensor(Box<MLIRType>, Vec<i64>), // tensor<shape x type>
+    /// Field element: 4 x i64 limbs in Montgomery form
+    Field256,
     None, // void
 }
 
@@ -61,6 +63,7 @@ impl std::fmt::Display for MLIRType {
                 }
                 write!(f, "{}>", elem)
             }
+            MLIRType::Field256 => write!(f, "!vortex.field256"),
             MLIRType::None => write!(f, "()"),
         }
     }

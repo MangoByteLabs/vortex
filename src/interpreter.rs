@@ -3904,3 +3904,127 @@ println(result)
         assert_eq!(o, vec!["42"]);
     }
 }
+
+#[cfg(test)]
+mod loop_and_builtin_tests {
+    use crate::lexer;
+    use crate::parser;
+    use crate::interpreter::interpret;
+    fn rv(s: &str) -> Vec<String> { let t = lexer::lex(s); let p = parser::parse(t, 0).unwrap(); interpret(&p).unwrap() }
+
+    #[test]
+    fn test_loop_with_break() {
+        let o = rv("fn main() {\nvar i = 0\nloop {\ni = i + 1\nif i == 5 {\nbreak\n}\n}\nprintln(i)\n}");
+        assert_eq!(o, vec!["5"]);
+    }
+
+    #[test]
+    fn test_loop_with_continue() {
+        let o = rv("fn main() {\nvar sum = 0\nvar i = 0\nloop {\ni = i + 1\nif i > 10 {\nbreak\n}\nif i % 2 == 0 {\ncontinue\n}\nsum = sum + i\n}\nprintln(sum)\n}");
+        assert_eq!(o, vec!["25"]);
+    }
+
+    #[test]
+    fn test_spike_attention_builtin() {
+        let o = rv("fn main() {\nlet q = spike_train(2, 3)\nlet k = spike_train(2, 3)\nlet v = [1.0, 2.0, 3.0, 4.0]\nlet result = spike_attention(q, k, v, 2)\nprintln(len(result))\n}");
+        assert_eq!(o, vec!["4"]);
+    }
+
+    #[test]
+    fn test_oja_update_builtin() {
+        let o = rv("fn main() {\nlet pre = [1.0, 0.5]\nlet post = [0.8, 0.3]\nlet w = [0.1, 0.2, 0.3, 0.4]\nlet result = oja_update(pre, post, w, 2, 2, 0.01)\nprintln(len(result))\n}");
+        assert_eq!(o, vec!["4"]);
+    }
+
+    #[test]
+    fn test_chunked_scan_builtin() {
+        let o = rv("fn main() {\nlet x = [1.0, 2.0, 3.0, 4.0]\nlet a = [0.9, 0.9, 0.9, 0.9]\nlet b = [1.0, 1.0, 1.0, 1.0]\nlet c = [1.0, 1.0, 1.0, 1.0]\nlet result = chunked_scan(x, a, b, c, 2)\nprintln(len(result))\n}");
+        assert_eq!(o, vec!["4"]);
+    }
+
+    #[test]
+    fn test_zero_grad_builtin() {
+        let o = rv("fn main() {\nlet t = tape_new()\nlet x = tape_var(t, 3.0)\nlet y = tape_mul(t, x, x)\ntape_backward(t, y)\nlet g1 = tape_grad(t, x)\nzero_grad(t)\nlet g2 = tape_grad(t, x)\nprintln(g1)\nprintln(g2)\n}");
+        assert_eq!(o, vec!["6", "0"]);
+    }
+
+    #[test]
+    fn test_rk45_solve_builtin() {
+        let o = rv("fn main() {\nlet f = |t: f64, y: [f64]| [-1.0 * y[0]]\nlet result = rk45_solve(f, [1.0], 0.0, 1.0, 0.001, 0.000001)\nprintln(result[0])\n}");
+        assert!(!o.is_empty());
+        let val: f64 = o[0].parse().unwrap();
+        assert!((val - 0.3679).abs() < 0.01, "Expected ~0.3679, got {}", val);
+    }
+}
+
+#[cfg(test)]
+mod phase1_2_tests {
+    use crate::lexer;
+    use crate::parser;
+    use crate::interpreter::interpret;
+    fn rv(s: &str) -> Vec<String> { let t = lexer::lex(s); let p = parser::parse(t, 0).unwrap(); interpret(&p).unwrap() }
+
+    #[test]
+    fn test_break_in_for_loop() {
+        let o = rv("fn main() {\nlet sum = 0\nfor i in 0..10 {\nif i == 5 {\nbreak\n}\nsum = sum + i\n}\nprintln(sum)\n}");
+        assert_eq!(o, vec!["10"]);
+    }
+
+    #[test]
+    fn test_continue_in_for_loop() {
+        let o = rv("fn main() {\nlet sum = 0\nfor i in 0..6 {\nif i == 3 {\ncontinue\n}\nsum = sum + i\n}\nprintln(sum)\n}");
+        assert_eq!(o, vec!["12"]);
+    }
+
+    #[test]
+    fn test_break_in_while_loop() {
+        let o = rv("fn main() {\nlet i = 0\nwhile true {\nif i == 3 {\nbreak\n}\ni = i + 1\n}\nprintln(i)\n}");
+        assert_eq!(o, vec!["3"]);
+    }
+
+    #[test]
+    fn test_matmul_2x2() {
+        let o = rv("fn main() {\nlet a = [[1.0, 2.0], [3.0, 4.0]]\nlet b = [[5.0, 6.0], [7.0, 8.0]]\nlet c = a @ b\nprintln(c)\n}");
+        assert!(o[0].contains("19"));
+        assert!(o[0].contains("50"));
+    }
+
+    #[test]
+    fn test_elementwise_mul() {
+        let o = rv("fn main() {\nlet a = [2.0, 3.0, 4.0]\nlet b = [5.0, 6.0, 7.0]\nlet c = a .* b\nprintln(c)\n}");
+        assert!(o[0].contains("10"));
+        assert!(o[0].contains("28"));
+    }
+
+    #[test]
+    fn test_elementwise_div() {
+        let o = rv("fn main() {\nlet a = [10.0, 20.0, 30.0]\nlet b = [2.0, 4.0, 5.0]\nlet c = a ./ b\nprintln(c)\n}");
+        assert!(o[0].contains("5"));
+        assert!(o[0].contains("6"));
+    }
+
+    #[test]
+    fn test_cast_int_to_float() {
+        let o = rv("fn main() {\nlet x = 42\nlet y = x as f64\nprintln(y)\n}");
+        assert_eq!(o, vec!["42"]);
+    }
+
+    #[test]
+    fn test_cast_float_to_int() {
+        let o = rv("fn main() {\nlet x = 3.7\nlet y = x as i64\nprintln(y)\n}");
+        assert_eq!(o, vec!["3"]);
+    }
+
+    #[test]
+    fn test_multi_index_2d() {
+        let o = rv("fn main() {\nlet m = [[10, 20, 30], [40, 50, 60]]\nlet v = m[1, 2]\nprintln(v)\n}");
+        assert_eq!(o, vec!["60"]);
+    }
+
+    #[test]
+    fn test_attention_2d() {
+        let o = rv("fn main() {\nlet q = [[1.0, 0.0], [0.0, 1.0]]\nlet k = [[1.0, 0.0], [0.0, 1.0]]\nlet v = [[1.0, 2.0], [3.0, 4.0]]\nlet r = attention(q, k, v)\nprintln(r)\n}");
+        assert!(!o.is_empty());
+        assert!(o[0].contains("["));
+    }
+}
