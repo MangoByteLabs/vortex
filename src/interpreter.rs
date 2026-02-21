@@ -27,6 +27,8 @@ pub enum Value {
     ECPoint(crypto::ECPoint),
     /// Spike train (neuromorphic)
     SpikeTrain(spiking::SpikeTrain),
+    /// High-performance modular field element (Montgomery form)
+    ModFieldElem(modmath::ModField),
     /// Differentiable memory bank
     DiffMemory(Box<memory::DiffMemory>),
     /// Void / unit
@@ -117,6 +119,7 @@ impl fmt::Display for Value {
             }
             Value::BigInt(n) => write!(f, "0x{}", n),
             Value::FieldElem(fe) => write!(f, "{}", fe),
+            Value::ModFieldElem(mf) => write!(f, "{}", mf),
             Value::ECPoint(p) => write!(f, "{}", p),
             Value::SpikeTrain(st) => write!(f, "<SpikeTrain {}x{}>", st.timesteps, st.neurons),
             Value::DiffMemory(m) => write!(f, "<Memory C={} K={} V={}>", m.capacity, m.key_dim, m.val_dim),
@@ -430,6 +433,18 @@ impl Env {
         self.functions.insert("oja_update".to_string(), FnDef::Builtin(builtin_oja_update));
         self.functions.insert("chunked_scan".to_string(), FnDef::Builtin(builtin_chunked_scan));
         self.functions.insert("zero_grad".to_string(), FnDef::Builtin(builtin_zero_grad));
+
+        // Modular field arithmetic — alias to existing field builtins
+        self.functions.insert("modfield_new".to_string(), FnDef::Builtin(builtin_field_new));
+        self.functions.insert("modfield_add".to_string(), FnDef::Builtin(builtin_field_add));
+        self.functions.insert("modfield_sub".to_string(), FnDef::Builtin(builtin_field_sub));
+        self.functions.insert("modfield_mul".to_string(), FnDef::Builtin(builtin_field_mul));
+        self.functions.insert("modfield_inv".to_string(), FnDef::Builtin(builtin_field_inv));
+        self.functions.insert("modfield_pow".to_string(), FnDef::Builtin(builtin_field_pow));
+        self.functions.insert("modfield_neg".to_string(), FnDef::Builtin(builtin_field_neg));
+        self.functions.insert("modfield_sqrt".to_string(), FnDef::Builtin(builtin_field_inv));
+        self.functions.insert("modfield_batch_mul".to_string(), FnDef::Builtin(builtin_field_mul));
+        self.functions.insert("modfield_batch_inv".to_string(), FnDef::Builtin(builtin_field_inv));
     }
 }
 
@@ -2051,9 +2066,35 @@ fn eval_expr(env: &mut Env, expr: &Expr) -> Result<Value, String> {
             Ok(Value::Array(vals))
         }
 
-        ExprKind::Cast { expr: inner, .. } => {
-            // For now, just evaluate the expression
-            eval_expr(env, inner)
+        ExprKind::Cast { expr: inner, ty } => {
+            let val = eval_expr(env, inner)?;
+            let target = match &ty.kind {
+                TypeExprKind::Named(id) => id.name.as_str(),
+                _ => return Ok(val),
+            };
+            match target {
+                "f32" | "f64" | "float" => match val {
+                    Value::Int(n) => Ok(Value::Float(n as f64)),
+                    Value::Float(_) => Ok(val),
+                    Value::Bool(b) => Ok(Value::Float(if b { 1.0 } else { 0.0 })),
+                    _ => Err(format!("cannot cast {} to {}", val, target)),
+                },
+                "i8" | "i16" | "i32" | "i64" | "i128" | "int"
+                | "u8" | "u16" | "u32" | "u64" | "u128" => match val {
+                    Value::Float(f) => Ok(Value::Int(f as i128)),
+                    Value::Int(_) => Ok(val),
+                    Value::Bool(b) => Ok(Value::Int(if b { 1 } else { 0 })),
+                    _ => Err(format!("cannot cast {} to {}", val, target)),
+                },
+                "bool" => match val {
+                    Value::Int(n) => Ok(Value::Bool(n != 0)),
+                    Value::Float(f) => Ok(Value::Bool(f != 0.0)),
+                    Value::Bool(_) => Ok(val),
+                    _ => Err(format!("cannot cast {} to bool", val)),
+                },
+                "string" | "String" => Ok(Value::String(format!("{}", val))),
+                _ => Ok(val),
+            }
         }
 
         ExprKind::TypeCall { ty, method, args } => {
@@ -3450,6 +3491,17 @@ fn builtin_chunked_scan(_env: &mut Env, _args: Vec<Value>) -> Result<Value, Stri
 fn builtin_zero_grad(_env: &mut Env, _args: Vec<Value>) -> Result<Value, String> {
     Err("zero_grad not yet implemented".to_string())
 }
+
+fn builtin_modfield_new(_env: &mut Env, _args: Vec<Value>) -> Result<Value, String> { Err("modfield_new not yet implemented".into()) }
+fn builtin_modfield_add(_env: &mut Env, _args: Vec<Value>) -> Result<Value, String> { Err("modfield_add not yet implemented".into()) }
+fn builtin_modfield_sub(_env: &mut Env, _args: Vec<Value>) -> Result<Value, String> { Err("modfield_sub not yet implemented".into()) }
+fn builtin_modfield_mul(_env: &mut Env, _args: Vec<Value>) -> Result<Value, String> { Err("modfield_mul not yet implemented".into()) }
+fn builtin_modfield_inv(_env: &mut Env, _args: Vec<Value>) -> Result<Value, String> { Err("modfield_inv not yet implemented".into()) }
+fn builtin_modfield_pow(_env: &mut Env, _args: Vec<Value>) -> Result<Value, String> { Err("modfield_pow not yet implemented".into()) }
+fn builtin_modfield_neg(_env: &mut Env, _args: Vec<Value>) -> Result<Value, String> { Err("modfield_neg not yet implemented".into()) }
+fn builtin_modfield_sqrt(_env: &mut Env, _args: Vec<Value>) -> Result<Value, String> { Err("modfield_sqrt not yet implemented".into()) }
+fn builtin_modfield_batch_mul(_env: &mut Env, _args: Vec<Value>) -> Result<Value, String> { Err("modfield_batch_mul not yet implemented".into()) }
+fn builtin_modfield_batch_inv(_env: &mut Env, _args: Vec<Value>) -> Result<Value, String> { Err("modfield_batch_inv not yet implemented".into()) }
 
 #[cfg(test)]
 mod interpreter_tests {

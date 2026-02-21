@@ -1,6 +1,7 @@
 mod ast;
 mod bytecarry;
 mod autodiff;
+mod tensor_autodiff;
 mod codegen;
 mod ctcheck;
 pub mod crypto;
@@ -10,6 +11,7 @@ mod interpreter;
 mod lexer;
 mod local_learn;
 mod memory;
+pub mod modmath;
 mod module;
 mod msm;
 mod ntt;
