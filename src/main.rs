@@ -37,6 +37,7 @@ mod fft;
 mod python_bridge;
 mod runtime;
 mod gpu_runtime;
+mod server;
 mod shape_check;
 mod typeck;
 
@@ -361,9 +362,58 @@ fn main() {
                 }
             }
         }
+        "serve" => {
+            let tokens = lexer::lex(&source);
+            match parser::parse(tokens, file_id) {
+                Ok(program) => {
+                    let file_dir = PathBuf::from(filename)
+                        .parent()
+                        .map(|p| p.to_path_buf())
+                        .unwrap_or_else(|| PathBuf::from("."));
+                    let mut resolver = module::ModuleResolver::new(file_dir);
+                    let program = match resolver.resolve_imports(&program) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            eprintln!("Import error: {}", e);
+                            std::process::exit(1);
+                        }
+                    };
+
+                    let mut srv = server::VortexServer::new();
+                    if let Err(e) = srv.load_program(&source) {
+                        eprintln!("Server load error: {}", e);
+                        std::process::exit(1);
+                    }
+
+                    // Auto-register any functions starting with "handle_" as routes
+                    let fn_names: Vec<String> = srv.env().functions.keys().cloned().collect();
+                    for name in &fn_names {
+                        if let Some(route) = name.strip_prefix("handle_") {
+                            srv.register_handler(&format!("/{}", route), name);
+                        }
+                    }
+
+                    let port = args.iter()
+                        .position(|a| a == "--port")
+                        .and_then(|i| args.get(i + 1))
+                        .and_then(|p| p.parse::<u16>().ok())
+                        .unwrap_or(8080);
+
+                    eprintln!("Vortex server ready on port {} (event-loop mode)", port);
+                    eprintln!("Loaded {} functions from {}", fn_names.len(), filename);
+                    srv.run();
+                }
+                Err(diagnostics) => {
+                    for diag in &diagnostics {
+                        term::emit(&mut writer.lock(), &config, &files, diag).unwrap();
+                    }
+                    std::process::exit(1);
+                }
+            }
+        }
         _ => {
             eprintln!("Unknown command: {}", command);
-            eprintln!("Commands: run, check, parse, lex, codegen, compile, toolchain, bridge, diagnose, symbols, hover, definition");
+            eprintln!("Commands: run, check, parse, lex, codegen, compile, serve, toolchain, bridge, diagnose, symbols, hover, definition");
             std::process::exit(1);
         }
     }
