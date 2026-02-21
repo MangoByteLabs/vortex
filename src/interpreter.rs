@@ -1,8 +1,11 @@
 use crate::ast::*;
 use crate::autodiff;
 use crate::crypto;
+use crate::local_learn;
 use crate::memory;
+use crate::ode;
 use crate::spiking;
+use crate::ssm;
 use std::collections::HashMap;
 use std::fmt;
 
@@ -419,6 +422,13 @@ impl Env {
         self.functions.insert("hashmap_keys".to_string(), FnDef::Builtin(builtin_hashmap_keys));
         self.functions.insert("hashmap_values".to_string(), FnDef::Builtin(builtin_hashmap_values));
         self.functions.insert("hashmap_len".to_string(), FnDef::Builtin(builtin_hashmap_len));
+
+        // Additional builtins: ODE, spiking attention, Oja, chunked scan, zero_grad
+        self.functions.insert("rk45_solve".to_string(), FnDef::Builtin(builtin_rk45_solve));
+        self.functions.insert("spike_attention".to_string(), FnDef::Builtin(builtin_spike_attention));
+        self.functions.insert("oja_update".to_string(), FnDef::Builtin(builtin_oja_update));
+        self.functions.insert("chunked_scan".to_string(), FnDef::Builtin(builtin_chunked_scan));
+        self.functions.insert("zero_grad".to_string(), FnDef::Builtin(builtin_zero_grad));
     }
 }
 
@@ -2333,6 +2343,64 @@ fn value_div(a: &Value, b: &Value) -> Result<Value, String> {
     }
 }
 
+fn value_to_f64(v: &Value) -> Result<f64, String> {
+    match v {
+        Value::Float(f) => Ok(*f),
+        Value::Int(i) => Ok(*i as f64),
+        _ => Err(format!("cannot convert {} to float", v)),
+    }
+}
+
+fn matmul_values(a: &Value, b: &Value) -> Result<Value, String> {
+    let a_rows = match a {
+        Value::Array(rows) => rows,
+        _ => return Err("matmul: left operand must be a 2D array".to_string()),
+    };
+    let b_rows = match b {
+        Value::Array(rows) => rows,
+        _ => return Err("matmul: right operand must be a 2D array".to_string()),
+    };
+    if a_rows.is_empty() || b_rows.is_empty() {
+        return Ok(Value::Array(vec![]));
+    }
+    let m = a_rows.len();
+    let k = match &a_rows[0] {
+        Value::Array(row) => row.len(),
+        _ => return Err("matmul: left operand must be a 2D array".to_string()),
+    };
+    let k2 = b_rows.len();
+    if k != k2 {
+        return Err(format!("matmul: inner dimensions mismatch: {} vs {}", k, k2));
+    }
+    let n = match &b_rows[0] {
+        Value::Array(row) => row.len(),
+        _ => return Err("matmul: right operand must be a 2D array".to_string()),
+    };
+    let a_mat: Vec<Vec<f64>> = a_rows.iter().map(|row| {
+        match row {
+            Value::Array(r) => r.iter().map(|v| value_to_f64(v)).collect(),
+            _ => Err("matmul: expected 2D array".to_string()),
+        }
+    }).collect::<Result<Vec<Vec<f64>>, String>>()?;
+    let b_mat: Vec<Vec<f64>> = b_rows.iter().map(|row| {
+        match row {
+            Value::Array(r) => r.iter().map(|v| value_to_f64(v)).collect(),
+            _ => Err("matmul: expected 2D array".to_string()),
+        }
+    }).collect::<Result<Vec<Vec<f64>>, String>>()?;
+    let mut result = vec![vec![0.0f64; n]; m];
+    for i in 0..m {
+        for j in 0..n {
+            for p in 0..k {
+                result[i][j] += a_mat[i][p] * b_mat[p][j];
+            }
+        }
+    }
+    Ok(Value::Array(result.into_iter().map(|row| {
+        Value::Array(row.into_iter().map(Value::Float).collect())
+    }).collect()))
+}
+
 fn value_to_int(v: &Value) -> Result<i128, String> {
     match v {
         Value::Int(n) => Ok(*n),
@@ -3338,6 +3406,26 @@ fn builtin_ad_cross_entropy_loss(env: &mut Env, args: Vec<Value>) -> Result<Valu
     let tape = env.tapes.get_mut(&tape_id).ok_or("invalid tape id")?;
     let loss_idx = autodiff::cross_entropy_loss(tape, &logits, target_idx);
     Ok(Value::Int(loss_idx as i128))
+}
+
+fn builtin_rk45_solve(_env: &mut Env, _args: Vec<Value>) -> Result<Value, String> {
+    Err("rk45_solve not yet implemented".to_string())
+}
+
+fn builtin_spike_attention(_env: &mut Env, _args: Vec<Value>) -> Result<Value, String> {
+    Err("spike_attention not yet implemented".to_string())
+}
+
+fn builtin_oja_update(_env: &mut Env, _args: Vec<Value>) -> Result<Value, String> {
+    Err("oja_update not yet implemented".to_string())
+}
+
+fn builtin_chunked_scan(_env: &mut Env, _args: Vec<Value>) -> Result<Value, String> {
+    Err("chunked_scan not yet implemented".to_string())
+}
+
+fn builtin_zero_grad(_env: &mut Env, _args: Vec<Value>) -> Result<Value, String> {
+    Err("zero_grad not yet implemented".to_string())
 }
 
 #[cfg(test)]
