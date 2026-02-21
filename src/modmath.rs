@@ -149,51 +149,45 @@ fn is_zero_u256(a: &[u64; 4]) -> bool {
     a[0] == 0 && a[1] == 0 && a[2] == 0 && a[3] == 0
 }
 
-/// Montgomery multiplication using Finely Integrated Operand Scanning (FIOS).
+/// Montgomery multiplication: a * b * R^(-1) mod P where R = 2^256.
 ///
-/// Computes a * b * R^(-1) mod P where R = 2^256.
-/// This interleaves multiplication and reduction, avoiding a full 512-bit intermediate.
+/// Uses full 4x4 limb multiplication to produce 8-limb (512-bit) product,
+/// then word-by-word Montgomery reduction (REDC) with u64 limbs.
 #[inline]
 pub fn montgomery_mul(a: &[u64; 4], b: &[u64; 4], modulus: &[u64; 4], inv: u64) -> [u64; 4] {
-    // We accumulate into 5 limbs (256 bits + overflow).
-    let mut t = [0u64; 5];
-
+    // Step 1: Full 512-bit multiplication -> 8 limbs
+    let mut t = [0u64; 9]; // 8 limbs + 1 overflow
     for i in 0..4 {
-        // Step 1: Multiply a[i] * b and accumulate into t
         let mut carry: u64 = 0;
         for j in 0..4 {
-            let prod = (a[i] as u128) * (b[j] as u128) + (t[j] as u128) + (carry as u128);
-            t[j] = prod as u64;
+            let prod = (a[i] as u128) * (b[j] as u128) + (t[i + j] as u128) + (carry as u128);
+            t[i + j] = prod as u64;
             carry = (prod >> 64) as u64;
         }
-        let sum = (t[4] as u128) + (carry as u128);
-        t[4] = sum as u64;
-        // overflow beyond t[4] is at most 1 bit, tracked implicitly
-
-        // Step 2: Compute reduction factor m = t[0] * inv mod 2^64
-        let m = t[0].wrapping_mul(inv);
-
-        // Step 3: Add m * modulus to t (this zeros out t[0])
-        let mut carry2: u64 = 0;
-        for j in 0..4 {
-            let prod = (m as u128) * (modulus[j] as u128) + (t[j] as u128) + (carry2 as u128);
-            t[j] = prod as u64;
-            carry2 = (prod >> 64) as u64;
-        }
-        let sum2 = (t[4] as u128) + (carry2 as u128);
-        t[4] = sum2 as u64;
-
-        // Step 4: Shift right by 64 bits (discard t[0] which is now 0)
-        t[0] = t[1];
-        t[1] = t[2];
-        t[2] = t[3];
-        t[3] = t[4];
-        t[4] = 0;
+        t[i + 4] = carry;
     }
 
-    // Final conditional subtraction
-    let result = [t[0], t[1], t[2], t[3]];
-    if t[4] != 0 || cmp_u256(&result, modulus) != std::cmp::Ordering::Less {
+    // Step 2: Montgomery REDC — word-by-word reduction
+    for i in 0..4 {
+        let m = t[i].wrapping_mul(inv);
+        let mut carry: u64 = 0;
+        for j in 0..4 {
+            let prod = (m as u128) * (modulus[j] as u128) + (t[i + j] as u128) + (carry as u128);
+            t[i + j] = prod as u64;
+            carry = (prod >> 64) as u64;
+        }
+        // Propagate carry through remaining limbs
+        for k in (i + 4)..9 {
+            let sum = (t[k] as u128) + (carry as u128);
+            t[k] = sum as u64;
+            carry = (sum >> 64) as u64;
+            if carry == 0 { break; }
+        }
+    }
+
+    // Result is in t[4..8], with possible overflow in t[8]
+    let result = [t[4], t[5], t[6], t[7]];
+    if t[8] != 0 || cmp_u256(&result, modulus) != std::cmp::Ordering::Less {
         let (sub, _) = sub_u256(&result, modulus);
         sub
     } else {
@@ -201,108 +195,11 @@ pub fn montgomery_mul(a: &[u64; 4], b: &[u64; 4], modulus: &[u64; 4], inv: u64) 
     }
 }
 
-/// Montgomery squaring — optimized: exploits symmetry to save ~25% multiplies.
-///
-/// For a 4-limb number, the off-diagonal products a[i]*a[j] (i<j) appear twice,
-/// so we compute them once and double. Diagonal terms a[i]*a[i] appear once.
+/// Montgomery squaring: computes a^2 * R^(-1) mod P.
+/// Currently delegates to montgomery_mul. Can be optimized later.
 #[inline]
 pub fn montgomery_square(a: &[u64; 4], modulus: &[u64; 4], inv: u64) -> [u64; 4] {
-    // First compute the full 512-bit square using the optimized method
-    let mut t = [0u128; 8];
-
-    // Off-diagonal: compute a[i]*a[j] for i < j, accumulate doubled
-    for i in 0..4 {
-        for j in (i + 1)..4 {
-            let prod = (a[i] as u128) * (a[j] as u128);
-            t[i + j] += prod;
-        }
-    }
-
-    // Double the off-diagonal terms (with carry propagation)
-    let mut carry_128 = 0u128;
-    for k in 0..8 {
-        let val = (t[k] << 1) | carry_128;
-        carry_128 = t[k] >> 127; // carry from the doubling shift
-        t[k] = val;
-    }
-
-    // Add diagonal terms a[i]*a[i]
-    for i in 0..4 {
-        let sq = (a[i] as u128) * (a[i] as u128);
-        t[2 * i] += sq & 0xFFFFFFFFFFFFFFFF_FFFFFFFFFFFFFFFF;
-    }
-
-    // Now propagate carries and reduce to u64 limbs
-    let mut product = [0u64; 8];
-    let mut c: u128 = 0;
-    for k in 0..8 {
-        let val = t[k] + c;
-        product[k] = val as u64;
-        c = val >> 64;
-    }
-
-    // Now do Montgomery reduction on the 512-bit product
-    // Using word-by-word REDC
-    let mut r = [0u64; 5]; // 4 limbs + overflow
-    r[0] = product[4];
-    r[1] = product[5];
-    r[2] = product[6];
-    r[3] = product[7];
-
-    // Process low 4 limbs
-    let mut low = [product[0], product[1], product[2], product[3]];
-
-    for i in 0..4 {
-        let m = low[i].wrapping_mul(inv);
-        let mut carry: u64 = 0;
-
-        // Add m * modulus to [low[i..], r[..]]
-        // First, process remaining low limbs
-        for j in 0..4 {
-            let idx = i + j;
-            let prod = (m as u128) * (modulus[j] as u128) + (carry as u128);
-            if idx < 4 {
-                let sum = prod + (low[idx] as u128);
-                low[idx] = sum as u64;
-                carry = (sum >> 64) as u64;
-            } else {
-                let ridx = idx - 4;
-                let sum = prod + (r[ridx] as u128);
-                r[ridx] = sum as u64;
-                carry = (sum >> 64) as u64;
-            }
-        }
-        // propagate carry
-        let start = if i + 4 < 4 { i + 4 } else { (i + 4) - 4 };
-        let in_r = i + 4 >= 4;
-        if in_r {
-            for k in (start + 4 - (i + 4 - start))..5 {
-                // just propagate through r
-                let _ = k; // complex index math, let's simplify
-                break;
-            }
-        }
-        // Simpler: propagate carry through remaining r limbs
-        {
-            let start_r = if i + 4 >= 4 { i + 4 - 4 + 4 - 4 } else { 0 };
-            // Actually, let's just propagate starting from the right position
-            let first_r_touched = if i + 4 >= 4 { i } else { 0 };
-            for k in first_r_touched..5 {
-                if carry == 0 { break; }
-                let sum = (r[k] as u128) + (carry as u128);
-                r[k] = sum as u64;
-                carry = (sum >> 64) as u64;
-            }
-        }
-    }
-
-    let result = [r[0], r[1], r[2], r[3]];
-    if r[4] != 0 || cmp_u256(&result, modulus) != std::cmp::Ordering::Less {
-        let (sub, _) = sub_u256(&result, modulus);
-        sub
-    } else {
-        result
-    }
+    montgomery_mul(a, a, modulus, inv)
 }
 
 // ============================================================
@@ -661,36 +558,10 @@ impl GoldilocksField {
     }
 
     /// Reduce a u128 value mod p = 2^64 - 2^32 + 1.
-    ///
-    /// If x = x_hi * 2^64 + x_lo, then x mod p:
-    ///   x = x_lo + x_hi * 2^64
-    ///   2^64 ≡ 2^32 - 1 (mod p)
-    ///   so x ≡ x_lo + x_hi * (2^32 - 1) (mod p)
     #[inline]
     fn reduce_u128(x: u128) -> u64 {
-        let x_lo = x as u64;
-        let x_hi = (x >> 64) as u64;
-        // x ≡ x_lo + x_hi * (2^32 - 1) mod p
-        // = x_lo + x_hi * 2^32 - x_hi
-        let (a, carry1) = x_lo.overflowing_sub(x_hi);
-        let hi_shifted = x_hi << 32; // x_hi * 2^32 (fits in u64 if x_hi < 2^32)
-        let (b, carry2) = a.overflowing_add(hi_shifted);
-
-        // Handle carries/borrows
-        let mut result = b;
-        if carry2 {
-            // Overflowed u64, subtract p (which means add 2^32 - 1 since 2^64 - p = 2^32 - 1)
-            result = result.wrapping_add(0xFFFFFFFF); // 2^32 - 1
-        }
-        if carry1 && !carry2 {
-            // Net borrow, add p
-            result = result.wrapping_add(GOLDILOCKS_P);
-        }
-        // Final reduction
-        if result >= GOLDILOCKS_P {
-            result -= GOLDILOCKS_P;
-        }
-        result
+        // Simple and correct: use u128 arithmetic
+        (x % GOLDILOCKS_P as u128) as u64
     }
 
     pub fn add(self, other: Self) -> Self {
@@ -1109,10 +980,30 @@ mod tests {
     #[test]
     fn test_secp256k1_inv() {
         let params: &'static FieldParams = &*SECP256K1_FIELD;
+
+        // Verify Montgomery parameter correctness
+        let check = params.inv.wrapping_mul(params.modulus[0]);
+        assert_eq!(check, u64::MAX, "inv * P[0] should be -1 mod 2^64");
+
+        // Verify one round-trip
+        let one = ModField::one(params);
+        assert_eq!(one.to_normal(), [1, 0, 0, 0]);
+
+        // Fermat's little theorem: a^(P-1) = 1
         let a = ModField::new([7, 0, 0, 0], params);
+        let p_minus_1: [u64; 4] = [0xFFFFFFFEFFFFFC2E, 0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF];
+        let fermat = a.pow(&p_minus_1);
+        assert!(fermat.is_one(), "7^(P-1) should be 1 mod P");
+
+        // Inverse
         let a_inv = a.inv();
         let product = a.mul(&a_inv);
         assert!(product.is_one(), "7 * 7^(-1) should be 1, got {:?}", product);
+
+        // Larger value inverse
+        let b = ModField::from_hex("DEADBEEFCAFEBABE1234567890ABCDEF", params).unwrap();
+        let b_inv = b.inv();
+        assert!(b.mul(&b_inv).is_one(), "large value inverse failed");
     }
 
     #[test]
@@ -1155,6 +1046,16 @@ mod tests {
         // Compare against the old slow path in crypto.rs
         let p_old = crate::crypto::secp256k1_field_prime();
         let params: &'static FieldParams = &*SECP256K1_FIELD;
+
+        // First test with LARGE values close to P
+        let a_big = BigUint256::from_hex("FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC00").unwrap();
+        let b_big = BigUint256::from_hex("FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFF000").unwrap();
+        let a_new_big = ModField::new(from_biguint256(&a_big), params);
+        let b_new_big = ModField::new(from_biguint256(&b_big), params);
+        let c_old_big = crate::crypto::mod_mul(&a_big, &b_big, &p_old);
+        let c_new_big = a_new_big.mul(&b_new_big);
+        assert_eq!(from_biguint256(&c_old_big), c_new_big.to_normal(),
+            "Large value Montgomery mul mismatch");
 
         let a_old = BigUint256::from_hex("DEADBEEF").unwrap();
         let b_old = BigUint256::from_hex("CAFEBABE").unwrap();
