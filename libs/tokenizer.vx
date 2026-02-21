@@ -1,0 +1,200 @@
+// BPE (Byte-Pair Encoding) Tokenizer in Vortex
+// Learns merge rules from training text and encodes/decodes strings
+
+fn chars_of(text: str) -> [str] {
+    var chars = []
+    let n = string_len(text)
+    var i = 0
+    while i < n {
+        chars = push(chars, char_at(text, i))
+        i = i + 1
+    }
+    return chars
+}
+
+fn most_frequent_pair(tokens: [str]) -> [str] {
+    let n = len(tokens)
+    if n < 2 { return ["", "", "0"] }
+    var counts = hashmap()
+    var best_key = ""
+    var best_count = 0
+    var best_a = ""
+    var best_b = ""
+    var i = 0
+    while i < n - 1 {
+        let a = tokens[i]
+        let b = tokens[i + 1]
+        let key = format("{}\t{}", a, b)
+        if hashmap_contains(counts, key) {
+            let prev2 = unwrap(hashmap_get(counts, key))
+            counts = hashmap_insert(counts, key, prev2 + 1)
+            if prev2 + 1 > best_count {
+                best_count = prev2 + 1
+                best_a = a
+                best_b = b
+            }
+        } else {
+            counts = hashmap_insert(counts, key, 1)
+            if 1 > best_count {
+                best_count = 1
+                best_a = a
+                best_b = b
+            }
+        }
+        i = i + 1
+    }
+    return [best_a, best_b, to_string(best_count)]
+}
+
+fn merge_pair(tokens: [str], a: str, b: str) -> [str] {
+    var result = []
+    let merged = format("{}{}", a, b)
+    let n = len(tokens)
+    var i = 0
+    while i < n {
+        if i < n - 1 {
+            if tokens[i] == a {
+                if tokens[i + 1] == b {
+                    result = push(result, merged)
+                    i = i + 2
+                } else {
+                    result = push(result, tokens[i])
+                    i = i + 1
+                }
+            } else {
+                result = push(result, tokens[i])
+                i = i + 1
+            }
+        } else {
+            result = push(result, tokens[i])
+            i = i + 1
+        }
+    }
+    return result
+}
+
+fn build_vocab(text: str, num_merges: i64) -> [str] {
+    var tokens = chars_of(text)
+    var vocab = hashmap()
+    var next_id = 0
+    var i = 0
+    while i < len(tokens) {
+        let ch = tokens[i]
+        if hashmap_contains(vocab, ch) == false {
+            vocab = hashmap_insert(vocab, ch, next_id)
+            next_id = next_id + 1
+        }
+        i = i + 1
+    }
+    println(format("Initial vocab size: {} characters", next_id))
+
+    var merges = []
+    var m = 0
+    while m < num_merges {
+        let pair_info = most_frequent_pair(tokens)
+        let a = pair_info[0]
+        let b = pair_info[1]
+        let count_str = pair_info[2]
+        if a == "" {
+            println("No more pairs to merge")
+            m = num_merges
+        } else {
+            let merged = format("{}{}", a, b)
+            println(format("Merge {}: '{}' + '{}' -> '{}' (count: {})", m, a, b, merged, count_str))
+            tokens = merge_pair(tokens, a, b)
+            merges = push(merges, [a, b])
+            if hashmap_contains(vocab, merged) == false {
+                vocab = hashmap_insert(vocab, merged, next_id)
+                next_id = next_id + 1
+            }
+            m = m + 1
+        }
+    }
+    println(format("Final vocab size: {}", hashmap_len(vocab)))
+    return [vocab, merges]
+}
+
+fn encode(text: str, vocab: any, merges: [any]) -> [i64] {
+    var tokens = chars_of(text)
+    var m = 0
+    while m < len(merges) {
+        let pair = merges[m]
+        tokens = merge_pair(tokens, pair[0], pair[1])
+        m = m + 1
+    }
+    var ids = []
+    var i = 0
+    while i < len(tokens) {
+        let tok = tokens[i]
+        if hashmap_contains(vocab, tok) {
+            ids = push(ids, unwrap(hashmap_get(vocab, tok)))
+        } else {
+            ids = push(ids, -1)
+        }
+        i = i + 1
+    }
+    return ids
+}
+
+fn build_reverse_vocab(vocab: any) -> any {
+    var rev = hashmap()
+    let ks = hashmap_keys(vocab)
+    var i = 0
+    while i < len(ks) {
+        let k = ks[i]
+        let v = unwrap(hashmap_get(vocab, k))
+        rev = hashmap_insert(rev, to_string(v), k)
+        i = i + 1
+    }
+    return rev
+}
+
+fn decode(ids: [i64], vocab: any) -> str {
+    let rev = build_reverse_vocab(vocab)
+    var parts = []
+    var i = 0
+    while i < len(ids) {
+        let id_str = to_string(ids[i])
+        if hashmap_contains(rev, id_str) {
+            parts = push(parts, unwrap(hashmap_get(rev, id_str)))
+        } else {
+            parts = push(parts, "?")
+        }
+        i = i + 1
+    }
+    return join(parts, "")
+}
+
+fn main() {
+    println("=== BPE Tokenizer ===")
+    println("")
+
+    let text = "the cat sat on the mat the cat"
+    println(format("Training text: '{}'", text))
+    println("")
+
+    let result = build_vocab(text, 10)
+    let vocab = result[0]
+    let merges = result[1]
+
+    println("")
+
+    let encoded = encode(text, vocab, merges)
+    println(format("Encoded: {}", to_string(encoded)))
+
+    let decoded = decode(encoded, vocab)
+    println(format("Decoded: '{}'", decoded))
+
+    assert(decoded == text, "Roundtrip encode->decode failed!")
+    println("")
+    println("Roundtrip validation PASSED: encode then decode recovers original text")
+
+    let test = "the cat"
+    let test_enc = encode(test, vocab, merges)
+    let test_dec = decode(test_enc, vocab)
+    println(format("Test encode '{}' -> {} -> '{}'", test, to_string(test_enc), test_dec))
+    assert(test_dec == test, "Substring roundtrip failed!")
+
+    println("")
+    println("Tokenizer complete!")
+}

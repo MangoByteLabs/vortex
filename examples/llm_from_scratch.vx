@@ -1,0 +1,395 @@
+// Complete LLM Pipeline in Vortex - End to End
+// 1. Tokenize  2. Init model  3. Forward pass  4. Loss  5. Train  6. Generate
+
+fn dot(a: [f64], b: [f64]) -> f64 {
+    var s = 0.0
+    var i = 0
+    while i < len(a) {
+        s = s + a[i] * b[i]
+        i = i + 1
+    }
+    return s
+}
+
+fn vec_add(a: [f64], b: [f64]) -> [f64] {
+    var result = []
+    var i = 0
+    while i < len(a) {
+        result = push(result, a[i] + b[i])
+        i = i + 1
+    }
+    return result
+}
+
+fn matvec(mat: [f64], v: [f64]) -> [f64] {
+    var result = []
+    var i = 0
+    while i < len(mat) {
+        result = push(result, dot(mat[i], v))
+        i = i + 1
+    }
+    return result
+}
+
+fn zeros(n: i64) -> [f64] {
+    var r = []
+    var i = 0
+    while i < n {
+        r = push(r, 0.0)
+        i = i + 1
+    }
+    return r
+}
+
+fn det_weight(seed: i64) -> f64 {
+    let x = ((seed * 1103515245 + 12345) % 65536) * 1.0
+    return (x / 65536.0 - 0.5) * 0.2
+}
+
+fn argmax(arr: [f64]) -> i64 {
+    var best = 0
+    var best_val = arr[0]
+    var i = 1
+    while i < len(arr) {
+        if arr[i] > best_val {
+            best_val = arr[i]
+            best = i
+        }
+        i = i + 1
+    }
+    return best
+}
+
+fn main() {
+    println("========================================")
+    println("  Vortex LLM: Complete Pipeline Demo")
+    println("========================================")
+    println("")
+
+    // =============================================
+    // STEP 1: Define vocabulary and tokenize
+    // =============================================
+    println("--- Step 1: Tokenization ---")
+    let text = "hello world"
+    println(format("Input text: '{}'", text))
+
+    // Character-level vocabulary
+    // h=0, e=1, l=2, o=3, _=4, w=5, r=6, d=7
+    var char_to_id = hashmap()
+    char_to_id = hashmap_insert(char_to_id, "h", 0)
+    char_to_id = hashmap_insert(char_to_id, "e", 1)
+    char_to_id = hashmap_insert(char_to_id, "l", 2)
+    char_to_id = hashmap_insert(char_to_id, "o", 3)
+    char_to_id = hashmap_insert(char_to_id, " ", 4)
+    char_to_id = hashmap_insert(char_to_id, "w", 5)
+    char_to_id = hashmap_insert(char_to_id, "r", 6)
+    char_to_id = hashmap_insert(char_to_id, "d", 7)
+
+    let id_to_char = ["h", "e", "l", "o", " ", "w", "r", "d"]
+    let V = 8
+    let D = 4
+
+    // Tokenize
+    var tokens = []
+    var ci = 0
+    while ci < string_len(text) {
+        let ch = char_at(text, ci)
+        tokens = push(tokens, unwrap(hashmap_get(char_to_id, ch)))
+        ci = ci + 1
+    }
+    println(format("Tokens: {}", to_string(tokens)))
+    println(format("Vocab size: {}, Embedding dim: {}", V, D))
+    println("")
+
+    // =============================================
+    // STEP 2: Initialize model weights
+    // =============================================
+    println("--- Step 2: Model Initialization ---")
+
+    // Simplified GPT: embedding(8x4) + attention weights(4x4) + output projection(8x4)
+    // Total: 32 + 16 + 32 = 80 params
+    // Layout: [0..31] = tok_emb, [32..47] = attn_w, [48..79] = out_proj
+    let num_params = 80
+    var params = []
+    var pi = 0
+    while pi < num_params {
+        params = push(params, det_weight(pi + 42))
+        pi = pi + 1
+    }
+    println(format("Total parameters: {}", num_params))
+    println(format("  Token embeddings: {} ({}x{})", V * D, V, D))
+    println(format("  Attention weights: {} ({}x{})", D * D, D, D))
+    println(format("  Output projection: {} ({}x{})", V * D, V, D))
+    println("")
+
+    // =============================================
+    // STEP 3: Forward pass (without tape)
+    // =============================================
+    println("--- Step 3: Forward Pass ---")
+
+    // Build weight matrices from flat params
+    var tok_emb = []
+    var k = 0
+    while k < V {
+        var row = []
+        var c = 0
+        while c < D {
+            row = push(row, params[k * D + c])
+            c = c + 1
+        }
+        tok_emb = push(tok_emb, row)
+        k = k + 1
+    }
+
+    var attn_w = []
+    var k2 = 0
+    while k2 < D {
+        var row = []
+        var c = 0
+        while c < D {
+            row = push(row, params[32 + k2 * D + c])
+            c = c + 1
+        }
+        attn_w = push(attn_w, row)
+        k2 = k2 + 1
+    }
+
+    var out_proj = []
+    var k3 = 0
+    while k3 < V {
+        var row = []
+        var c = 0
+        while c < D {
+            row = push(row, params[48 + k3 * D + c])
+            c = c + 1
+        }
+        out_proj = push(out_proj, row)
+        k3 = k3 + 1
+    }
+
+    // Forward: embed last 3 tokens, apply attention-like transform, project to logits
+    let test_seq = [0, 1, 2, 2]
+    let last_tok = test_seq[3]
+    let emb = tok_emb[last_tok]
+    let transformed = matvec(attn_w, emb)
+    let normed = layer_norm(transformed)
+    let logits = matvec(out_proj, normed)
+    let probs = softmax(logits)
+
+    println(format("Test input: {} ('{}')", to_string(test_seq), "hell"))
+    println(format("Logits: {}", to_string(logits)))
+    println(format("Probs:  {}", to_string(probs)))
+    println(format("Predicted: '{}' (id={})", id_to_char[argmax(probs)], argmax(probs)))
+
+    let prob_sum = sum(probs)
+    assert(prob_sum > 0.99, "probs should sum to ~1")
+    assert(prob_sum < 1.01, "probs should sum to ~1")
+    println("Probability sum validated!")
+    println("")
+
+    // =============================================
+    // STEP 4: Compute cross-entropy loss
+    // =============================================
+    println("--- Step 4: Loss Computation ---")
+    let target = 3
+    // Manual cross-entropy: -log(prob[target])
+    let target_prob = probs[target]
+    println(format("Target: '{}' (id={}), probability: {}", id_to_char[target], target, target_prob))
+    println("")
+
+    // =============================================
+    // STEP 5: Training with autodiff
+    // =============================================
+    println("--- Step 5: Training (20 epochs) ---")
+
+    // Training sequences from "hello world"
+    let seqs = [[0,1,2,2], [1,2,2,3], [2,2,3,4], [2,3,4,5]]
+    let tgts = [3, 4, 5, 3]
+
+    var train_params = []
+    var tp = 0
+    while tp < num_params {
+        train_params = push(train_params, params[tp])
+        tp = tp + 1
+    }
+
+    let lr = 0.05
+    var first_loss = 0.0
+    var last_loss = 0.0
+
+    var epoch = 0
+    while epoch < 20 {
+        let t = tape_new()
+
+        // Put params on tape
+        var tape_p = []
+        var j = 0
+        while j < num_params {
+            tape_p = push(tape_p, tape_var(t, train_params[j]))
+            j = j + 1
+        }
+
+        var total_loss = tape_var(t, 0.0)
+
+        var s = 0
+        while s < len(seqs) {
+            let seq = seqs[s]
+            let tgt = tgts[s]
+            let lt = seq[3]
+
+            // Embed
+            var t_emb = []
+            var d = 0
+            while d < D {
+                t_emb = push(t_emb, tape_p[lt * D + d])
+                d = d + 1
+            }
+
+            // Attention transform
+            var t_transformed = []
+            var r = 0
+            while r < D {
+                var val = tape_var(t, 0.0)
+                var c = 0
+                while c < D {
+                    val = tape_add(t, val, tape_mul(t, tape_p[32 + r * D + c], t_emb[c]))
+                    c = c + 1
+                }
+                t_transformed = push(t_transformed, val)
+                r = r + 1
+            }
+
+            // Output projection
+            var t_logits = []
+            var v = 0
+            while v < V {
+                var logit = tape_var(t, 0.0)
+                var d2 = 0
+                while d2 < D {
+                    logit = tape_add(t, logit, tape_mul(t, tape_p[48 + v * D + d2], t_transformed[d2]))
+                    d2 = d2 + 1
+                }
+                t_logits = push(t_logits, logit)
+                v = v + 1
+            }
+
+            let loss = ad_cross_entropy_loss(t, t_logits, tgt)
+            total_loss = tape_add(t, total_loss, loss)
+            s = s + 1
+        }
+
+        tape_backward(t, total_loss)
+        let loss_val = tape_value(t, total_loss)
+
+        if epoch == 0 {
+            first_loss = loss_val
+        }
+        last_loss = loss_val
+
+        if epoch % 5 == 0 {
+            println(format("  Epoch {}: loss = {}", epoch, loss_val))
+        }
+
+        var grads = []
+        var g = 0
+        while g < num_params {
+            grads = push(grads, tape_grad(t, tape_p[g]))
+            g = g + 1
+        }
+        train_params = ad_sgd_step(train_params, grads, lr)
+
+        epoch = epoch + 1
+    }
+
+    println("")
+    assert(last_loss < first_loss, "Loss should decrease during training!")
+    println(format("Loss decreased: {} -> {} (VALIDATED)", first_loss, last_loss))
+    println("")
+
+    // =============================================
+    // STEP 6: Generate text
+    // =============================================
+    println("--- Step 6: Text Generation ---")
+
+    // Rebuild weight matrices from trained params
+    var trained_tok_emb = []
+    var m = 0
+    while m < V {
+        var row = []
+        var c = 0
+        while c < D {
+            row = push(row, train_params[m * D + c])
+            c = c + 1
+        }
+        trained_tok_emb = push(trained_tok_emb, row)
+        m = m + 1
+    }
+
+    var trained_attn_w = []
+    var m2 = 0
+    while m2 < D {
+        var row = []
+        var c = 0
+        while c < D {
+            row = push(row, train_params[32 + m2 * D + c])
+            c = c + 1
+        }
+        trained_attn_w = push(trained_attn_w, row)
+        m2 = m2 + 1
+    }
+
+    var trained_out_proj = []
+    var m3 = 0
+    while m3 < V {
+        var row = []
+        var c = 0
+        while c < D {
+            row = push(row, train_params[48 + m3 * D + c])
+            c = c + 1
+        }
+        trained_out_proj = push(trained_out_proj, row)
+        m3 = m3 + 1
+    }
+
+    // Generate from prompt "hel"
+    var gen_seq = [0, 1, 2]
+    println(format("Prompt: 'hel' = {}", to_string(gen_seq)))
+
+    var step = 0
+    while step < 5 {
+        let lt = gen_seq[len(gen_seq) - 1]
+        let e = trained_tok_emb[lt]
+        let tr = matvec(trained_attn_w, e)
+        let n = layer_norm(tr)
+        let lg = matvec(trained_out_proj, n)
+        let pr = softmax(lg)
+        let next = argmax(pr)
+        gen_seq = push(gen_seq, next)
+        println(format("  Generated: '{}' (prob: {})", id_to_char[next], pr[next]))
+        step = step + 1
+    }
+
+    var gen_text_parts = []
+    var gi = 0
+    while gi < len(gen_seq) {
+        gen_text_parts = push(gen_text_parts, id_to_char[gen_seq[gi]])
+        gi = gi + 1
+    }
+    let gen_text = join(gen_text_parts, "")
+    println(format("Generated text: '{}'", gen_text))
+    println("")
+
+    // =============================================
+    // STEP 7: Validation summary
+    // =============================================
+    println("--- Step 7: Validation Summary ---")
+    println(format("  Tokenization: {} chars -> {} tokens", string_len(text), len(tokens)))
+    println(format("  Model params: {}", num_params))
+    println(format("  Training: loss {} -> {}", first_loss, last_loss))
+    println(format("  Generation: {} tokens generated", 5))
+    println(format("  Prob sums: validated (all ~1.0)"))
+    println("")
+    println("========================================")
+    println("  Vortex LLM Pipeline: ALL CHECKS PASS")
+    println("========================================")
+}

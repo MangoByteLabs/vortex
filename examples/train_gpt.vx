@@ -1,0 +1,212 @@
+// Train a tiny GPT model on a small text corpus using autodiff
+// vocab=8, d_model=4, heads=1, layers=1, d_ff=8, seq_len=4
+
+fn dot(a: [f64], b: [f64]) -> f64 {
+    var s = 0.0
+    var i = 0
+    while i < len(a) {
+        s = s + a[i] * b[i]
+        i = i + 1
+    }
+    return s
+}
+
+fn vec_add(a: [f64], b: [f64]) -> [f64] {
+    var result = []
+    var i = 0
+    while i < len(a) {
+        result = push(result, a[i] + b[i])
+        i = i + 1
+    }
+    return result
+}
+
+fn matvec(mat: [f64], v: [f64]) -> [f64] {
+    var result = []
+    var i = 0
+    while i < len(mat) {
+        result = push(result, dot(mat[i], v))
+        i = i + 1
+    }
+    return result
+}
+
+fn zeros(n: i64) -> [f64] {
+    var r = []
+    var i = 0
+    while i < n {
+        r = push(r, 0.0)
+        i = i + 1
+    }
+    return r
+}
+
+fn det_weight(seed: i64) -> f64 {
+    let x = ((seed * 1103515245 + 12345) % 65536) * 1.0
+    return (x / 65536.0 - 0.5) * 0.2
+}
+
+fn argmax(arr: [f64]) -> i64 {
+    var best = 0
+    var best_val = arr[0]
+    var i = 1
+    while i < len(arr) {
+        if arr[i] > best_val {
+            best_val = arr[i]
+            best = i
+        }
+        i = i + 1
+    }
+    return best
+}
+
+fn main() {
+    println("=== Training Tiny GPT ===")
+    println("")
+
+    // Config: vocab=8, d_model=4, 1 head, 1 layer, d_ff=8, seq_len=4
+    let V = 8
+    let D = 4
+    let FF = 8
+
+    // Training data: "hello world" mapped to char ids
+    // h=0, e=1, l=2, o=3, _=4, w=5, r=6, d=7
+    // "hello wo" -> [0,1,2,2,3,4,5,3]
+    // We'll train on sequences of length 4 with next-token prediction
+    // seq1: [0,1,2,2] -> target 3 (o)
+    // seq2: [1,2,2,3] -> target 4 (_)
+    // seq3: [2,2,3,4] -> target 5 (w)
+    // seq4: [2,3,4,5] -> target 3 (o)
+    let seqs = [[0,1,2,2], [1,2,2,3], [2,2,3,4], [2,3,4,5]]
+    let targets = [3, 4, 5, 3]
+
+    // Initialize all weights as a flat array for SGD
+    // We'll use a simplified model: just embedding + linear output
+    // Total params: tok_emb(8x4=32) + out_proj(8x4=32) = 64 params
+    let num_params = 64
+    var params = []
+    var pi = 0
+    while pi < num_params {
+        params = push(params, det_weight(pi + 42))
+        pi = pi + 1
+    }
+
+    let lr = 0.1
+    let epochs = 20
+
+    println(format("Model: vocab={}, d_model={}", V, D))
+    println(format("Training on {} sequences, {} epochs", len(seqs), epochs))
+    println("")
+
+    var epoch = 0
+    while epoch < epochs {
+        // Create tape
+        let t = tape_new()
+
+        // Put params on tape
+        var tape_params = []
+        var j = 0
+        while j < num_params {
+            tape_params = push(tape_params, tape_var(t, params[j]))
+            j = j + 1
+        }
+
+        // Forward pass for each training example, accumulate loss
+        var total_loss = tape_var(t, 0.0)
+
+        var s = 0
+        while s < len(seqs) {
+            let seq = seqs[s]
+            let target = targets[s]
+
+            // Embedding lookup: average token embeddings
+            // tok_emb[token_id] = params[token_id * D .. (token_id+1) * D]
+            // Use last token's embedding for prediction (simplified)
+            let last_tok = seq[3]
+            var emb = []
+            var d = 0
+            while d < D {
+                emb = push(emb, tape_params[last_tok * D + d])
+                d = d + 1
+            }
+
+            // Output projection: logits[v] = sum_d(out_proj[v*D+d] * emb[d])
+            // out_proj starts at offset 32 in params
+            var logits = []
+            var v = 0
+            while v < V {
+                var logit = tape_var(t, 0.0)
+                var d2 = 0
+                while d2 < D {
+                    let w_idx = 32 + v * D + d2
+                    logit = tape_add(t, logit, tape_mul(t, tape_params[w_idx], emb[d2]))
+                    d2 = d2 + 1
+                }
+                logits = push(logits, logit)
+                v = v + 1
+            }
+
+            // Cross-entropy loss
+            let loss = ad_cross_entropy_loss(t, logits, target)
+            total_loss = tape_add(t, total_loss, loss)
+
+            s = s + 1
+        }
+
+        // Backward pass
+        tape_backward(t, total_loss)
+
+        let loss_val = tape_value(t, total_loss)
+
+        if epoch % 5 == 0 {
+            println(format("Epoch {}: loss = {}", epoch, loss_val))
+        }
+
+        // Extract gradients and update
+        var grads = []
+        var g = 0
+        while g < num_params {
+            grads = push(grads, tape_grad(t, tape_params[g]))
+            g = g + 1
+        }
+
+        params = ad_sgd_step(params, grads, lr)
+
+        epoch = epoch + 1
+    }
+
+    println("")
+    println("Training complete!")
+    println("")
+
+    // Test: generate predictions for each training sequence
+    println("Predictions after training:")
+    let chars = ["h", "e", "l", "l", "o", " ", "w", "d"]
+    var s2 = 0
+    while s2 < len(seqs) {
+        let seq = seqs[s2]
+        let last_tok = seq[3]
+
+        // Forward pass (without tape)
+        var logits = []
+        var v = 0
+        while v < V {
+            var logit = 0.0
+            var d2 = 0
+            while d2 < D {
+                logit = logit + params[32 + v * D + d2] * params[last_tok * D + d2]
+                d2 = d2 + 1
+            }
+            logits = push(logits, logit)
+            v = v + 1
+        }
+
+        let probs = softmax(logits)
+        let pred = argmax(probs)
+        println(format("  {} -> predicted: {} (target: {})", to_string(seq), pred, targets[s2]))
+        s2 = s2 + 1
+    }
+
+    println("")
+    println("Tiny GPT training complete!")
+}

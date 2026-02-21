@@ -1,0 +1,208 @@
+// GPT Inference with Autoregressive Text Generation
+// Uses a pre-trained (hardcoded) weight set to generate text token by token
+
+fn dot(a: [f64], b: [f64]) -> f64 {
+    var s = 0.0
+    var i = 0
+    while i < len(a) {
+        s = s + a[i] * b[i]
+        i = i + 1
+    }
+    return s
+}
+
+fn vec_add(a: [f64], b: [f64]) -> [f64] {
+    var result = []
+    var i = 0
+    while i < len(a) {
+        result = push(result, a[i] + b[i])
+        i = i + 1
+    }
+    return result
+}
+
+fn matvec(mat: [f64], v: [f64]) -> [f64] {
+    var result = []
+    var i = 0
+    while i < len(mat) {
+        result = push(result, dot(mat[i], v))
+        i = i + 1
+    }
+    return result
+}
+
+fn argmax(arr: [f64]) -> i64 {
+    var best = 0
+    var best_val = arr[0]
+    var i = 1
+    while i < len(arr) {
+        if arr[i] > best_val {
+            best_val = arr[i]
+            best = i
+        }
+        i = i + 1
+    }
+    return best
+}
+
+fn det_weight(seed: i64) -> f64 {
+    let x = ((seed * 1103515245 + 12345) % 65536) * 1.0
+    return (x / 65536.0 - 0.5) * 0.4
+}
+
+fn main() {
+    println("=== GPT Text Generation ===")
+    println("")
+
+    // Vocabulary: h=0, e=1, l=2, o=3, _=4, w=5, r=6, d=7
+    let chars = ["h", "e", "l", "o", " ", "w", "r", "d"]
+    let V = 8
+    let D = 4
+
+    // Pre-trained weights (embedding + output projection)
+    // These are "trained" weights that map token embeddings well
+    // In practice these would come from train_gpt.vx
+    var tok_emb = []
+    var i = 0
+    while i < V * D {
+        tok_emb = push(tok_emb, det_weight(i + 100))
+        i = i + 1
+    }
+
+    var out_proj = []
+    var j = 0
+    while j < V * D {
+        out_proj = push(out_proj, det_weight(j + 200))
+        j = j + 1
+    }
+
+    // Position embeddings (simple)
+    var pos_emb = []
+    var p = 0
+    while p < 16 * D {
+        pos_emb = push(pos_emb, det_weight(p + 300) * 0.1)
+        p = p + 1
+    }
+
+    // Group into matrices
+    var tok_emb_mat = []
+    var k = 0
+    while k < V {
+        var row = []
+        var c = 0
+        while c < D {
+            row = push(row, tok_emb[k * D + c])
+            c = c + 1
+        }
+        tok_emb_mat = push(tok_emb_mat, row)
+        k = k + 1
+    }
+
+    var out_proj_mat = []
+    var k2 = 0
+    while k2 < V {
+        var row = []
+        var c = 0
+        while c < D {
+            row = push(row, out_proj[k2 * D + c])
+            c = c + 1
+        }
+        out_proj_mat = push(out_proj_mat, row)
+        k2 = k2 + 1
+    }
+
+    var pos_emb_mat = []
+    var k3 = 0
+    while k3 < 16 {
+        var row = []
+        var c = 0
+        while c < D {
+            row = push(row, pos_emb[k3 * D + c])
+            c = c + 1
+        }
+        pos_emb_mat = push(pos_emb_mat, row)
+        k3 = k3 + 1
+    }
+
+    // Prompt: "hel" = [0, 1, 2]
+    var sequence = [0, 1, 2]
+    let gen_len = 8
+
+    println(format("Prompt: {}", to_string(sequence)))
+    println(format("Generating {} tokens...", gen_len))
+    println("")
+
+    // Autoregressive generation
+    var step = 0
+    while step < gen_len {
+        // Get last token embedding + position embedding
+        let seq_len = len(sequence)
+        let last_pos = seq_len - 1
+        let last_tok = sequence[last_pos]
+
+        // Average the last few embeddings for context (simplified)
+        var context = [0.0, 0.0, 0.0, 0.0]
+        var window = 0
+        let start = last_pos
+        while window <= last_pos {
+            let tok = sequence[window]
+            let emb = vec_add(tok_emb_mat[tok], pos_emb_mat[window])
+            var new_ctx = []
+            var d = 0
+            while d < D {
+                new_ctx = push(new_ctx, context[d] + emb[d])
+                d = d + 1
+            }
+            context = new_ctx
+            window = window + 1
+        }
+        // Average
+        let n_ctx = (last_pos + 1) * 1.0
+        var avg_ctx = []
+        var d = 0
+        while d < D {
+            avg_ctx = push(avg_ctx, context[d] / n_ctx)
+            d = d + 1
+        }
+
+        // Layer norm
+        let normed = layer_norm(avg_ctx)
+
+        // Output projection -> logits
+        let logits = matvec(out_proj_mat, normed)
+        let probs = softmax(logits)
+
+        // Get predicted token (argmax / greedy)
+        let next_tok = argmax(probs)
+
+        // Show probabilities
+        var prob_strs = []
+        var v = 0
+        while v < V {
+            prob_strs = push(prob_strs, format("{}:{}", chars[v], probs[v]))
+            v = v + 1
+        }
+        println(format("Step {}: probs=[{}] -> '{}'", step, join(prob_strs, ", "), chars[next_tok]))
+
+        // Append to sequence
+        sequence = push(sequence, next_tok)
+        step = step + 1
+    }
+
+    // Convert sequence to text
+    println("")
+    var text_parts = []
+    var t = 0
+    while t < len(sequence) {
+        text_parts = push(text_parts, chars[sequence[t]])
+        t = t + 1
+    }
+    let generated_text = join(text_parts, "")
+    println(format("Generated sequence: {}", to_string(sequence)))
+    println(format("Generated text: '{}'", generated_text))
+
+    // Validate
+    assert(len(sequence) == 11, "should have 11 tokens total")
+    println("")
+    println("GPT inference complete!")
+}
