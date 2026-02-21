@@ -1,6 +1,7 @@
 use crate::ast::*;
 use crate::autodiff;
 use crate::crypto;
+use crate::gpu_runtime;
 use crate::local_learn;
 use crate::memory;
 use crate::modmath;
@@ -157,6 +158,8 @@ struct Env {
     /// AD tapes stored by integer id
     tapes: HashMap<usize, autodiff::Tape>,
     next_tape_id: usize,
+    /// GPU runtime (CPU fallback)
+    gpu_rt: gpu_runtime::CpuRuntime,
 }
 
 #[derive(Clone)]
@@ -177,6 +180,7 @@ impl Env {
             output: Vec::new(),
             tapes: HashMap::new(),
             next_tape_id: 0,
+            gpu_rt: gpu_runtime::CpuRuntime::new(),
         };
         env.register_builtins();
         env
@@ -445,6 +449,17 @@ impl Env {
         self.functions.insert("modfield_sqrt".to_string(), FnDef::Builtin(builtin_field_inv));
         self.functions.insert("modfield_batch_mul".to_string(), FnDef::Builtin(builtin_field_mul));
         self.functions.insert("modfield_batch_inv".to_string(), FnDef::Builtin(builtin_field_inv));
+
+        // GPU runtime builtins
+        self.functions.insert("gpu_alloc".to_string(), FnDef::Builtin(builtin_gpu_alloc));
+        self.functions.insert("gpu_free".to_string(), FnDef::Builtin(builtin_gpu_free));
+        self.functions.insert("gpu_matmul".to_string(), FnDef::Builtin(builtin_gpu_matmul));
+        self.functions.insert("gpu_add".to_string(), FnDef::Builtin(builtin_gpu_add));
+        self.functions.insert("gpu_mul".to_string(), FnDef::Builtin(builtin_gpu_mul));
+        self.functions.insert("gpu_relu".to_string(), FnDef::Builtin(builtin_gpu_relu));
+        self.functions.insert("gpu_softmax".to_string(), FnDef::Builtin(builtin_gpu_softmax));
+        self.functions.insert("gpu_copy_to_host".to_string(), FnDef::Builtin(builtin_gpu_copy_to_host));
+        self.functions.insert("gpu_copy_to_device".to_string(), FnDef::Builtin(builtin_gpu_copy_to_device));
     }
 }
 
@@ -4027,4 +4042,118 @@ mod phase1_2_tests {
         assert!(!o.is_empty());
         assert!(o[0].contains("["));
     }
+}
+
+// --- GPU runtime builtins ---
+
+fn extract_shape(v: &Value) -> Result<Vec<usize>, String> {
+    match v {
+        Value::Array(arr) => arr
+            .iter()
+            .map(|x| match x {
+                Value::Int(n) => Ok(*n as usize),
+                _ => Err("shape elements must be integers".to_string()),
+            })
+            .collect(),
+        _ => Err("shape must be an array".to_string()),
+    }
+}
+
+fn extract_f64_data(v: &Value) -> Result<Vec<f64>, String> {
+    fn flatten(v: &Value, out: &mut Vec<f64>) -> Result<(), String> {
+        match v {
+            Value::Float(f) => { out.push(*f); Ok(()) }
+            Value::Int(n) => { out.push(*n as f64); Ok(()) }
+            Value::Array(arr) => {
+                for x in arr { flatten(x, out)?; }
+                Ok(())
+            }
+            _ => Err("expected numeric data".to_string()),
+        }
+    }
+    let mut data = Vec::new();
+    flatten(v, &mut data)?;
+    Ok(data)
+}
+
+/// gpu_alloc(shape, dtype_str) -> buffer_id
+fn builtin_gpu_alloc(env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    if args.len() < 1 { return Err("gpu_alloc expects (shape) or (shape, dtype)".to_string()); }
+    let shape = extract_shape(&args[0])?;
+    let id = env.gpu_rt.alloc(&shape, gpu_runtime::DType::F64);
+    Ok(Value::Int(id as i128))
+}
+
+/// gpu_free(buffer_id)
+fn builtin_gpu_free(env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    if args.len() != 1 { return Err("gpu_free expects 1 argument".to_string()); }
+    let id = match &args[0] { Value::Int(n) => *n as usize, _ => return Err("gpu_free: id must be int".to_string()) };
+    env.gpu_rt.free(id);
+    Ok(Value::Void)
+}
+
+/// gpu_matmul(a, b) -> buffer_id
+fn builtin_gpu_matmul(env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    if args.len() != 2 { return Err("gpu_matmul expects 2 arguments".to_string()); }
+    let a = match &args[0] { Value::Int(n) => *n as usize, _ => return Err("expected int id".to_string()) };
+    let b = match &args[1] { Value::Int(n) => *n as usize, _ => return Err("expected int id".to_string()) };
+    let c = env.gpu_rt.matmul(a, b);
+    Ok(Value::Int(c as i128))
+}
+
+/// gpu_add(a, b) -> buffer_id
+fn builtin_gpu_add(env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    if args.len() != 2 { return Err("gpu_add expects 2 arguments".to_string()); }
+    let a = match &args[0] { Value::Int(n) => *n as usize, _ => return Err("expected int id".to_string()) };
+    let b = match &args[1] { Value::Int(n) => *n as usize, _ => return Err("expected int id".to_string()) };
+    let c = env.gpu_rt.elementwise_add(a, b);
+    Ok(Value::Int(c as i128))
+}
+
+/// gpu_mul(a, b) -> buffer_id
+fn builtin_gpu_mul(env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    if args.len() != 2 { return Err("gpu_mul expects 2 arguments".to_string()); }
+    let a = match &args[0] { Value::Int(n) => *n as usize, _ => return Err("expected int id".to_string()) };
+    let b = match &args[1] { Value::Int(n) => *n as usize, _ => return Err("expected int id".to_string()) };
+    let c = env.gpu_rt.elementwise_mul(a, b);
+    Ok(Value::Int(c as i128))
+}
+
+/// gpu_relu(a) -> buffer_id
+fn builtin_gpu_relu(env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    if args.len() != 1 { return Err("gpu_relu expects 1 argument".to_string()); }
+    let a = match &args[0] { Value::Int(n) => *n as usize, _ => return Err("expected int id".to_string()) };
+    let c = env.gpu_rt.relu(a);
+    Ok(Value::Int(c as i128))
+}
+
+/// gpu_softmax(a, axis) -> buffer_id
+fn builtin_gpu_softmax(env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    if args.len() < 1 { return Err("gpu_softmax expects (buffer_id) or (buffer_id, axis)".to_string()); }
+    let a = match &args[0] { Value::Int(n) => *n as usize, _ => return Err("expected int id".to_string()) };
+    let axis = if args.len() > 1 {
+        match &args[1] { Value::Int(n) => *n as usize, _ => 0 }
+    } else { 0 };
+    let c = env.gpu_rt.softmax(a, axis);
+    Ok(Value::Int(c as i128))
+}
+
+/// gpu_copy_to_host(buffer_id) -> Array of floats
+fn builtin_gpu_copy_to_host(env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    if args.len() != 1 { return Err("gpu_copy_to_host expects 1 argument".to_string()); }
+    let id = match &args[0] { Value::Int(n) => *n as usize, _ => return Err("expected int id".to_string()) };
+    let data = env.gpu_rt.copy_data(id);
+    Ok(Value::Array(data.into_iter().map(Value::Float).collect()))
+}
+
+/// gpu_copy_to_device(data, shape) -> buffer_id
+fn builtin_gpu_copy_to_device(env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    if args.len() < 2 { return Err("gpu_copy_to_device expects (data, shape)".to_string()); }
+    let data = extract_f64_data(&args[0])?;
+    let shape = extract_shape(&args[1])?;
+    let n: usize = shape.iter().product();
+    if data.len() != n { return Err(format!("data length {} != shape product {}", data.len(), n)); }
+    let id = env.gpu_rt.alloc(&shape, gpu_runtime::DType::F64);
+    env.gpu_rt.write_data(id, &data);
+    Ok(Value::Int(id as i128))
 }
