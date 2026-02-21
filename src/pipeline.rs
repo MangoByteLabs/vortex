@@ -235,31 +235,27 @@ impl Pipeline {
 
     fn get_mlir_opt_args(&self) -> Vec<String> {
         let mut args = Vec::new();
+        let is_gpu = self.config.target == Target::NvidiaPTX
+            || self.config.target == Target::AmdGCN;
 
-        // GPU-specific passes
-        if self.config.target == Target::NvidiaPTX || self.config.target == Target::AmdGCN {
-            args.push("--gpu-kernel-outlining".to_string());
-        }
-
-        // Bufferization and linalg passes
-        args.push("--normalize-memrefs".to_string());
-        args.push("--one-shot-bufferize".to_string());
-        args.push("--convert-linalg-to-loops".to_string());
-        args.push("--buffer-deallocation".to_string());
-
-        // Standard optimization pipeline
-        args.push("--convert-scf-to-cf".to_string());
-        args.push("--convert-arith-to-llvm".to_string());
-        args.push("--convert-func-to-llvm".to_string());
-        args.push("--convert-cf-to-llvm".to_string());
-        args.push("--reconcile-unrealized-casts".to_string());
-
+        // 1. High-level optimizations
         if self.config.opt_level >= 1 {
             args.push("--canonicalize".to_string());
             args.push("--cse".to_string());
         }
 
-        // Target-specific GPU lowering
+        // 2. GPU kernel outlining (must happen early, before lowering)
+        if is_gpu {
+            args.push("--gpu-kernel-outlining".to_string());
+        }
+
+        // 3. Bufferization
+        args.push("--one-shot-bufferize".to_string());
+        args.push("--convert-linalg-to-loops".to_string());
+        args.push("--convert-linalg-to-affine-loops".to_string());
+        args.push("--buffer-deallocation".to_string());
+
+        // 4. GPU dialect lowering (BEFORE LLVM conversion)
         match self.config.target {
             Target::NvidiaPTX => {
                 args.push("--gpu-to-nvvm".to_string());
@@ -269,6 +265,21 @@ impl Pipeline {
             }
             _ => {}
         }
+
+        // 5. SCF lowering
+        args.push("--convert-scf-to-cf".to_string());
+
+        // 6. Standard to LLVM lowering
+        args.push("--convert-func-to-llvm".to_string());
+        args.push("--convert-arith-to-llvm".to_string());
+        args.push("--convert-cf-to-llvm".to_string());
+        args.push("--convert-memref-to-llvm".to_string());
+
+        // 7. Final cleanup
+        if is_gpu {
+            args.push("--convert-gpu-to-llvm-spv".to_string());
+        }
+        args.push("--reconcile-unrealized-casts".to_string());
 
         args
     }
@@ -472,7 +483,11 @@ mod tests {
         let passes = pipeline.get_passes_for_target();
         assert!(passes.contains(&"--gpu-kernel-outlining".to_string()));
         assert!(passes.contains(&"--gpu-to-nvvm".to_string()));
-        assert!(passes.contains(&"--normalize-memrefs".to_string()));
+        assert!(passes.contains(&"--convert-memref-to-llvm".to_string()));
+        // GPU lowering must come before LLVM conversion
+        let nvvm_pos = passes.iter().position(|p| p == "--gpu-to-nvvm").unwrap();
+        let arith_pos = passes.iter().position(|p| p == "--convert-arith-to-llvm").unwrap();
+        assert!(nvvm_pos < arith_pos, "gpu-to-nvvm must run before convert-arith-to-llvm");
     }
 
     #[test]
