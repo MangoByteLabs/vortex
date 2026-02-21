@@ -17,7 +17,7 @@ module {
     %8 = arith.constant 1 : i64
     %9 = arith.index_cast %8 : i64 to index
     %10 = memref.load %4[%9] : memref<3xi64>
-    func.return %10
+    func.return %10 : i64
   }
   
 }

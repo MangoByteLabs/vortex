@@ -12,7 +12,7 @@ module {
         %result = arith.mulf %a, %b : f32
         linalg.yield %result : f32
     } -> tensor<4xf32>
-    func.return %3
+    func.return %3 : tensor<4xf32>
   }
   
 }

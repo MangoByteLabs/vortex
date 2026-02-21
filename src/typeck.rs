@@ -197,14 +197,189 @@ impl TypeEnv {
         }
     }
 
-    fn unify_var(&mut self, id: usize, ty: &Type) {
-        // Don't bind a var to itself
-        if let Type::Var(other) = ty {
-            if *other == id {
-                return;
+    /// Unify two types, updating the substitution map.
+    /// Returns the unified type on success, or None on failure (and records an error).
+    fn unify(&mut self, a: &Type, b: &Type, span: Span) -> Option<Type> {
+        let a = self.resolve_deep(a);
+        let b = self.resolve_deep(b);
+
+        // Error types unify with anything (avoid cascading errors)
+        if matches!(&a, Type::Error) || matches!(&b, Type::Error) {
+            return Some(if matches!(&a, Type::Error) { b } else { a });
+        }
+
+        match (&a, &b) {
+            // Type variable on the left -> bind
+            (Type::Var(id), _) => {
+                self.bind(*id, &b);
+                Some(b)
+            }
+            // Type variable on the right -> bind
+            (_, Type::Var(id)) => {
+                self.bind(*id, &a);
+                Some(a)
+            }
+
+            // Same concrete types
+            (Type::Scalar(sa), Type::Scalar(sb)) => {
+                if sa == sb {
+                    Some(a)
+                } else if are_numeric_compatible(sa, sb) {
+                    Some(wider_numeric_type(sa, sb))
+                } else {
+                    self.type_mismatch(span, &a, &b);
+                    None
+                }
+            }
+            (Type::Void, Type::Void) => Some(Type::Void),
+            (Type::Named(na), Type::Named(nb)) if na == nb => Some(a),
+
+            // Named types: be lenient only against Var/Error (handled above) and
+            // other Named types of the same name (handled above).
+            // Named vs Scalar/Array/Tensor/Void/Fn is a mismatch.
+            // Named vs Named (different) is also a mismatch.
+            (Type::Named(_), _) | (_, Type::Named(_)) => {
+                self.type_mismatch(span, &a, &b);
+                None
+            }
+
+            // Tensor types
+            (
+                Type::Tensor { elem: e1, shape: s1 },
+                Type::Tensor { elem: e2, shape: s2 },
+            ) => {
+                let elem_unified = self.unify(e1, e2, span);
+                if shapes_compatible(s1, s2) {
+                    elem_unified.map(|e| Type::Tensor {
+                        elem: Box::new(e),
+                        shape: s1.clone(),
+                    })
+                } else {
+                    self.type_mismatch(span, &a, &b);
+                    None
+                }
+            }
+
+            // Array types
+            (Type::Array { elem: e1, size: s1 }, Type::Array { elem: e2, size: s2 }) => {
+                if s1 == s2 {
+                    self.unify(e1, e2, span).map(|e| Type::Array {
+                        elem: Box::new(e),
+                        size: *s1,
+                    })
+                } else {
+                    self.type_mismatch(span, &a, &b);
+                    None
+                }
+            }
+
+            // Function types
+            (Type::Fn { params: p1, ret: r1 }, Type::Fn { params: p2, ret: r2 }) => {
+                if p1.len() != p2.len() {
+                    self.type_mismatch(span, &a, &b);
+                    return None;
+                }
+                let mut unified_params = Vec::new();
+                for (pa, pb) in p1.iter().zip(p2.iter()) {
+                    match self.unify(pa, pb, span) {
+                        Some(u) => unified_params.push(u),
+                        None => return None,
+                    }
+                }
+                self.unify(r1, r2, span).map(|r| Type::Fn {
+                    params: unified_params,
+                    ret: Box::new(r),
+                })
+            }
+
+            _ => {
+                self.type_mismatch(span, &a, &b);
+                None
             }
         }
+    }
+
+    /// Try to unify without reporting errors. Returns Some on success.
+    fn try_unify(&mut self, a: &Type, b: &Type) -> Option<Type> {
+        let a = self.resolve_deep(a);
+        let b = self.resolve_deep(b);
+
+        if matches!(&a, Type::Error) || matches!(&b, Type::Error) {
+            return Some(if matches!(&a, Type::Error) { b } else { a });
+        }
+
+        match (&a, &b) {
+            (Type::Var(id), _) => { self.bind(*id, &b); Some(b) }
+            (_, Type::Var(id)) => { self.bind(*id, &a); Some(a) }
+            (Type::Scalar(sa), Type::Scalar(sb)) => {
+                if sa == sb { Some(a) }
+                else if are_numeric_compatible(sa, sb) { Some(wider_numeric_type(sa, sb)) }
+                else { None }
+            }
+            (Type::Void, Type::Void) => Some(Type::Void),
+            (Type::Named(na), Type::Named(nb)) if na == nb => Some(a),
+            (Type::Named(_), _) | (_, Type::Named(_)) => None,
+            (
+                Type::Tensor { elem: e1, shape: s1 },
+                Type::Tensor { elem: e2, shape: s2 },
+            ) => {
+                if shapes_compatible(s1, s2) {
+                    self.try_unify(e1, e2).map(|e| Type::Tensor { elem: Box::new(e), shape: s1.clone() })
+                } else { None }
+            }
+            (Type::Array { elem: e1, size: s1 }, Type::Array { elem: e2, size: s2 }) => {
+                if s1 == s2 { self.try_unify(e1, e2).map(|e| Type::Array { elem: Box::new(e), size: *s1 }) }
+                else { None }
+            }
+            _ => None,
+        }
+    }
+
+    /// Follow substitution chains deeply: resolve Var inside compound types too
+    fn resolve_deep(&self, ty: &Type) -> Type {
+        match ty {
+            Type::Var(id) => {
+                if let Some(resolved) = self.substitutions.get(id) {
+                    self.resolve_deep(resolved)
+                } else {
+                    ty.clone()
+                }
+            }
+            Type::Array { elem, size } => Type::Array {
+                elem: Box::new(self.resolve_deep(elem)),
+                size: *size,
+            },
+            Type::Tensor { elem, shape } => Type::Tensor {
+                elem: Box::new(self.resolve_deep(elem)),
+                shape: shape.clone(),
+            },
+            Type::Fn { params, ret } => Type::Fn {
+                params: params.iter().map(|p| self.resolve_deep(p)).collect(),
+                ret: Box::new(self.resolve_deep(ret)),
+            },
+            _ => ty.clone(),
+        }
+    }
+
+    /// Bind a type variable (with occurs check)
+    fn bind(&mut self, id: usize, ty: &Type) {
+        if self.occurs(id, ty) {
+            return;
+        }
         self.substitutions.insert(id, ty.clone());
+    }
+
+    /// Occurs check: does Var(id) appear in ty?
+    fn occurs(&self, id: usize, ty: &Type) -> bool {
+        match self.resolve_deep(ty) {
+            Type::Var(other_id) => id == other_id,
+            Type::Array { elem, .. } => self.occurs(id, &elem),
+            Type::Tensor { elem, .. } => self.occurs(id, &elem),
+            Type::Fn { params, ret } => {
+                params.iter().any(|p| self.occurs(id, p)) || self.occurs(id, &ret)
+            }
+            _ => false,
+        }
     }
 
     fn error(&mut self, span: Span, msg: String) {
@@ -426,8 +601,8 @@ fn check_block(env: &mut TypeEnv, block: &Block, expected_ret: &Type) {
 
     if let Some(expr) = &block.expr {
         let ty = infer_expr(env, expr);
-        if !types_compatible(expected_ret, &ty) && *expected_ret != Type::Void {
-            env.type_mismatch(expr.span, expected_ret, &ty);
+        if *expected_ret != Type::Void {
+            env.unify(expected_ret, &ty, expr.span);
         }
     }
 }
@@ -438,30 +613,29 @@ fn check_stmt(env: &mut TypeEnv, stmt: &Stmt, expected_ret: &Type) {
             let value_ty = infer_expr(env, value);
             if let Some(annotated_ty) = ty {
                 let expected = resolve_type_expr(env, annotated_ty);
-                if !types_compatible(&expected, &value_ty) {
-                    env.type_mismatch(value.span, &expected, &value_ty);
-                }
-                env.define(&name.name, expected);
+                let unified = env.unify(&expected, &value_ty, value.span);
+                env.define(&name.name, unified.unwrap_or(expected));
             } else {
-                env.define(&name.name, value_ty);
+                // Resolve any type variables that got unified
+                let resolved = env.resolve_deep(&value_ty);
+                env.define(&name.name, resolved);
             }
         }
         StmtKind::Var { name, ty, value } => {
             let value_ty = infer_expr(env, value);
             if let Some(annotated_ty) = ty {
                 let expected = resolve_type_expr(env, annotated_ty);
-                if !types_compatible(&expected, &value_ty) {
-                    env.type_mismatch(value.span, &expected, &value_ty);
-                }
-                env.define(&name.name, expected);
+                let unified = env.unify(&expected, &value_ty, value.span);
+                env.define(&name.name, unified.unwrap_or(expected));
             } else {
-                env.define(&name.name, value_ty);
+                let resolved = env.resolve_deep(&value_ty);
+                env.define(&name.name, resolved);
             }
         }
         StmtKind::Return(Some(expr)) => {
             let ty = infer_expr(env, expr);
-            if !types_compatible(expected_ret, &ty) && *expected_ret != Type::Void {
-                env.type_mismatch(expr.span, expected_ret, &ty);
+            if *expected_ret != Type::Void {
+                env.unify(expected_ret, &ty, expr.span);
             }
         }
         StmtKind::Return(None) => {
@@ -475,9 +649,7 @@ fn check_stmt(env: &mut TypeEnv, stmt: &Stmt, expected_ret: &Type) {
         StmtKind::Assign { target, op: _, value } => {
             let target_ty = infer_expr(env, target);
             let value_ty = infer_expr(env, value);
-            if !types_compatible(&target_ty, &value_ty) {
-                env.type_mismatch(value.span, &target_ty, &value_ty);
-            }
+            env.unify(&target_ty, &value_ty, value.span);
         }
         StmtKind::For { var, iter, body } => {
             env.push_scope();
@@ -493,9 +665,7 @@ fn check_stmt(env: &mut TypeEnv, stmt: &Stmt, expected_ret: &Type) {
         }
         StmtKind::While { cond, body } => {
             let cond_ty = infer_expr(env, cond);
-            if !types_compatible(&Type::Scalar(ScalarType::Bool), &cond_ty) {
-                env.type_mismatch(cond.span, &Type::Scalar(ScalarType::Bool), &cond_ty);
-            }
+            env.unify(&Type::Scalar(ScalarType::Bool), &cond_ty, cond.span);
             env.push_scope();
             check_block(env, body, &Type::Void);
             env.pop_scope();
@@ -524,7 +694,7 @@ fn infer_expr(env: &mut TypeEnv, expr: &Expr) -> Type {
 
         ExprKind::Ident(id) => {
             if let Some(ty) = env.lookup(&id.name) {
-                ty.clone()
+                env.resolve_deep(ty)
             } else if env.type_params.contains_key(&id.name) {
                 // Generic type parameter — treat as its own type
                 Type::Named(id.name.clone())
@@ -540,9 +710,7 @@ fn infer_expr(env: &mut TypeEnv, expr: &Expr) -> Type {
 
             match op {
                 BinOp::Eq | BinOp::NotEq | BinOp::Lt | BinOp::Gt | BinOp::LtEq | BinOp::GtEq => {
-                    if !types_compatible(&lhs_ty, &rhs_ty) {
-                        env.type_mismatch(expr.span, &lhs_ty, &rhs_ty);
-                    }
+                    env.unify(&lhs_ty, &rhs_ty, expr.span);
                     Type::Scalar(ScalarType::Bool)
                 }
                 BinOp::And | BinOp::Or => {
@@ -564,9 +732,7 @@ fn infer_expr(env: &mut TypeEnv, expr: &Expr) -> Type {
                             Type::Tensor { elem: elem_l, shape: shape_l },
                             Type::Tensor { elem: elem_r, shape: shape_r },
                         ) => {
-                            if !types_compatible(elem_l, elem_r) {
-                                env.type_mismatch(expr.span, elem_l, elem_r);
-                            }
+                            env.unify(elem_l, elem_r, expr.span);
                             match ShapeChecker::check_broadcast(shape_l, shape_r) {
                                 Ok(result_shape) => Type::Tensor {
                                     elem: elem_l.clone(),
@@ -585,10 +751,8 @@ fn infer_expr(env: &mut TypeEnv, expr: &Expr) -> Type {
                     }
                 }
                 BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor | BinOp::Shl | BinOp::Shr => {
-                    if !types_compatible(&lhs_ty, &rhs_ty) {
-                        env.type_mismatch(expr.span, &lhs_ty, &rhs_ty);
-                    }
-                    lhs_ty
+                    let unified = env.unify(&lhs_ty, &rhs_ty, expr.span);
+                    unified.unwrap_or(lhs_ty)
                 }
             }
         }
@@ -628,9 +792,7 @@ fn infer_expr(env: &mut TypeEnv, expr: &Expr) -> Type {
                         } else {
                             for (arg, expected) in args.iter().zip(info.field_types.iter()) {
                                 let arg_ty = infer_expr(env, arg);
-                                if !types_compatible(expected, &arg_ty) {
-                                    env.type_mismatch(arg.span, expected, &arg_ty);
-                                }
+                                env.unify(expected, &arg_ty, arg.span);
                             }
                         }
                     }
@@ -651,19 +813,13 @@ fn infer_expr(env: &mut TypeEnv, expr: &Expr) -> Type {
                             ),
                         );
                     } else {
-                        // Check argument types
+                        // Check argument types via unification
                         for (arg, expected) in args.iter().zip(param_types.iter()) {
                             let arg_ty = infer_expr(env, arg);
-                            if !types_compatible(expected, &arg_ty) {
-                                env.type_mismatch(
-                                    arg.span,
-                                    expected,
-                                    &arg_ty,
-                                );
-                            }
+                            env.unify(expected, &arg_ty, arg.span);
                         }
                     }
-                    return ret_type;
+                    return env.resolve_deep(&ret_type);
                 }
             }
 
@@ -757,9 +913,7 @@ fn infer_expr(env: &mut TypeEnv, expr: &Expr) -> Type {
 
         ExprKind::If { cond, then_block, else_block } => {
             let cond_ty = infer_expr(env, cond);
-            if !types_compatible(&Type::Scalar(ScalarType::Bool), &cond_ty) {
-                env.type_mismatch(cond.span, &Type::Scalar(ScalarType::Bool), &cond_ty);
-            }
+            env.unify(&Type::Scalar(ScalarType::Bool), &cond_ty, cond.span);
 
             env.push_scope();
             let then_ty = if let Some(expr) = &then_block.expr {
@@ -790,13 +944,8 @@ fn infer_expr(env: &mut TypeEnv, expr: &Expr) -> Type {
                 };
                 env.pop_scope();
 
-                if !types_compatible(&then_ty, &else_ty) {
-                    env.error(
-                        expr.span,
-                        format!("if/else branches have incompatible types: `{}` vs `{}`", then_ty, else_ty),
-                    );
-                }
-                then_ty
+                let unified = env.unify(&then_ty, &else_ty, expr.span);
+                unified.unwrap_or(then_ty)
             } else {
                 Type::Void
             }
@@ -805,9 +954,7 @@ fn infer_expr(env: &mut TypeEnv, expr: &Expr) -> Type {
         ExprKind::Range { start, end } => {
             let start_ty = infer_expr(env, start);
             let end_ty = infer_expr(env, end);
-            if !types_compatible(&start_ty, &end_ty) {
-                env.type_mismatch(expr.span, &start_ty, &end_ty);
-            }
+            env.unify(&start_ty, &end_ty, expr.span);
             Type::Named("Range".to_string())
         }
 
@@ -818,15 +965,15 @@ fn infer_expr(env: &mut TypeEnv, expr: &Expr) -> Type {
                     size: 0,
                 };
             }
-            let first_ty = infer_expr(env, &elems[0]);
+            let mut elem_ty = infer_expr(env, &elems[0]);
             for elem in &elems[1..] {
                 let ty = infer_expr(env, elem);
-                if !types_compatible(&first_ty, &ty) {
-                    env.type_mismatch(elem.span, &first_ty, &ty);
+                if let Some(unified) = env.unify(&elem_ty, &ty, elem.span) {
+                    elem_ty = unified;
                 }
             }
             Type::Array {
-                elem: Box::new(first_ty),
+                elem: Box::new(env.resolve_deep(&elem_ty)),
                 size: elems.len() as u64,
             }
         }
@@ -910,16 +1057,13 @@ fn infer_expr(env: &mut TypeEnv, expr: &Expr) -> Type {
             if arm_types.is_empty() {
                 env.fresh_var()
             } else {
-                let first = &arm_types[0];
+                let mut result_ty = arm_types[0].clone();
                 for (i, arm_ty) in arm_types[1..].iter().enumerate() {
-                    if !types_compatible(first, arm_ty) {
-                        env.error(
-                            arms[i + 1].span,
-                            format!("match arm type mismatch: expected `{}`, found `{}`", first, arm_ty),
-                        );
+                    if let Some(unified) = env.unify(&result_ty, arm_ty, arms[i + 1].span) {
+                        result_ty = unified;
                     }
                 }
-                arm_types.into_iter().next().unwrap()
+                env.resolve_deep(&result_ty)
             }
         }
 
@@ -929,17 +1073,18 @@ fn infer_expr(env: &mut TypeEnv, expr: &Expr) -> Type {
 }
 
 fn check_numeric_op(env: &mut TypeEnv, span: Span, lhs: &Type, rhs: &Type) -> Type {
+    let lhs = env.resolve_deep(lhs);
+    let rhs = env.resolve_deep(rhs);
+
     // Both tensors — use shape broadcasting
     if let (
         Type::Tensor { elem: elem_l, shape: shape_l },
         Type::Tensor { elem: elem_r, shape: shape_r },
-    ) = (lhs, rhs) {
-        if !types_compatible(elem_l, elem_r) {
-            env.type_mismatch(span, elem_l, elem_r);
-        }
+    ) = (&lhs, &rhs) {
+        let unified_elem = env.unify(elem_l, elem_r, span);
         return match ShapeChecker::check_broadcast(shape_l, shape_r) {
             Ok(result_shape) => Type::Tensor {
-                elem: elem_l.clone(),
+                elem: Box::new(unified_elem.unwrap_or(*elem_l.clone())),
                 shape: result_shape,
             },
             Err(e) => {
@@ -949,33 +1094,30 @@ fn check_numeric_op(env: &mut TypeEnv, span: Span, lhs: &Type, rhs: &Type) -> Ty
         };
     }
 
-    // Both scalars
-    if is_numeric(lhs) && is_numeric(rhs) {
-        if !types_compatible(lhs, rhs) {
-            env.type_mismatch(span, lhs, rhs);
-        }
-        return lhs.clone();
+    // Both scalars — unify (handles widening)
+    if is_numeric(&lhs) && is_numeric(&rhs) {
+        return env.unify(&lhs, &rhs, span).unwrap_or(lhs);
     }
 
     // Scalar + tensor broadcasting
-    if is_numeric(lhs) && matches!(rhs, Type::Tensor { .. }) {
-        return rhs.clone();
+    if is_numeric(&lhs) && matches!(&rhs, Type::Tensor { .. }) {
+        return rhs;
     }
-    if matches!(lhs, Type::Tensor { .. }) && is_numeric(rhs) {
-        return lhs.clone();
+    if matches!(&lhs, Type::Tensor { .. }) && is_numeric(&rhs) {
+        return lhs;
     }
 
     // Named types (might be field elements or other numeric types)
-    if matches!(lhs, Type::Named(_)) || matches!(rhs, Type::Named(_)) {
-        return lhs.clone();
+    if matches!(&lhs, Type::Named(_)) || matches!(&rhs, Type::Named(_)) {
+        return lhs;
     }
 
-    // Type variables
-    if matches!(lhs, Type::Var(_)) || matches!(rhs, Type::Var(_)) {
-        return lhs.clone();
+    // Type variables — unify
+    if matches!(&lhs, Type::Var(_)) || matches!(&rhs, Type::Var(_)) {
+        return env.unify(&lhs, &rhs, span).unwrap_or(lhs);
     }
 
-    if matches!(lhs, Type::Error) || matches!(rhs, Type::Error) {
+    if matches!(&lhs, Type::Error) || matches!(&rhs, Type::Error) {
         return Type::Error;
     }
 
@@ -992,6 +1134,23 @@ fn is_numeric(ty: &Type) -> bool {
             ScalarType::F16 | ScalarType::F32 | ScalarType::F64
         )
     )
+}
+
+/// Given two numeric-compatible scalar types, return the wider one
+fn wider_numeric_type(a: &ScalarType, b: &ScalarType) -> Type {
+    use ScalarType::*;
+    // Float always wins over integer
+    let result = match (a, b) {
+        (F64, _) | (_, F64) => F64,
+        (F32, _) | (_, F32) => F32,
+        (F16, _) | (_, F16) => F16,
+        (I64, _) | (_, I64) => I64,
+        (U64, _) | (_, U64) => U64,
+        (I32, _) | (_, I32) => I32,
+        (U32, _) | (_, U32) => U32,
+        _ => a.clone(),
+    };
+    Type::Scalar(result)
 }
 
 fn types_compatible(expected: &Type, got: &Type) -> bool {
@@ -1334,6 +1493,76 @@ mod tests {
                 return a @ b
             }",
         );
+    }
+
+    // --- Hindley-Milner unification tests ---
+
+    #[test]
+    fn test_unify_let_infer_i64() {
+        // let x = 42 -> x inferred as i64
+        check_ok("fn test() -> i64 { let x = 42\n return x }");
+    }
+
+    #[test]
+    fn test_unify_let_infer_f64() {
+        // let y = 3.14 -> y inferred as f64
+        check_ok("fn test() -> f64 { let y = 3.14\n return y }");
+    }
+
+    #[test]
+    fn test_unify_numeric_widening() {
+        // i64 + f64 is not compatible (they are different scalar types without widening rule)
+        // But i32 + i64 should work
+        check_ok("fn test(x: i32) -> i64 { return x + 1 }");
+    }
+
+    #[test]
+    fn test_unify_fn_call_type_checks() {
+        check_ok("fn f(a: i64) -> i64 { return a }\nfn test() { f(42) }");
+    }
+
+    #[test]
+    fn test_unify_fn_call_type_error() {
+        let src = "fn f(a: i64) -> i64 { return a }\nfn test() { f(\"hi\") }";
+        let tokens = lexer::lex(src);
+        let program = parser::parse(tokens, 0).expect("parse failed");
+        let result = check(&program, 0);
+        assert!(result.is_err(), "expected type error for f(\"hi\") but got Ok");
+        let errs = result.unwrap_err();
+        assert!(errs.iter().any(|d| d.message.contains("type mismatch")));
+    }
+
+    #[test]
+    fn test_unify_if_else_same_type() {
+        check_ok("fn test() -> i64 { if true { 1 } else { 2 } }");
+    }
+
+    #[test]
+    fn test_unify_if_else_type_error() {
+        let src = "fn test() { let x = if true { 1 } else { \"hi\" } }";
+        let tokens = lexer::lex(src);
+        let program = parser::parse(tokens, 0).expect("parse failed");
+        let result = check(&program, 0);
+        assert!(result.is_err(), "expected type error for if/else mismatch but got Ok");
+        let errs = result.unwrap_err();
+        assert!(errs.iter().any(|d| d.message.contains("type mismatch")));
+    }
+
+    #[test]
+    fn test_unify_array_indexing() {
+        check_ok("fn test() -> i64 { let arr = [1, 2, 3]\n return arr[0] }");
+    }
+
+    #[test]
+    fn test_unify_fn_return_inferred() {
+        // Function with annotated return type, body returns correct type
+        check_ok("fn f(x: i64) -> i64 { return x + 1 }");
+    }
+
+    #[test]
+    fn test_unify_var_resolution() {
+        // Type variables from unknown function calls should not cause errors
+        check_ok("fn test() { let x = unknown_fn(1, 2) }");
     }
 
     #[test]

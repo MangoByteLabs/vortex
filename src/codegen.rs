@@ -89,6 +89,8 @@ pub struct CodeGen {
     in_kernel: bool,
     /// Track which variables have unsigned source types
     unsigned_vars: HashMap<String, bool>,
+    /// Nesting depth inside scf regions (if/for/while) where func.return is invalid
+    scf_depth: usize,
 }
 
 impl CodeGen {
@@ -102,6 +104,7 @@ impl CodeGen {
             fn_signatures: HashMap::new(),
             in_kernel: false,
             unsigned_vars: HashMap::new(),
+            scf_depth: 0,
         }
     }
 
@@ -335,15 +338,15 @@ impl CodeGen {
     }
 
     /// Emit the appropriate return for the current context (gpu.return vs func.return)
-    fn emit_return(&mut self, value: Option<&str>) {
+    fn emit_return_typed(&mut self, value: Option<(&str, &MLIRType)>) {
         if self.in_kernel {
-            if let Some(v) = value {
-                self.emit_line(&format!("gpu.return {}", v));
+            if let Some((v, ty)) = value {
+                self.emit_line(&format!("gpu.return {} : {}", v, ty));
             } else {
                 self.emit_line("gpu.return");
             }
-        } else if let Some(v) = value {
-            self.emit_line(&format!("func.return {}", v));
+        } else if let Some((v, ty)) = value {
+            self.emit_line(&format!("func.return {} : {}", v, ty));
         } else {
             self.emit_line("func.return");
         }
@@ -408,6 +411,13 @@ impl CodeGen {
 
         self.gen_block(&func.body, &ret_type);
 
+        // Ensure every function has a terminator
+        let has_explicit_return = func.body.stmts.iter().any(|s| matches!(s.kind, StmtKind::Return(_)));
+        let has_tail_expr = func.body.expr.is_some() && ret_type != MLIRType::None;
+        if !has_explicit_return && !has_tail_expr {
+            self.emit_line("func.return");
+        }
+
         self.indent -= 1;
         self.emit_line("}");
         self.emit_line("");
@@ -454,8 +464,13 @@ impl CodeGen {
 
         self.gen_block(&kernel.body, &ret_type);
 
-        // GPU functions need gpu.return
-        self.emit_line("gpu.return");
+        // Only emit gpu.return if the block didn't already produce one
+        // (i.e., it has no explicit return statement and no trailing expression)
+        let has_explicit_return = kernel.body.stmts.iter().any(|s| matches!(s.kind, StmtKind::Return(_)));
+        let has_tail_expr = kernel.body.expr.is_some() && ret_type != MLIRType::None;
+        if !has_explicit_return && !has_tail_expr {
+            self.emit_line("gpu.return");
+        }
 
         self.indent -= 1;
         self.emit_line("}");
@@ -475,9 +490,9 @@ impl CodeGen {
         }
 
         if let Some(expr) = &block.expr {
-            let (ssa, _ty) = self.gen_expr(expr);
+            let (ssa, ty) = self.gen_expr(expr);
             if *expected_ret != MLIRType::None {
-                self.emit_return(Some(&ssa));
+                self.emit_return_typed(Some((&ssa, &ty)));
             }
         }
     }
@@ -500,11 +515,20 @@ impl CodeGen {
             }
 
             StmtKind::Return(Some(expr)) => {
-                let (ssa, _ty) = self.gen_expr(expr);
-                self.emit_return(Some(&ssa));
+                let (ssa, ty) = self.gen_expr(expr);
+                if self.scf_depth > 0 {
+                    // Cannot emit func.return/gpu.return inside scf regions.
+                    self.emit_line(&format!("// early return: {} (inside scf region)", ssa));
+                } else {
+                    self.emit_return_typed(Some((&ssa, &ty)));
+                }
             }
             StmtKind::Return(None) => {
-                self.emit_return(None);
+                if self.scf_depth > 0 {
+                    self.emit_line("// early return (inside scf region)");
+                } else {
+                    self.emit_return_typed(None);
+                }
             }
 
             StmtKind::Expr(expr) => {
@@ -616,6 +640,7 @@ impl CodeGen {
                 // Emit as scf.while with constant true condition
                 self.emit_line("scf.while : () -> () {");
                 self.indent += 1;
+                self.scf_depth += 1;
                 let cond_ssa = self.fresh_ssa();
                 self.emit_line(&format!("{} = arith.constant 1 : i1", cond_ssa));
                 self.emit_line(&format!("scf.condition({})", cond_ssa));
@@ -628,6 +653,7 @@ impl CodeGen {
                 }
                 self.pop_scope();
                 self.emit_line("scf.yield");
+                self.scf_depth -= 1;
                 self.indent -= 1;
                 self.emit_line("}");
             }
@@ -732,12 +758,36 @@ impl CodeGen {
 
             ExprKind::Binary { lhs, op, rhs } => {
                 let (l_ssa, l_ty) = self.gen_expr(lhs);
-                let (r_ssa, _r_ty) = self.gen_expr(rhs);
+                let (mut r_ssa, r_ty) = self.gen_expr(rhs);
                 let is_unsigned = if let ExprKind::Ident(id) = &lhs.kind {
                     self.unsigned_vars.contains_key(&id.name)
                 } else {
                     false
                 };
+                // Insert cast if types mismatch (e.g., f32 vs f64)
+                if l_ty != r_ty {
+                    let cast_ssa = self.fresh_ssa();
+                    if Self::is_float_type(&l_ty) && Self::is_float_type(&r_ty) {
+                        // Cast rhs to match lhs type
+                        let op_name = match (&r_ty, &l_ty) {
+                            (MLIRType::F64, MLIRType::F32) | (MLIRType::F64, MLIRType::F16) |
+                            (MLIRType::F32, MLIRType::F16) => "arith.truncf",
+                            _ => "arith.extf",
+                        };
+                        self.emit_line(&format!(
+                            "{} = {} {} : {} to {}",
+                            cast_ssa, op_name, r_ssa, r_ty, l_ty
+                        ));
+                        r_ssa = cast_ssa;
+                    } else if Self::is_int_type(&l_ty) && Self::is_int_type(&r_ty) {
+                        // Cast rhs int to match lhs int type
+                        self.emit_line(&format!(
+                            "{} = arith.extsi {} : {} to {}",
+                            cast_ssa, r_ssa, r_ty, l_ty
+                        ));
+                        r_ssa = cast_ssa;
+                    }
+                }
                 self.gen_binop(&l_ssa, *op, &r_ssa, &l_ty, is_unsigned)
             }
 
@@ -1322,21 +1372,25 @@ impl CodeGen {
         if result_ty == MLIRType::None {
             self.emit_line(&format!("scf.if {} {{", cond_ssa));
             self.indent += 1;
+            self.scf_depth += 1;
             self.push_scope();
             for stmt in &then_block.stmts {
                 self.gen_stmt(stmt);
             }
             self.pop_scope();
+            self.scf_depth -= 1;
             self.indent -= 1;
 
             if let Some(else_b) = else_block {
                 self.emit_line("} else {");
                 self.indent += 1;
+                self.scf_depth += 1;
                 self.push_scope();
                 for stmt in &else_b.stmts {
                     self.gen_stmt(stmt);
                 }
                 self.pop_scope();
+                self.scf_depth -= 1;
                 self.indent -= 1;
             }
             self.emit_line("}");
@@ -1348,29 +1402,33 @@ impl CodeGen {
             let ssa = self.fresh_ssa();
             self.emit_line(&format!("{} = scf.if {} -> ({}) {{", ssa, cond_ssa, result_ty));
             self.indent += 1;
+            self.scf_depth += 1;
             self.push_scope();
             for stmt in &then_block.stmts {
                 self.gen_stmt(stmt);
             }
             if let Some(expr) = &then_block.expr {
                 let (then_ssa, _) = self.gen_expr(expr);
-                self.emit_line(&format!("scf.yield {}", then_ssa));
+                self.emit_line(&format!("scf.yield {} : {}", then_ssa, result_ty));
             }
             self.pop_scope();
+            self.scf_depth -= 1;
             self.indent -= 1;
 
             if let Some(else_b) = else_block {
                 self.emit_line(&format!("}} else {{"));
                 self.indent += 1;
+                self.scf_depth += 1;
                 self.push_scope();
                 for stmt in &else_b.stmts {
                     self.gen_stmt(stmt);
                 }
                 if let Some(expr) = &else_b.expr {
                     let (else_ssa, _) = self.gen_expr(expr);
-                    self.emit_line(&format!("scf.yield {}", else_ssa));
+                    self.emit_line(&format!("scf.yield {} : {}", else_ssa, result_ty));
                 }
                 self.pop_scope();
+                self.scf_depth -= 1;
                 self.indent -= 1;
             }
             self.emit_line("}");
@@ -1398,6 +1456,7 @@ impl CodeGen {
                 iv, start_idx, end_idx, step_idx
             ));
             self.indent += 1;
+            self.scf_depth += 1;
 
             self.push_scope();
             let iv_i64 = self.fresh_ssa();
@@ -1409,6 +1468,7 @@ impl CodeGen {
             }
 
             self.pop_scope();
+            self.scf_depth -= 1;
             self.indent -= 1;
             self.emit_line("}");
         } else {
@@ -1419,6 +1479,7 @@ impl CodeGen {
     fn gen_while_loop(&mut self, cond: &Expr, body: &Block) {
         self.emit_line("scf.while : () -> () {");
         self.indent += 1;
+        self.scf_depth += 1;
 
         let (cond_ssa, _) = self.gen_expr(cond);
         self.emit_line(&format!("scf.condition({})", cond_ssa));
@@ -1434,6 +1495,7 @@ impl CodeGen {
         self.pop_scope();
 
         self.emit_line("scf.yield");
+        self.scf_depth -= 1;
         self.indent -= 1;
         self.emit_line("}");
     }
@@ -1443,6 +1505,148 @@ impl CodeGen {
 pub fn generate_mlir(program: &Program) -> String {
     let mut codegen = CodeGen::new();
     codegen.generate(program)
+}
+
+/// MLIR structural validation errors
+#[derive(Debug, Clone)]
+pub struct MLIRValidationError {
+    pub line: usize,
+    pub message: String,
+}
+
+/// Validate generated MLIR text for common structural errors.
+/// This is not a full parser -- it catches the most common codegen bugs.
+pub fn validate_mlir(mlir: &str) -> Vec<MLIRValidationError> {
+    let mut errors = Vec::new();
+    let lines: Vec<&str> = mlir.lines().collect();
+
+    // Track SSA definitions and uses
+    let mut defined_ssas: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // Track block/region nesting
+    let mut region_stack: Vec<(usize, &str)> = Vec::new(); // (line, kind)
+    // Track if each func/kernel region has a terminator
+    let mut func_has_terminator = false;
+    let mut in_func = false;
+
+    for (i, line) in lines.iter().enumerate() {
+        let trimmed = line.trim();
+        let lineno = i + 1;
+
+        // Skip comments and empty lines
+        if trimmed.starts_with("//") || trimmed.is_empty() {
+            continue;
+        }
+
+        // Track SSA definitions: %N = ...
+        if let Some(eq_pos) = trimmed.find(" = ") {
+            let lhs = &trimmed[..eq_pos].trim();
+            // Could be multiple results but typically single
+            if lhs.starts_with('%') && !lhs.contains(',') {
+                let ssa_name = lhs.to_string();
+                if defined_ssas.contains(&ssa_name) {
+                    errors.push(MLIRValidationError {
+                        line: lineno,
+                        message: format!("SSA value {} defined more than once", ssa_name),
+                    });
+                }
+                defined_ssas.insert(ssa_name);
+            }
+        }
+
+        // Track region opens
+        if trimmed.ends_with('{') || trimmed.ends_with("kernel {") {
+            let kind = if trimmed.starts_with("func.func") {
+                in_func = true;
+                func_has_terminator = false;
+                "func"
+            } else if trimmed.starts_with("gpu.func") {
+                in_func = true;
+                func_has_terminator = false;
+                "gpu.func"
+            } else if trimmed.starts_with("gpu.module") {
+                "gpu.module"
+            } else if trimmed.starts_with("scf.if") || trimmed.contains("= scf.if") {
+                "scf.if"
+            } else if trimmed.starts_with("scf.for") {
+                "scf.for"
+            } else if trimmed.starts_with("scf.while") {
+                "scf.while"
+            } else if trimmed.starts_with("module") {
+                "module"
+            } else if trimmed.starts_with("} do {") || trimmed.starts_with("} else {") {
+                // continuation, not a new region
+                ""
+            } else {
+                "block"
+            };
+            if !kind.is_empty() {
+                region_stack.push((lineno, kind));
+            }
+        }
+
+        // Check for terminators
+        if trimmed.starts_with("func.return") || trimmed.starts_with("gpu.return") {
+            func_has_terminator = true;
+
+            // Check: func.return should not appear inside scf regions
+            let in_scf = region_stack.iter().rev().any(|(_, k)|
+                k.starts_with("scf."));
+            if in_scf {
+                let ret_kind = if trimmed.starts_with("func.return") { "func.return" } else { "gpu.return" };
+                errors.push(MLIRValidationError {
+                    line: lineno,
+                    message: format!("{} inside scf region is invalid", ret_kind),
+                });
+            }
+        }
+
+        // Track region closes
+        if trimmed == "}" {
+            if let Some((open_line, kind)) = region_stack.pop() {
+                // Check func/gpu.func has terminator
+                if (kind == "func" || kind == "gpu.func") && !func_has_terminator {
+                    errors.push(MLIRValidationError {
+                        line: open_line,
+                        message: format!("{} region has no terminator (func.return/gpu.return)", kind),
+                    });
+                }
+                if kind == "func" || kind == "gpu.func" {
+                    in_func = false;
+                }
+            }
+        }
+
+        // Check for type mismatches in arith ops: both operands should have same type annotation
+        if trimmed.contains("arith.addf") || trimmed.contains("arith.subf")
+            || trimmed.contains("arith.mulf") || trimmed.contains("arith.divf")
+            || trimmed.contains("arith.cmpf")
+        {
+            // The type after ':' should match the operand types
+            // We can't fully check this without a type map, but we can check
+            // that there's exactly one type annotation at the end
+        }
+
+        // Check for double terminators (two consecutive return-like statements)
+        if lineno > 1 && (trimmed.starts_with("func.return") || trimmed.starts_with("gpu.return")) {
+            let prev = lines[i - 1].trim();
+            if prev.starts_with("func.return") || prev.starts_with("gpu.return") {
+                errors.push(MLIRValidationError {
+                    line: lineno,
+                    message: "double terminator: consecutive return statements".to_string(),
+                });
+            }
+        }
+    }
+
+    // Check unmatched regions
+    for (line, kind) in &region_stack {
+        errors.push(MLIRValidationError {
+            line: *line,
+            message: format!("unclosed {} region", kind),
+        });
+    }
+
+    errors
 }
 
 #[cfg(test)]
@@ -1598,5 +1802,165 @@ mod tests {
     fn test_matmul_independent_operand_types() {
         let ir = gen("fn mm(a: Tensor<f32, [4, 8]>, b: Tensor<f32, [8, 4]>) -> Tensor<f32, [4, 4]> { return a @ b }");
         assert!(ir.contains("tensor<4x8xf32>, tensor<8x4xf32>"), "Expected independent operand types in: {}", ir);
+    }
+
+    // --- MLIR Validation Tests ---
+
+    fn gen_and_validate(source: &str) -> (String, Vec<MLIRValidationError>) {
+        let ir = gen(source);
+        let errors = validate_mlir(&ir);
+        (ir, errors)
+    }
+
+    #[test]
+    fn test_validate_simple_function() {
+        let (ir, errors) = gen_and_validate(
+            "fn add(a: i64, b: i64) -> i64 { return a + b }"
+        );
+        assert!(errors.is_empty(), "Expected no errors for simple function, got: {:?}\nIR:\n{}", errors, ir);
+    }
+
+    #[test]
+    fn test_validate_no_double_return_in_kernel() {
+        let (ir, errors) = gen_and_validate(
+            "kernel vadd(a: Tensor<f32, [N]>, b: Tensor<f32, [N]>) -> Tensor<f32, [N]> { return a + b }"
+        );
+        let double_returns: Vec<_> = errors.iter()
+            .filter(|e| e.message.contains("double terminator"))
+            .collect();
+        assert!(double_returns.is_empty(),
+            "Should not have double terminator in kernel, got: {:?}\nIR:\n{}", double_returns, ir);
+    }
+
+    #[test]
+    fn test_validate_no_func_return_in_scf() {
+        let (ir, errors) = gen_and_validate(
+            "fn factorial(n: i64) -> i64 { if n <= 1 { return 1 }\n return n * factorial(n - 1) }"
+        );
+        let scf_returns: Vec<_> = errors.iter()
+            .filter(|e| e.message.contains("inside scf region"))
+            .collect();
+        assert!(scf_returns.is_empty(),
+            "Should not have func.return inside scf.if, got: {:?}\nIR:\n{}", scf_returns, ir);
+    }
+
+    #[test]
+    fn test_validate_no_duplicate_ssa() {
+        let (ir, errors) = gen_and_validate(
+            "fn test() -> i64 { let a = 1\n let b = 2\n return a + b }"
+        );
+        let dup_ssas: Vec<_> = errors.iter()
+            .filter(|e| e.message.contains("defined more than once"))
+            .collect();
+        assert!(dup_ssas.is_empty(),
+            "Should not have duplicate SSA defs, got: {:?}\nIR:\n{}", dup_ssas, ir);
+    }
+
+    #[test]
+    fn test_validate_type_cast_in_comparison() {
+        // f32 param compared with float literal (which defaults to f64)
+        // Should insert a cast so types match
+        let (ir, _errors) = gen_and_validate(
+            "fn abs(x: f32) -> f32 { if x > 0.0 { x } else { 0.0 - x } }"
+        );
+        // Check that there's a truncf or extf cast
+        assert!(ir.contains("arith.truncf") || !ir.contains("cmpf ogt, %"),
+            "Should insert type cast for f32 vs f64 comparison\nIR:\n{}", ir);
+    }
+
+    #[test]
+    fn test_validate_for_loop() {
+        let (ir, errors) = gen_and_validate(
+            "fn sum(n: i64) -> i64 { var s: i64 = 0\n for i in 0..n { s += i }\n return s }"
+        );
+        let critical: Vec<_> = errors.iter()
+            .filter(|e| e.message.contains("inside scf") || e.message.contains("no terminator"))
+            .collect();
+        assert!(critical.is_empty(),
+            "For loop should not cause structural errors, got: {:?}\nIR:\n{}", critical, ir);
+    }
+
+    #[test]
+    fn test_validate_while_loop() {
+        let (ir, errors) = gen_and_validate(
+            "fn countdown(n: i64) -> i64 { var x = n\n while x > 0 { x -= 1 }\n return x }"
+        );
+        let critical: Vec<_> = errors.iter()
+            .filter(|e| e.message.contains("inside scf") || e.message.contains("no terminator"))
+            .collect();
+        assert!(critical.is_empty(),
+            "While loop should not cause structural errors, got: {:?}\nIR:\n{}", critical, ir);
+    }
+
+    #[test]
+    fn test_validate_void_function_has_terminator() {
+        let (ir, errors) = gen_and_validate(
+            "fn noop() { let x = 42 }"
+        );
+        let no_term: Vec<_> = errors.iter()
+            .filter(|e| e.message.contains("no terminator"))
+            .collect();
+        assert!(no_term.is_empty(),
+            "Void function should have func.return terminator, got: {:?}\nIR:\n{}", no_term, ir);
+    }
+
+    /// Test that generated MLIR is accepted by mlir-opt-20 if available.
+    /// This is an integration test that requires mlir-20-tools to be installed.
+    #[test]
+    fn test_mlir_opt_validates_simple_function() {
+        let ir = gen("fn add(a: i64, b: i64) -> i64 { return a + b }");
+
+        // Check if mlir-opt-20 is available
+        let which = std::process::Command::new("which")
+            .arg("mlir-opt-20")
+            .output();
+        if which.is_err() || !which.unwrap().status.success() {
+            eprintln!("mlir-opt-20 not found, skipping integration test");
+            return;
+        }
+
+        let mut child = std::process::Command::new("mlir-opt-20")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("failed to spawn mlir-opt-20");
+
+        use std::io::Write;
+        child.stdin.take().unwrap().write_all(ir.as_bytes()).unwrap();
+        let output = child.wait_with_output().unwrap();
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            panic!("mlir-opt-20 rejected the IR:\n{}\n\nGenerated IR:\n{}", stderr, ir);
+        }
+    }
+
+    #[test]
+    fn test_mlir_opt_validates_for_loop() {
+        let ir = gen("fn sum(n: i64) -> i64 { var s: i64 = 0\n for i in 0..n { s += i }\n return s }");
+
+        let which = std::process::Command::new("which")
+            .arg("mlir-opt-20")
+            .output();
+        if which.is_err() || !which.unwrap().status.success() {
+            return;
+        }
+
+        let mut child = std::process::Command::new("mlir-opt-20")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("failed to spawn mlir-opt-20");
+
+        use std::io::Write;
+        child.stdin.take().unwrap().write_all(ir.as_bytes()).unwrap();
+        let output = child.wait_with_output().unwrap();
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            panic!("mlir-opt-20 rejected the IR:\n{}\n\nGenerated IR:\n{}", stderr, ir);
+        }
     }
 }

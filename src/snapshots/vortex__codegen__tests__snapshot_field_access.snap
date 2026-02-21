@@ -7,7 +7,7 @@ module {
     // field access: %0.x
     %2 = arith.constant 8 : index
     %1 = llvm.extractvalue %0[8] : !llvm.struct<(i64)>
-    func.return %1
+    func.return %1 : i64
   }
   
 }
