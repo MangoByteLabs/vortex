@@ -14,6 +14,7 @@ mod interpreter;
 mod lexer;
 mod local_learn;
 mod memory;
+mod memory_safety;
 pub mod modmath;
 mod module;
 mod msm;
