@@ -151,12 +151,12 @@ impl fmt::Display for Value {
 }
 
 /// Environment for the interpreter
-struct Env {
-    scopes: Vec<HashMap<String, Value>>,
-    functions: HashMap<String, FnDef>,
+pub(crate) struct Env {
+    pub(crate) scopes: Vec<HashMap<String, Value>>,
+    pub(crate) functions: HashMap<String, FnDef>,
     /// Struct definitions: name -> field names (in order)
-    struct_defs: HashMap<String, Vec<String>>,
-    output: Vec<String>,
+    pub(crate) struct_defs: HashMap<String, Vec<String>>,
+    pub(crate) output: Vec<String>,
     /// AD tapes stored by integer id
     tapes: HashMap<usize, autodiff::Tape>,
     next_tape_id: usize,
@@ -173,7 +173,7 @@ struct Env {
 }
 
 #[derive(Clone)]
-enum FnDef {
+pub(crate) enum FnDef {
     User {
         params: Vec<String>,
         body: Block,
@@ -182,7 +182,7 @@ enum FnDef {
 }
 
 impl Env {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let mut env = Self {
             scopes: vec![HashMap::new()],
             functions: HashMap::new(),
@@ -201,21 +201,21 @@ impl Env {
         env
     }
 
-    fn push_scope(&mut self) {
+    pub(crate) fn push_scope(&mut self) {
         self.scopes.push(HashMap::new());
     }
 
-    fn pop_scope(&mut self) {
+    pub(crate) fn pop_scope(&mut self) {
         self.scopes.pop();
     }
 
-    fn define(&mut self, name: &str, val: Value) {
+    pub(crate) fn define(&mut self, name: &str, val: Value) {
         if let Some(scope) = self.scopes.last_mut() {
             scope.insert(name.to_string(), val);
         }
     }
 
-    fn get(&self, name: &str) -> Option<Value> {
+    pub(crate) fn get(&self, name: &str) -> Option<Value> {
         for scope in self.scopes.iter().rev() {
             if let Some(val) = scope.get(name) {
                 return Some(val.clone());
@@ -224,7 +224,7 @@ impl Env {
         None
     }
 
-    fn set(&mut self, name: &str, val: Value) -> bool {
+    pub(crate) fn set(&mut self, name: &str, val: Value) -> bool {
         for scope in self.scopes.iter_mut().rev() {
             if scope.contains_key(name) {
                 scope.insert(name.to_string(), val);
@@ -365,6 +365,14 @@ impl Env {
         self.functions.insert("ssm_scan".to_string(), FnDef::Builtin(builtin_ssm_scan));
         self.functions.insert("selective_ssm".to_string(), FnDef::Builtin(builtin_selective_ssm));
         self.functions.insert("parallel_scan".to_string(), FnDef::Builtin(builtin_parallel_scan));
+
+        // FFT builtins
+        self.functions.insert("fft".to_string(), FnDef::Builtin(builtin_fft));
+        self.functions.insert("ifft".to_string(), FnDef::Builtin(builtin_ifft));
+        self.functions.insert("fft_convolve".to_string(), FnDef::Builtin(builtin_fft_convolve));
+        self.functions.insert("fnet_mix".to_string(), FnDef::Builtin(builtin_fnet_mix));
+        self.functions.insert("linear_attention".to_string(), FnDef::Builtin(builtin_linear_attention));
+        self.functions.insert("ssm_parallel_scan".to_string(), FnDef::Builtin(builtin_ssm_parallel_scan));
 
         // DynTensor builtins
         self.functions.insert("dyn_tensor".to_string(), FnDef::Builtin(builtin_dyn_tensor));
@@ -1926,7 +1934,7 @@ pub fn interpret(program: &Program) -> Result<Vec<String>, String> {
     Ok(env.output)
 }
 
-fn eval_block(env: &mut Env, block: &Block) -> Result<Value, String> {
+pub(crate) fn eval_block(env: &mut Env, block: &Block) -> Result<Value, String> {
     for stmt in &block.stmts {
         let val = eval_stmt(env, stmt)?;
         match &val {
@@ -2108,7 +2116,7 @@ fn eval_stmt(env: &mut Env, stmt: &Stmt) -> Result<Value, String> {
     }
 }
 
-fn eval_expr(env: &mut Env, expr: &Expr) -> Result<Value, String> {
+pub(crate) fn eval_expr(env: &mut Env, expr: &Expr) -> Result<Value, String> {
     match &expr.kind {
         ExprKind::IntLiteral(n) => Ok(Value::Int(*n as i128)),
         ExprKind::FloatLiteral(n) => Ok(Value::Float(*n)),
@@ -3032,6 +3040,82 @@ fn builtin_selective_ssm(_env: &mut Env, args: Vec<Value>) -> Result<Value, Stri
     let d = match &args[4] { Value::Float(f) => *f, Value::Int(i) => *i as f64, _ => return Err("d must be numeric".into()) };
     let delta = values_to_f64_vec(&args[5])?;
     let result = crate::ssm::selective_ssm(&x, &a_proj, &b_proj, &c_proj, d, &delta);
+    Ok(f64_vec_to_value(&result))
+}
+
+// --- FFT builtins ---
+
+fn builtin_fft(_env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    if args.len() != 1 { return Err("fft expects 1 argument: data (real array)".to_string()); }
+    let data = values_to_f64_vec(&args[0])?;
+    let result = crate::fft::rfft(&data);
+    // Return as array of [re, im] pairs
+    let pairs: Vec<Value> = result.iter().map(|c| {
+        Value::Array(vec![Value::Float(c.re), Value::Float(c.im)])
+    }).collect();
+    Ok(Value::Array(pairs))
+}
+
+fn builtin_ifft(_env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    if args.len() != 1 { return Err("ifft expects 1 argument: complex array of [re, im] pairs".to_string()); }
+    match &args[0] {
+        Value::Array(pairs) => {
+            let mut complex = Vec::new();
+            for p in pairs {
+                match p {
+                    Value::Array(ri) if ri.len() == 2 => {
+                        let re = match &ri[0] { Value::Float(f) => *f, Value::Int(i) => *i as f64, _ => return Err("expected numeric".into()) };
+                        let im = match &ri[1] { Value::Float(f) => *f, Value::Int(i) => *i as f64, _ => return Err("expected numeric".into()) };
+                        complex.push(crate::fft::Complex::new(re, im));
+                    }
+                    _ => return Err("ifft: expected array of [re, im] pairs".into()),
+                }
+            }
+            let result = crate::fft::ifft(&complex);
+            let pairs: Vec<Value> = result.iter().map(|c| {
+                Value::Array(vec![Value::Float(c.re), Value::Float(c.im)])
+            }).collect();
+            Ok(Value::Array(pairs))
+        }
+        _ => Err("ifft expects an array".into()),
+    }
+}
+
+fn builtin_fft_convolve(_env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    if args.len() != 2 { return Err("fft_convolve expects 2 arguments: (a, b)".to_string()); }
+    let a = values_to_f64_vec(&args[0])?;
+    let b = values_to_f64_vec(&args[1])?;
+    let result = crate::fft::fft_convolve(&a, &b);
+    Ok(f64_vec_to_value(&result))
+}
+
+fn builtin_fnet_mix(_env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    if args.len() != 3 { return Err("fnet_mix expects 3 arguments: (x, seq_len, d_model)".to_string()); }
+    let x = values_to_f64_vec(&args[0])?;
+    let seq_len = match &args[1] { Value::Int(i) => *i as usize, _ => return Err("seq_len must be int".into()) };
+    let d_model = match &args[2] { Value::Int(i) => *i as usize, _ => return Err("d_model must be int".into()) };
+    let mixer = crate::fft::FNetMixer::new(seq_len, d_model);
+    let result = mixer.forward(&x);
+    Ok(f64_vec_to_value(&result))
+}
+
+fn builtin_linear_attention(_env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    if args.len() < 5 { return Err("linear_attention expects 5+ arguments: (q, k, v, n, d, [feature_map])".to_string()); }
+    let q = values_to_f64_vec(&args[0])?;
+    let k = values_to_f64_vec(&args[1])?;
+    let v = values_to_f64_vec(&args[2])?;
+    let n = match &args[3] { Value::Int(i) => *i as usize, _ => return Err("n must be int".into()) };
+    let d = match &args[4] { Value::Int(i) => *i as usize, _ => return Err("d must be int".into()) };
+    let fm = crate::fft::FeatureMap::EluPlus1;
+    let result = crate::fft::linear_attention(&q, &k, &v, n, d, fm);
+    Ok(f64_vec_to_value(&result))
+}
+
+fn builtin_ssm_parallel_scan(_env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    if args.len() != 2 { return Err("ssm_parallel_scan expects 2 arguments: (a, bx)".to_string()); }
+    let a = values_to_f64_vec(&args[0])?;
+    let bx = values_to_f64_vec(&args[1])?;
+    let result = crate::fft::ssm_parallel_scan(&a, &bx);
     Ok(f64_vec_to_value(&result))
 }
 

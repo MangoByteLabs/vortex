@@ -33,6 +33,7 @@ mod quantize;
 mod sparse;
 mod spiking;
 mod ssm;
+mod fft;
 mod python_bridge;
 mod runtime;
 mod gpu_runtime;
