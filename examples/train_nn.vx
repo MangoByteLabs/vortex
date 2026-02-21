@@ -1,0 +1,216 @@
+// Neural network training on XOR using autodiff tape
+// 2-layer MLP: 2 inputs -> 4 hidden (tanh) -> 1 output (sigmoid)
+// Trained with SGD and MSE loss
+
+fn main() {
+    // XOR dataset: inputs and targets
+    let x0 = [0.0, 0.0]
+    let x1 = [1.0, 0.0]
+    let x2 = [0.0, 1.0]
+    let x3 = [1.0, 1.0]
+    let targets = [0.0, 1.0, 1.0, 0.0]
+
+    // Initialize weights (hand-picked small values for reproducibility)
+    // Layer 1: 2 inputs x 4 hidden = 8 weights + 4 biases = 12 params
+    // Layer 2: 4 hidden x 1 output = 4 weights + 1 bias = 5 params
+    // Total: 17 parameters stored in flat array
+    var params = [
+        0.5, -0.3, 0.4, -0.6,
+        0.2, 0.7, -0.5, 0.3,
+        0.1, -0.1, 0.2, -0.2,
+        0.8, -0.4, 0.6, -0.7,
+        0.0
+    ]
+
+    let lr = 2.0
+    let epochs = 200
+
+    println("Training XOR neural network...")
+    println("Architecture: 2 -> 4 (tanh) -> 1 (sigmoid)")
+    println("")
+
+    var epoch = 0
+    while epoch < epochs {
+        // Create a fresh tape for this epoch
+        let t = tape_new()
+
+        // Put all params on tape as variables
+        var p0 = tape_var(t, params[0])
+        var p1 = tape_var(t, params[1])
+        var p2 = tape_var(t, params[2])
+        var p3 = tape_var(t, params[3])
+        var p4 = tape_var(t, params[4])
+        var p5 = tape_var(t, params[5])
+        var p6 = tape_var(t, params[6])
+        var p7 = tape_var(t, params[7])
+        var p8 = tape_var(t, params[8])
+        var p9 = tape_var(t, params[9])
+        var p10 = tape_var(t, params[10])
+        var p11 = tape_var(t, params[11])
+        var p12 = tape_var(t, params[12])
+        var p13 = tape_var(t, params[13])
+        var p14 = tape_var(t, params[14])
+        var p15 = tape_var(t, params[15])
+        var p16 = tape_var(t, params[16])
+
+        // Forward pass for all 4 XOR samples
+        // Sample 0: [0, 0] -> 0
+        let in00 = tape_var(t, 0.0)
+        let in01 = tape_var(t, 0.0)
+        // hidden[j] = tanh(x[0]*w1[0][j] + x[1]*w1[1][j] + b1[j])
+        // w1[0][j] = params[j] for j=0..3, w1[1][j] = params[4+j], b1[j] = params[8+j]
+        let h00_pre = tape_add(t, tape_add(t, tape_mul(t, in00, p0), tape_mul(t, in01, p4)), p8)
+        let h01_pre = tape_add(t, tape_add(t, tape_mul(t, in00, p1), tape_mul(t, in01, p5)), p9)
+        let h02_pre = tape_add(t, tape_add(t, tape_mul(t, in00, p2), tape_mul(t, in01, p6)), p10)
+        let h03_pre = tape_add(t, tape_add(t, tape_mul(t, in00, p3), tape_mul(t, in01, p7)), p11)
+        let h00 = tape_tanh(t, h00_pre)
+        let h01 = tape_tanh(t, h01_pre)
+        let h02 = tape_tanh(t, h02_pre)
+        let h03 = tape_tanh(t, h03_pre)
+        // output = sigmoid(h[0]*w2[0] + h[1]*w2[1] + h[2]*w2[2] + h[3]*w2[3] + b2)
+        let o0_pre = tape_add(t, tape_add(t, tape_add(t, tape_add(t, tape_mul(t, h00, p12), tape_mul(t, h01, p13)), tape_mul(t, h02, p14)), tape_mul(t, h03, p15)), p16)
+        let out0 = tape_sigmoid(t, o0_pre)
+
+        // Sample 1: [1, 0] -> 1
+        let in10 = tape_var(t, 1.0)
+        let in11 = tape_var(t, 0.0)
+        let h10_pre = tape_add(t, tape_add(t, tape_mul(t, in10, p0), tape_mul(t, in11, p4)), p8)
+        let h11_pre = tape_add(t, tape_add(t, tape_mul(t, in10, p1), tape_mul(t, in11, p5)), p9)
+        let h12_pre = tape_add(t, tape_add(t, tape_mul(t, in10, p2), tape_mul(t, in11, p6)), p10)
+        let h13_pre = tape_add(t, tape_add(t, tape_mul(t, in10, p3), tape_mul(t, in11, p7)), p11)
+        let h10 = tape_tanh(t, h10_pre)
+        let h11 = tape_tanh(t, h11_pre)
+        let h12 = tape_tanh(t, h12_pre)
+        let h13 = tape_tanh(t, h13_pre)
+        let o1_pre = tape_add(t, tape_add(t, tape_add(t, tape_add(t, tape_mul(t, h10, p12), tape_mul(t, h11, p13)), tape_mul(t, h12, p14)), tape_mul(t, h13, p15)), p16)
+        let out1 = tape_sigmoid(t, o1_pre)
+
+        // Sample 2: [0, 1] -> 1
+        let in20 = tape_var(t, 0.0)
+        let in21 = tape_var(t, 1.0)
+        let h20_pre = tape_add(t, tape_add(t, tape_mul(t, in20, p0), tape_mul(t, in21, p4)), p8)
+        let h21_pre = tape_add(t, tape_add(t, tape_mul(t, in20, p1), tape_mul(t, in21, p5)), p9)
+        let h22_pre = tape_add(t, tape_add(t, tape_mul(t, in20, p2), tape_mul(t, in21, p6)), p10)
+        let h23_pre = tape_add(t, tape_add(t, tape_mul(t, in20, p3), tape_mul(t, in21, p7)), p11)
+        let h20 = tape_tanh(t, h20_pre)
+        let h21 = tape_tanh(t, h21_pre)
+        let h22 = tape_tanh(t, h22_pre)
+        let h23 = tape_tanh(t, h23_pre)
+        let o2_pre = tape_add(t, tape_add(t, tape_add(t, tape_add(t, tape_mul(t, h20, p12), tape_mul(t, h21, p13)), tape_mul(t, h22, p14)), tape_mul(t, h23, p15)), p16)
+        let out2 = tape_sigmoid(t, o2_pre)
+
+        // Sample 3: [1, 1] -> 0
+        let in30 = tape_var(t, 1.0)
+        let in31 = tape_var(t, 1.0)
+        let h30_pre = tape_add(t, tape_add(t, tape_mul(t, in30, p0), tape_mul(t, in31, p4)), p8)
+        let h31_pre = tape_add(t, tape_add(t, tape_mul(t, in30, p1), tape_mul(t, in31, p5)), p9)
+        let h32_pre = tape_add(t, tape_add(t, tape_mul(t, in30, p2), tape_mul(t, in31, p6)), p10)
+        let h33_pre = tape_add(t, tape_add(t, tape_mul(t, in30, p3), tape_mul(t, in31, p7)), p11)
+        let h30 = tape_tanh(t, h30_pre)
+        let h31 = tape_tanh(t, h31_pre)
+        let h32 = tape_tanh(t, h32_pre)
+        let h33 = tape_tanh(t, h33_pre)
+        let o3_pre = tape_add(t, tape_add(t, tape_add(t, tape_add(t, tape_mul(t, h30, p12), tape_mul(t, h31, p13)), tape_mul(t, h32, p14)), tape_mul(t, h33, p15)), p16)
+        let out3 = tape_sigmoid(t, o3_pre)
+
+        // Compute MSE loss on tape
+        let preds = [out0, out1, out2, out3]
+        let loss_idx = ad_mse_loss(t, preds, targets)
+
+        // Backward pass
+        tape_backward(t, loss_idx)
+
+        // Extract loss value
+        let loss_val = tape_value(t, loss_idx)
+
+        // Print every 10 epochs
+        if epoch % 20 == 0 {
+            println(format("Epoch {}: loss = {}", epoch, loss_val))
+        }
+
+        // Extract gradients for all 17 params
+        let grads = [
+            tape_grad(t, p0), tape_grad(t, p1), tape_grad(t, p2), tape_grad(t, p3),
+            tape_grad(t, p4), tape_grad(t, p5), tape_grad(t, p6), tape_grad(t, p7),
+            tape_grad(t, p8), tape_grad(t, p9), tape_grad(t, p10), tape_grad(t, p11),
+            tape_grad(t, p12), tape_grad(t, p13), tape_grad(t, p14), tape_grad(t, p15),
+            tape_grad(t, p16)
+        ]
+
+        // SGD update
+        params = ad_sgd_step(params, grads, lr)
+
+        epoch = epoch + 1
+    }
+
+    // Final evaluation
+    println("")
+    println("Training complete! Final predictions:")
+
+    let t = tape_new()
+    var p0 = tape_var(t, params[0])
+    var p1 = tape_var(t, params[1])
+    var p2 = tape_var(t, params[2])
+    var p3 = tape_var(t, params[3])
+    var p4 = tape_var(t, params[4])
+    var p5 = tape_var(t, params[5])
+    var p6 = tape_var(t, params[6])
+    var p7 = tape_var(t, params[7])
+    var p8 = tape_var(t, params[8])
+    var p9 = tape_var(t, params[9])
+    var p10 = tape_var(t, params[10])
+    var p11 = tape_var(t, params[11])
+    var p12 = tape_var(t, params[12])
+    var p13 = tape_var(t, params[13])
+    var p14 = tape_var(t, params[14])
+    var p15 = tape_var(t, params[15])
+    var p16 = tape_var(t, params[16])
+
+    // Sample 0: [0, 0] -> 0
+    let in00 = tape_var(t, 0.0)
+    let in01 = tape_var(t, 0.0)
+    let h00 = tape_tanh(t, tape_add(t, tape_add(t, tape_mul(t, in00, p0), tape_mul(t, in01, p4)), p8))
+    let h01 = tape_tanh(t, tape_add(t, tape_add(t, tape_mul(t, in00, p1), tape_mul(t, in01, p5)), p9))
+    let h02 = tape_tanh(t, tape_add(t, tape_add(t, tape_mul(t, in00, p2), tape_mul(t, in01, p6)), p10))
+    let h03 = tape_tanh(t, tape_add(t, tape_add(t, tape_mul(t, in00, p3), tape_mul(t, in01, p7)), p11))
+    let out0 = tape_sigmoid(t, tape_add(t, tape_add(t, tape_add(t, tape_add(t, tape_mul(t, h00, p12), tape_mul(t, h01, p13)), tape_mul(t, h02, p14)), tape_mul(t, h03, p15)), p16))
+
+    // Sample 1: [1, 0] -> 1
+    let in10 = tape_var(t, 1.0)
+    let in11 = tape_var(t, 0.0)
+    let h10 = tape_tanh(t, tape_add(t, tape_add(t, tape_mul(t, in10, p0), tape_mul(t, in11, p4)), p8))
+    let h11 = tape_tanh(t, tape_add(t, tape_add(t, tape_mul(t, in10, p1), tape_mul(t, in11, p5)), p9))
+    let h12 = tape_tanh(t, tape_add(t, tape_add(t, tape_mul(t, in10, p2), tape_mul(t, in11, p6)), p10))
+    let h13 = tape_tanh(t, tape_add(t, tape_add(t, tape_mul(t, in10, p3), tape_mul(t, in11, p7)), p11))
+    let out1 = tape_sigmoid(t, tape_add(t, tape_add(t, tape_add(t, tape_add(t, tape_mul(t, h10, p12), tape_mul(t, h11, p13)), tape_mul(t, h12, p14)), tape_mul(t, h13, p15)), p16))
+
+    // Sample 2: [0, 1] -> 1
+    let in20 = tape_var(t, 0.0)
+    let in21 = tape_var(t, 1.0)
+    let h20 = tape_tanh(t, tape_add(t, tape_add(t, tape_mul(t, in20, p0), tape_mul(t, in21, p4)), p8))
+    let h21 = tape_tanh(t, tape_add(t, tape_add(t, tape_mul(t, in20, p1), tape_mul(t, in21, p5)), p9))
+    let h22 = tape_tanh(t, tape_add(t, tape_add(t, tape_mul(t, in20, p2), tape_mul(t, in21, p6)), p10))
+    let h23 = tape_tanh(t, tape_add(t, tape_add(t, tape_mul(t, in20, p3), tape_mul(t, in21, p7)), p11))
+    let out2 = tape_sigmoid(t, tape_add(t, tape_add(t, tape_add(t, tape_add(t, tape_mul(t, h20, p12), tape_mul(t, h21, p13)), tape_mul(t, h22, p14)), tape_mul(t, h23, p15)), p16))
+
+    // Sample 3: [1, 1] -> 0
+    let in30 = tape_var(t, 1.0)
+    let in31 = tape_var(t, 1.0)
+    let h30 = tape_tanh(t, tape_add(t, tape_add(t, tape_mul(t, in30, p0), tape_mul(t, in31, p4)), p8))
+    let h31 = tape_tanh(t, tape_add(t, tape_add(t, tape_mul(t, in30, p1), tape_mul(t, in31, p5)), p9))
+    let h32 = tape_tanh(t, tape_add(t, tape_add(t, tape_mul(t, in30, p2), tape_mul(t, in31, p6)), p10))
+    let h33 = tape_tanh(t, tape_add(t, tape_add(t, tape_mul(t, in30, p3), tape_mul(t, in31, p7)), p11))
+    let out3 = tape_sigmoid(t, tape_add(t, tape_add(t, tape_add(t, tape_add(t, tape_mul(t, h30, p12), tape_mul(t, h31, p13)), tape_mul(t, h32, p14)), tape_mul(t, h33, p15)), p16))
+
+    let v0 = tape_value(t, out0)
+    let v1 = tape_value(t, out1)
+    let v2 = tape_value(t, out2)
+    let v3 = tape_value(t, out3)
+
+    println(format("[0, 0] -> {} (expected 0)", v0))
+    println(format("[1, 0] -> {} (expected 1)", v1))
+    println(format("[0, 1] -> {} (expected 1)", v2))
+    println(format("[1, 1] -> {} (expected 0)", v3))
+    println("")
+    println("XOR training complete!")
+}
