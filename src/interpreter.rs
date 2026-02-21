@@ -1189,9 +1189,92 @@ fn builtin_layer_norm(_env: &mut Env, args: Vec<Value>) -> Result<Value, String>
 }
 
 fn builtin_attention(_env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
-    match args.get(2) {
-        Some(Value::Array(v)) => Ok(Value::Array(v.clone())),
-        _ => Err("attention expects 3 array arguments (q, k, v)".to_string()),
+    if args.len() != 3 {
+        return Err("attention expects 3 array arguments (q, k, v)".to_string());
+    }
+    let q = &args[0];
+    let k = &args[1];
+    let v = &args[2];
+
+    // Extract 2D matrices
+    let q_mat = value_to_2d_f64(q, "Q")?;
+    let k_mat = value_to_2d_f64(k, "K")?;
+    let v_mat = value_to_2d_f64(v, "V")?;
+
+    if q_mat.is_empty() || k_mat.is_empty() || v_mat.is_empty() {
+        return Ok(Value::Array(vec![]));
+    }
+
+    let d_k = k_mat[0].len() as f64;
+    let scale = 1.0 / d_k.sqrt();
+
+    // Q @ K^T: (seq_q, d_k) x (d_k, seq_k) -> (seq_q, seq_k)
+    let seq_q = q_mat.len();
+    let seq_k = k_mat.len();
+    let dk = q_mat[0].len();
+    if dk != k_mat[0].len() {
+        return Err("attention: Q and K dimension mismatch".to_string());
+    }
+
+    let mut scores = vec![vec![0.0f64; seq_k]; seq_q];
+    for i in 0..seq_q {
+        for j in 0..seq_k {
+            for p in 0..dk {
+                scores[i][j] += q_mat[i][p] * k_mat[j][p]; // K^T: swap j,p
+            }
+            scores[i][j] *= scale;
+        }
+    }
+
+    // Apply softmax to each row
+    for row in &mut scores {
+        let max = row.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        let exps: Vec<f64> = row.iter().map(|x| (x - max).exp()).collect();
+        let sum: f64 = exps.iter().sum();
+        for (i, e) in exps.iter().enumerate() {
+            row[i] = e / sum;
+        }
+    }
+
+    // scores @ V: (seq_q, seq_k) x (seq_k, d_v) -> (seq_q, d_v)
+    let d_v = v_mat[0].len();
+    if seq_k != v_mat.len() {
+        return Err("attention: K and V sequence length mismatch".to_string());
+    }
+    let mut output = vec![vec![0.0f64; d_v]; seq_q];
+    for i in 0..seq_q {
+        for j in 0..d_v {
+            for p in 0..seq_k {
+                output[i][j] += scores[i][p] * v_mat[p][j];
+            }
+        }
+    }
+
+    Ok(Value::Array(output.into_iter().map(|row| {
+        Value::Array(row.into_iter().map(Value::Float).collect())
+    }).collect()))
+}
+
+fn value_to_2d_f64(val: &Value, name: &str) -> Result<Vec<Vec<f64>>, String> {
+    match val {
+        Value::Array(rows) if !rows.is_empty() => {
+            // Check if first element is an array (2D) or scalar (1D)
+            match &rows[0] {
+                Value::Array(_) => {
+                    rows.iter().map(|row| match row {
+                        Value::Array(r) => r.iter().map(|v| value_to_f64(v)).collect(),
+                        _ => Err(format!("{}: expected 2D array", name)),
+                    }).collect()
+                }
+                _ => {
+                    // 1D array: treat as single row
+                    let row: Result<Vec<f64>, String> = rows.iter().map(|v| value_to_f64(v)).collect();
+                    Ok(vec![row?])
+                }
+            }
+        }
+        Value::Array(_) => Ok(vec![]),
+        _ => Err(format!("{}: expected 2D array", name)),
     }
 }
 
