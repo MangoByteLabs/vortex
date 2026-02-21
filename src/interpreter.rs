@@ -584,18 +584,10 @@ impl Env {
         self.functions.insert("hetero_layer_stats".to_string(), FnDef::Builtin(builtin_hetero_layer_stats));
 
         // Continuous learning builtins
-        self.functions.insert("continuous_learner_new".to_string(), FnDef::Builtin(|_env, _args| {
-            Ok(Value::Int(0))
-        }));
-        self.functions.insert("continuous_learner_infer".to_string(), FnDef::Builtin(|_env, args| {
-            if args.len() >= 2 { Ok(args[1].clone()) } else { Ok(Value::Void) }
-        }));
-        self.functions.insert("continuous_learner_learn".to_string(), FnDef::Builtin(|_env, _args| {
-            Ok(Value::Void)
-        }));
-        self.functions.insert("continuous_learner_stats".to_string(), FnDef::Builtin(|_env, _args| {
-            Ok(Value::Array(vec![Value::Float(0.0), Value::Float(0.0), Value::Float(0.0)]))
-        }));
+        self.functions.insert("continuous_learner_new".to_string(), FnDef::Builtin(builtin_continuous_learner_new));
+        self.functions.insert("continuous_learner_infer".to_string(), FnDef::Builtin(builtin_continuous_learner_infer));
+        self.functions.insert("continuous_learner_learn".to_string(), FnDef::Builtin(builtin_continuous_learner_learn));
+        self.functions.insert("continuous_learner_stats".to_string(), FnDef::Builtin(builtin_continuous_learner_stats));
 
         // Verifiable inference builtins
         self.functions.insert("zk_compile_model".to_string(), FnDef::Builtin(crate::verifiable_inference::builtin_zk_compile_model));

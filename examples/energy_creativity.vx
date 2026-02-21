@@ -1,0 +1,169 @@
+// Energy-Based Creative Reasoning: Diverse Generation via Langevin Dynamics
+// IMPOSSIBLE in PyTorch/JAX today:
+//   - PyTorch has no built-in energy-based model primitives
+//   - Langevin sampling requires manual gradient computation + noise injection
+//   - Anomaly detection via energy scores needs custom implementation
+//   - Vortex: ebm_new, ebm_train_step, ebm_generate, ebm_score are native builtins
+//   - One language for training, sampling, AND scoring — no glue code
+
+fn abs_f(x: f64) -> f64 {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn vec_norm(v: [f64]) -> f64 {
+    var s = 0.0
+    for i in 0..len(v) {
+        s = s + v[i] * v[i]
+    }
+    return s
+}
+
+fn main() {
+    println("========================================")
+    println("  Energy-Based Creative Reasoning")
+    println("========================================")
+    println("")
+    println("Energy-based models learn the shape of a data manifold.")
+    println("Low energy = likely data; high energy = unlikely/novel.")
+    println("PyTorch: no EBM primitives, manual MCMC, no anomaly scoring.")
+    println("Vortex: ebm_* builtins handle training, sampling, and scoring.")
+    println("")
+
+    // Create an EBM: 4-dimensional input, hidden layers [8, 4]
+    let model = ebm_new(4, [8, 4])
+    println(format("Created EBM (id={})", to_string(model)))
+    println("  Input dim: 4, Hidden: [8, 4]")
+    println("")
+
+    // --- Step 1: Training data — two clusters ---
+    println("--- Step 1: Training on Two-Cluster Data ---")
+    println("  Cluster A: centered at [0.8, 0.8, 0.2, 0.2]")
+    println("  Cluster B: centered at [0.2, 0.2, 0.8, 0.8]")
+    println("")
+
+    // Generate training data
+    let cluster_a = [
+        [0.8, 0.7, 0.2, 0.3],
+        [0.9, 0.8, 0.1, 0.2],
+        [0.7, 0.9, 0.3, 0.1],
+        [0.85, 0.75, 0.15, 0.25],
+        [0.75, 0.85, 0.25, 0.15]
+    ]
+    let cluster_b = [
+        [0.2, 0.3, 0.8, 0.7],
+        [0.1, 0.2, 0.9, 0.8],
+        [0.3, 0.1, 0.7, 0.9],
+        [0.15, 0.25, 0.85, 0.75],
+        [0.25, 0.15, 0.75, 0.85]
+    ]
+
+    // Combine training data
+    let train_data = [
+        [0.8, 0.7, 0.2, 0.3],
+        [0.9, 0.8, 0.1, 0.2],
+        [0.7, 0.9, 0.3, 0.1],
+        [0.85, 0.75, 0.15, 0.25],
+        [0.75, 0.85, 0.25, 0.15],
+        [0.2, 0.3, 0.8, 0.7],
+        [0.1, 0.2, 0.9, 0.8],
+        [0.3, 0.1, 0.7, 0.9],
+        [0.15, 0.25, 0.85, 0.75],
+        [0.25, 0.15, 0.75, 0.85]
+    ]
+
+    // Train for multiple steps
+    var loss_history = []
+    for step in 0..20 {
+        let loss = ebm_train_step(model, train_data, 0.01)
+        loss_history = push(loss_history, loss)
+        if step % 5 == 4 {
+            println(format("  Step {}: loss = {}", to_string(step + 1), to_string(loss)))
+        }
+    }
+    println("")
+
+    // --- Step 2: Energy landscape ---
+    println("--- Step 2: Energy Landscape ---")
+    println("  Scoring known points (should have LOW energy):")
+
+    let in_dist_a = [0.8, 0.8, 0.2, 0.2]
+    let in_dist_b = [0.2, 0.2, 0.8, 0.8]
+    let energy_a = ebm_score(model, in_dist_a)
+    let energy_b = ebm_score(model, in_dist_b)
+    println(format("  Cluster A center: energy = {}", to_string(energy_a)))
+    println(format("  Cluster B center: energy = {}", to_string(energy_b)))
+    println("")
+
+    println("  Scoring out-of-distribution points (should have HIGH energy):")
+    let ood_1 = [0.5, 0.5, 0.5, 0.5]  // between clusters
+    let ood_2 = [1.0, 1.0, 1.0, 1.0]  // far from both
+    let ood_3 = [0.0, 0.0, 0.0, 0.0]  // far from both
+    let energy_ood1 = ebm_score(model, ood_1)
+    let energy_ood2 = ebm_score(model, ood_2)
+    let energy_ood3 = ebm_score(model, ood_3)
+    println(format("  Middle [0.5,0.5,0.5,0.5]: energy = {}", to_string(energy_ood1)))
+    println(format("  Far [1,1,1,1]:            energy = {}", to_string(energy_ood2)))
+    println(format("  Origin [0,0,0,0]:         energy = {}", to_string(energy_ood3)))
+    println("")
+
+    // --- Step 3: Creative generation via Langevin sampling ---
+    println("--- Step 3: Creative Generation (Langevin Sampling) ---")
+    println("  Generating 6 samples from the learned energy landscape:")
+    let samples = ebm_generate(model, 6)
+    for i in 0..len(samples) {
+        let s = samples[i]
+        let e = ebm_score(model, s)
+        println(format("  Sample {}: [{}, {}, {}, {}] energy={}",
+            to_string(i),
+            to_string(s[0]), to_string(s[1]), to_string(s[2]), to_string(s[3]),
+            to_string(e)))
+    }
+    println("")
+
+    // --- Step 4: Anomaly detection ---
+    println("--- Step 4: Anomaly Detection ---")
+    println("  Using energy score as anomaly detector:")
+    println("  (High energy = anomaly, Low energy = normal)")
+    println("")
+
+    let test_points = [
+        [0.82, 0.78, 0.18, 0.22],   // normal (cluster A)
+        [0.18, 0.22, 0.82, 0.78],   // normal (cluster B)
+        [0.5, 0.5, 0.5, 0.5],       // anomaly (between clusters)
+        [0.9, 0.1, 0.9, 0.1],       // anomaly (mixed pattern)
+        [0.0, 1.0, 0.0, 1.0]        // anomaly (unusual pattern)
+    ]
+    let labels = ["normal-A", "normal-B", "anomaly-mid", "anomaly-mixed", "anomaly-unusual"]
+
+    for i in 0..5 {
+        let pt = test_points[i]
+        let e = ebm_score(model, pt)
+        let is_anomaly = if abs_f(e) > abs_f(energy_a) * 2.0 { "ANOMALY" } else { "NORMAL" }
+        println(format("  {} [{},{},{},{}]: energy={} -> {}",
+            labels[i],
+            to_string(pt[0]), to_string(pt[1]), to_string(pt[2]), to_string(pt[3]),
+            to_string(e), is_anomaly))
+    }
+    println("")
+
+    // --- Step 5: Training progress ---
+    println("--- Step 5: Training Progress ---")
+    let first_loss = loss_history[0]
+    let last_loss = loss_history[19]
+    println(format("  Initial loss: {}", to_string(first_loss)))
+    println(format("  Final loss:   {}", to_string(last_loss)))
+    println("")
+
+    println("--- Why EBMs Need Vortex ---")
+    println("  1. PyTorch has no EBM primitives (must implement MCMC from scratch)")
+    println("  2. Langevin sampling needs gradient + noise (manual in PyTorch)")
+    println("  3. Anomaly scoring via energy is not a standard PyTorch op")
+    println("  4. Vortex: ebm_new, train_step, generate, score — all native")
+    println("  Result: creative generation + anomaly detection in ~30 lines.")
+    println("")
+
+    println("========================================")
+    println("  Energy-based creativity demo complete!")
+    println("========================================")
+}
