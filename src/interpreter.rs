@@ -3,6 +3,7 @@ use crate::autodiff;
 use crate::crypto;
 use crate::local_learn;
 use crate::memory;
+use crate::modmath;
 use crate::ode;
 use crate::spiking;
 use crate::ssm;
@@ -2288,8 +2289,11 @@ fn eval_binop(lhs: &Value, op: BinOp, rhs: &Value) -> Result<Value, String> {
                 _ => Err(">> requires integers".to_string()),
             }
         }
-        BinOp::ElemMul | BinOp::ElemDiv => {
-            Err("elementwise ops not yet supported in interpreter".to_string())
+        BinOp::ElemMul => {
+            elementwise_op(lhs, rhs, |a, b| a * b, ".*")
+        }
+        BinOp::ElemDiv => {
+            elementwise_op(lhs, rhs, |a, b| a / b, "./")
         }
     }
 }
@@ -2399,6 +2403,25 @@ fn matmul_values(a: &Value, b: &Value) -> Result<Value, String> {
     Ok(Value::Array(result.into_iter().map(|row| {
         Value::Array(row.into_iter().map(Value::Float).collect())
     }).collect()))
+}
+
+fn elementwise_op(lhs: &Value, rhs: &Value, op: fn(f64, f64) -> f64, op_name: &str) -> Result<Value, String> {
+    match (lhs, rhs) {
+        (Value::Array(a), Value::Array(b)) => {
+            if a.len() != b.len() {
+                return Err(format!("{}: array length mismatch: {} vs {}", op_name, a.len(), b.len()));
+            }
+            let results: Result<Vec<Value>, String> = a.iter().zip(b.iter()).map(|(x, y)| {
+                elementwise_op(x, y, op, op_name)
+            }).collect();
+            Ok(Value::Array(results?))
+        }
+        _ => {
+            let a = value_to_f64(lhs)?;
+            let b = value_to_f64(rhs)?;
+            Ok(Value::Float(op(a, b)))
+        }
+    }
 }
 
 fn value_to_int(v: &Value) -> Result<i128, String> {
