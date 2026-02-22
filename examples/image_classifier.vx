@@ -1,0 +1,89 @@
+// Image Classification Network
+// Trains a neural network to classify synthetic 4x4 "image" patterns
+// Demonstrates: classification, cross-entropy loss, accuracy tracking
+
+fn main() {
+    println("=== Image Classifier: Pattern Recognition ===")
+    println("")
+
+    // MLP classifier: 16 (4x4 pixels) -> 32 -> 16 -> 4 classes
+    let l1 = nn_linear(16, 32)
+    let a1 = nn_relu()
+    let l2 = nn_linear(32, 16)
+    let a2 = nn_relu()
+    let l3 = nn_linear(16, 4)
+    let model = nn_sequential([l1, a1, l2, a2, l3])
+
+    let params = nn_num_params(model)
+    println(format("Model: MLP classifier | {} parameters", params))
+    println("Classes: 0=horizontal, 1=vertical, 2=diagonal, 3=checkerboard")
+    println("")
+
+    // Synthetic 4x4 patterns (flattened to 16-dim)
+    let data = [
+        [1.0,1.0,1.0,1.0, 0.0,0.0,0.0,0.0, 1.0,1.0,1.0,1.0, 0.0,0.0,0.0,0.0],
+        [0.0,0.0,0.0,0.0, 1.0,1.0,1.0,1.0, 0.0,0.0,0.0,0.0, 1.0,1.0,1.0,1.0],
+        [0.8,0.8,0.8,0.8, 0.2,0.2,0.2,0.2, 0.9,0.9,0.9,0.9, 0.1,0.1,0.1,0.1],
+        [0.7,0.7,0.7,0.7, 0.3,0.3,0.3,0.3, 0.8,0.8,0.8,0.8, 0.2,0.2,0.2,0.2],
+        [1.0,0.0,1.0,0.0, 1.0,0.0,1.0,0.0, 1.0,0.0,1.0,0.0, 1.0,0.0,1.0,0.0],
+        [0.0,1.0,0.0,1.0, 0.0,1.0,0.0,1.0, 0.0,1.0,0.0,1.0, 0.0,1.0,0.0,1.0],
+        [0.2,0.8,0.2,0.8, 0.2,0.8,0.2,0.8, 0.2,0.8,0.2,0.8, 0.2,0.8,0.2,0.8],
+        [0.1,0.9,0.1,0.9, 0.1,0.9,0.1,0.9, 0.1,0.9,0.1,0.9, 0.1,0.9,0.1,0.9],
+        [1.0,0.0,0.0,0.0, 0.0,1.0,0.0,0.0, 0.0,0.0,1.0,0.0, 0.0,0.0,0.0,1.0],
+        [0.0,0.0,0.0,1.0, 0.0,0.0,1.0,0.0, 0.0,1.0,0.0,0.0, 1.0,0.0,0.0,0.0],
+        [0.8,0.1,0.1,0.1, 0.1,0.8,0.1,0.1, 0.1,0.1,0.8,0.1, 0.1,0.1,0.1,0.8],
+        [0.1,0.1,0.1,0.9, 0.1,0.1,0.9,0.1, 0.1,0.9,0.1,0.1, 0.9,0.1,0.1,0.1],
+        [1.0,0.0,1.0,0.0, 0.0,1.0,0.0,1.0, 1.0,0.0,1.0,0.0, 0.0,1.0,0.0,1.0],
+        [0.0,1.0,0.0,1.0, 1.0,0.0,1.0,0.0, 0.0,1.0,0.0,1.0, 1.0,0.0,1.0,0.0],
+        [0.9,0.1,0.9,0.1, 0.1,0.9,0.1,0.9, 0.9,0.1,0.9,0.1, 0.1,0.9,0.1,0.9],
+        [0.2,0.8,0.2,0.8, 0.8,0.2,0.8,0.2, 0.2,0.8,0.2,0.8, 0.8,0.2,0.8,0.2]
+    ]
+    // Class indices: 0=horizontal, 1=vertical, 2=diagonal, 3=checkerboard
+    let labels = [
+        [0.0], [0.0], [0.0], [0.0],
+        [1.0], [1.0], [1.0], [1.0],
+        [2.0], [2.0], [2.0], [2.0],
+        [3.0], [3.0], [3.0], [3.0]
+    ]
+
+    println("Training...")
+    let final_loss = nn_train_verbose(model, data, labels, "adam", 500, 0.005, 50)
+    println(format("Final loss: {}", final_loss))
+    println("")
+
+    let eval = nn_evaluate(model, data, labels)
+    println(format("Training accuracy: {} (loss: {})", eval[1], eval[0]))
+    println("")
+
+    let names = ["horizontal", "vertical", "diagonal", "checkerboard"]
+    println("--- Test Predictions ---")
+
+    let p1 = nn_predict(model, [0.9,0.9,0.9,0.9, 0.1,0.1,0.1,0.1, 0.9,0.9,0.9,0.9, 0.1,0.1,0.1,0.1])
+    println(format("  Horiz pattern -> {} (class {})", names[argmax(p1)], argmax(p1)))
+
+    let p2 = nn_predict(model, [0.1,0.9,0.1,0.9, 0.1,0.9,0.1,0.9, 0.1,0.9,0.1,0.9, 0.1,0.9,0.1,0.9])
+    println(format("  Vert pattern  -> {} (class {})", names[argmax(p2)], argmax(p2)))
+
+    let p3 = nn_predict(model, [0.9,0.1,0.1,0.1, 0.1,0.9,0.1,0.1, 0.1,0.1,0.9,0.1, 0.1,0.1,0.1,0.9])
+    println(format("  Diag pattern  -> {} (class {})", names[argmax(p3)], argmax(p3)))
+
+    let p4 = nn_predict(model, [0.8,0.2,0.8,0.2, 0.2,0.8,0.2,0.8, 0.8,0.2,0.8,0.2, 0.2,0.8,0.2,0.8])
+    println(format("  Check pattern -> {} (class {})", names[argmax(p4)], argmax(p4)))
+
+    println("")
+    println("Image classifier complete!")
+}
+
+fn argmax(arr: [float]) -> int {
+    var best = 0
+    var best_val = arr[0]
+    var i = 1
+    while i < len(arr) {
+        if arr[i] > best_val {
+            best = i
+            best_val = arr[i]
+        }
+        i = i + 1
+    }
+    return best
+}

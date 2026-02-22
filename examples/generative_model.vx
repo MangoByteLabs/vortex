@@ -1,0 +1,97 @@
+// Simple Generative Model (Autoencoder)
+// Trains an encoder-decoder to compress and reconstruct data
+// Demonstrates: autoencoders, latent spaces, data generation
+
+fn main() {
+    println("=== Generative Model: Autoencoder ===")
+    println("")
+
+    // Full autoencoder: 8 -> 16 -> relu -> 4 (latent) -> 16 -> relu -> 8
+    let enc1 = nn_linear(8, 16)
+    let ea1 = nn_relu()
+    let enc2 = nn_linear(16, 4)
+    let dec1 = nn_linear(4, 16)
+    let da1 = nn_relu()
+    let dec2 = nn_linear(16, 8)
+    let model = nn_sequential([enc1, ea1, enc2, dec1, da1, dec2])
+
+    let params = nn_num_params(model)
+    println(format("Autoencoder: 8 -> 4 (latent) -> 8 | {} parameters", params))
+    println("")
+
+    // 4 distinct pattern types to learn
+    let data = [
+        [0.9, 0.8, 0.7, 0.5, 0.2, 0.1, 0.0, 0.0],
+        [0.8, 0.9, 0.6, 0.4, 0.1, 0.0, 0.1, 0.0],
+        [0.7, 0.7, 0.8, 0.5, 0.3, 0.1, 0.0, 0.1],
+        [0.0, 0.0, 0.1, 0.2, 0.5, 0.7, 0.8, 0.9],
+        [0.0, 0.1, 0.0, 0.1, 0.4, 0.6, 0.9, 0.8],
+        [0.1, 0.0, 0.1, 0.3, 0.5, 0.8, 0.7, 0.7],
+        [0.9, 0.1, 0.8, 0.2, 0.7, 0.1, 0.9, 0.2],
+        [0.1, 0.8, 0.2, 0.9, 0.1, 0.7, 0.2, 0.8],
+        [0.8, 0.2, 0.7, 0.1, 0.8, 0.2, 0.7, 0.1],
+        [0.1, 0.3, 0.5, 0.9, 0.9, 0.5, 0.3, 0.1],
+        [0.0, 0.2, 0.6, 0.8, 0.8, 0.6, 0.2, 0.0],
+        [0.2, 0.4, 0.7, 0.9, 0.7, 0.4, 0.2, 0.1]
+    ]
+    // Targets = inputs (self-reconstruction)
+    let labels = [
+        [0.9, 0.8, 0.7, 0.5, 0.2, 0.1, 0.0, 0.0],
+        [0.8, 0.9, 0.6, 0.4, 0.1, 0.0, 0.1, 0.0],
+        [0.7, 0.7, 0.8, 0.5, 0.3, 0.1, 0.0, 0.1],
+        [0.0, 0.0, 0.1, 0.2, 0.5, 0.7, 0.8, 0.9],
+        [0.0, 0.1, 0.0, 0.1, 0.4, 0.6, 0.9, 0.8],
+        [0.1, 0.0, 0.1, 0.3, 0.5, 0.8, 0.7, 0.7],
+        [0.9, 0.1, 0.8, 0.2, 0.7, 0.1, 0.9, 0.2],
+        [0.1, 0.8, 0.2, 0.9, 0.1, 0.7, 0.2, 0.8],
+        [0.8, 0.2, 0.7, 0.1, 0.8, 0.2, 0.7, 0.1],
+        [0.1, 0.3, 0.5, 0.9, 0.9, 0.5, 0.3, 0.1],
+        [0.0, 0.2, 0.6, 0.8, 0.8, 0.6, 0.2, 0.0],
+        [0.2, 0.4, 0.7, 0.9, 0.7, 0.4, 0.2, 0.1]
+    ]
+
+    println("Training autoencoder (reconstruct input through 4-dim bottleneck)...")
+    let final_loss = nn_train_verbose(model, data, labels, "adam", 800, 0.003, 80)
+    println(format("Final reconstruction loss: {}", final_loss))
+    println("")
+
+    println("--- Reconstruction Quality ---")
+    let tests = [
+        [0.9, 0.8, 0.7, 0.5, 0.2, 0.1, 0.0, 0.0],
+        [0.0, 0.0, 0.1, 0.2, 0.5, 0.7, 0.8, 0.9],
+        [0.1, 0.3, 0.5, 0.9, 0.9, 0.5, 0.3, 0.1],
+        [0.9, 0.1, 0.8, 0.2, 0.7, 0.1, 0.9, 0.2]
+    ]
+    let test_names = ["left-heavy", "right-heavy", "bell-curve", "alternating"]
+
+    var i = 0
+    while i < 4 {
+        let rec = nn_predict(model, tests[i])
+        println(format("  {} pattern:", test_names[i]))
+        println(format("    Input:  {}", tests[i]))
+        println(format("    Output: {}", rec))
+        // Compute reconstruction error
+        var err = 0.0
+        var j = 0
+        while j < 8 {
+            let d = tests[i][j] - rec[j]
+            err = err + d * d
+            j = j + 1
+        }
+        println(format("    MSE: {}", err / 8.0))
+        i = i + 1
+    }
+
+    println("")
+    println("--- Novel Data Generation ---")
+    println("(Feeding unseen inputs to see what the autoencoder generates)")
+    let novel1 = nn_predict(model, [0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5])
+    println(format("  Uniform 0.5 -> {}", novel1))
+    let novel2 = nn_predict(model, [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0])
+    println(format("  Endpoints   -> {}", novel2))
+    let novel3 = nn_predict(model, [0.0, 0.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0])
+    println(format("  Center band -> {}", novel3))
+
+    println("")
+    println("Generative model complete!")
+}

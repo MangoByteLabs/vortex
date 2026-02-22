@@ -1,0 +1,123 @@
+// Simple Reinforcement Learning: Multi-Armed Bandit
+// An agent learns which actions give the highest reward
+// Demonstrates: Q-learning, exploration vs exploitation
+
+fn main() {
+    println("=== Reinforcement Learning: Multi-Armed Bandit ===")
+    println("")
+
+    let true_probs = [0.2, 0.5, 0.8, 0.3, 0.6]
+    println("Hidden reward probabilities: [0.2, 0.5, 0.8, 0.3, 0.6]")
+    println("Best arm: #2 (prob=0.8)")
+    println("")
+
+    // Q-table: estimated value for each arm
+    var q_values = [0.5, 0.5, 0.5, 0.5, 0.5]
+    var arm_counts = [1.0, 1.0, 1.0, 1.0, 1.0]
+    var total_reward = 0.0
+    var best_selections = 0.0
+    var seed = 7.0
+
+    var ep = 0.0
+    while ep < 500.0 {
+        // LCG random number
+        seed = seed * 1103515245.0 + 12345.0
+        seed = seed - floor(seed / 2147483648.0) * 2147483648.0
+
+        // Epsilon-greedy with decay
+        let eps = 0.3 / (1.0 + ep * 0.01)
+        let explore_roll = seed / 2147483648.0
+
+        var action = 0.0
+        if explore_roll < eps {
+            // Random
+            seed = seed * 1103515245.0 + 12345.0
+            seed = seed - floor(seed / 2147483648.0) * 2147483648.0
+            let r = floor(seed / 2147483648.0 * 5.0)
+            if r >= 5.0 { action = 4.0 } else { action = r }
+        } else {
+            // Greedy
+            var best_q = -1.0
+            var a = 0.0
+            while a < 5.0 {
+                if q_values[a] > best_q {
+                    best_q = q_values[a]
+                    action = a
+                }
+                a = a + 1.0
+            }
+        }
+
+        // Stochastic reward
+        seed = seed * 1103515245.0 + 12345.0
+        seed = seed - floor(seed / 2147483648.0) * 2147483648.0
+        let reward_roll = seed / 2147483648.0
+        var reward = 0.0
+        if reward_roll < true_probs[action] {
+            reward = 1.0
+        }
+
+        // Running average update
+        arm_counts[action] = arm_counts[action] + 1.0
+        let alpha = 1.0 / arm_counts[action]
+        q_values[action] = q_values[action] + alpha * (reward - q_values[action])
+
+        total_reward = total_reward + reward
+        if action == 2.0 {
+            best_selections = best_selections + 1.0
+        }
+
+        // Report every 100 episodes
+        let ep_mod = ep - floor(ep / 100.0) * 100.0
+        if ep_mod == 0.0 {
+            let avg = total_reward / (ep + 1.0)
+            println(format("  Episode {}: Q={}, avg_reward={}", ep, q_values, avg))
+        }
+
+        ep = ep + 1.0
+    }
+
+    println("")
+    println("--- Final Results ---")
+    println(format("Q-values:   {}", q_values))
+    println(format("True probs: {}", true_probs))
+    println(format("Arm pulls:  {}", arm_counts))
+    println(format("Total reward: {} / 500", total_reward))
+    println(format("Average reward: {}", total_reward / 500.0))
+    println(format("Best arm (#2) selected: {}%", best_selections * 100.0 / 500.0))
+    println("")
+
+    // Train neural Q-network on learned Q-table
+    println("--- Training Neural Q-Network ---")
+    let l1 = nn_linear(5, 16)
+    let a1 = nn_relu()
+    let l2 = nn_linear(16, 1)
+    let q_net = nn_sequential([l1, a1, l2])
+
+    let train_data = [
+        [1.0, 0.0, 0.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0, 0.0, 0.0],
+        [0.0, 0.0, 1.0, 0.0, 0.0],
+        [0.0, 0.0, 0.0, 1.0, 0.0],
+        [0.0, 0.0, 0.0, 0.0, 1.0]
+    ]
+    let train_labels = [
+        [q_values[0]], [q_values[1]], [q_values[2]], [q_values[3]], [q_values[4]]
+    ]
+
+    let loss = nn_train_verbose(q_net, train_data, train_labels, "adam", 200, 0.01, 40)
+    println("")
+
+    println("Neural Q-Network Predictions vs Q-Table:")
+    var a = 0.0
+    while a < 5.0 {
+        var oh = [0.0, 0.0, 0.0, 0.0, 0.0]
+        oh[a] = 1.0
+        let pred = nn_predict(q_net, oh)
+        println(format("  Arm {}: nn={}, table={}, true={}", a, pred, q_values[a], true_probs[a]))
+        a = a + 1.0
+    }
+
+    println("")
+    println("RL bandit complete!")
+}

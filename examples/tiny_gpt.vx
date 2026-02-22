@@ -1,0 +1,69 @@
+// Tiny GPT-style Language Model
+// Uses a deep MLP to predict the next number in arithmetic sequences
+// Demonstrates: deep networks, pattern learning, sequence prediction
+
+fn main() {
+    println("=== Tiny GPT: Sequence Prediction Network ===")
+    println("")
+
+    // Deep MLP: 8 -> 32 -> 32 -> 16 -> 1
+    let l1 = nn_linear(8, 32)
+    let a1 = nn_gelu()
+    let l2 = nn_linear(32, 32)
+    let a2 = nn_gelu()
+    let l3 = nn_linear(32, 16)
+    let a3 = nn_gelu()
+    let l4 = nn_linear(16, 1)
+    let model = nn_sequential([l1, a1, l2, a2, l3, a3, l4])
+
+    let params = nn_num_params(model)
+    println(format("Model: 4-layer MLP with GELU | {} parameters", params))
+    println("")
+
+    // Features: [x1, x2, x3, x4, d1, d2, d3, mean]
+    let data = [
+        [1.0, 2.0, 3.0, 4.0, 1.0, 1.0, 1.0, 2.5],
+        [2.0, 4.0, 6.0, 8.0, 2.0, 2.0, 2.0, 5.0],
+        [3.0, 6.0, 9.0, 12.0, 3.0, 3.0, 3.0, 7.5],
+        [5.0, 10.0, 15.0, 20.0, 5.0, 5.0, 5.0, 12.5],
+        [1.0, 3.0, 5.0, 7.0, 2.0, 2.0, 2.0, 4.0],
+        [10.0, 20.0, 30.0, 40.0, 10.0, 10.0, 10.0, 25.0],
+        [4.0, 8.0, 12.0, 16.0, 4.0, 4.0, 4.0, 10.0],
+        [2.0, 3.0, 4.0, 5.0, 1.0, 1.0, 1.0, 3.5],
+        [0.0, 5.0, 10.0, 15.0, 5.0, 5.0, 5.0, 7.5],
+        [1.0, 4.0, 7.0, 10.0, 3.0, 3.0, 3.0, 5.5],
+        [0.0, 1.0, 2.0, 3.0, 1.0, 1.0, 1.0, 1.5],
+        [0.0, 10.0, 20.0, 30.0, 10.0, 10.0, 10.0, 15.0]
+    ]
+    let labels = [
+        [5.0], [10.0], [15.0], [25.0], [9.0],
+        [50.0], [20.0], [6.0], [20.0], [13.0],
+        [4.0], [40.0]
+    ]
+
+    println("Task: [a, a+d, a+2d, a+3d] -> predict a+4d")
+    println("")
+    let final_loss = nn_train_verbose(model, data, labels, "adam", 500, 0.003, 50)
+    println(format("Final loss: {}", final_loss))
+    println("")
+
+    println("--- Training Set ---")
+    let p1 = nn_predict(model, [1.0, 2.0, 3.0, 4.0, 1.0, 1.0, 1.0, 2.5])
+    println(format("  [1,2,3,4]     -> {} (expected 5)", p1))
+    let p2 = nn_predict(model, [2.0, 4.0, 6.0, 8.0, 2.0, 2.0, 2.0, 5.0])
+    println(format("  [2,4,6,8]     -> {} (expected 10)", p2))
+    let p3 = nn_predict(model, [10.0, 20.0, 30.0, 40.0, 10.0, 10.0, 10.0, 25.0])
+    println(format("  [10,20,30,40] -> {} (expected 50)", p3))
+
+    println("")
+    println("--- Unseen Sequences ---")
+    let p4 = nn_predict(model, [6.0, 12.0, 18.0, 24.0, 6.0, 6.0, 6.0, 15.0])
+    println(format("  [6,12,18,24]  -> {} (expected 30)", p4))
+    let p5 = nn_predict(model, [0.0, 3.0, 6.0, 9.0, 3.0, 3.0, 3.0, 4.5])
+    println(format("  [0,3,6,9]     -> {} (expected 12)", p5))
+    let p6 = nn_predict(model, [7.0, 14.0, 21.0, 28.0, 7.0, 7.0, 7.0, 17.5])
+    println(format("  [7,14,21,28]  -> {} (expected 35)", p6))
+
+    println("")
+    println("Tiny GPT training complete!")
+}

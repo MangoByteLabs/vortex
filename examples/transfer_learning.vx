@@ -1,0 +1,98 @@
+// Transfer Learning Demo
+// Train a base model on one task, then fine-tune on a related task
+// Shows that pre-training leads to faster convergence
+
+fn main() {
+    println("=== Transfer Learning Demo ===")
+    println("")
+
+    // Task A: Learn y = 2*x1 + 3*x2 (linear combination)
+    let data_a = [
+        [1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0],
+        [1.0, 1.0, 0.0, 0.0], [2.0, 1.0, 0.0, 0.0],
+        [1.0, 2.0, 0.0, 0.0], [3.0, 1.0, 0.0, 0.0],
+        [0.5, 0.5, 0.0, 0.0], [2.0, 2.0, 0.0, 0.0],
+        [1.5, 0.5, 0.0, 0.0], [0.5, 1.5, 0.0, 0.0]
+    ]
+    let labels_a = [
+        [2.0], [3.0], [5.0], [7.0], [8.0],
+        [9.0], [2.5], [10.0], [4.5], [5.5]
+    ]
+
+    // Task B: Learn y = 2*x1 + 3*x2 + x3 - x4 (extends task A)
+    let data_b = [
+        [1.0, 0.0, 1.0, 0.0], [0.0, 1.0, 0.0, 1.0],
+        [1.0, 1.0, 1.0, 1.0], [2.0, 1.0, 0.5, 0.5],
+        [1.0, 2.0, 1.0, 0.5], [0.5, 0.5, 2.0, 1.0],
+        [1.5, 1.0, 0.0, 1.0], [2.0, 0.5, 1.0, 0.0],
+        [0.0, 2.0, 0.5, 0.5], [1.0, 1.0, 2.0, 0.0]
+    ]
+    let labels_b = [
+        [3.0], [2.0], [5.0], [7.0], [8.5],
+        [4.5], [5.0], [6.5], [6.0], [7.0]
+    ]
+
+    // --- Approach 1: Train from scratch on Task B ---
+    println("--- Approach 1: Train from scratch on Task B ---")
+    let s1 = nn_linear(4, 16)
+    let sa1 = nn_relu()
+    let s2 = nn_linear(16, 8)
+    let sa2 = nn_relu()
+    let s3 = nn_linear(8, 1)
+    let scratch_model = nn_sequential([s1, sa1, s2, sa2, s3])
+    println(format("Model: {} parameters", nn_num_params(scratch_model)))
+
+    let scratch_loss = nn_train_verbose(scratch_model, data_b, labels_b, "adam", 200, 0.01, 40)
+    println(format("From-scratch final loss: {}", scratch_loss))
+    println("")
+
+    // --- Approach 2: Pre-train on Task A, then fine-tune on Task B ---
+    println("--- Approach 2: Pre-train on Task A, then fine-tune on Task B ---")
+    let p1 = nn_linear(4, 16)
+    let pa1 = nn_relu()
+    let p2 = nn_linear(16, 8)
+    let pa2 = nn_relu()
+    let p3 = nn_linear(8, 1)
+    let pretrained = nn_sequential([p1, pa1, p2, pa2, p3])
+
+    println("Phase 1: Pre-training on Task A (y = 2x1 + 3x2)...")
+    let pretrain_loss = nn_train_verbose(pretrained, data_a, labels_a, "adam", 200, 0.01, 40)
+    println(format("Pre-training loss: {}", pretrain_loss))
+    println("")
+
+    println("Phase 2: Fine-tuning on Task B (y = 2x1 + 3x2 + x3 - x4)...")
+    let finetune_loss = nn_train_verbose(pretrained, data_b, labels_b, "adam", 200, 0.005, 40)
+    println(format("Fine-tuned loss: {}", finetune_loss))
+    println("")
+
+    // Compare
+    println("=== Comparison ===")
+    println(format("From scratch loss: {}", scratch_loss))
+    println(format("Transfer learning loss: {}", finetune_loss))
+    if finetune_loss < scratch_loss {
+        println("Transfer learning converged to LOWER loss!")
+    } else {
+        println("Both approaches achieved similar loss")
+    }
+    println("")
+
+    // Test predictions on Task B
+    println("--- Task B Predictions ---")
+    let test_inputs = [
+        [1.0, 1.0, 1.0, 0.0],
+        [2.0, 0.0, 0.0, 1.0],
+        [0.0, 1.0, 1.0, 1.0]
+    ]
+    let expected = [6.0, 3.0, 3.0]
+
+    var i = 0
+    while i < 3 {
+        let ps = nn_predict(scratch_model, test_inputs[i])
+        let pt = nn_predict(pretrained, test_inputs[i])
+        println(format("  Input {}: scratch={}, transfer={}, expected={}", test_inputs[i], ps, pt, expected[i]))
+        i = i + 1
+    }
+
+    println("")
+    println("Transfer learning demo complete!")
+}
