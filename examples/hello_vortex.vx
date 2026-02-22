@@ -1,0 +1,90 @@
+// === Hello Vortex! A GPU Language That Learns ===
+
+fn fibonacci(n: i64) -> i64 {
+    if n <= 1 {
+        return n
+    }
+    return fibonacci(n - 1) + fibonacci(n - 2)
+}
+
+struct Point {
+    x: f64
+    y: f64
+}
+
+fn main() {
+    println("========================================")
+    println("  Vortex GPU Programming Language v0.1")
+    println("========================================")
+
+    // 1. Basic arithmetic
+    println("")
+    println("[1] Arithmetic")
+    println(42 + 58)
+    println(42 * 58)
+    println(2.5 * 4.0)
+
+    // 2. Recursion
+    println("")
+    println("[2] Fibonacci(10) & Fibonacci(20)")
+    println(fibonacci(10))
+    println(fibonacci(20))
+
+    // 3. Structs
+    println("")
+    println("[3] Struct field access")
+    let p = Point { x: 3.0, y: 4.0 }
+    println(p.x)
+    println(p.y)
+
+    // 4. Arrays
+    println("")
+    println("[4] Arrays")
+    let arr = [100, 200, 300, 400, 500]
+    println(len(arr))
+    println(arr[2])
+
+    // 5. Crypto - SHA256
+    println("")
+    println("[5] SHA-256")
+    println(sha256("Hello Vortex!"))
+
+    // 6. Self-improving neural network (impossible in PyTorch during serving!)
+    println("")
+    println("[6] Continuous Learning Neural Net")
+    let model = continuous_learner_new([4, 8, 2])
+    let i = 0
+    while i < 20 {
+        let loss = continuous_learner_learn(model, [1.0, 0.0, 1.0, 0.0], [1.0, 0.0], 0.01)
+        if i == 0 {
+            println("  Step 1 loss:")
+            println(loss)
+        }
+        if i == 9 {
+            println("  Step 10 loss:")
+            println(loss)
+        }
+        if i == 19 {
+            println("  Step 20 loss:")
+            println(loss)
+        }
+        i = i + 1
+    }
+
+    // 7. Inference on the trained model
+    println("")
+    println("[7] Inference")
+    let out = continuous_learner_infer(model, [1.0, 0.0, 1.0, 0.0])
+    println(out)
+
+    // 8. Model stats
+    println("")
+    println("[8] Model Stats [loss_ema, drift, updates, memory_mb]")
+    let stats = continuous_learner_stats(model)
+    println(stats)
+
+    println("")
+    println("========================================")
+    println("  Done! The model learned while serving.")
+    println("========================================")
+}
