@@ -585,6 +585,85 @@ impl MemoryPool {
 }
 
 // ---------------------------------------------------------------------------
+// 6. CUDA FFI (only when `cuda` feature is enabled)
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "cuda")]
+mod cuda_ffi {
+    use std::ffi::c_void;
+
+    type CUresult = i32;
+
+    extern "C" {
+        pub fn cuInit(flags: u32) -> CUresult;
+        pub fn cuDeviceGet(device: *mut i32, ordinal: i32) -> CUresult;
+        pub fn cuCtxCreate_v2(
+            ctx: *mut *mut c_void,
+            flags: u32,
+            device: i32,
+        ) -> CUresult;
+        pub fn cuCtxDestroy_v2(ctx: *mut c_void) -> CUresult;
+        pub fn cuModuleLoadData(
+            module: *mut *mut c_void,
+            image: *const u8,
+        ) -> CUresult;
+        pub fn cuModuleGetFunction(
+            hfunc: *mut *mut c_void,
+            hmod: *mut c_void,
+            name: *const i8,
+        ) -> CUresult;
+        pub fn cuLaunchKernel(
+            f: *mut c_void,
+            grid_dim_x: u32,
+            grid_dim_y: u32,
+            grid_dim_z: u32,
+            block_dim_x: u32,
+            block_dim_y: u32,
+            block_dim_z: u32,
+            shared_mem_bytes: u32,
+            hstream: *mut c_void,
+            kernel_params: *mut *mut c_void,
+            extra: *mut *mut c_void,
+        ) -> CUresult;
+        pub fn cuMemAlloc_v2(dptr: *mut u64, bytesize: usize) -> CUresult;
+        pub fn cuMemFree_v2(dptr: u64) -> CUresult;
+        pub fn cuMemcpyHtoD_v2(
+            dst_device: u64,
+            src_host: *const c_void,
+            byte_count: usize,
+        ) -> CUresult;
+        pub fn cuMemcpyDtoH_v2(
+            dst_host: *mut c_void,
+            src_device: u64,
+            byte_count: usize,
+        ) -> CUresult;
+        pub fn cuCtxSynchronize() -> CUresult;
+    }
+
+    /// Check a CUDA driver call result.
+    pub fn check(result: CUresult, context: &str) -> Result<(), String> {
+        if result == 0 {
+            Ok(())
+        } else {
+            Err(format!("CUDA error {} in {}", result, context))
+        }
+    }
+}
+
+/// When `cuda` feature is not enabled, GPU operations fall back to CPU simulation.
+#[cfg(not(feature = "cuda"))]
+pub fn cuda_available() -> bool {
+    false
+}
+
+#[cfg(feature = "cuda")]
+pub fn cuda_available() -> bool {
+    unsafe {
+        cuda_ffi::cuInit(0) == 0
+    }
+}
+
+// ---------------------------------------------------------------------------
 // 7. Tests
 // ---------------------------------------------------------------------------
 

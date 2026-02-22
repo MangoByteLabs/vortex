@@ -6,6 +6,7 @@ description = "The Vortex GPU programming language compiler"
 
 [features]
 nccl = []
+cuda = []
 
 [dependencies]
 logos = "0.14"

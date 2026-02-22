@@ -50,6 +50,7 @@ mod tiered_experts;
 mod fft;
 mod python_bridge;
 mod runtime;
+mod gpu_pipeline;
 mod gpu_runtime;
 mod server;
 mod shape_check;

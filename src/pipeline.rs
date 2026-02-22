@@ -273,7 +273,7 @@ impl Pipeline {
         args.push("--convert-func-to-llvm".to_string());
         args.push("--convert-arith-to-llvm".to_string());
         args.push("--convert-cf-to-llvm".to_string());
-        args.push("--convert-memref-to-llvm".to_string());
+        args.push("--finalize-memref-to-llvm".to_string());
 
         // 7. Final cleanup
         if is_gpu {
@@ -483,7 +483,7 @@ mod tests {
         let passes = pipeline.get_passes_for_target();
         assert!(passes.contains(&"--gpu-kernel-outlining".to_string()));
         assert!(passes.contains(&"--gpu-to-nvvm".to_string()));
-        assert!(passes.contains(&"--convert-memref-to-llvm".to_string()));
+        assert!(passes.contains(&"--finalize-memref-to-llvm".to_string()));
         // GPU lowering must come before LLVM conversion
         let nvvm_pos = passes.iter().position(|p| p == "--gpu-to-nvvm").unwrap();
         let arith_pos = passes.iter().position(|p| p == "--convert-arith-to-llvm").unwrap();
