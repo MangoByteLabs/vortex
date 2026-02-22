@@ -429,6 +429,12 @@ impl CodeGen {
         self.push_scope();
         self.in_kernel = true;
 
+        // GPU kernel functions MUST have void return type per MLIR gpu dialect.
+        // If the Vortex kernel has a return type, we add an output memref parameter.
+        let ret_type = kernel.ret_type.as_ref()
+            .map(|t| self.resolve_type(t))
+            .unwrap_or(MLIRType::None);
+
         let mut param_strs = Vec::new();
         for param in &kernel.params {
             let ty = self.resolve_type(&param.ty);
@@ -437,22 +443,24 @@ impl CodeGen {
             param_strs.push(format!("{}: {}", ssa, ty));
         }
 
-        let ret_type = kernel.ret_type.as_ref()
-            .map(|t| self.resolve_type(t))
-            .unwrap_or(MLIRType::None);
+        // If there's a return type, add an output parameter
+        let output_ssa = if ret_type != MLIRType::None {
+            let ssa = self.fresh_ssa();
+            let out_ty = MLIRType::MemRef(Box::new(ret_type.clone()), vec![1]);
+            param_strs.push(format!("{}: {}", ssa, out_ty));
+            Some((ssa, out_ty))
+        } else {
+            None
+        };
 
         let params_str = param_strs.join(", ");
-        let ret_str = if ret_type == MLIRType::None {
-            String::new()
-        } else {
-            format!(" -> {}", ret_type)
-        };
 
         self.emit_line(&format!("gpu.module @{}_module {{", kernel.name.name));
         self.indent += 1;
+        // Always void return for kernel
         self.emit_line(&format!(
-            "gpu.func @{}({}){} kernel {{",
-            kernel.name.name, params_str, ret_str
+            "gpu.func @{}({}) kernel {{",
+            kernel.name.name, params_str
         ));
         self.indent += 1;
 
@@ -462,14 +470,32 @@ impl CodeGen {
             }
         }
 
-        self.gen_block(&kernel.body, &ret_type);
-
-        // Only emit gpu.return if the block didn't already produce one
-        // (i.e., it has no explicit return statement and no trailing expression)
-        let has_explicit_return = kernel.body.stmts.iter().any(|s| matches!(s.kind, StmtKind::Return(_)));
-        let has_tail_expr = kernel.body.expr.is_some() && ret_type != MLIRType::None;
-        if !has_explicit_return && !has_tail_expr {
-            self.emit_line("gpu.return");
+        // For kernels with return types, generate the body but intercept returns
+        // to store into the output memref instead
+        if ret_type != MLIRType::None {
+            let has_explicit_return = kernel.body.stmts.iter().any(|s| matches!(s.kind, StmtKind::Return(_)));
+            // Generate body statements
+            for stmt in &kernel.body.stmts {
+                self.gen_stmt_kernel_return(stmt, &output_ssa);
+            }
+            // Handle tail expression
+            if let Some(expr) = &kernel.body.expr {
+                let (val_ssa, _val_ty) = self.gen_expr(expr);
+                if let Some((ref out_ssa, ref out_ty)) = output_ssa {
+                    let idx = self.fresh_ssa();
+                    self.emit_line(&format!("{} = arith.constant 0 : index", idx));
+                    self.emit_line(&format!("memref.store {}, {}[{}] : {}", val_ssa, out_ssa, idx, out_ty));
+                }
+                self.emit_line("gpu.return");
+            } else if !has_explicit_return {
+                self.emit_line("gpu.return");
+            }
+        } else {
+            self.gen_block(&kernel.body, &MLIRType::None);
+            let has_explicit_return = kernel.body.stmts.iter().any(|s| matches!(s.kind, StmtKind::Return(_)));
+            if !has_explicit_return {
+                self.emit_line("gpu.return");
+            }
         }
 
         self.indent -= 1;
@@ -480,6 +506,26 @@ impl CodeGen {
 
         self.in_kernel = false;
         self.pop_scope();
+    }
+
+    /// Generate a statement inside a kernel, converting return statements
+    /// to memref.store + gpu.return instead of gpu.return with value.
+    fn gen_stmt_kernel_return(&mut self, stmt: &Stmt, output_ssa: &Option<(String, MLIRType)>) {
+        match &stmt.kind {
+            StmtKind::Return(Some(expr)) => {
+                let (val_ssa, _val_ty) = self.gen_expr(expr);
+                if let Some((ref out_ssa, ref out_ty)) = output_ssa {
+                    let idx = self.fresh_ssa();
+                    self.emit_line(&format!("{} = arith.constant 0 : index", idx));
+                    self.emit_line(&format!("memref.store {}, {}[{}] : {}", val_ssa, out_ssa, idx, out_ty));
+                }
+                self.emit_line("gpu.return");
+            }
+            StmtKind::Return(None) => {
+                self.emit_line("gpu.return");
+            }
+            _ => self.gen_stmt(stmt),
+        }
     }
 
     // --- Block generation ---
@@ -1938,12 +1984,16 @@ mod tests {
 
     #[test]
     fn test_mlir_opt_validates_for_loop() {
-        let ir = gen("fn sum(n: i64) -> i64 { var s: i64 = 0\n for i in 0..n { s += i }\n return s }");
+        run_mlir_opt_or_skip(&gen("fn sum(n: i64) -> i64 { var s: i64 = 0\n for i in 0..n { s += i }\n return s }"));
+    }
 
+    /// Helper: run mlir-opt-20 on IR, panic if rejected, skip if not installed.
+    fn run_mlir_opt_or_skip(ir: &str) {
         let which = std::process::Command::new("which")
             .arg("mlir-opt-20")
             .output();
         if which.is_err() || !which.unwrap().status.success() {
+            eprintln!("mlir-opt-20 not found, skipping");
             return;
         }
 
@@ -1962,5 +2012,138 @@ mod tests {
             let stderr = String::from_utf8_lossy(&output.stderr);
             panic!("mlir-opt-20 rejected the IR:\n{}\n\nGenerated IR:\n{}", stderr, ir);
         }
+    }
+
+    /// Helper: run mlir-opt-20 with full lowering passes
+    fn run_mlir_opt_full_pipeline_or_skip(ir: &str) {
+        let which = std::process::Command::new("which")
+            .arg("mlir-opt-20")
+            .output();
+        if which.is_err() || !which.unwrap().status.success() {
+            eprintln!("mlir-opt-20 not found, skipping");
+            return;
+        }
+
+        let mut child = std::process::Command::new("mlir-opt-20")
+            .args(&[
+                "--canonicalize",
+                "--cse",
+                "--convert-scf-to-cf",
+                "--convert-func-to-llvm",
+                "--convert-arith-to-llvm",
+                "--convert-cf-to-llvm",
+                "--finalize-memref-to-llvm",
+                "--reconcile-unrealized-casts",
+            ])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("failed to spawn mlir-opt-20");
+
+        use std::io::Write;
+        child.stdin.take().unwrap().write_all(ir.as_bytes()).unwrap();
+        let output = child.wait_with_output().unwrap();
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            panic!("mlir-opt-20 full pipeline rejected the IR:\n{}\n\nGenerated IR:\n{}", stderr, ir);
+        }
+    }
+
+    #[test]
+    fn test_mlir_opt_full_pipeline_simple_add() {
+        run_mlir_opt_full_pipeline_or_skip(&gen("fn add(a: i64, b: i64) -> i64 { return a + b }"));
+    }
+
+    #[test]
+    fn test_mlir_opt_validates_void_function() {
+        run_mlir_opt_or_skip(&gen("fn noop() { let x = 42 }"));
+    }
+
+    #[test]
+    fn test_mlir_opt_validates_if_else() {
+        run_mlir_opt_or_skip(&gen("fn abs(x: i64) -> i64 { if x > 0 { return x } else { return 0 - x } }"));
+    }
+
+    #[test]
+    fn test_mlir_opt_validates_while_loop() {
+        run_mlir_opt_or_skip(&gen("fn countdown(n: i64) -> i64 { var x = n\n while x > 0 { x -= 1 }\n return x }"));
+    }
+
+    #[test]
+    fn test_mlir_opt_validates_bool_ops() {
+        run_mlir_opt_or_skip(&gen("fn both(a: bool, b: bool) -> bool { return a && b }"));
+    }
+
+    #[test]
+    fn test_mlir_opt_full_pipeline_for_loop() {
+        run_mlir_opt_full_pipeline_or_skip(&gen("fn sum(n: i64) -> i64 { var s: i64 = 0\n for i in 0..n { s += i }\n return s }"));
+    }
+
+    #[test]
+    fn test_mlir_opt_validates_kernel_basic() {
+        run_mlir_opt_or_skip(&gen("kernel nop() { let x = 42 }"));
+    }
+
+    #[test]
+    fn test_mlir_opt_validates_array_literal() {
+        run_mlir_opt_or_skip(&gen("fn make() -> i64 { let a = [1, 2, 3]\n return 0 }"));
+    }
+
+    #[test]
+    fn test_mlir_opt_validates_cast() {
+        run_mlir_opt_or_skip(&gen("fn to_float(x: i64) -> f64 { return x as f64 }"));
+    }
+
+    #[test]
+    fn test_mlir_opt_validates_multiple_functions() {
+        run_mlir_opt_or_skip(&gen("fn square(x: i64) -> i64 { return x * x }\nfn main() -> i64 { return square(5) }"));
+    }
+
+    #[test]
+    fn test_mlir_opt_validates_negation() {
+        run_mlir_opt_or_skip(&gen("fn neg(x: i64) -> i64 { return 0 - x }"));
+    }
+
+    #[test]
+    fn test_mlir_opt_full_pipeline_void_function() {
+        run_mlir_opt_full_pipeline_or_skip(&gen("fn noop() { let x = 42 }"));
+    }
+
+    #[test]
+    fn test_mlir_opt_full_pipeline_if_else() {
+        run_mlir_opt_full_pipeline_or_skip(&gen("fn max(a: i64, b: i64) -> i64 { if a > b { return a } else { return b } }"));
+    }
+
+    #[test]
+    fn test_mlir_opt_full_pipeline_while() {
+        run_mlir_opt_full_pipeline_or_skip(&gen("fn countdown(n: i64) -> i64 { var x = n\n while x > 0 { x -= 1 }\n return x }"));
+    }
+
+    #[test]
+    fn test_mlir_opt_full_pipeline_array() {
+        run_mlir_opt_full_pipeline_or_skip(&gen("fn make() -> i64 { let a = [1, 2, 3]\n return 0 }"));
+    }
+
+    #[test]
+    fn test_mlir_opt_full_pipeline_cast() {
+        run_mlir_opt_full_pipeline_or_skip(&gen("fn to_float(x: i64) -> f64 { return x as f64 }"));
+    }
+
+    #[test]
+    fn test_mlir_opt_full_pipeline_multi_fn() {
+        run_mlir_opt_full_pipeline_or_skip(&gen("fn square(x: i64) -> i64 { return x * x }\nfn main() -> i64 { return square(5) }"));
+    }
+
+    #[test]
+    fn test_mlir_opt_validates_fibonacci() {
+        // This has if inside function with early return - tricky scf pattern
+        run_mlir_opt_or_skip(&gen("fn fib(n: i64) -> i64 { if n <= 1 { return n }\n return fib(n - 1) + fib(n - 2) }"));
+    }
+
+    #[test]
+    fn test_mlir_opt_validates_kernel_with_return() {
+        run_mlir_opt_or_skip(&gen("kernel add(a: i64, b: i64) -> i64 { return a + b }"));
     }
 }
