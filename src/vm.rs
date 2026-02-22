@@ -622,6 +622,7 @@ impl Compiler {
         self.emit(OpCode::Constant(one), line);
         self.emit(OpCode::Add, line);
         self.emit(OpCode::StoreLocal(counter_slot), line);
+        self.emit(OpCode::Pop, line); // clean up after store
 
         self.emit(OpCode::Loop(loop_start), line);
         self.chunk().patch_jump(exit_jump);
