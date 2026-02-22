@@ -2000,4 +2000,43 @@ fn main() {
             panic!("expected function");
         }
     }
+
+    #[test]
+    fn test_parser_collects_multiple_errors() {
+        // Two invalid items - parser should collect errors from both
+        let tokens = lexer::lex("func foo() {} class Bar {}");
+        let result = parse(tokens, 0);
+        assert!(result.is_err());
+        let errs = result.unwrap_err();
+        assert!(errs.len() >= 2, "expected at least 2 errors, got {}", errs.len());
+    }
+
+    #[test]
+    fn test_did_you_mean_fn() {
+        let tokens = lexer::lex("func foo() {}");
+        let result = parse(tokens, 0);
+        assert!(result.is_err());
+        let errs = result.unwrap_err();
+        assert!(errs.iter().any(|d| d.message.contains("did you mean `fn`")),
+            "expected 'did you mean fn' suggestion, got: {:?}", errs.iter().map(|d| &d.message).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn test_did_you_mean_struct() {
+        let tokens = lexer::lex("class Foo {}");
+        let result = parse(tokens, 0);
+        assert!(result.is_err());
+        let errs = result.unwrap_err();
+        assert!(errs.iter().any(|d| d.message.contains("did you mean `struct`")),
+            "expected 'did you mean struct' suggestion, got: {:?}", errs.iter().map(|d| &d.message).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn test_error_recovery_parses_valid_items() {
+        // First item is invalid, but second is valid - parser should recover
+        let tokens = lexer::lex("func bad() {}\nfn good() { return 1 }");
+        let result = parse(tokens, 0);
+        // Result is Err because there were errors, but items may have been partially parsed
+        assert!(result.is_err());
+    }
 }

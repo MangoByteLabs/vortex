@@ -537,7 +537,7 @@ fn combinations(items: &[usize], k: usize) -> Vec<Vec<usize>> {
 
 /// Mean squared error loss
 pub fn scm_loss(model: &StructuralCausalModel, data: &[Vec<f64>]) -> f64 {
-    let n = model.graph.nodes.len();
+    let _n = model.graph.nodes.len();
     let order = model.graph.topological_sort();
     let mut total_loss = 0.0;
     for row in data {

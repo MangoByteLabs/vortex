@@ -642,7 +642,7 @@ impl HeterogeneousLayer {
         let mut results = vec![vec![]; batch.len()];
 
         // Process each expert group
-        for (expert_idx, batch_indices) in &groups {
+        for (_expert_idx, batch_indices) in &groups {
             for &bi in batch_indices {
                 let routing = &assignments[bi].1;
                 let mut output = vec![0.0f64; batch[bi].len()];

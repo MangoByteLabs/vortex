@@ -1617,4 +1617,54 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn test_string_where_int_expected() {
+        let errs = check_err(
+            "fn f(x: i64) -> i64 { return x }
+             fn test() { f(\"hello\") }",
+        );
+        assert!(errs.iter().any(|d| d.message.contains("type mismatch")));
+    }
+
+    #[test]
+    fn test_arg_count_mismatch() {
+        let errs = check_err(
+            "fn f(a: i64, b: i64) -> i64 { return a + b }
+             fn test() { f(1) }",
+        );
+        assert!(errs.iter().any(|d| d.message.contains("expects 2 arguments")));
+    }
+
+    #[test]
+    fn test_struct_field_type_mismatch() {
+        let errs = check_err(
+            "struct Point { x: f64, y: f64 }
+             fn test() { let p = Point { x: \"hello\", y: 1.0 } }",
+        );
+        assert!(errs.iter().any(|d| d.message.contains("type mismatch")));
+    }
+
+    #[test]
+    fn test_struct_missing_field() {
+        let errs = check_err(
+            "struct Point { x: f64, y: f64 }
+             fn test() { let p = Point { x: 1.0 } }",
+        );
+        assert!(errs.iter().any(|d| d.message.contains("missing field")));
+    }
+
+    #[test]
+    fn test_named_type_strict() {
+        let errs = check_err(
+            "struct Foo { x: i64 }
+             struct Bar { x: i64 }
+             fn takes_foo(f: Foo) -> i64 { return 0 }
+             fn test() {
+                 let b = Bar { x: 1 }
+                 takes_foo(b)
+             }",
+        );
+        assert!(errs.iter().any(|d| d.message.contains("type mismatch")));
+    }
 }

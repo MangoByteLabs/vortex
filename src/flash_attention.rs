@@ -434,7 +434,7 @@ fn trace_through_elementwise(nodes: &[FusionNode], node: &FusionNode, first_call
 
 /// Generate MLIR for a FlashAttention kernel.
 pub fn emit_flash_attention_mlir(
-    detection: &FlashAttentionDetection,
+    _detection: &FlashAttentionDetection,
     config: &FlashAttentionConfig,
 ) -> String {
     let mut out = String::new();

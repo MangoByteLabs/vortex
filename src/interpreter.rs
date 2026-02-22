@@ -1577,7 +1577,7 @@ fn builtin_flash_attention_backward(_env: &mut Env, args: Vec<Value>) -> Result<
         Some(Value::Int(h)) => *h as usize,
         _ => 1,
     };
-    let causal = match args.get(6) {
+    let _causal = match args.get(6) {
         Some(Value::Bool(b)) => *b,
         _ => false,
     };
@@ -2093,6 +2093,59 @@ pub fn interpret(program: &Program) -> Result<Vec<String>, String> {
     Ok(env.output)
 }
 
+/// Create a new REPL environment with builtins registered
+pub fn repl_env() -> Env { Env::new() }
+
+/// Evaluate a line of input in the REPL
+pub fn repl_eval_line(env: &mut Env, line: &str) -> Result<Option<String>, String> {
+    let tokens = crate::lexer::lex(line);
+    if let Ok(program) = crate::parser::parse(tokens, 0) {
+        if !program.items.is_empty() {
+            for item in &program.items {
+                match &item.kind {
+                    ItemKind::Function(func) => {
+                        let params: Vec<String> = func.params.iter().map(|p| p.name.name.clone()).collect();
+                        env.functions.insert(func.name.name.clone(), FnDef::User { params, body: func.body.clone() });
+                    }
+                    ItemKind::Struct(s) => {
+                        let field_names: Vec<String> = s.fields.iter().map(|f| f.name.name.clone()).collect();
+                        env.struct_defs.insert(s.name.name.clone(), field_names);
+                    }
+                    _ => {}
+                }
+            }
+            let output: Vec<String> = env.output.drain(..).collect();
+            for o in &output { println!("{}", o); }
+            return Ok(None);
+        }
+    }
+    let wrapped = format!("fn __repl__() {{\n{}\n}}", line);
+    let tokens = crate::lexer::lex(&wrapped);
+    if let Ok(program) = crate::parser::parse(tokens, 0) {
+        for item in &program.items {
+            if let ItemKind::Function(func) = &item.kind {
+                if func.name.name == "__repl__" {
+                    let result = eval_block(env, &func.body)?;
+                    let output: Vec<String> = env.output.drain(..).collect();
+                    for o in &output { println!("{}", o); }
+                    return match &result {
+                        Value::Void => Ok(None),
+                        _ => Ok(Some(format!("{}", result))),
+                    };
+                }
+            }
+        }
+    }
+    Err(format!("could not parse: {}", line))
+}
+
+/// Get variable names from REPL env
+pub fn repl_env_vars(env: &Env) -> Vec<String> {
+    let mut vars = Vec::new();
+    for scope in &env.scopes { for k in scope.keys() { vars.push(k.clone()); } }
+    vars.sort(); vars
+}
+
 pub(crate) fn eval_block(env: &mut Env, block: &Block) -> Result<Value, String> {
     for stmt in &block.stmts {
         let val = eval_stmt(env, stmt)?;
@@ -2562,7 +2615,7 @@ pub(crate) fn eval_expr(env: &mut Env, expr: &Expr) -> Result<Value, String> {
             }
         }
 
-        ExprKind::TypeCall { ty, method, args } => {
+        ExprKind::TypeCall { ty: _, method: _, args: _ } => {
             Err("type method calls not yet supported in interpreter".to_string())
         }
 
@@ -4998,7 +5051,7 @@ fn builtin_tensor_adam(env: &mut Env, args: Vec<Value>) -> Result<Value, String>
     let eps = value_to_f64(&args[4])?;
     let step = value_to_tensor_id(&args[5])?;
     let m_state_id = value_to_tensor_id(&args[6])?;
-    let v_state_id = value_to_tensor_id(&args[7])?;
+    let _v_state_id = value_to_tensor_id(&args[7])?;
 
     // Get or create adam states
     let n_params = params.len();
@@ -5585,5 +5638,78 @@ mod math_builtin_tests {
     #[test]
     fn test_tan() {
         assert_eq!(rv("fn main() { println(tan(0)) }"), vec!["0"]);
+    }
+}
+
+#[cfg(test)]
+mod file_io_tests {
+    use crate::lexer;
+    use crate::parser;
+    use crate::interpreter::interpret;
+    fn rv(s: &str) -> Vec<String> { let t = lexer::lex(s); let p = parser::parse(t, 0).unwrap(); interpret(&p).unwrap() }
+
+    #[test]
+    fn test_read_write_file_roundtrip() {
+        let o = rv("fn main() {\nwrite_file(\"/tmp/vx_test_rw.txt\", \"hello vortex\")\nlet content = read_file(\"/tmp/vx_test_rw.txt\")\nprintln(content)\n}");
+        assert_eq!(o, vec!["hello vortex"]);
+        std::fs::remove_file("/tmp/vx_test_rw.txt").ok();
+    }
+
+    #[test]
+    fn test_file_exists_true_false() {
+        let o = rv("fn main() {\nwrite_file(\"/tmp/vx_test_ex.txt\", \"x\")\nprintln(file_exists(\"/tmp/vx_test_ex.txt\"))\nprintln(file_exists(\"/tmp/vx_nonexist.txt\"))\n}");
+        assert_eq!(o, vec!["true", "false"]);
+        std::fs::remove_file("/tmp/vx_test_ex.txt").ok();
+    }
+
+    #[test]
+    fn test_load_csv() {
+        std::fs::write("/tmp/vx_test.csv", "a,b,c\n1,2,3\nx,y,z\n").unwrap();
+        let o = rv("fn main() {\nlet data = load_csv(\"/tmp/vx_test.csv\")\nprintln(len(data))\n}");
+        assert_eq!(o[0], "3");
+        std::fs::remove_file("/tmp/vx_test.csv").ok();
+    }
+
+    #[test]
+    fn test_float_display_decimal() {
+        let o = rv("fn main() {\nlet x: f64 = 10.0\nprintln(x)\nlet y: f64 = 3.14\nprintln(y)\n}");
+        assert_eq!(o[0], "10.0");
+        assert_eq!(o[1], "3.14");
+    }
+}
+
+#[cfg(test)]
+mod import_tests {
+    use crate::lexer;
+    use crate::parser;
+    use crate::interpreter::interpret;
+
+    #[test]
+    fn test_import_from_stdlib() {
+        let src = "import std.nn { relu }\nfn main() {\n    println(relu(5.0))\n    println(relu(-3.0))\n}";
+        let tokens = lexer::lex(src);
+        let program = parser::parse(tokens, 0).unwrap();
+        let output = interpret(&program).unwrap();
+        assert_eq!(output, vec!["5", "0"]);
+    }
+
+    #[test]
+    fn test_import_nonexistent_module() {
+        let src = "import nonexistent.module { Foo }\nfn main() {}";
+        let tokens = lexer::lex(src);
+        let program = parser::parse(tokens, 0).unwrap();
+        let result = interpret(&program);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.contains("not found"), "error should mention not found: {}", err);
+    }
+
+    #[test]
+    fn test_from_import_syntax() {
+        let src = "from std.nn import relu\nfn main() {\n    println(relu(2.5))\n}";
+        let tokens = lexer::lex(src);
+        let program = parser::parse(tokens, 0).unwrap();
+        let output = interpret(&program).unwrap();
+        assert_eq!(output, vec!["2.5"]);
     }
 }

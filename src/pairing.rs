@@ -351,8 +351,8 @@ pub fn line_func_double(r: &G2Point, p_g1: &G1Point) -> (G2Point, Fp12) {
     // Line evaluated at P = (xp, yp):
     // l(P) = yp - yr - lambda * (xp - xr)
     // We encode this into Fp12, scaling by Fp2 coefficients.
-    let xp = Fp2::new(p_g1.x.clone(), BigUint256::ZERO, fp.clone());
-    let yp = Fp2::new(p_g1.y.clone(), BigUint256::ZERO, fp.clone());
+    let _xp = Fp2::new(p_g1.x.clone(), BigUint256::ZERO, fp.clone());
+    let _yp = Fp2::new(p_g1.y.clone(), BigUint256::ZERO, fp.clone());
 
     // Line coefficients for sparse multiplication:
     //   a = lambda * xr - yr  (constant part)

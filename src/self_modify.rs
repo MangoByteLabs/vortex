@@ -76,7 +76,7 @@ impl DynamicLayer {
                 output
             }
             DynamicLayer::Attention { q_proj, k_proj, v_proj, o_proj, n_heads } => {
-                let d = input.len();
+                let _d = input.len();
                 // Simple single-token self-attention: Q=K=V from input
                 let q = mat_vec_mul(q_proj, input);
                 let k = mat_vec_mul(k_proj, input);
@@ -110,7 +110,7 @@ impl DynamicLayer {
                     row.iter().zip(&hidden).map(|(w, h)| w * h).sum::<f64>() + b
                 }).collect()
             }
-            DynamicLayer::SSM { a, b, c, d, state_size } => {
+            DynamicLayer::SSM { a: _, b, c, d, state_size: _ } => {
                 // Simplified linear SSM: y = C*(A*0 + B*x) + D*x  (state starts at 0)
                 let bx = mat_vec_mul(b, input);
                 let cx = mat_vec_mul(c, &bx);
@@ -501,7 +501,7 @@ impl ArchitectureSearcher {
         }
     }
 
-    pub fn search_step(&mut self, model: &mut DynamicModel, train_loss: f64, val_loss: f64) -> Option<Modification> {
+    pub fn search_step(&mut self, model: &mut DynamicModel, _train_loss: f64, val_loss: f64) -> Option<Modification> {
         self.step_count += 1;
         // Save snapshot for potential rollback
         self.prev_snapshot = Some(model.layers.clone());

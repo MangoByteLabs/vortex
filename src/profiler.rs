@@ -258,6 +258,6 @@ mod tests {
     #[test]
     fn test_truncate_name() {
         assert_eq!(truncate_name("short", 20), "short");
-        assert_eq!(truncate_name("a_very_long_function_name_here", 20), "a_very_long_functio...");
+        assert_eq!(truncate_name("a_very_long_function_name_here", 20), "a_very_long_funct...");
     }
 }

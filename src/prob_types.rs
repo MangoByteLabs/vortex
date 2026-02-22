@@ -127,7 +127,7 @@ impl Distribution {
             Distribution::Empirical(samples) => {
                 // KDE with bandwidth = 1.06 * std * n^(-1/5)
                 if samples.is_empty() { return f64::NEG_INFINITY; }
-                let m = self.mean();
+                let _m = self.mean();
                 let v = self.variance().sqrt().max(1e-10);
                 let n = samples.len() as f64;
                 let h = 1.06 * v * n.powf(-0.2);
@@ -713,7 +713,7 @@ fn builtin_bayesian_forward(env: &mut Env, args: Vec<Value>) -> Result<Value, St
     Ok(Value::Array(vec![Value::Float(mean), Value::Float(var.sqrt())]))
 }
 
-fn builtin_calibration_check(env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+fn builtin_calibration_check(_env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
     if args.len() != 2 { return Err("calibration_check expects 2 args: (predictions, outcomes)".into()); }
     let preds: Vec<f64> = match &args[0] {
         Value::Array(arr) => arr.iter().map(value_to_f64).collect::<Result<Vec<_>, _>>()?,

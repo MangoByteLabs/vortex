@@ -161,7 +161,7 @@ fn attention_at_positions(
     if spike_positions.is_empty() {
         return vec![];
     }
-    let seq_len = x.len();
+    let _seq_len = x.len();
     let d_head = d_model / weights.num_heads.max(1);
     let scale = (d_head as f64).sqrt();
 
@@ -484,7 +484,7 @@ impl SpikeSSMFormer {
     /// Training step with hybrid learning
     pub fn train_step(
         &mut self,
-        token_ids: &[usize],
+        _token_ids: &[usize],
         embeddings: &[Vec<f64>],
         targets: &[usize],
         lr: f64,

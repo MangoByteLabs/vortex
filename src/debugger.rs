@@ -162,7 +162,7 @@ impl Debugger {
                         eprintln!("(no variables in scope)");
                     } else {
                         let mut sorted: Vec<_> = vars.iter().collect();
-                        sorted.sort_by_key(|(k, _)| k.clone());
+                        sorted.sort_by_key(|(k, _)| (*k).clone());
                         for (name, val) in sorted {
                             eprintln!("  {} = {}", name, val);
                         }

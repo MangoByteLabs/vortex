@@ -237,7 +237,7 @@ impl TensorTape {
         let a_shape = self.tensors[a].shape.clone();
         let b_shape = self.tensors[b].shape.clone();
         let out_shape = broadcast_shapes(&a_shape, &b_shape);
-        let numel: usize = out_shape.iter().product();
+        let _numel: usize = out_shape.iter().product();
 
         let (a_exp, b_exp) = elementwise_broadcast(
             &self.tensors[a].data, &a_shape,
@@ -767,7 +767,7 @@ impl TensorTape {
 
                 TensorOp::Reshape { input, new_shape: _ } => {
                     // Gradient passes through with same reshaping back
-                    let input_shape = self.tensors[input].shape.clone();
+                    let _input_shape = self.tensors[input].shape.clone();
                     // grad has out shape, just reshape back
                     let dg = grad.clone(); // same data, different logical shape
                     add_grad(&mut self.tensors[input].grad, &dg);
@@ -790,7 +790,7 @@ impl TensorTape {
                     // Jacobian-vector product: ds_i = s_i * (dL_i - sum_j(dL_j * s_j))
                     let out_data = self.tensors[i].data.clone();
                     let shape = self.tensors[i].shape.clone();
-                    let ndim = shape.len();
+                    let _ndim = shape.len();
                     let axis_size = shape[axis];
                     let outer: usize = shape[..axis].iter().product();
                     let inner: usize = shape[axis + 1..].iter().product();

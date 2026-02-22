@@ -110,6 +110,11 @@ fn main() {
         return;
     }
 
+    if command == "repl" {
+        run_repl();
+        return;
+    }
+
     if args.len() < 3 {
         eprintln!("Usage: vortex {} <file.vx>", command);
         std::process::exit(1);
@@ -424,7 +429,7 @@ fn main() {
                         .map(|p| p.to_path_buf())
                         .unwrap_or_else(|| PathBuf::from("."));
                     let mut resolver = module::ModuleResolver::new(file_dir);
-                    let program = match resolver.resolve_imports(&program) {
+                    let _program = match resolver.resolve_imports(&program) {
                         Ok(p) => p,
                         Err(e) => {
                             eprintln!("Import error: {}", e);

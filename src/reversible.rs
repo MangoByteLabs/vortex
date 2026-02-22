@@ -410,7 +410,7 @@ impl MemoryEfficientTrainer {
     }
 
     /// Peak memory usage (bytes) for reversible training: O(1) per layer.
-    pub fn peak_memory(n_layers: usize, hidden_dim: usize) -> usize {
+    pub fn peak_memory(_n_layers: usize, hidden_dim: usize) -> usize {
         // Only store: final output + one layer's activations for reconstruction
         let activation_size = hidden_dim * 8; // f64 = 8 bytes
         2 * activation_size // final output + one reconstruction buffer

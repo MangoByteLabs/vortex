@@ -145,7 +145,7 @@ impl DiffHashMap {
         }
         let weights = SoftAttention::attention_weights(query, &self.keys);
         let n = self.keys.len();
-        let dim_v = self.values[0].len();
+        let _dim_v = self.values[0].len();
         let dim_k = query.len();
 
         // grad_values[i] = weights[i] * grad_output
