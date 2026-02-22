@@ -1,0 +1,36 @@
+// Self-Evolving Code Demo
+// Demonstrates Vortex's ability to generate, evaluate, and evolve its own code.
+
+fn main() {
+    // 1. Runtime code generation and eval
+    let code = "1 + 2 + 3"
+    let result = eval_code(code)
+    println("Eval result:", result)
+
+    // 2. Generate a function at runtime
+    let fn_code = generate_function("double", ["x"], "x * 2")
+    println("Generated function:")
+    println(fn_code)
+
+    // 3. Template rendering
+    let tmpl = "nn_linear({{input}}, {{output}})"
+    let rendered = template_render(tmpl, [["input", "64"], ["output", "32"]])
+    println("Rendered template:", rendered)
+
+    // 4. AST round-trip
+    let src = "fn add(a: Int, b: Int) -> Int { a + b }"
+    let ast = ast_parse(src)
+    println("AST:", ast)
+    let reconstructed = ast_to_code(src)
+    println("Reconstructed:", reconstructed)
+
+    // 5. Code generation for neural network model
+    let layers = [["linear", 2, 8], "relu", ["linear", 8, 1]]
+    let model_code = codegen_model(layers)
+    println("Generated model code:", model_code)
+
+    // 6. Generate optimizer code
+    let opt_code = codegen_optimizer(0.01, 0.9, 0.0001)
+    println("Generated optimizer:")
+    println(opt_code)
+}

@@ -1,0 +1,22 @@
+// Neural Architecture Search Demo
+// Uses Vortex's meta-engine to search for optimal neural network architectures.
+
+fn main() {
+    // Define search space
+    let layer_types = ["linear", "relu", "sigmoid", "tanh"]
+    let min_layers = 3
+    let max_layers = 6
+    let budget = 10
+
+    // Run NAS
+    let best_arch = nas_search(layer_types, min_layers, max_layers, budget)
+    println("Best architecture found:")
+    println(best_arch)
+
+    // Generate model code for different configurations
+    let small_model = codegen_model([["linear", 2, 4], "relu", ["linear", 4, 1]])
+    println("Small model:", small_model)
+
+    let large_model = codegen_model([["linear", 2, 32], "relu", ["linear", 32, 16], "relu", ["linear", 16, 1]])
+    println("Large model:", large_model)
+}
