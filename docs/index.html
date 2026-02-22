@@ -1,0 +1,382 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Vortex - The Language AI Thinks In</title>
+<style>
+  :root {
+    --bg: #0d1117;
+    --bg2: #161b22;
+    --bg3: #1c2129;
+    --fg: #e6edf3;
+    --fg2: #8b949e;
+    --accent: #58a6ff;
+    --accent2: #7ee787;
+    --accent3: #d2a8ff;
+    --accent4: #ffa657;
+    --border: #30363d;
+    --red: #ff7b72;
+    --yellow: #e3b341;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;
+    background: var(--bg);
+    color: var(--fg);
+    line-height: 1.6;
+  }
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+
+  /* NAV */
+  nav {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 16px 40px;
+    border-bottom: 1px solid var(--border);
+    background: var(--bg2);
+    position: sticky; top: 0; z-index: 100;
+  }
+  nav .logo { font-size: 20px; font-weight: 700; letter-spacing: -0.5px; }
+  nav .logo span { color: var(--accent); }
+  nav .links { display: flex; gap: 24px; }
+  nav .links a { color: var(--fg2); font-size: 14px; }
+  nav .links a:hover { color: var(--fg); text-decoration: none; }
+
+  /* HERO */
+  .hero {
+    text-align: center;
+    padding: 100px 40px 60px;
+    max-width: 900px;
+    margin: 0 auto;
+  }
+  .hero h1 {
+    font-size: 56px;
+    font-weight: 800;
+    letter-spacing: -2px;
+    line-height: 1.1;
+    margin-bottom: 20px;
+  }
+  .hero h1 .gradient {
+    background: linear-gradient(135deg, var(--accent), var(--accent3));
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    background-clip: text;
+  }
+  .hero .tagline {
+    font-size: 20px;
+    color: var(--fg2);
+    margin-bottom: 40px;
+    max-width: 600px;
+    margin-left: auto;
+    margin-right: auto;
+  }
+  .hero .cta {
+    display: flex; gap: 16px; justify-content: center; flex-wrap: wrap;
+  }
+  .btn {
+    display: inline-block;
+    padding: 12px 28px;
+    border-radius: 8px;
+    font-size: 15px;
+    font-weight: 600;
+    transition: all 0.2s;
+  }
+  .btn-primary {
+    background: var(--accent);
+    color: var(--bg);
+  }
+  .btn-primary:hover { opacity: 0.9; text-decoration: none; }
+  .btn-secondary {
+    border: 1px solid var(--border);
+    color: var(--fg);
+    background: var(--bg2);
+  }
+  .btn-secondary:hover { border-color: var(--fg2); text-decoration: none; }
+
+  /* CODE COMPARISON */
+  .comparison {
+    max-width: 1100px;
+    margin: 40px auto 80px;
+    padding: 0 40px;
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 20px;
+  }
+  @media (max-width: 768px) {
+    .comparison { grid-template-columns: 1fr; }
+    .hero h1 { font-size: 36px; }
+    .features { grid-template-columns: 1fr !important; }
+  }
+  .code-panel {
+    background: var(--bg2);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    overflow: hidden;
+  }
+  .code-panel .label {
+    padding: 10px 16px;
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--fg2);
+    border-bottom: 1px solid var(--border);
+    background: var(--bg3);
+  }
+  .code-panel pre {
+    padding: 20px;
+    font-size: 13px;
+    line-height: 1.7;
+    font-family: 'SF Mono', 'Fira Code', monospace;
+    overflow-x: auto;
+  }
+  /* Syntax highlighting classes */
+  .kw { color: var(--red); }
+  .fn { color: var(--accent3); }
+  .str { color: var(--accent2); }
+  .num { color: var(--accent4); }
+  .cm { color: var(--fg2); }
+  .ty { color: var(--accent); }
+  .op { color: var(--fg2); }
+
+  /* FEATURES */
+  .section { max-width: 1100px; margin: 0 auto; padding: 80px 40px; }
+  .section h2 {
+    font-size: 36px;
+    font-weight: 700;
+    margin-bottom: 12px;
+    letter-spacing: -1px;
+  }
+  .section .subtitle {
+    font-size: 16px;
+    color: var(--fg2);
+    margin-bottom: 48px;
+    max-width: 600px;
+  }
+  .features {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 20px;
+  }
+  .feature {
+    background: var(--bg2);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 28px;
+    transition: border-color 0.2s;
+  }
+  .feature:hover { border-color: var(--accent); }
+  .feature .icon { font-size: 28px; margin-bottom: 12px; }
+  .feature h3 { font-size: 17px; margin-bottom: 8px; }
+  .feature p { font-size: 14px; color: var(--fg2); line-height: 1.5; }
+
+  /* INSTALL */
+  .install {
+    text-align: center;
+    padding: 80px 40px;
+    background: var(--bg2);
+    border-top: 1px solid var(--border);
+    border-bottom: 1px solid var(--border);
+  }
+  .install h2 { font-size: 32px; margin-bottom: 24px; }
+  .install-box {
+    display: inline-block;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 16px 32px;
+    font-family: 'SF Mono', 'Fira Code', monospace;
+    font-size: 16px;
+    margin-bottom: 16px;
+    user-select: all;
+  }
+  .install-box span { color: var(--fg2); }
+  .install p { color: var(--fg2); font-size: 14px; }
+
+  /* DOCS NAV */
+  .docs-nav {
+    max-width: 1100px;
+    margin: 0 auto;
+    padding: 80px 40px;
+  }
+  .docs-nav h2 { font-size: 32px; margin-bottom: 32px; }
+  .docs-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+    gap: 16px;
+  }
+  .doc-link {
+    display: block;
+    padding: 20px 24px;
+    background: var(--bg2);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    transition: border-color 0.2s;
+  }
+  .doc-link:hover { border-color: var(--accent); text-decoration: none; }
+  .doc-link h3 { font-size: 16px; color: var(--fg); margin-bottom: 4px; }
+  .doc-link p { font-size: 13px; color: var(--fg2); }
+
+  /* FOOTER */
+  footer {
+    text-align: center;
+    padding: 40px;
+    color: var(--fg2);
+    font-size: 13px;
+    border-top: 1px solid var(--border);
+  }
+</style>
+</head>
+<body>
+
+<nav>
+  <div class="logo"><span>Vortex</span></div>
+  <div class="links">
+    <a href="guide/getting-started.md">Get Started</a>
+    <a href="guide/language-reference.md">Language</a>
+    <a href="guide/neural-networks.md">Neural Nets</a>
+    <a href="guide/gpu-computing.md">GPU</a>
+    <a href="guide/mcp-server.md">MCP</a>
+    <a href="guide/builtins-reference.md">Builtins</a>
+    <a href="https://github.com/MangoByteLabs/vortex">GitHub</a>
+  </div>
+</nav>
+
+<div class="hero">
+  <h1>Vortex: <span class="gradient">The Language AI Thinks In</span></h1>
+  <p class="tagline">A GPU programming language built for the era of intelligent machines. Train neural networks, run cryptographic proofs, and deploy to GPU &mdash; all in one language.</p>
+  <div class="cta">
+    <a href="guide/getting-started.md" class="btn btn-primary">Get Started</a>
+    <a href="https://github.com/MangoByteLabs/vortex" class="btn btn-secondary">View on GitHub</a>
+  </div>
+</div>
+
+<div class="comparison">
+  <div class="code-panel">
+    <div class="label">Vortex &mdash; Train an XOR classifier</div>
+    <pre><span class="kw">fn</span> <span class="fn">main</span>() {
+    <span class="kw">let</span> l1 = <span class="fn">nn_linear</span>(<span class="num">2</span>, <span class="num">8</span>)
+    <span class="kw">let</span> l2 = <span class="fn">nn_linear</span>(<span class="num">8</span>, <span class="num">1</span>)
+    <span class="kw">let</span> model = <span class="fn">nn_sequential</span>([l1, l2])
+
+    <span class="kw">let</span> data   = [[<span class="num">0.0</span>,<span class="num">0.0</span>],[<span class="num">0.0</span>,<span class="num">1.0</span>],[<span class="num">1.0</span>,<span class="num">0.0</span>],[<span class="num">1.0</span>,<span class="num">1.0</span>]]
+    <span class="kw">let</span> labels = [[<span class="num">0.0</span>],[<span class="num">1.0</span>],[<span class="num">1.0</span>],[<span class="num">0.0</span>]]
+
+    <span class="fn">nn_train</span>(model, data, labels, <span class="str">"adam"</span>, <span class="num">1000</span>, <span class="num">0.01</span>)
+
+    <span class="kw">for</span> x <span class="kw">in</span> data {
+        <span class="fn">println</span>(<span class="fn">nn_predict</span>(model, x))
+    }
+}</pre>
+  </div>
+  <div class="code-panel">
+    <div class="label">Python + PyTorch &mdash; Same task</div>
+    <pre><span class="kw">import</span> torch
+<span class="kw">import</span> torch.nn <span class="kw">as</span> nn
+
+model = nn.Sequential(
+    nn.Linear(<span class="num">2</span>, <span class="num">8</span>), nn.ReLU(),
+    nn.Linear(<span class="num">8</span>, <span class="num">1</span>), nn.Sigmoid()
+)
+opt = torch.optim.Adam(model.parameters(), <span class="num">0.01</span>)
+data = torch.tensor([[<span class="num">0,0</span>],[<span class="num">0,1</span>],[<span class="num">1,0</span>],[<span class="num">1,1</span>]], dtype=torch.float)
+labels = torch.tensor([[<span class="num">0</span>],[<span class="num">1</span>],[<span class="num">1</span>],[<span class="num">0</span>]], dtype=torch.float)
+
+<span class="kw">for</span> _ <span class="kw">in</span> <span class="fn">range</span>(<span class="num">1000</span>):
+    loss = nn.BCELoss()(model(data), labels)
+    opt.zero_grad(); loss.backward(); opt.step()
+
+<span class="kw">with</span> torch.no_grad():
+    <span class="kw">for</span> x <span class="kw">in</span> data:
+        <span class="fn">print</span>(model(x).item())</pre>
+  </div>
+</div>
+
+<div class="section">
+  <h2>Why Vortex?</h2>
+  <p class="subtitle">One language for AI, GPU computing, and cryptography. No Python glue. No C++ headers. No CUDA boilerplate.</p>
+  <div class="features">
+    <div class="feature">
+      <div class="icon">&#x26A1;</div>
+      <h3>Native GPU Compilation</h3>
+      <p>Compiles through MLIR to PTX (NVIDIA) and AMDGCN (AMD). Write kernel functions and run them on the GPU with zero FFI.</p>
+    </div>
+    <div class="feature">
+      <div class="icon">&#x1F9E0;</div>
+      <h3>Built-in Neural Networks</h3>
+      <p>Linear, Conv2D, Transformer, LSTM, GRU layers as builtins. Train with Adam/SGD in one function call. No framework needed.</p>
+    </div>
+    <div class="feature">
+      <div class="icon">&#x1F3AF;</div>
+      <h3>Type-Safe Tensors</h3>
+      <p>Tensor autodiff with automatic backward pass. Reshape, broadcast, and matmul with shape checking at runtime.</p>
+    </div>
+    <div class="feature">
+      <div class="icon">&#x1F504;</div>
+      <h3>Auto-Differentiation</h3>
+      <p>Scalar and tensor autodiff tapes built in. Forward and backward AD for training loops, ODEs, and scientific computing.</p>
+    </div>
+    <div class="feature">
+      <div class="icon">&#x1F517;</div>
+      <h3>Cryptography Native</h3>
+      <p>secp256k1 elliptic curves, ECDSA/Schnorr signatures, SHA-256, field arithmetic, NTT, pairings, and ZK primitives.</p>
+    </div>
+    <div class="feature">
+      <div class="icon">&#x1F916;</div>
+      <h3>MCP for AI Agents</h3>
+      <p>Built-in Model Context Protocol server. AI agents can create, train, and query models via JSON-RPC. First-class agent support.</p>
+    </div>
+  </div>
+</div>
+
+<div class="install">
+  <h2>Get started in seconds</h2>
+  <div class="install-box">
+    <span>$</span> git clone https://github.com/MangoByteLabs/vortex && cd vortex && cargo build --release
+  </div>
+  <p>Requires Rust 1.70+. Optional: MLIR toolchain for GPU compilation.</p>
+</div>
+
+<div class="docs-nav">
+  <h2>Documentation</h2>
+  <div class="docs-grid">
+    <a class="doc-link" href="guide/getting-started.md">
+      <h3>Getting Started</h3>
+      <p>Install, hello world, your first neural network.</p>
+    </a>
+    <a class="doc-link" href="guide/language-reference.md">
+      <h3>Language Reference</h3>
+      <p>Types, functions, control flow, structs, operators.</p>
+    </a>
+    <a class="doc-link" href="guide/neural-networks.md">
+      <h3>Neural Networks</h3>
+      <p>Models, layers, training, inference, save/load.</p>
+    </a>
+    <a class="doc-link" href="guide/gpu-computing.md">
+      <h3>GPU Computing</h3>
+      <p>Kernels, MLIR pipeline, compilation targets.</p>
+    </a>
+    <a class="doc-link" href="guide/mcp-server.md">
+      <h3>MCP Server</h3>
+      <p>AI agent integration via Model Context Protocol.</p>
+    </a>
+    <a class="doc-link" href="guide/builtins-reference.md">
+      <h3>Builtins Reference</h3>
+      <p>Complete reference of 200+ built-in functions.</p>
+    </a>
+    <a class="doc-link" href="guide/examples.md">
+      <h3>Examples</h3>
+      <p>Curated code examples with explanations.</p>
+    </a>
+    <a class="doc-link" href="guide/architecture.md">
+      <h3>Architecture</h3>
+      <p>Compiler pipeline, module map, contributing guide.</p>
+    </a>
+  </div>
+</div>
+
+<footer>
+  Vortex is open source under the MIT License. &copy; 2025 MangoByteLabs.
+</footer>
+
+</body>
+</html>
