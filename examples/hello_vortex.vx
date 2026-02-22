@@ -12,79 +12,83 @@ struct Point {
     y: f64
 }
 
+fn distance(p: Point) -> f64 {
+    return sqrt(p.x * p.x + p.y * p.y)
+}
+
 fn main() {
     println("========================================")
     println("  Vortex GPU Programming Language v0.1")
     println("========================================")
 
-    // 1. Basic arithmetic
+    // 1. Arithmetic + math builtins
     println("")
-    println("[1] Arithmetic")
+    println("[1] Math")
     println(42 + 58)
-    println(42 * 58)
-    println(2.5 * 4.0)
+    println(sqrt(144.0))
+    println(sin(PI / 2.0))
+    println(pow(2.0, 10.0))
 
     // 2. Recursion
     println("")
-    println("[2] Fibonacci(10) & Fibonacci(20)")
-    println(fibonacci(10))
+    println("[2] Fibonacci(20)")
     println(fibonacci(20))
 
-    // 3. Structs
-    println("")
-    println("[3] Struct field access")
+    // 3. Structs + sqrt
     let p = Point { x: 3.0, y: 4.0 }
-    println(p.x)
-    println(p.y)
-
-    // 4. Arrays
     println("")
-    println("[4] Arrays")
-    let arr = [100, 200, 300, 400, 500]
-    println(len(arr))
-    println(arr[2])
+    println("[3] Distance from (3,4) to origin")
+    println(distance(p))
 
-    // 5. Crypto - SHA256
+    // 4. For loop with range
     println("")
-    println("[5] SHA-256")
-    println(sha256("Hello Vortex!"))
+    println("[4] Squares via range()")
+    for i in range(1, 6) {
+        println(i * i)
+    }
 
-    // 6. Self-improving neural network (impossible in PyTorch during serving!)
+    // 5. Crypto
     println("")
-    println("[6] Continuous Learning Neural Net")
+    println("[5] SHA-256 of 'Vortex'")
+    println(sha256("Vortex"))
+
+    // 6. Closures
+    println("")
+    println("[6] Closure: double(7)")
+    let double = |x: i64| { return x * 2 }
+    println(double(7))
+
+    // 7. Self-improving neural network
+    println("")
+    println("[7] Neural net learns while serving")
     let model = continuous_learner_new([4, 8, 2])
     let i = 0
-    while i < 20 {
+    while i < 30 {
         let loss = continuous_learner_learn(model, [1.0, 0.0, 1.0, 0.0], [1.0, 0.0], 0.01)
         if i == 0 {
-            println("  Step 1 loss:")
+            println("  Loss step 1:")
             println(loss)
         }
-        if i == 9 {
-            println("  Step 10 loss:")
-            println(loss)
-        }
-        if i == 19 {
-            println("  Step 20 loss:")
+        if i == 29 {
+            println("  Loss step 30:")
             println(loss)
         }
         i = i + 1
     }
 
-    // 7. Inference on the trained model
-    println("")
-    println("[7] Inference")
+    // 8. Inference
     let out = continuous_learner_infer(model, [1.0, 0.0, 1.0, 0.0])
+    println("  Prediction:")
     println(out)
 
-    // 8. Model stats
+    // 9. Symbolic exact math
     println("")
-    println("[8] Model Stats [loss_ema, drift, updates, memory_mb]")
-    let stats = continuous_learner_stats(model)
-    println(stats)
+    println("[8] Exact symbolic: GCD(48,18) and isPrime(97)")
+    println(symbolic_eval("gcd", [48, 18]))
+    println(symbolic_eval("is_prime", [97]))
 
     println("")
     println("========================================")
-    println("  Done! The model learned while serving.")
+    println("  All working. The future is Vortex.")
     println("========================================")
 }
