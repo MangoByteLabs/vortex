@@ -193,6 +193,10 @@ pub(crate) struct Env {
     pub(crate) next_causal_id: usize,
     pub(crate) reversible_networks: HashMap<usize, crate::reversible::ReversibleNetwork>,
     pub(crate) next_reversible_id: usize,
+    pub(crate) prob_values: HashMap<usize, crate::prob_types::ProbValue>,
+    pub(crate) next_prob_id: usize,
+    pub(crate) prob_layers: HashMap<usize, crate::prob_types::BayesianLayer>,
+    pub(crate) next_prob_layer_id: usize,
 }
 
 #[derive(Clone)]
@@ -237,6 +241,10 @@ impl Env {
             next_causal_id: 0,
             reversible_networks: HashMap::new(),
             next_reversible_id: 0,
+            prob_values: HashMap::new(),
+            next_prob_id: 0,
+            prob_layers: HashMap::new(),
+            next_prob_layer_id: 0,
         };
         env.register_builtins();
         env
