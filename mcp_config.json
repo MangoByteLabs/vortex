@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "vortex": {
+      "command": "cargo",
+      "args": ["run", "--manifest-path", "/root/vortex/Cargo.toml", "--", "mcp"],
+      "description": "Vortex GPU programming language - neural net training, inference, and GPU compute"
+    }
+  }
+}

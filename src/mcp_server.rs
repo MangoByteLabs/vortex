@@ -1,12 +1,14 @@
 //! MCP (Model Context Protocol) server for Vortex.
 //!
-//! Exposes Vortex language tools (run, typecheck, codegen, etc.) over
-//! JSON-RPC 2.0 on stdin/stdout so that AI agents can use Vortex as a tool.
+//! Exposes Vortex language tools (run, typecheck, codegen, etc.) and neural network
+//! tools (create, train, predict, save, load) over JSON-RPC 2.0 on stdin/stdout
+//! so that AI agents can use Vortex as a tool.
 
 use crate::ast::Program;
 use crate::codegen;
 use crate::interpreter;
 use crate::lexer;
+use crate::nn;
 use crate::parser;
 use crate::typeck;
 
@@ -15,12 +17,23 @@ use std::collections::HashMap;
 use std::io::{self, BufRead, Write};
 use std::time::Instant;
 
+// ── Stored model info ────────────────────────────────────────────────────
+
+/// A persisted neural network model in the server session.
+struct StoredModel {
+    model: nn::Model,
+    architecture: String,
+    optimizer: nn::Optimizer,
+    loss_fn: String,
+    training_losses: Vec<f64>,
+}
+
 // ── Session state ──────────────────────────────────────────────────────
 
 /// Persistent state across MCP tool calls.
 pub struct SessionState {
-    /// Named model registry (model_id -> parameter count).
-    pub models: HashMap<String, usize>,
+    /// Named model registry (model_id -> stored model).
+    pub models: HashMap<String, StoredModel>,
     /// Command history: (tool_name, summary).
     pub history: Vec<(String, String)>,
     /// Monotonic counter for generating model ids.
@@ -58,6 +71,17 @@ fn tool_descriptors() -> Value {
             }
         },
         {
+            "name": "vortex_eval",
+            "description": "Evaluate a Vortex expression and return its result. Wraps the expression in a main function that prints it.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "code": { "type": "string", "description": "Vortex expression to evaluate (e.g. '2 + 3' or 'fibonacci(10)')" }
+                },
+                "required": ["code"]
+            }
+        },
+        {
             "name": "vortex_typecheck",
             "description": "Type-check Vortex code. Returns type errors or OK.",
             "inputSchema": {
@@ -81,33 +105,8 @@ fn tool_descriptors() -> Value {
             }
         },
         {
-            "name": "vortex_train",
-            "description": "Train a model defined in Vortex code.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "code":   { "type": "string" },
-                    "epochs": { "type": "integer", "default": 10 },
-                    "lr":     { "type": "number",  "default": 0.001 }
-                },
-                "required": ["code"]
-            }
-        },
-        {
-            "name": "vortex_infer",
-            "description": "Run inference on a trained model.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "model_id": { "type": "string" },
-                    "input":    { "type": "array", "items": { "type": "number" } }
-                },
-                "required": ["model_id", "input"]
-            }
-        },
-        {
             "name": "vortex_benchmark",
-            "description": "Benchmark a Vortex program.",
+            "description": "Benchmark a Vortex program by running it multiple times.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -129,25 +128,91 @@ fn tool_descriptors() -> Value {
             }
         },
         {
-            "name": "vortex_gpu_status",
-            "description": "Query GPU resource status.",
+            "name": "vortex_list_builtins",
+            "description": "List all available Vortex builtin functions.",
             "inputSchema": { "type": "object", "properties": {} }
         },
         {
-            "name": "vortex_create_model",
-            "description": "Create a model from an architecture description.",
+            "name": "nn_create_model",
+            "description": "Create a neural network model. Supported architectures: mlp (specify layers as [{\"type\":\"linear\",\"in\":N,\"out\":M}, {\"type\":\"relu\"}, ...]), transformer (specify dim, num_heads, ff_dim, num_blocks), cnn (layers with conv2d/linear/relu), lstm (input_size, hidden_size, output_size).",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "architecture": { "type": "string", "enum": ["transformer","ssm","hybrid","ebm"] },
-                    "config":       { "type": "object" }
+                    "architecture": { "type": "string", "enum": ["mlp","transformer","cnn","lstm"], "description": "Model architecture type" },
+                    "layers": { "type": "array", "description": "Layer specifications (for mlp/cnn)" },
+                    "name": { "type": "string", "description": "Optional model name" },
+                    "dim": { "type": "integer", "description": "Model dimension (for transformer)" },
+                    "num_heads": { "type": "integer", "description": "Number of attention heads (for transformer)" },
+                    "ff_dim": { "type": "integer", "description": "Feed-forward dimension (for transformer)" },
+                    "num_blocks": { "type": "integer", "description": "Number of transformer blocks" },
+                    "input_size": { "type": "integer", "description": "Input size (for lstm)" },
+                    "hidden_size": { "type": "integer", "description": "Hidden size (for lstm)" },
+                    "output_size": { "type": "integer", "description": "Output size (for lstm)" }
                 },
                 "required": ["architecture"]
             }
         },
         {
-            "name": "vortex_list_builtins",
-            "description": "List all available Vortex builtin functions.",
+            "name": "nn_train_model",
+            "description": "Train a neural network model on provided data.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "model_id": { "type": "string", "description": "Model ID from nn_create_model" },
+                    "data": { "type": "array", "items": { "type": "array", "items": { "type": "number" } }, "description": "Training inputs (2D array)" },
+                    "labels": { "type": "array", "items": { "type": "array", "items": { "type": "number" } }, "description": "Training labels (2D array)" },
+                    "epochs": { "type": "integer", "default": 100, "description": "Number of training epochs" },
+                    "lr": { "type": "number", "default": 0.01, "description": "Learning rate" },
+                    "optimizer": { "type": "string", "enum": ["adam","sgd","adamw"], "default": "adam", "description": "Optimizer" },
+                    "loss": { "type": "string", "enum": ["mse","cross_entropy","bce"], "default": "mse", "description": "Loss function" }
+                },
+                "required": ["model_id", "data", "labels"]
+            }
+        },
+        {
+            "name": "nn_predict",
+            "description": "Run inference on a model.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "model_id": { "type": "string", "description": "Model ID" },
+                    "input": { "type": "array", "description": "Input data (1D or 2D array of numbers)" }
+                },
+                "required": ["model_id", "input"]
+            }
+        },
+        {
+            "name": "nn_save_model",
+            "description": "Save a model's weights to a JSON file.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "model_id": { "type": "string" },
+                    "path": { "type": "string", "description": "File path to save to" }
+                },
+                "required": ["model_id", "path"]
+            }
+        },
+        {
+            "name": "nn_load_model",
+            "description": "Load model weights from a JSON file into an existing model.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "model_id": { "type": "string" },
+                    "path": { "type": "string", "description": "File path to load from" }
+                },
+                "required": ["model_id", "path"]
+            }
+        },
+        {
+            "name": "nn_list_models",
+            "description": "List all loaded models in the current session.",
+            "inputSchema": { "type": "object", "properties": {} }
+        },
+        {
+            "name": "gpu_status",
+            "description": "Check GPU and compilation toolchain availability (mlir-opt, mlir-translate, llc, clang, nvidia-smi).",
             "inputSchema": { "type": "object", "properties": {} }
         }
     ])
@@ -177,6 +242,82 @@ fn get_code(params: &Value) -> Result<String, String> {
     }
 }
 
+fn check_command(cmd: &str) -> bool {
+    std::process::Command::new("which")
+        .arg(cmd)
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// Parse a JSON array of numbers into Vec<f64>.
+fn json_to_f64_vec(v: &Value) -> Result<Vec<f64>, String> {
+    v.as_array()
+        .ok_or_else(|| "expected array of numbers".to_string())?
+        .iter()
+        .map(|x| x.as_f64().ok_or_else(|| "expected number".to_string()))
+        .collect()
+}
+
+/// Parse a JSON 2D array into Vec<Vec<f64>>.
+fn json_to_2d(v: &Value) -> Result<Vec<Vec<f64>>, String> {
+    v.as_array()
+        .ok_or_else(|| "expected 2D array".to_string())?
+        .iter()
+        .map(|row| json_to_f64_vec(row))
+        .collect()
+}
+
+/// Build layers from a JSON layer specification array.
+fn build_layers_from_spec(layers: &[Value]) -> Result<Vec<nn::Layer>, String> {
+    let mut result = Vec::new();
+    for spec in layers {
+        let ty = spec
+            .get("type")
+            .and_then(Value::as_str)
+            .ok_or("each layer needs a 'type' field")?;
+        match ty {
+            "linear" => {
+                let in_f = spec.get("in").and_then(Value::as_u64).ok_or("linear layer needs 'in'")? as usize;
+                let out_f = spec.get("out").and_then(Value::as_u64).ok_or("linear layer needs 'out'")? as usize;
+                result.push(nn::Layer::linear(in_f, out_f));
+            }
+            "conv2d" => {
+                let in_ch = spec.get("in_channels").and_then(Value::as_u64).ok_or("conv2d needs 'in_channels'")? as usize;
+                let out_ch = spec.get("out_channels").and_then(Value::as_u64).ok_or("conv2d needs 'out_channels'")? as usize;
+                let ks = spec.get("kernel_size").and_then(Value::as_u64).unwrap_or(3) as usize;
+                let stride = spec.get("stride").and_then(Value::as_u64).unwrap_or(1) as usize;
+                let padding = spec.get("padding").and_then(Value::as_u64).unwrap_or(0) as usize;
+                result.push(nn::Layer::conv2d(in_ch, out_ch, ks, stride, padding));
+            }
+            "relu" => result.push(nn::Layer::ReLU { cache: None }),
+            "sigmoid" => result.push(nn::Layer::Sigmoid { cache: None }),
+            "tanh" => result.push(nn::Layer::Tanh { cache: None }),
+            "gelu" => result.push(nn::Layer::GELU { cache: None }),
+            "softmax" => result.push(nn::Layer::Softmax { cache: None }),
+            "dropout" => {
+                let rate = spec.get("rate").and_then(Value::as_f64).unwrap_or(0.1);
+                result.push(nn::Layer::dropout(rate));
+            }
+            "layer_norm" => {
+                let dim = spec.get("dim").and_then(Value::as_u64).ok_or("layer_norm needs 'dim'")? as usize;
+                result.push(nn::Layer::layer_norm(dim));
+            }
+            "batch_norm" => {
+                let dim = spec.get("dim").and_then(Value::as_u64).ok_or("batch_norm needs 'dim'")? as usize;
+                result.push(nn::Layer::batch_norm(dim));
+            }
+            "lstm" => {
+                let input_size = spec.get("input_size").and_then(Value::as_u64).ok_or("lstm needs 'input_size'")? as usize;
+                let hidden_size = spec.get("hidden_size").and_then(Value::as_u64).ok_or("lstm needs 'hidden_size'")? as usize;
+                result.push(nn::Layer::lstm(input_size, hidden_size));
+            }
+            other => return Err(format!("Unknown layer type: {}", other)),
+        }
+    }
+    Ok(result)
+}
+
 // ── Tool implementations ───────────────────────────────────────────────
 
 fn tool_run(params: &Value, _state: &mut SessionState) -> Result<Value, String> {
@@ -184,6 +325,18 @@ fn tool_run(params: &Value, _state: &mut SessionState) -> Result<Value, String> 
     let program = parse_vortex(&code)?;
     let output = interpreter::interpret(&program)?;
     Ok(json!({ "output": output.join("\n") }))
+}
+
+fn tool_eval(params: &Value, _state: &mut SessionState) -> Result<Value, String> {
+    let expr = params
+        .get("code")
+        .and_then(Value::as_str)
+        .ok_or("Missing 'code' parameter")?;
+    // Wrap expression in a main that prints it
+    let code = format!("fn main() {{\n  print({})\n}}", expr);
+    let program = parse_vortex(&code)?;
+    let output = interpreter::interpret(&program)?;
+    Ok(json!({ "result": output.join("\n") }))
 }
 
 fn tool_typecheck(params: &Value, _state: &mut SessionState) -> Result<Value, String> {
@@ -207,57 +360,6 @@ fn tool_codegen(params: &Value, _state: &mut SessionState) -> Result<Value, Stri
     let program = parse_vortex(&code)?;
     let mlir = codegen::generate_mlir(&program);
     Ok(json!({ "mlir": mlir }))
-}
-
-fn tool_train(params: &Value, state: &mut SessionState) -> Result<Value, String> {
-    let code = get_code(params)?;
-    let epochs = params.get("epochs").and_then(Value::as_i64).unwrap_or(10) as usize;
-    let lr = params.get("lr").and_then(Value::as_f64).unwrap_or(0.001);
-
-    // Validate the program first
-    let program = parse_vortex(&code)?;
-    interpreter::interpret(&program).map_err(|e| format!("Program error: {}", e))?;
-
-    // Simulate training (real GPU training would go through MLIR pipeline)
-    let mut losses: Vec<f64> = Vec::new();
-    let mut loss = 1.0_f64;
-    for _ in 0..epochs {
-        loss *= 1.0 - lr;
-        losses.push(loss);
-    }
-
-    let model_id = state.next_model_id();
-    state.models.insert(model_id.clone(), 0);
-
-    Ok(json!({
-        "model_id": model_id,
-        "epochs": epochs,
-        "lr": lr,
-        "losses": losses,
-        "final_loss": loss
-    }))
-}
-
-fn tool_infer(params: &Value, state: &mut SessionState) -> Result<Value, String> {
-    let model_id = params
-        .get("model_id")
-        .and_then(Value::as_str)
-        .ok_or("Missing model_id")?;
-    let input = params
-        .get("input")
-        .ok_or("Missing input")?;
-
-    if !state.models.contains_key(model_id) {
-        return Err(format!("Unknown model: {}", model_id));
-    }
-
-    // Placeholder inference – echo input through an identity transform
-    Ok(json!({
-        "model_id": model_id,
-        "input": input,
-        "output": input,
-        "status": "ok"
-    }))
 }
 
 fn tool_benchmark(params: &Value, _state: &mut SessionState) -> Result<Value, String> {
@@ -331,8 +433,26 @@ fn tool_explain(params: &Value, _state: &mut SessionState) -> Result<Value, Stri
     }))
 }
 
+fn tool_list_builtins(_params: &Value, _state: &mut SessionState) -> Result<Value, String> {
+    Ok(json!({
+        "math": ["abs", "sqrt", "sin", "cos", "exp", "log", "pow", "min", "max", "floor", "ceil"],
+        "tensor": ["zeros", "ones", "rand", "shape", "reshape", "transpose", "matmul", "sum", "mean"],
+        "crypto": ["sha256", "keccak256", "secp256k1_mul", "field_add", "field_mul", "field_inv", "msm", "ntt"],
+        "io": ["print", "println", "assert", "assert_eq"],
+        "gpu": ["launch", "sync", "alloc_device", "memcpy_h2d", "memcpy_d2h"],
+        "nn": ["nn_linear", "nn_conv2d", "nn_transformer", "nn_lstm", "nn_sequential",
+               "nn_forward", "nn_train", "nn_predict", "nn_save", "nn_load",
+               "nn_adam", "nn_sgd", "nn_cross_entropy", "tensor_new", "tensor_zeros_nn",
+               "tensor_randn_nn", "tensor_matmul_nn", "tensor_add_nn"]
+    }))
+}
+
 fn tool_gpu_status(_params: &Value, _state: &mut SessionState) -> Result<Value, String> {
-    // Probe for NVIDIA GPU via nvidia-smi
+    let mlir_opt = check_command("mlir-opt");
+    let mlir_translate = check_command("mlir-translate");
+    let llc = check_command("llc");
+    let clang = check_command("clang");
+
     let gpu_info = match std::process::Command::new("nvidia-smi")
         .arg("--query-gpu=name,memory.total,memory.used,utilization.gpu")
         .arg("--format=csv,noheader,nounits")
@@ -340,51 +460,306 @@ fn tool_gpu_status(_params: &Value, _state: &mut SessionState) -> Result<Value, 
     {
         Ok(out) if out.status.success() => {
             let text = String::from_utf8_lossy(&out.stdout).to_string();
-            json!({ "available": true, "driver": "nvidia", "info": text.trim() })
+            Some(text.trim().to_string())
         }
-        _ => json!({ "available": false, "reason": "No GPU detected (nvidia-smi not found)" }),
+        _ => None,
     };
 
-    Ok(gpu_info)
+    Ok(json!({
+        "mlir_opt": mlir_opt,
+        "mlir_translate": mlir_translate,
+        "llc": llc,
+        "clang": clang,
+        "gpu_available": gpu_info.is_some(),
+        "gpu_info": gpu_info
+    }))
 }
 
-fn tool_create_model(params: &Value, state: &mut SessionState) -> Result<Value, String> {
+fn tool_nn_create_model(params: &Value, state: &mut SessionState) -> Result<Value, String> {
     let arch = params
         .get("architecture")
         .and_then(Value::as_str)
-        .ok_or("Missing architecture")?;
-    let config = params.get("config").cloned().unwrap_or(json!({}));
+        .ok_or("Missing 'architecture' parameter")?;
 
-    let param_count: usize = match arch {
-        "transformer" => config.get("layers").and_then(Value::as_u64).unwrap_or(6) as usize
-            * config.get("d_model").and_then(Value::as_u64).unwrap_or(512) as usize
-            * 4,
-        "ssm" => config.get("d_state").and_then(Value::as_u64).unwrap_or(64) as usize
-            * config.get("d_model").and_then(Value::as_u64).unwrap_or(256) as usize,
-        "hybrid" => 500_000,
-        "ebm" => 250_000,
-        other => return Err(format!("Unknown architecture: {}", other)),
+    let model = match arch {
+        "mlp" => {
+            let layers_spec = params
+                .get("layers")
+                .and_then(Value::as_array)
+                .ok_or("MLP architecture requires 'layers' array")?;
+            let layers = build_layers_from_spec(layers_spec)?;
+            nn::Model::sequential(layers)
+        }
+        "transformer" => {
+            let dim = params.get("dim").and_then(Value::as_u64).unwrap_or(64) as usize;
+            let num_heads = params.get("num_heads").and_then(Value::as_u64).unwrap_or(4) as usize;
+            let ff_dim = params.get("ff_dim").and_then(Value::as_u64).unwrap_or(dim as u64 * 4) as usize;
+            let num_blocks = params.get("num_blocks").and_then(Value::as_u64).unwrap_or(2) as usize;
+            nn::Model::transformer(dim, num_heads, ff_dim, num_blocks)
+        }
+        "cnn" => {
+            let layers_spec = params
+                .get("layers")
+                .and_then(Value::as_array)
+                .ok_or("CNN architecture requires 'layers' array")?;
+            let layers = build_layers_from_spec(layers_spec)?;
+            let mut m = nn::Model::sequential(layers);
+            m.name = "cnn".into();
+            m
+        }
+        "lstm" => {
+            let input_size = params.get("input_size").and_then(Value::as_u64).ok_or("LSTM needs 'input_size'")? as usize;
+            let hidden_size = params.get("hidden_size").and_then(Value::as_u64).ok_or("LSTM needs 'hidden_size'")? as usize;
+            let output_size = params.get("output_size").and_then(Value::as_u64).ok_or("LSTM needs 'output_size'")? as usize;
+            let layers = vec![
+                nn::Layer::lstm(input_size, hidden_size),
+                nn::Layer::linear(hidden_size, output_size),
+            ];
+            let mut m = nn::Model::sequential(layers);
+            m.name = "lstm".into();
+            m
+        }
+        other => return Err(format!("Unknown architecture: {}. Supported: mlp, transformer, cnn, lstm", other)),
     };
 
+    let name = params
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or(arch);
+
+    let num_params = model.num_parameters();
+    let layer_descriptions: Vec<String> = model.layers.iter().map(|l| describe_layer(l)).collect();
+
     let model_id = state.next_model_id();
-    state.models.insert(model_id.clone(), param_count);
+    state.models.insert(
+        model_id.clone(),
+        StoredModel {
+            model,
+            architecture: name.to_string(),
+            optimizer: nn::Optimizer::adam(0.001),
+            loss_fn: "mse".into(),
+            training_losses: Vec::new(),
+        },
+    );
 
     Ok(json!({
         "model_id": model_id,
-        "architecture": arch,
-        "param_count": param_count,
-        "config": config
+        "architecture": name,
+        "params": num_params,
+        "layers": layer_descriptions
     }))
 }
 
-fn tool_list_builtins(_params: &Value, _state: &mut SessionState) -> Result<Value, String> {
+fn tool_nn_train_model(params: &Value, state: &mut SessionState) -> Result<Value, String> {
+    let model_id = params
+        .get("model_id")
+        .and_then(Value::as_str)
+        .ok_or("Missing 'model_id'")?;
+
+    let data = json_to_2d(params.get("data").ok_or("Missing 'data'")?)?;
+    let labels = json_to_2d(params.get("labels").ok_or("Missing 'labels'")?)?;
+
+    if data.is_empty() || labels.is_empty() {
+        return Err("data and labels must not be empty".into());
+    }
+    if data.len() != labels.len() {
+        return Err(format!(
+            "data length ({}) must match labels length ({})",
+            data.len(),
+            labels.len()
+        ));
+    }
+
+    let epochs = params.get("epochs").and_then(Value::as_u64).unwrap_or(100) as usize;
+    let lr = params.get("lr").and_then(Value::as_f64).unwrap_or(0.01);
+    let opt_name = params.get("optimizer").and_then(Value::as_str).unwrap_or("adam");
+    let loss_fn = params.get("loss").and_then(Value::as_str).unwrap_or("mse");
+
+    let stored = state
+        .models
+        .get_mut(model_id)
+        .ok_or_else(|| format!("Unknown model: {}", model_id))?;
+
+    // Set optimizer
+    stored.optimizer = match opt_name {
+        "sgd" => nn::Optimizer::sgd(lr, 0.9, 0.0),
+        "adamw" => nn::Optimizer::adamw(lr, 0.01),
+        _ => nn::Optimizer::adam(lr),
+    };
+    stored.loss_fn = loss_fn.to_string();
+
+    let losses = nn::train(
+        &mut stored.model,
+        data,
+        labels,
+        &mut stored.optimizer,
+        epochs,
+        &stored.loss_fn,
+    );
+
+    let final_loss = losses.last().copied().unwrap_or(f64::NAN);
+    stored.training_losses.extend_from_slice(&losses);
+
     Ok(json!({
-        "math": ["abs", "sqrt", "sin", "cos", "exp", "log", "pow", "min", "max", "floor", "ceil"],
-        "tensor": ["zeros", "ones", "rand", "shape", "reshape", "transpose", "matmul", "sum", "mean"],
-        "crypto": ["sha256", "keccak256", "secp256k1_mul", "field_add", "field_mul", "field_inv", "msm", "ntt"],
-        "io": ["print", "println", "assert", "assert_eq"],
-        "gpu": ["launch", "sync", "alloc_device", "memcpy_h2d", "memcpy_d2h"]
+        "final_loss": final_loss,
+        "losses": losses,
+        "epochs_completed": epochs,
+        "optimizer": opt_name,
+        "loss_fn": loss_fn
     }))
+}
+
+fn tool_nn_predict(params: &Value, state: &mut SessionState) -> Result<Value, String> {
+    let model_id = params
+        .get("model_id")
+        .and_then(Value::as_str)
+        .ok_or("Missing 'model_id'")?;
+
+    let input_val = params.get("input").ok_or("Missing 'input'")?;
+
+    let stored = state
+        .models
+        .get_mut(model_id)
+        .ok_or_else(|| format!("Unknown model: {}", model_id))?;
+
+    // Detect if input is 1D or 2D
+    let input_tensor = if input_val
+        .as_array()
+        .and_then(|a| a.first())
+        .and_then(Value::as_array)
+        .is_some()
+    {
+        // 2D input
+        let data_2d = json_to_2d(input_val)?;
+        let rows = data_2d.len();
+        let cols = data_2d[0].len();
+        let flat: Vec<f64> = data_2d.into_iter().flatten().collect();
+        nn::Tensor::new(vec![rows, cols], flat)
+    } else {
+        // 1D input - treat as single sample
+        let data = json_to_f64_vec(input_val)?;
+        let len = data.len();
+        nn::Tensor::new(vec![1, len], data)
+    };
+
+    let output = stored.model.forward(&input_tensor);
+
+    // Convert output to nested arrays
+    let output_data: Vec<Vec<f64>> = if output.shape.len() >= 2 {
+        let rows = output.shape[0];
+        let cols: usize = output.shape[1..].iter().product();
+        (0..rows)
+            .map(|r| output.data[r * cols..(r + 1) * cols].to_vec())
+            .collect()
+    } else {
+        vec![output.data.clone()]
+    };
+
+    Ok(json!({
+        "output": output_data,
+        "shape": output.shape
+    }))
+}
+
+fn tool_nn_save_model(params: &Value, state: &mut SessionState) -> Result<Value, String> {
+    let model_id = params
+        .get("model_id")
+        .and_then(Value::as_str)
+        .ok_or("Missing 'model_id'")?;
+    let path = params
+        .get("path")
+        .and_then(Value::as_str)
+        .ok_or("Missing 'path'")?;
+
+    let stored = state
+        .models
+        .get(model_id)
+        .ok_or_else(|| format!("Unknown model: {}", model_id))?;
+
+    nn::save_model(&stored.model, path)?;
+
+    Ok(json!({
+        "status": "saved",
+        "model_id": model_id,
+        "path": path
+    }))
+}
+
+fn tool_nn_load_model(params: &Value, state: &mut SessionState) -> Result<Value, String> {
+    let model_id = params
+        .get("model_id")
+        .and_then(Value::as_str)
+        .ok_or("Missing 'model_id'")?;
+    let path = params
+        .get("path")
+        .and_then(Value::as_str)
+        .ok_or("Missing 'path'")?;
+
+    let stored = state
+        .models
+        .get_mut(model_id)
+        .ok_or_else(|| format!("Unknown model: {}", model_id))?;
+
+    nn::load_model_weights(&mut stored.model, path)?;
+
+    Ok(json!({
+        "status": "loaded",
+        "model_id": model_id,
+        "path": path
+    }))
+}
+
+fn tool_nn_list_models(_params: &Value, state: &mut SessionState) -> Result<Value, String> {
+    let models: Vec<Value> = state
+        .models
+        .iter()
+        .map(|(id, stored)| {
+            json!({
+                "id": id,
+                "architecture": stored.architecture,
+                "params": stored.model.num_parameters(),
+                "layers": stored.model.layers.len(),
+                "total_training_epochs": stored.training_losses.len(),
+                "last_loss": stored.training_losses.last()
+            })
+        })
+        .collect();
+
+    Ok(json!({ "models": models }))
+}
+
+/// Return a human-readable description of a layer.
+fn describe_layer(layer: &nn::Layer) -> String {
+    match layer {
+        nn::Layer::Linear { weight, .. } => {
+            format!("Linear({}x{})", weight.shape[0], weight.shape[1])
+        }
+        nn::Layer::Conv2D { in_ch, out_ch, kernel_size, stride, padding, .. } => {
+            format!("Conv2D(in={}, out={}, k={}, s={}, p={})", in_ch, out_ch, kernel_size, stride, padding)
+        }
+        nn::Layer::LayerNorm { dim, .. } => format!("LayerNorm({})", dim),
+        nn::Layer::BatchNorm { dim, .. } => format!("BatchNorm({})", dim),
+        nn::Layer::Dropout { rate, .. } => format!("Dropout({})", rate),
+        nn::Layer::Embedding { vocab_size, dim, .. } => format!("Embedding({}, {})", vocab_size, dim),
+        nn::Layer::ReLU { .. } => "ReLU".into(),
+        nn::Layer::Sigmoid { .. } => "Sigmoid".into(),
+        nn::Layer::Tanh { .. } => "Tanh".into(),
+        nn::Layer::GELU { .. } => "GELU".into(),
+        nn::Layer::Softmax { .. } => "Softmax".into(),
+        nn::Layer::MultiHeadAttention { dim, num_heads, .. } => {
+            format!("MultiHeadAttention(dim={}, heads={})", dim, num_heads)
+        }
+        nn::Layer::FeedForward { w1, .. } => {
+            format!("FeedForward({}->{})", w1.shape[0], w1.shape[1])
+        }
+        nn::Layer::TransformerBlock { .. } => "TransformerBlock".into(),
+        nn::Layer::LSTM { input_size, hidden_size, .. } => {
+            format!("LSTM(in={}, hidden={})", input_size, hidden_size)
+        }
+        nn::Layer::GRU { input_size, hidden_size, .. } => {
+            format!("GRU(in={}, hidden={})", input_size, hidden_size)
+        }
+    }
 }
 
 // ── MCP Server ─────────────────────────────────────────────────────────
@@ -404,11 +779,11 @@ impl MCPServer {
     pub fn handle_request(&mut self, input: &str) -> Option<Value> {
         let req: Value = match serde_json::from_str(input) {
             Ok(v) => v,
-            Err(_) => {
+            Err(e) => {
                 return Some(json!({
                     "jsonrpc": "2.0",
                     "id": null,
-                    "error": { "code": -32700, "message": "Parse error" }
+                    "error": { "code": -32700, "message": format!("Parse error: {}", e) }
                 }));
             }
         };
@@ -427,7 +802,7 @@ impl MCPServer {
                     },
                     "serverInfo": {
                         "name": "vortex-mcp",
-                        "version": "0.1.0"
+                        "version": "0.2.0"
                     }
                 });
                 Some(jsonrpc_ok(id, result))
@@ -445,16 +820,20 @@ impl MCPServer {
                 let args = params.get("arguments").cloned().unwrap_or(json!({}));
 
                 let result = match tool_name {
-                    "vortex_run"           => tool_run(&args, &mut self.state),
-                    "vortex_typecheck"     => tool_typecheck(&args, &mut self.state),
-                    "vortex_codegen"       => tool_codegen(&args, &mut self.state),
-                    "vortex_train"         => tool_train(&args, &mut self.state),
-                    "vortex_infer"         => tool_infer(&args, &mut self.state),
-                    "vortex_benchmark"     => tool_benchmark(&args, &mut self.state),
-                    "vortex_explain"       => tool_explain(&args, &mut self.state),
-                    "vortex_gpu_status"    => tool_gpu_status(&args, &mut self.state),
-                    "vortex_create_model"  => tool_create_model(&args, &mut self.state),
+                    "vortex_run"         => tool_run(&args, &mut self.state),
+                    "vortex_eval"        => tool_eval(&args, &mut self.state),
+                    "vortex_typecheck"   => tool_typecheck(&args, &mut self.state),
+                    "vortex_codegen"     => tool_codegen(&args, &mut self.state),
+                    "vortex_benchmark"   => tool_benchmark(&args, &mut self.state),
+                    "vortex_explain"     => tool_explain(&args, &mut self.state),
                     "vortex_list_builtins" => tool_list_builtins(&args, &mut self.state),
+                    "nn_create_model"    => tool_nn_create_model(&args, &mut self.state),
+                    "nn_train_model"     => tool_nn_train_model(&args, &mut self.state),
+                    "nn_predict"         => tool_nn_predict(&args, &mut self.state),
+                    "nn_save_model"      => tool_nn_save_model(&args, &mut self.state),
+                    "nn_load_model"      => tool_nn_load_model(&args, &mut self.state),
+                    "nn_list_models"     => tool_nn_list_models(&args, &mut self.state),
+                    "gpu_status"         => tool_gpu_status(&args, &mut self.state),
                     _ => Err(format!("Unknown tool: {}", tool_name)),
                 };
 
@@ -492,7 +871,7 @@ impl MCPServer {
         }
     }
 
-    /// Main event loop – reads JSON-RPC from stdin, writes to stdout.
+    /// Main event loop -- reads JSON-RPC from stdin, writes to stdout.
     pub fn run(&mut self) {
         let stdin = io::stdin();
         let mut stdout = io::stdout();
@@ -536,91 +915,78 @@ mod tests {
         server.handle_request(&input).unwrap()
     }
 
+    fn call_tool(server: &mut MCPServer, name: &str, args: Value) -> Value {
+        let resp = call(
+            server,
+            json!({
+                "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                "params": { "name": name, "arguments": args }
+            }),
+        );
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        serde_json::from_str(text).unwrap_or_else(|_| json!(text))
+    }
+
+    fn call_tool_raw(server: &mut MCPServer, name: &str, args: Value) -> Value {
+        call(
+            server,
+            json!({
+                "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                "params": { "name": name, "arguments": args }
+            }),
+        )
+    }
+
+    // ── MCP lifecycle tests ─────────────────────────────────
+
     #[test]
     fn test_initialize() {
         let mut s = MCPServer::new();
-        let resp = call(&mut s, json!({
-            "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}
-        }));
+        let resp = call(
+            &mut s,
+            json!({
+                "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}
+            }),
+        );
         let result = &resp["result"];
         assert_eq!(result["serverInfo"]["name"], "vortex-mcp");
+        assert_eq!(result["serverInfo"]["version"], "0.2.0");
         assert!(result["capabilities"]["tools"].is_object());
     }
 
     #[test]
     fn test_tools_list() {
         let mut s = MCPServer::new();
-        let resp = call(&mut s, json!({
-            "jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}
-        }));
+        let resp = call(
+            &mut s,
+            json!({
+                "jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}
+            }),
+        );
         let tools = resp["result"]["tools"].as_array().unwrap();
-        assert!(tools.len() >= 10);
+        assert!(tools.len() >= 14);
         let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         assert!(names.contains(&"vortex_run"));
+        assert!(names.contains(&"vortex_eval"));
         assert!(names.contains(&"vortex_typecheck"));
         assert!(names.contains(&"vortex_codegen"));
+        assert!(names.contains(&"nn_create_model"));
+        assert!(names.contains(&"nn_train_model"));
+        assert!(names.contains(&"nn_predict"));
+        assert!(names.contains(&"nn_save_model"));
+        assert!(names.contains(&"nn_load_model"));
+        assert!(names.contains(&"nn_list_models"));
+        assert!(names.contains(&"gpu_status"));
     }
 
     #[test]
-    fn test_vortex_run() {
+    fn test_notification_returns_none() {
         let mut s = MCPServer::new();
-        let resp = call(&mut s, json!({
-            "jsonrpc": "2.0", "id": 3, "method": "tools/call",
-            "params": {
-                "name": "vortex_run",
-                "arguments": { "code": "fn main() { print(42) }" }
-            }
-        }));
-        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
-        let val: Value = serde_json::from_str(text).unwrap();
-        assert!(val["output"].as_str().unwrap().contains("42"));
-    }
-
-    #[test]
-    fn test_vortex_typecheck() {
-        let mut s = MCPServer::new();
-        let resp = call(&mut s, json!({
-            "jsonrpc": "2.0", "id": 4, "method": "tools/call",
-            "params": {
-                "name": "vortex_typecheck",
-                "arguments": { "code": "fn main() { let x: i32 = 1 }" }
-            }
-        }));
-        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
-        let val: Value = serde_json::from_str(text).unwrap();
-        assert_eq!(val["status"], "OK");
-    }
-
-    #[test]
-    fn test_vortex_codegen() {
-        let mut s = MCPServer::new();
-        let resp = call(&mut s, json!({
-            "jsonrpc": "2.0", "id": 5, "method": "tools/call",
-            "params": {
-                "name": "vortex_codegen",
-                "arguments": { "code": "fn add(a: i64, b: i64) -> i64 { return a + b }" }
-            }
-        }));
-        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
-        let val: Value = serde_json::from_str(text).unwrap();
-        assert!(val["mlir"].as_str().unwrap().contains("func"));
-    }
-
-    #[test]
-    fn test_vortex_explain() {
-        let mut s = MCPServer::new();
-        let resp = call(&mut s, json!({
-            "jsonrpc": "2.0", "id": 6, "method": "tools/call",
-            "params": {
-                "name": "vortex_explain",
-                "arguments": { "code": "fn foo(x: i64) -> i64 { return x + 1 }" }
-            }
-        }));
-        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
-        let val: Value = serde_json::from_str(text).unwrap();
-        let fns = val["functions"].as_array().unwrap();
-        assert!(!fns.is_empty());
-        assert_eq!(fns[0]["name"], "foo");
+        let input = serde_json::to_string(&json!({
+            "jsonrpc": "2.0", "method": "notifications/initialized"
+        }))
+        .unwrap();
+        assert!(s.handle_request(&input).is_none());
     }
 
     #[test]
@@ -633,51 +999,476 @@ mod tests {
     #[test]
     fn test_unknown_method() {
         let mut s = MCPServer::new();
-        let resp = call(&mut s, json!({
-            "jsonrpc": "2.0", "id": 99, "method": "nonexistent", "params": {}
-        }));
+        let resp = call(
+            &mut s,
+            json!({
+                "jsonrpc": "2.0", "id": 99, "method": "nonexistent", "params": {}
+            }),
+        );
         assert_eq!(resp["error"]["code"], -32601);
     }
 
     #[test]
-    fn test_session_state_persists() {
+    fn test_unknown_tool() {
         let mut s = MCPServer::new();
-
-        // Create a model
-        let resp = call(&mut s, json!({
-            "jsonrpc": "2.0", "id": 10, "method": "tools/call",
-            "params": {
-                "name": "vortex_create_model",
-                "arguments": { "architecture": "transformer" }
-            }
-        }));
+        let resp = call_tool_raw(&mut s, "nonexistent_tool", json!({}));
         let text = resp["result"]["content"][0]["text"].as_str().unwrap();
-        let val: Value = serde_json::from_str(text).unwrap();
-        let model_id = val["model_id"].as_str().unwrap().to_string();
-        assert!(!model_id.is_empty());
+        assert!(text.contains("Unknown tool"));
+        assert!(resp["result"]["isError"].as_bool().unwrap());
+    }
 
-        // Use it for inference
-        let resp2 = call(&mut s, json!({
-            "jsonrpc": "2.0", "id": 11, "method": "tools/call",
-            "params": {
-                "name": "vortex_infer",
-                "arguments": { "model_id": model_id, "input": [1.0, 2.0] }
-            }
-        }));
-        let text2 = resp2["result"]["content"][0]["text"].as_str().unwrap();
-        let val2: Value = serde_json::from_str(text2).unwrap();
-        assert_eq!(val2["status"], "ok");
+    // ── Vortex language tools ───────────────────────────────
 
-        // History should have 2 entries
-        assert_eq!(s.state.history.len(), 2);
+    #[test]
+    fn test_vortex_run() {
+        let mut s = MCPServer::new();
+        let val = call_tool(&mut s, "vortex_run", json!({ "code": "fn main() { print(42) }" }));
+        assert!(val["output"].as_str().unwrap().contains("42"));
     }
 
     #[test]
-    fn test_notification_returns_none() {
+    fn test_vortex_run_missing_code() {
         let mut s = MCPServer::new();
-        let input = serde_json::to_string(&json!({
-            "jsonrpc": "2.0", "method": "notifications/initialized"
-        })).unwrap();
-        assert!(s.handle_request(&input).is_none());
+        let resp = call_tool_raw(&mut s, "vortex_run", json!({}));
+        assert!(resp["result"]["isError"].as_bool().unwrap());
+    }
+
+    #[test]
+    fn test_vortex_run_invalid_code() {
+        let mut s = MCPServer::new();
+        let resp = call_tool_raw(&mut s, "vortex_run", json!({ "code": "fn {{{invalid" }));
+        assert!(resp["result"]["isError"].as_bool().unwrap());
+    }
+
+    #[test]
+    fn test_vortex_eval() {
+        let mut s = MCPServer::new();
+        let val = call_tool(&mut s, "vortex_eval", json!({ "code": "2 + 3" }));
+        assert!(val["result"].as_str().unwrap().contains("5"));
+    }
+
+    #[test]
+    fn test_vortex_typecheck() {
+        let mut s = MCPServer::new();
+        let val = call_tool(
+            &mut s,
+            "vortex_typecheck",
+            json!({ "code": "fn main() { let x: i32 = 1 }" }),
+        );
+        assert_eq!(val["status"], "OK");
+    }
+
+    #[test]
+    fn test_vortex_codegen() {
+        let mut s = MCPServer::new();
+        let val = call_tool(
+            &mut s,
+            "vortex_codegen",
+            json!({ "code": "fn add(a: i64, b: i64) -> i64 { return a + b }" }),
+        );
+        assert!(val["mlir"].as_str().unwrap().contains("func"));
+    }
+
+    #[test]
+    fn test_vortex_explain() {
+        let mut s = MCPServer::new();
+        let val = call_tool(
+            &mut s,
+            "vortex_explain",
+            json!({ "code": "fn foo(x: i64) -> i64 { return x + 1 }" }),
+        );
+        let fns = val["functions"].as_array().unwrap();
+        assert!(!fns.is_empty());
+        assert_eq!(fns[0]["name"], "foo");
+    }
+
+    #[test]
+    fn test_vortex_list_builtins() {
+        let mut s = MCPServer::new();
+        let val = call_tool(&mut s, "vortex_list_builtins", json!({}));
+        assert!(val["math"].as_array().unwrap().len() > 0);
+        assert!(val["nn"].as_array().unwrap().len() > 0);
+    }
+
+    #[test]
+    fn test_vortex_benchmark() {
+        let mut s = MCPServer::new();
+        let val = call_tool(
+            &mut s,
+            "vortex_benchmark",
+            json!({ "code": "fn main() { let x = 1 + 2 }", "iterations": 5 }),
+        );
+        assert_eq!(val["iterations"], 5);
+        assert!(val["total_ms"].as_f64().unwrap() >= 0.0);
+    }
+
+    // ── Neural network tools ────────────────────────────────
+
+    #[test]
+    fn test_nn_create_mlp() {
+        let mut s = MCPServer::new();
+        let val = call_tool(
+            &mut s,
+            "nn_create_model",
+            json!({
+                "architecture": "mlp",
+                "name": "test_mlp",
+                "layers": [
+                    { "type": "linear", "in": 4, "out": 8 },
+                    { "type": "relu" },
+                    { "type": "linear", "in": 8, "out": 2 }
+                ]
+            }),
+        );
+        assert!(val["model_id"].as_str().unwrap().starts_with("model_"));
+        assert!(val["params"].as_u64().unwrap() > 0);
+        assert_eq!(val["layers"].as_array().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn test_nn_create_transformer() {
+        let mut s = MCPServer::new();
+        let val = call_tool(
+            &mut s,
+            "nn_create_model",
+            json!({ "architecture": "transformer", "dim": 32, "num_heads": 4, "num_blocks": 1 }),
+        );
+        assert!(val["model_id"].as_str().is_some());
+        assert!(val["params"].as_u64().unwrap() > 0);
+    }
+
+    #[test]
+    fn test_nn_create_invalid_arch() {
+        let mut s = MCPServer::new();
+        let resp = call_tool_raw(&mut s, "nn_create_model", json!({ "architecture": "invalid" }));
+        assert!(resp["result"]["isError"].as_bool().unwrap());
+    }
+
+    #[test]
+    fn test_nn_train_model() {
+        let mut s = MCPServer::new();
+        // Create a simple MLP
+        let create_val = call_tool(
+            &mut s,
+            "nn_create_model",
+            json!({
+                "architecture": "mlp",
+                "layers": [
+                    { "type": "linear", "in": 2, "out": 4 },
+                    { "type": "relu" },
+                    { "type": "linear", "in": 4, "out": 1 }
+                ]
+            }),
+        );
+        let model_id = create_val["model_id"].as_str().unwrap();
+
+        // Train on XOR-like data
+        let train_val = call_tool(
+            &mut s,
+            "nn_train_model",
+            json!({
+                "model_id": model_id,
+                "data": [[0.0, 0.0], [0.0, 1.0], [1.0, 0.0], [1.0, 1.0]],
+                "labels": [[0.0], [1.0], [1.0], [0.0]],
+                "epochs": 50,
+                "lr": 0.01,
+                "optimizer": "adam"
+            }),
+        );
+        assert_eq!(train_val["epochs_completed"], 50);
+        assert!(train_val["losses"].as_array().unwrap().len() == 50);
+        assert!(train_val["final_loss"].as_f64().is_some());
+    }
+
+    #[test]
+    fn test_nn_train_missing_model() {
+        let mut s = MCPServer::new();
+        let resp = call_tool_raw(
+            &mut s,
+            "nn_train_model",
+            json!({
+                "model_id": "nonexistent",
+                "data": [[1.0]],
+                "labels": [[1.0]]
+            }),
+        );
+        assert!(resp["result"]["isError"].as_bool().unwrap());
+    }
+
+    #[test]
+    fn test_nn_predict() {
+        let mut s = MCPServer::new();
+        let create_val = call_tool(
+            &mut s,
+            "nn_create_model",
+            json!({
+                "architecture": "mlp",
+                "layers": [
+                    { "type": "linear", "in": 2, "out": 1 }
+                ]
+            }),
+        );
+        let model_id = create_val["model_id"].as_str().unwrap();
+
+        // Predict with 1D input
+        let pred = call_tool(
+            &mut s,
+            "nn_predict",
+            json!({ "model_id": model_id, "input": [1.0, 2.0] }),
+        );
+        assert!(pred["output"].as_array().is_some());
+        assert!(pred["shape"].as_array().is_some());
+
+        // Predict with 2D input (batch)
+        let pred2 = call_tool(
+            &mut s,
+            "nn_predict",
+            json!({ "model_id": model_id, "input": [[1.0, 2.0], [3.0, 4.0]] }),
+        );
+        assert_eq!(pred2["output"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn test_nn_predict_missing_model() {
+        let mut s = MCPServer::new();
+        let resp = call_tool_raw(
+            &mut s,
+            "nn_predict",
+            json!({ "model_id": "nope", "input": [1.0] }),
+        );
+        assert!(resp["result"]["isError"].as_bool().unwrap());
+    }
+
+    #[test]
+    fn test_nn_list_models() {
+        let mut s = MCPServer::new();
+        // Initially empty
+        let val = call_tool(&mut s, "nn_list_models", json!({}));
+        assert_eq!(val["models"].as_array().unwrap().len(), 0);
+
+        // Create two models
+        call_tool(
+            &mut s,
+            "nn_create_model",
+            json!({
+                "architecture": "mlp",
+                "layers": [{ "type": "linear", "in": 2, "out": 1 }]
+            }),
+        );
+        call_tool(
+            &mut s,
+            "nn_create_model",
+            json!({ "architecture": "transformer", "dim": 16, "num_heads": 2, "num_blocks": 1 }),
+        );
+
+        let val2 = call_tool(&mut s, "nn_list_models", json!({}));
+        assert_eq!(val2["models"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn test_nn_save_load_model() {
+        let mut s = MCPServer::new();
+        let create_val = call_tool(
+            &mut s,
+            "nn_create_model",
+            json!({
+                "architecture": "mlp",
+                "layers": [
+                    { "type": "linear", "in": 2, "out": 3 },
+                    { "type": "relu" },
+                    { "type": "linear", "in": 3, "out": 1 }
+                ]
+            }),
+        );
+        let model_id = create_val["model_id"].as_str().unwrap();
+
+        // Predict before save
+        let pred_before = call_tool(
+            &mut s,
+            "nn_predict",
+            json!({ "model_id": model_id, "input": [1.0, 2.0] }),
+        );
+
+        // Save
+        let save_path = "/tmp/vortex_test_model.json";
+        let save_val = call_tool(
+            &mut s,
+            "nn_save_model",
+            json!({ "model_id": model_id, "path": save_path }),
+        );
+        assert_eq!(save_val["status"], "saved");
+
+        // Load into same model (restoring weights should give same output)
+        let load_val = call_tool(
+            &mut s,
+            "nn_load_model",
+            json!({ "model_id": model_id, "path": save_path }),
+        );
+        assert_eq!(load_val["status"], "loaded");
+
+        let pred_after = call_tool(
+            &mut s,
+            "nn_predict",
+            json!({ "model_id": model_id, "input": [1.0, 2.0] }),
+        );
+        assert_eq!(pred_before["output"], pred_after["output"]);
+
+        // Cleanup
+        let _ = std::fs::remove_file(save_path);
+    }
+
+    // ── Full lifecycle test ─────────────────────────────────
+
+    #[test]
+    fn test_model_lifecycle_create_train_predict_save_load_predict() {
+        let mut s = MCPServer::new();
+
+        // 1. Create
+        let create_val = call_tool(
+            &mut s,
+            "nn_create_model",
+            json!({
+                "architecture": "mlp",
+                "name": "lifecycle_test",
+                "layers": [
+                    { "type": "linear", "in": 2, "out": 8 },
+                    { "type": "relu" },
+                    { "type": "linear", "in": 8, "out": 1 }
+                ]
+            }),
+        );
+        let model_id = create_val["model_id"].as_str().unwrap().to_string();
+
+        // 2. Train
+        let train_val = call_tool(
+            &mut s,
+            "nn_train_model",
+            json!({
+                "model_id": &model_id,
+                "data": [[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0]],
+                "labels": [[0.0], [1.0], [1.0], [0.0]],
+                "epochs": 20,
+                "lr": 0.01
+            }),
+        );
+        assert_eq!(train_val["epochs_completed"], 20);
+
+        // 3. Predict
+        let pred1 = call_tool(
+            &mut s,
+            "nn_predict",
+            json!({ "model_id": &model_id, "input": [1.0, 0.0] }),
+        );
+        assert!(pred1["output"].as_array().is_some());
+
+        // 4. Save
+        let save_path = "/tmp/vortex_lifecycle_test.json";
+        call_tool(
+            &mut s,
+            "nn_save_model",
+            json!({ "model_id": &model_id, "path": save_path }),
+        );
+
+        // 5. Load
+        call_tool(
+            &mut s,
+            "nn_load_model",
+            json!({ "model_id": &model_id, "path": save_path }),
+        );
+
+        // 6. Predict again (should match)
+        let pred2 = call_tool(
+            &mut s,
+            "nn_predict",
+            json!({ "model_id": &model_id, "input": [1.0, 0.0] }),
+        );
+        assert_eq!(pred1["output"], pred2["output"]);
+
+        // 7. Verify in list
+        let list = call_tool(&mut s, "nn_list_models", json!({}));
+        assert_eq!(list["models"].as_array().unwrap().len(), 1);
+
+        let _ = std::fs::remove_file(save_path);
+    }
+
+    // ── GPU status ──────────────────────────────────────────
+
+    #[test]
+    fn test_gpu_status() {
+        let mut s = MCPServer::new();
+        let val = call_tool(&mut s, "gpu_status", json!({}));
+        // Should return booleans for toolchain checks
+        assert!(val["mlir_opt"].is_boolean());
+        assert!(val["mlir_translate"].is_boolean());
+        assert!(val["llc"].is_boolean());
+        assert!(val["clang"].is_boolean());
+        assert!(val["gpu_available"].is_boolean());
+    }
+
+    // ── Error handling ──────────────────────────────────────
+
+    #[test]
+    fn test_train_data_label_mismatch() {
+        let mut s = MCPServer::new();
+        let create_val = call_tool(
+            &mut s,
+            "nn_create_model",
+            json!({
+                "architecture": "mlp",
+                "layers": [{ "type": "linear", "in": 2, "out": 1 }]
+            }),
+        );
+        let model_id = create_val["model_id"].as_str().unwrap();
+        let resp = call_tool_raw(
+            &mut s,
+            "nn_train_model",
+            json!({
+                "model_id": model_id,
+                "data": [[1.0, 2.0], [3.0, 4.0]],
+                "labels": [[1.0]]
+            }),
+        );
+        assert!(resp["result"]["isError"].as_bool().unwrap());
+    }
+
+    #[test]
+    fn test_save_missing_model() {
+        let mut s = MCPServer::new();
+        let resp = call_tool_raw(
+            &mut s,
+            "nn_save_model",
+            json!({ "model_id": "nope", "path": "/tmp/x.json" }),
+        );
+        assert!(resp["result"]["isError"].as_bool().unwrap());
+    }
+
+    #[test]
+    fn test_load_missing_file() {
+        let mut s = MCPServer::new();
+        let create_val = call_tool(
+            &mut s,
+            "nn_create_model",
+            json!({
+                "architecture": "mlp",
+                "layers": [{ "type": "linear", "in": 2, "out": 1 }]
+            }),
+        );
+        let model_id = create_val["model_id"].as_str().unwrap();
+        let resp = call_tool_raw(
+            &mut s,
+            "nn_load_model",
+            json!({ "model_id": model_id, "path": "/tmp/nonexistent_vortex_model_12345.json" }),
+        );
+        assert!(resp["result"]["isError"].as_bool().unwrap());
+    }
+
+    #[test]
+    fn test_history_tracking() {
+        let mut s = MCPServer::new();
+        call_tool(&mut s, "vortex_run", json!({ "code": "fn main() { print(1) }" }));
+        call_tool(&mut s, "nn_list_models", json!({}));
+        assert_eq!(s.state.history.len(), 2);
+        assert_eq!(s.state.history[0].0, "vortex_run");
+        assert_eq!(s.state.history[1].0, "nn_list_models");
     }
 }
