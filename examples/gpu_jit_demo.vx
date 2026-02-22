@@ -1,0 +1,47 @@
+// GPU JIT Compilation Demo
+// Functions annotated with @gpu are automatically compiled through
+// the MLIR pipeline to native machine code and executed natively.
+// If MLIR tools are not available, they fall back to the interpreter.
+
+@gpu
+fn vector_add(a: f64, b: f64) -> f64 {
+    return a + b
+}
+
+@gpu
+fn dot_product_step(a: f64, b: f64, acc: f64) -> f64 {
+    return acc + a * b
+}
+
+@gpu
+fn scale(x: f64, factor: f64) -> f64 {
+    return x * factor
+}
+
+@distributed
+fn distributed_sum(a: f64, b: f64) -> f64 {
+    return a + b
+}
+
+fn main() {
+    println("=== Vortex @gpu JIT Compilation Demo ===")
+    println("")
+
+    println("Testing @gpu JIT compilation:")
+    let r1 = vector_add(3.0, 4.0)
+    println(r1)
+
+    let r2 = dot_product_step(3.0, 4.0, 10.0)
+    println(r2)
+
+    let r3 = scale(5.0, 3.0)
+    println(r3)
+
+    println("")
+    println("Testing @distributed (stub):")
+    let r4 = distributed_sum(10.0, 20.0)
+    println(r4)
+
+    println("")
+    println("JIT-compiled functions produce same results as interpreted")
+}

@@ -187,9 +187,20 @@ impl Parser {
                 "recurrent" => {
                     annotations.push(Annotation::Recurrent);
                 }
-                _ => {
-                    self.error(name.span, format!("unknown annotation @{}", name.name));
-                    return Err(());
+                "gpu" => {
+                    annotations.push(Annotation::Gpu);
+                }
+                "jit" => {
+                    annotations.push(Annotation::Jit);
+                }
+                "inline" => {
+                    annotations.push(Annotation::Inline);
+                }
+                "distributed" => {
+                    annotations.push(Annotation::Distributed);
+                }
+                other => {
+                    annotations.push(Annotation::Custom(other.to_string(), vec![]));
                 }
             }
             self.skip_newlines();
