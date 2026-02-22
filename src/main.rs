@@ -68,10 +68,12 @@ mod debugger;
 mod lsp_server;
 mod package;
 mod nn;
+mod tensor_engine;
 mod profiler;
 mod vm;
 mod registry;
 mod gpu_compute;
+mod gpu_exec;
 
 use codespan_reporting::files::SimpleFiles;
 use codespan_reporting::term;

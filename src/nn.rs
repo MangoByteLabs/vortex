@@ -104,6 +104,13 @@ impl Tensor {
     /// 2D matmul: [M,K] x [K,N] -> [M,N], supports batched [B,M,K] x [K,N]
     pub fn matmul(&self, other: &Tensor) -> Tensor {
         if self.ndim() == 2 && other.ndim() == 2 {
+            // Use fast tensor engine backend
+            if crate::tensor_engine::use_fast_backend() {
+                let (out, shape) = crate::tensor_engine::fast_tensor_matmul(
+                    &self.data, &self.shape, &other.data, &other.shape,
+                );
+                return Tensor::new(shape, out);
+            }
             let (m, k) = (self.shape[0], self.shape[1]);
             let (k2, n) = (other.shape[0], other.shape[1]);
             assert_eq!(k, k2, "matmul dim mismatch: {} vs {}", k, k2);
@@ -119,6 +126,12 @@ impl Tensor {
         }
         // Batched: [B,M,K] x [K,N] -> [B,M,N]
         if self.ndim() == 3 && other.ndim() == 2 {
+            if crate::tensor_engine::use_fast_backend() {
+                let (out, shape) = crate::tensor_engine::fast_tensor_batched_matmul(
+                    &self.data, &self.shape, &other.data, &other.shape,
+                );
+                return Tensor::new(shape, out);
+            }
             let (b, m, k) = (self.shape[0], self.shape[1], self.shape[2]);
             let (k2, n) = (other.shape[0], other.shape[1]);
             assert_eq!(k, k2);
