@@ -630,8 +630,30 @@ impl Env {
         self.functions.insert("tensor_adam".to_string(), FnDef::Builtin(builtin_tensor_adam));
         self.functions.insert("tensor_zero_grad".to_string(), FnDef::Builtin(builtin_tensor_zero_grad));
 
-        // autograd builtins (TODO: implement)
-        // self.functions.insert("autograd_new".into(), FnDef::Builtin(builtin_autograd_new));
+        // Autograd builtins
+        self.functions.insert("autograd_new".into(), FnDef::Builtin(crate::autograd::builtin_autograd_new));
+        self.functions.insert("autograd_tensor".into(), FnDef::Builtin(crate::autograd::builtin_autograd_tensor));
+        self.functions.insert("autograd_input".into(), FnDef::Builtin(crate::autograd::builtin_autograd_input));
+        self.functions.insert("autograd_matmul".into(), FnDef::Builtin(crate::autograd::builtin_autograd_matmul));
+        self.functions.insert("autograd_add".into(), FnDef::Builtin(crate::autograd::builtin_autograd_add));
+        self.functions.insert("autograd_mul".into(), FnDef::Builtin(crate::autograd::builtin_autograd_mul));
+        self.functions.insert("autograd_sub".into(), FnDef::Builtin(crate::autograd::builtin_autograd_sub));
+        self.functions.insert("autograd_div".into(), FnDef::Builtin(crate::autograd::builtin_autograd_div));
+        self.functions.insert("autograd_relu".into(), FnDef::Builtin(crate::autograd::builtin_autograd_relu));
+        self.functions.insert("autograd_sigmoid".into(), FnDef::Builtin(crate::autograd::builtin_autograd_sigmoid));
+        self.functions.insert("autograd_tanh".into(), FnDef::Builtin(crate::autograd::builtin_autograd_tanh));
+        self.functions.insert("autograd_softmax".into(), FnDef::Builtin(crate::autograd::builtin_autograd_softmax));
+        self.functions.insert("autograd_exp".into(), FnDef::Builtin(crate::autograd::builtin_autograd_exp));
+        self.functions.insert("autograd_log".into(), FnDef::Builtin(crate::autograd::builtin_autograd_log));
+        self.functions.insert("autograd_sum".into(), FnDef::Builtin(crate::autograd::builtin_autograd_sum));
+        self.functions.insert("autograd_mean".into(), FnDef::Builtin(crate::autograd::builtin_autograd_mean));
+        self.functions.insert("autograd_mse".into(), FnDef::Builtin(crate::autograd::builtin_autograd_mse));
+        self.functions.insert("autograd_broadcast_add".into(), FnDef::Builtin(crate::autograd::builtin_autograd_broadcast_add));
+        self.functions.insert("autograd_backward".into(), FnDef::Builtin(crate::autograd::builtin_autograd_backward));
+        self.functions.insert("autograd_grad".into(), FnDef::Builtin(crate::autograd::builtin_autograd_grad));
+        self.functions.insert("autograd_data".into(), FnDef::Builtin(crate::autograd::builtin_autograd_data));
+        self.functions.insert("autograd_zero_grad".into(), FnDef::Builtin(crate::autograd::builtin_autograd_zero_grad));
+        self.functions.insert("autograd_adam_step".into(), FnDef::Builtin(crate::autograd::builtin_autograd_adam_step));
 
         // SpikeSSMFormer architecture builtins
         self.functions.insert("spike_ssm_new".to_string(), FnDef::Builtin(builtin_spike_ssm_new));

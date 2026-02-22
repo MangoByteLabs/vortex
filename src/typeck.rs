@@ -1,6 +1,6 @@
 use crate::ast::*;
 use crate::lexer::Span;
-use crate::shape_check::ShapeChecker;
+use crate::shape_checker::LegacyShapeChecker as ShapeChecker;
 use codespan_reporting::diagnostic::{Diagnostic, Label};
 use std::collections::HashMap;
 
