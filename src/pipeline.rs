@@ -69,26 +69,50 @@ impl Default for PipelineConfig {
     }
 }
 
-/// Check if an external tool is available
+/// Check if an external tool is available (tries versioned name first, e.g. mlir-opt-20)
 fn tool_available(name: &str) -> bool {
-    Command::new("which")
-        .arg(name)
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+    let versioned = format!("{}-20", name);
+    for candidate in &[versioned.as_str(), name] {
+        if Command::new("which")
+            .arg(candidate)
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+        {
+            return true;
+        }
+    }
+    false
 }
 
-/// Run an external tool and return its output
+/// Find the actual tool name (versioned or plain)
+fn find_tool_name(name: &str) -> Option<String> {
+    let versioned = format!("{}-20", name);
+    for candidate in &[versioned.as_str(), name] {
+        if Command::new("which")
+            .arg(candidate)
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+        {
+            return Some(candidate.to_string());
+        }
+    }
+    None
+}
+
+/// Run an external tool and return its output (auto-resolves versioned names)
 fn run_tool(name: &str, args: &[&str], input_file: &Path, verbose: bool) -> Result<String, String> {
+    let actual = find_tool_name(name).unwrap_or_else(|| name.to_string());
     if verbose {
-        eprintln!("[pipeline] {} {}", name, args.join(" "));
+        eprintln!("[pipeline] {} {}", actual, args.join(" "));
     }
 
-    let output = Command::new(name)
+    let output = Command::new(&actual)
         .args(args)
         .arg(input_file)
         .output()
-        .map_err(|e| format!("failed to run {}: {}", name, e))?;
+        .map_err(|e| format!("failed to run {}: {}", actual, e))?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
