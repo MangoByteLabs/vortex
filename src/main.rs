@@ -51,6 +51,7 @@ mod runtime;
 mod gpu_runtime;
 mod server;
 mod shape_check;
+mod swarm;
 mod typeck;
 mod matrix_of_thought;
 mod symbolic_reasoning;
