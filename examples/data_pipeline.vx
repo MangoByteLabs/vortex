@@ -1,0 +1,14 @@
+fn main() {
+    // Load data — auto-detects CSV format and types
+    let data = data_load("dataset.csv")
+    println(data_schema(data))
+    println(data_stats(data))
+
+    // Build ML pipeline
+    let clean = data_filter(data, "age > 0")
+    let normalized = data_normalize(clean, "standard")
+    let splits = data_split(normalized, 0.8, 0.1, 0.1)
+
+    // Every step is tracked
+    println(data_lineage(splits[0]))
+}

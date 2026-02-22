@@ -271,6 +271,12 @@ impl Env {
             next_prob_layer_id: 0,
             swarms: HashMap::new(),
             next_swarm_id: 0,
+            novel_memories: HashMap::new(),
+            novel_worlds: HashMap::new(),
+            novel_reasoners: HashMap::new(),
+            novel_workspaces: HashMap::new(),
+            novel_continual: HashMap::new(),
+            novel_compositional: HashMap::new(),
             loading_modules: HashSet::new(),
             loaded_modules: HashSet::new(),
             nn_models: HashMap::new(),
@@ -745,6 +751,9 @@ impl Env {
         // Swarm intelligence builtins
         crate::swarm::register_builtins(self);
 
+        // Novel architecture builtins
+        crate::novel_arch::register_builtins(self);
+
         // Math builtins
         self.functions.insert("sqrt".to_string(), FnDef::Builtin(builtin_sqrt));
         self.functions.insert("sin".to_string(), FnDef::Builtin(builtin_sin));
@@ -776,6 +785,12 @@ impl Env {
 
         // Huge matrix engine builtins
         crate::huge_matrix::register_builtins(self);
+
+        // Data fabric builtins
+        crate::data_fabric::register_builtins(self);
+
+        // Meta-engine: self-evolving code builtins
+        crate::meta_engine::register_builtins(self);
 
         // Math constants
         self.define("PI", Value::Float(std::f64::consts::PI));

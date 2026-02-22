@@ -85,6 +85,7 @@ mod dist_runtime;
 mod jit;
 mod autograd;
 pub mod bigint_engine;
+mod meta_engine;
 
 use codespan_reporting::files::SimpleFiles;
 use codespan_reporting::term;
