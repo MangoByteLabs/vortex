@@ -1,0 +1,54 @@
+// Autoencoder: compress 8D data to 3D bottleneck and reconstruct
+// Demonstrates learned compression and reconstruction quality
+
+fn main() {
+    println("=== Autoencoder ===")
+    println("Compressing 8D data through 3D bottleneck")
+    println("")
+
+    // Encoder: 8 -> 5 -> 3, Decoder: 3 -> 5 -> 8
+    let model = nn_sequential([
+        nn_linear(8, 5), nn_relu(),
+        nn_linear(5, 3), nn_relu(),
+        nn_linear(3, 5), nn_relu(),
+        nn_linear(5, 8), nn_sigmoid()
+    ])
+
+    // Generate 20 training patterns (binary-ish vectors)
+    var data = []
+    for i in 0..20 {
+        var row = []
+        for j in 0..8 {
+            let v = sin((i * 7 + j * 3) * 1.0) * 0.4 + 0.5
+            row = push(row, v)
+        }
+        data = push(data, row)
+    }
+
+    // For autoencoder: labels = inputs (reconstruct itself)
+    println(format("Training autoencoder on {} samples for 1000 epochs...", to_string(len(data))))
+    println("")
+    let loss = nn_train_verbose(model, data, data, "adam", 1000, 0.005, 200)
+    println("")
+    println(format("Final reconstruction loss: {}", to_string(loss)))
+    println("")
+
+    // Show reconstruction quality
+    println("--- Reconstruction Quality ---")
+    var total_err = 0.0
+    for i in 0..5 {
+        let original = data[i]
+        let reconstructed = nn_predict(model, original)
+        var err = 0.0
+        for j in 0..8 {
+            let d = original[j] - reconstructed[j]
+            err = err + abs(d)
+        }
+        err = err / 8.0
+        total_err = total_err + err
+        println(format("  Sample {}: avg_error={}", to_string(i + 1), to_string(floor(err * 10000.0) / 10000.0)))
+        println(format("    Original:      [{}]", to_string(floor(original[0]*100.0)/100.0)))
+        println(format("    Reconstructed: [{}]", to_string(floor(reconstructed[0]*100.0)/100.0)))
+    }
+    println(format("\nOverall avg reconstruction error: {}", to_string(total_err / 5.0)))
+}

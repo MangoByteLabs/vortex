@@ -1,0 +1,76 @@
+// Binary classifier: classify 2D points inside vs outside a circle
+// Uses nn_sequential with ReLU activations and nn_train_verbose
+
+fn main() {
+    println("=== Circle Classifier ===")
+    println("Training a 3-layer MLP to classify 2D points")
+    println("Points inside circle(0.5, 0.5, r=0.35) -> 1, outside -> 0")
+    println("")
+
+    // Build model: 2 -> 16 -> 8 -> 1 with ReLU + Sigmoid
+    let l1 = nn_linear(2, 16)
+    let r1 = nn_relu()
+    let l2 = nn_linear(16, 8)
+    let r2 = nn_relu()
+    let l3 = nn_linear(8, 1)
+    let sig = nn_sigmoid()
+    let model = nn_sequential([l1, r1, l2, r2, l3, sig])
+
+    // Generate 64 training points on a grid
+    var data = []
+    var labels = []
+    for i in 0..64 {
+        let x = (i % 8) * 0.125 + 0.0625
+        let y = floor(i / 8) * 0.125 + 0.0625
+        let dx = x - 0.5
+        let dy = y - 0.5
+        let d = dx * dx + dy * dy
+        data = push(data, [x, y])
+        if d < 0.1225 {
+            labels = push(labels, [1.0])
+        } else {
+            labels = push(labels, [0.0])
+        }
+    }
+
+    println(format("Training on {} points for 500 epochs...", to_string(len(data))))
+    println("")
+
+    // Train with verbose output
+    let final_loss = nn_train_verbose(model, data, labels, "adam", 500, 0.01, 100)
+    println("")
+    println(format("Final loss: {}", to_string(final_loss)))
+    println("")
+
+    // Evaluate
+    println("--- Predictions on test grid ---")
+    var correct = 0
+    var total = 0
+    for i in 0..25 {
+        let x = (i % 5) * 0.2 + 0.1
+        let y = floor(i / 5) * 0.2 + 0.1
+        let dx = x - 0.5
+        let dy = y - 0.5
+        let d = dx * dx + dy * dy
+        var actual = "OUT"
+        var lbl = 0.0
+        if d < 0.1225 {
+            actual = " IN"
+            lbl = 1.0
+        }
+        let pred = nn_predict(model, [x, y])
+        let p = pred[0]
+        var pl = 0.0
+        if p > 0.5 {
+            pl = 1.0
+        }
+        var mark = "MISS"
+        if pl == lbl {
+            mark = " OK "
+            correct = correct + 1
+        }
+        total = total + 1
+        println(format("  ({}, {}) actual={} pred={} [{}]", to_string(x), to_string(y), actual, to_string(p), mark))
+    }
+    println(format("\nAccuracy: {}%", to_string((correct * 100) / total)))
+}

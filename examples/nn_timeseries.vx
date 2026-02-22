@@ -1,0 +1,71 @@
+// Time series prediction: predict next value in a sine wave
+// Uses a sliding window of 4 values to predict the 5th
+
+fn main() {
+    println("=== Time Series Prediction ===")
+    println("Predicting the next value in a sine wave")
+    println("Input: 4 consecutive values -> Output: next value")
+    println("")
+
+    // Model: 4 -> 16 -> 8 -> 1
+    let model = nn_sequential([
+        nn_linear(4, 16), nn_relu(),
+        nn_linear(16, 8), nn_relu(),
+        nn_linear(8, 1)
+    ])
+
+    // Generate sine wave data with sliding window
+    var data = []
+    var labels = []
+    for i in 0..40 {
+        let t0 = sin(i * 0.3)
+        let t1 = sin((i + 1) * 0.3)
+        let t2 = sin((i + 2) * 0.3)
+        let t3 = sin((i + 3) * 0.3)
+        let target = sin((i + 4) * 0.3)
+        data = push(data, [t0, t1, t2, t3])
+        labels = push(labels, [target])
+    }
+
+    println(format("Training on {} windows for 800 epochs...", to_string(len(data))))
+    println("")
+    let loss = nn_train_verbose(model, data, labels, "adam", 800, 0.005, 160)
+    println("")
+    println(format("Final MSE loss: {}", to_string(loss)))
+    println("")
+
+    // Predict and show results
+    println("--- Predictions vs Actual ---")
+    println("  step | actual  | predicted | error")
+    var total_err = 0.0
+    var count = 0
+    for i in 0..15 {
+        let t = 40 + i
+        let input = [sin(t * 0.3), sin((t+1) * 0.3), sin((t+2) * 0.3), sin((t+3) * 0.3)]
+        let actual = sin((t + 4) * 0.3)
+        let pred = nn_predict(model, input)
+        let p = pred[0]
+        let err = abs(p - actual)
+        total_err = total_err + err
+        count = count + 1
+        println(format("  {}    | {}  | {}  | {}", to_string(t), to_string(floor(actual*1000.0)/1000.0), to_string(floor(p*1000.0)/1000.0), to_string(floor(err*1000.0)/1000.0)))
+    }
+    println(format("\nAvg prediction error: {}", to_string(total_err / 15.0)))
+
+    // Multi-step autoregressive prediction
+    println("")
+    println("--- Autoregressive Forecast (10 steps) ---")
+    var w0 = sin(50.0 * 0.3)
+    var w1 = sin(51.0 * 0.3)
+    var w2 = sin(52.0 * 0.3)
+    var w3 = sin(53.0 * 0.3)
+    for step in 0..10 {
+        let pred = nn_predict(model, [w0, w1, w2, w3])
+        let actual = sin((54 + step) * 0.3)
+        println(format("  step {}: predicted={}, actual={}", to_string(step), to_string(floor(pred[0]*1000.0)/1000.0), to_string(floor(actual*1000.0)/1000.0)))
+        w0 = w1
+        w1 = w2
+        w2 = w3
+        w3 = pred[0]
+    }
+}

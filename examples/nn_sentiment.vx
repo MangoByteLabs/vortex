@@ -1,0 +1,93 @@
+// Sentiment classifier: bag-of-words features -> positive/negative
+// Uses a small vocabulary and binary classification
+
+fn main() {
+    println("=== Sentiment Classifier ===")
+    println("Classifying text as positive (1) or negative (0)")
+    println("Using 10-dim bag-of-words features")
+    println("")
+
+    // Vocabulary: good=0, great=1, love=2, happy=3, best=4,
+    //             bad=5, terrible=6, hate=7, worst=8, awful=9
+    // Feature = word count in 10-dim vector
+
+    let model = nn_sequential([
+        nn_linear(10, 16), nn_relu(),
+        nn_linear(16, 8), nn_relu(),
+        nn_linear(8, 1), nn_sigmoid()
+    ])
+
+    // Training data: bag-of-words features
+    let data = [
+        [1.0, 1.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        [0.0, 0.0, 1.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        [1.0, 0.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        [0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 0.0],
+        [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 0.0],
+        [0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0],
+        [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 1.0, 1.0],
+        [0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0],
+        [2.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0]
+    ]
+    let labels = [
+        [1.0], [1.0], [1.0], [1.0], [1.0],
+        [0.0], [0.0], [0.0], [0.0], [0.0],
+        [1.0], [0.0]
+    ]
+    let descs = [
+        "good great happy", "love best", "good love happy best",
+        "great", "happy",
+        "bad terrible", "hate worst", "bad hate awful",
+        "terrible worst awful", "bad",
+        "good good love", "worst awful"
+    ]
+
+    println("Training for 500 epochs...")
+    println("")
+    let loss = nn_train_verbose(model, data, labels, "adam", 500, 0.01, 100)
+    println("")
+    println(format("Final loss: {}", to_string(loss)))
+    println("")
+
+    // Evaluate
+    println("--- Predictions ---")
+    var correct = 0
+    for i in 0..12 {
+        let pred = nn_predict(model, data[i])
+        let p = pred[0]
+        var sentiment = "NEGATIVE"
+        var pl = 0.0
+        if p > 0.5 {
+            sentiment = "POSITIVE"
+            pl = 1.0
+        }
+        var mark = "X"
+        if pl == labels[i][0] {
+            mark = "OK"
+            correct = correct + 1
+        }
+        println(format("  '{}' -> {} ({}) [{}]", descs[i], sentiment, to_string(floor(p * 100.0) / 100.0), mark))
+    }
+    println(format("\nAccuracy: {}/12", to_string(correct)))
+
+    // Test on unseen combinations
+    println("")
+    println("--- Unseen Test Cases ---")
+    let test_data = [
+        [1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        [0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 0.0, 0.0],
+        [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0]
+    ]
+    let test_descs = ["good great love", "bad terrible hate", "good + bad (mixed)"]
+    for i in 0..3 {
+        let pred = nn_predict(model, test_data[i])
+        var s = "NEGATIVE"
+        if pred[0] > 0.5 {
+            s = "POSITIVE"
+        }
+        println(format("  '{}' -> {} ({})", test_descs[i], s, to_string(floor(pred[0] * 100.0) / 100.0)))
+    }
+}

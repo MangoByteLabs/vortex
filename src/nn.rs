@@ -1390,6 +1390,20 @@ pub fn register_nn_builtins(env: &mut Env) {
     env.functions.insert("tensor_randn_nn".into(), FnDef::Builtin(builtin_tensor_randn));
     env.functions.insert("tensor_matmul_nn".into(), FnDef::Builtin(builtin_tensor_matmul));
     env.functions.insert("tensor_add_nn".into(), FnDef::Builtin(builtin_tensor_add));
+    env.functions.insert("nn_relu".into(), FnDef::Builtin(builtin_nn_relu));
+    env.functions.insert("nn_sigmoid".into(), FnDef::Builtin(builtin_nn_sigmoid));
+    env.functions.insert("nn_tanh".into(), FnDef::Builtin(builtin_nn_tanh));
+    env.functions.insert("nn_gelu".into(), FnDef::Builtin(builtin_nn_gelu));
+    env.functions.insert("nn_softmax".into(), FnDef::Builtin(builtin_nn_softmax));
+    env.functions.insert("nn_embedding".into(), FnDef::Builtin(builtin_nn_embedding));
+    env.functions.insert("nn_layer_norm".into(), FnDef::Builtin(builtin_nn_layer_norm));
+    env.functions.insert("nn_dropout".into(), FnDef::Builtin(builtin_nn_dropout));
+    env.functions.insert("nn_gru".into(), FnDef::Builtin(builtin_nn_gru));
+    env.functions.insert("nn_batch_norm".into(), FnDef::Builtin(builtin_nn_batch_norm));
+    env.functions.insert("nn_train_verbose".into(), FnDef::Builtin(builtin_nn_train_verbose));
+    env.functions.insert("nn_evaluate".into(), FnDef::Builtin(builtin_nn_evaluate));
+    env.functions.insert("nn_num_params".into(), FnDef::Builtin(builtin_nn_num_params));
+    env.functions.insert("nn_clone".into(), FnDef::Builtin(builtin_nn_clone));
 }
 
 fn builtin_nn_linear(env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
@@ -1482,7 +1496,13 @@ fn builtin_nn_train(env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
         _ => Optimizer::adam(lr),
     };
     let model = env.nn_models.get_mut(&model_id).ok_or("no such model")?;
-    let loss_fn = if labels[0].len() == 1 { "mse" } else { "cross_entropy" };
+    // Detect classification: if all label values are small non-negative integers and single column
+    let is_class_index = labels[0].len() == 1 && labels.iter().all(|l| l[0] >= 0.0 && l[0] == l[0].floor() && l[0] < 100.0);
+    let num_outputs = model.layers.iter().rev().find_map(|l| match l {
+        Layer::Linear { weight, .. } => Some(weight.shape[1]),
+        _ => None,
+    }).unwrap_or(1);
+    let loss_fn = if num_outputs > 1 && is_class_index { "cross_entropy" } else { "mse" };
     let losses = train(model, data, labels, &mut optimizer, epochs, loss_fn);
     Ok(Value::Array(losses.into_iter().map(|l| Value::Float(l)).collect()))
 }
@@ -1565,6 +1585,156 @@ fn builtin_tensor_add(_env: &mut Env, args: Vec<Value>) -> Result<Value, String>
     let a = parse_tensor_arg(&args[0])?;
     let b = parse_tensor_arg(&args[1])?;
     Ok(tensor_to_value(&a.add(&b)))
+}
+
+fn builtin_nn_relu(env: &mut Env, _args: Vec<Value>) -> Result<Value, String> {
+    let model = Model::sequential(vec![Layer::ReLU { cache: None }]);
+    let id = env.nn_models.len();
+    env.nn_models.insert(id, model);
+    Ok(Value::Int(id as i128))
+}
+
+fn builtin_nn_sigmoid(env: &mut Env, _args: Vec<Value>) -> Result<Value, String> {
+    let model = Model::sequential(vec![Layer::Sigmoid { cache: None }]);
+    let id = env.nn_models.len();
+    env.nn_models.insert(id, model);
+    Ok(Value::Int(id as i128))
+}
+
+fn builtin_nn_tanh(env: &mut Env, _args: Vec<Value>) -> Result<Value, String> {
+    let model = Model::sequential(vec![Layer::Tanh { cache: None }]);
+    let id = env.nn_models.len();
+    env.nn_models.insert(id, model);
+    Ok(Value::Int(id as i128))
+}
+
+fn builtin_nn_gelu(env: &mut Env, _args: Vec<Value>) -> Result<Value, String> {
+    let model = Model::sequential(vec![Layer::GELU { cache: None }]);
+    let id = env.nn_models.len();
+    env.nn_models.insert(id, model);
+    Ok(Value::Int(id as i128))
+}
+
+fn builtin_nn_softmax(env: &mut Env, _args: Vec<Value>) -> Result<Value, String> {
+    let model = Model::sequential(vec![Layer::Softmax { cache: None }]);
+    let id = env.nn_models.len();
+    env.nn_models.insert(id, model);
+    Ok(Value::Int(id as i128))
+}
+
+fn builtin_nn_embedding(env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    if args.len() != 2 { return Err("nn_embedding(vocab_size, dim)".into()); }
+    let vocab = match &args[0] { Value::Int(i) => *i as usize, _ => return Err("expected int".into()) };
+    let dim = match &args[1] { Value::Int(i) => *i as usize, _ => return Err("expected int".into()) };
+    let model = Model::sequential(vec![Layer::embedding(vocab, dim)]);
+    let id = env.nn_models.len();
+    env.nn_models.insert(id, model);
+    Ok(Value::Int(id as i128))
+}
+
+fn builtin_nn_layer_norm(env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    if args.len() != 1 { return Err("nn_layer_norm(dim)".into()); }
+    let dim = match &args[0] { Value::Int(i) => *i as usize, _ => return Err("expected int".into()) };
+    let model = Model::sequential(vec![Layer::layer_norm(dim)]);
+    let id = env.nn_models.len();
+    env.nn_models.insert(id, model);
+    Ok(Value::Int(id as i128))
+}
+
+fn builtin_nn_dropout(env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    if args.len() != 1 { return Err("nn_dropout(rate)".into()); }
+    let rate = match &args[0] { Value::Float(f) => *f, Value::Int(i) => *i as f64, _ => return Err("expected number".into()) };
+    let model = Model::sequential(vec![Layer::dropout(rate)]);
+    let id = env.nn_models.len();
+    env.nn_models.insert(id, model);
+    Ok(Value::Int(id as i128))
+}
+
+fn builtin_nn_gru(env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    if args.len() != 2 { return Err("nn_gru(input_size, hidden_size)".into()); }
+    let input_size = match &args[0] { Value::Int(i) => *i as usize, _ => return Err("expected int".into()) };
+    let hidden_size = match &args[1] { Value::Int(i) => *i as usize, _ => return Err("expected int".into()) };
+    let model = Model::sequential(vec![Layer::gru(input_size, hidden_size)]);
+    let id = env.nn_models.len();
+    env.nn_models.insert(id, model);
+    Ok(Value::Int(id as i128))
+}
+
+fn builtin_nn_batch_norm(env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    if args.len() != 1 { return Err("nn_batch_norm(dim)".into()); }
+    let dim = match &args[0] { Value::Int(i) => *i as usize, _ => return Err("expected int".into()) };
+    let model = Model::sequential(vec![Layer::batch_norm(dim)]);
+    let id = env.nn_models.len();
+    env.nn_models.insert(id, model);
+    Ok(Value::Int(id as i128))
+}
+
+fn builtin_nn_train_verbose(env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    if args.len() != 7 { return Err("nn_train_verbose(model_id, data, labels, optimizer, epochs, lr, print_every)".into()); }
+    let model_id = match &args[0] { Value::Int(i) => *i as usize, _ => return Err("expected int".into()) };
+    let data = value_to_2d(&args[1])?;
+    let labels = value_to_2d(&args[2])?;
+    let opt_name = match &args[3] { Value::String(s) => s.clone(), _ => "adam".into() };
+    let epochs = match &args[4] { Value::Int(i) => *i as usize, Value::Float(f) => *f as usize, _ => 100 };
+    let lr = match &args[5] { Value::Float(f) => *f, Value::Int(i) => *i as f64, _ => 0.01 };
+    let print_every = match &args[6] { Value::Int(i) => *i as usize, Value::Float(f) => *f as usize, _ => 10 };
+    let mut optimizer = match opt_name.as_str() {
+        "sgd" => Optimizer::sgd(lr, 0.9, 0.0),
+        "adamw" => Optimizer::adamw(lr, 0.01),
+        _ => Optimizer::adam(lr),
+    };
+    let model = env.nn_models.get_mut(&model_id).ok_or("no such model")?;
+    let is_class_index = labels[0].len() == 1 && labels.iter().all(|l| l[0] >= 0.0 && l[0] == l[0].floor() && l[0] < 100.0);
+    let num_outputs = model.layers.iter().rev().find_map(|l| match l {
+        Layer::Linear { weight, .. } => Some(weight.shape[1]),
+        _ => None,
+    }).unwrap_or(1);
+    let loss_fn = if num_outputs > 1 && is_class_index { "cross_entropy" } else { "mse" };
+    let mut loader = DataLoader::new(data, labels, 32, true);
+    loader.batch_size = loader.data.len();
+    let mut final_loss = 0.0;
+    for epoch in 0..epochs {
+        loader.shuffle_indices(epoch as u64 * 7 + 42);
+        let loss = train_epoch(model, &loader, &mut optimizer, loss_fn);
+        final_loss = loss;
+        if epoch % print_every == 0 || epoch == epochs - 1 {
+            println!("  Epoch {}/{}: loss = {:.6}", epoch + 1, epochs, loss);
+        }
+    }
+    Ok(Value::Float(final_loss))
+}
+
+fn builtin_nn_evaluate(env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    if args.len() != 3 { return Err("nn_evaluate(model_id, data, labels)".into()); }
+    let model_id = match &args[0] { Value::Int(i) => *i as usize, _ => return Err("expected int".into()) };
+    let data = value_to_2d(&args[1])?;
+    let labels = value_to_2d(&args[2])?;
+    let model = env.nn_models.get_mut(&model_id).ok_or("no such model")?;
+    let is_class_index = labels[0].len() == 1 && labels.iter().all(|l| l[0] >= 0.0 && l[0] == l[0].floor() && l[0] < 100.0);
+    let num_outputs = model.layers.iter().rev().find_map(|l| match l {
+        Layer::Linear { weight, .. } => Some(weight.shape[1]),
+        _ => None,
+    }).unwrap_or(1);
+    let loss_fn = if num_outputs > 1 && is_class_index { "cross_entropy" } else { "mse" };
+    let loader = DataLoader::new(data, labels, 32, false);
+    let (loss, acc) = evaluate(model, &loader, loss_fn);
+    Ok(Value::Array(vec![Value::Float(loss), Value::Float(acc)]))
+}
+
+fn builtin_nn_num_params(env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    if args.len() != 1 { return Err("nn_num_params(model_id)".into()); }
+    let model_id = match &args[0] { Value::Int(i) => *i as usize, _ => return Err("expected int".into()) };
+    let model = env.nn_models.get(&model_id).ok_or("no such model")?;
+    Ok(Value::Int(model.num_parameters() as i128))
+}
+
+fn builtin_nn_clone(env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    if args.len() != 1 { return Err("nn_clone(model_id)".into()); }
+    let model_id = match &args[0] { Value::Int(i) => *i as usize, _ => return Err("expected int".into()) };
+    let model = env.nn_models.get(&model_id).ok_or("no such model")?.clone();
+    let new_id = env.nn_models.len();
+    env.nn_models.insert(new_id, model);
+    Ok(Value::Int(new_id as i128))
 }
 
 fn parse_tensor_arg(v: &Value) -> Result<Tensor, String> {

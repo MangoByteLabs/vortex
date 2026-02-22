@@ -1,0 +1,51 @@
+// Function approximation: train a network to learn sin(x) over [-pi, pi]
+// Uses nn_sequential with ReLU activations and Adam optimizer
+
+fn main() {
+    println("=== Function Approximation: sin(x) ===")
+    println("Training a neural network to approximate sin(x)")
+    println("")
+
+    // Build model: 1 -> 32 -> 16 -> 1
+    let model = nn_sequential([
+        nn_linear(1, 32), nn_relu(),
+        nn_linear(32, 16), nn_relu(),
+        nn_linear(16, 1)
+    ])
+
+    // Generate 40 training points over [-3.14, 3.14]
+    var data = []
+    var labels = []
+    for i in 0..40 {
+        let x = -3.14 + i * 0.157
+        data = push(data, [x])
+        labels = push(labels, [sin(x)])
+    }
+
+    println(format("Training on {} points for 1000 epochs...", to_string(len(data))))
+    println("")
+    let final_loss = nn_train_verbose(model, data, labels, "adam", 1000, 0.005, 200)
+    println("")
+    println(format("Final MSE loss: {}", to_string(final_loss)))
+    println("")
+
+    // Show predictions vs actual
+    println("--- Predictions vs Actual ---")
+    println("     x      actual   predicted  error")
+    var total_err = 0.0
+    for i in 0..15 {
+        let x = -3.0 + i * 0.4
+        let actual = sin(x)
+        let pred = nn_predict(model, [x])
+        let p = pred[0]
+        let err = abs(p - actual)
+        total_err = total_err + err
+        let xs = to_string(floor(x * 100.0) / 100.0)
+        let as_ = to_string(floor(actual * 1000.0) / 1000.0)
+        let ps = to_string(floor(p * 1000.0) / 1000.0)
+        let es = to_string(floor(err * 1000.0) / 1000.0)
+        println(format("  {} | {} | {} | {}", xs, as_, ps, es))
+    }
+    let avg_err = total_err / 15.0
+    println(format("\nAverage absolute error: {}", to_string(avg_err)))
+}

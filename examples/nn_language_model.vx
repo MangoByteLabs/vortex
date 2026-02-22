@@ -1,0 +1,94 @@
+// Tiny character-level language model
+// Learns to predict the next character in simple repeating patterns
+// Uses nn_sequential with MSE on one-hot outputs
+
+fn main() {
+    println("=== Tiny Character-Level Language Model ===")
+    println("Learning: a->b->c->a and x->y->z->x")
+    println("")
+
+    // 6 chars one-hot encoded, model: 6->16->6 with sigmoid output
+    let model = nn_sequential([
+        nn_linear(6, 16), nn_relu(),
+        nn_linear(16, 6), nn_sigmoid()
+    ])
+
+    // Duplicate training data for better learning (24 samples)
+    var data = []
+    var labels = []
+    let inputs = [
+        [1.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0, 0.0, 0.0, 0.0],
+        [0.0, 0.0, 1.0, 0.0, 0.0, 0.0],
+        [0.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+        [0.0, 0.0, 0.0, 0.0, 1.0, 0.0],
+        [0.0, 0.0, 0.0, 0.0, 0.0, 1.0]
+    ]
+    let tgts = [
+        [0.0, 1.0, 0.0, 0.0, 0.0, 0.0],
+        [0.0, 0.0, 1.0, 0.0, 0.0, 0.0],
+        [1.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        [0.0, 0.0, 0.0, 0.0, 1.0, 0.0],
+        [0.0, 0.0, 0.0, 0.0, 0.0, 1.0],
+        [0.0, 0.0, 0.0, 1.0, 0.0, 0.0]
+    ]
+    for rep in 0..4 {
+        for i in 0..6 {
+            data = push(data, inputs[i])
+            labels = push(labels, tgts[i])
+        }
+    }
+
+    let chars = ["a", "b", "c", "x", "y", "z"]
+    println(format("Training on {} samples for 500 epochs...", to_string(len(data))))
+    println("")
+    let loss = nn_train_verbose(model, data, labels, "adam", 500, 0.01, 100)
+    println("")
+    println(format("Final loss: {}", to_string(loss)))
+
+    // Generate sequences
+    println("")
+    println("--- Generated Sequences (9 chars) ---")
+    for start in 0..6 {
+        var seq = chars[start]
+        var current = inputs[start]
+        for step in 0..8 {
+            let pred = nn_predict(model, current)
+            var best = 0
+            var best_val = pred[0]
+            for k in 1..6 {
+                if pred[k] > best_val {
+                    best = k
+                    best_val = pred[k]
+                }
+            }
+            seq = format("{}{}", seq, chars[best])
+            current = inputs[best]
+        }
+        println(format("  Start '{}': {}", chars[start], seq))
+    }
+
+    // Confidence
+    println("")
+    println("--- Prediction Confidence ---")
+    let expected = [1, 2, 0, 4, 5, 3]
+    var correct = 0
+    for i in 0..6 {
+        let pred = nn_predict(model, inputs[i])
+        var best = 0
+        var best_val = pred[0]
+        for k in 1..6 {
+            if pred[k] > best_val {
+                best = k
+                best_val = pred[k]
+            }
+        }
+        var mark = "MISS"
+        if best == expected[i] {
+            mark = "OK"
+            correct = correct + 1
+        }
+        println(format("  {} -> {} (conf={}) [{}]", chars[i], chars[best], to_string(floor(best_val * 100.0) / 100.0), mark))
+    }
+    println(format("\nAccuracy: {}/6", to_string(correct)))
+}
