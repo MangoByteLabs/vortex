@@ -402,6 +402,7 @@ dependencies = [
  "logos",
  "serde",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]

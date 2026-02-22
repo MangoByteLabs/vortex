@@ -205,6 +205,12 @@ pub struct Env {
     pub(crate) next_prob_layer_id: usize,
     pub(crate) swarms: HashMap<usize, crate::swarm::VortexSwarm>,
     pub(crate) next_swarm_id: usize,
+    pub(crate) novel_memories: HashMap<usize, crate::novel_arch::NeuralMemory>,
+    pub(crate) novel_worlds: HashMap<usize, crate::novel_arch::WorldModel>,
+    pub(crate) novel_reasoners: HashMap<usize, crate::novel_arch::SymbolicReasoner>,
+    pub(crate) novel_workspaces: HashMap<usize, crate::novel_arch::GlobalWorkspace>,
+    pub(crate) novel_continual: HashMap<usize, crate::novel_arch::ContinualLearner>,
+    pub(crate) novel_compositional: HashMap<usize, crate::novel_arch::CompositionalNet>,
     loading_modules: HashSet<PathBuf>,
     loaded_modules: HashSet<PathBuf>,
     pub(crate) nn_models: HashMap<usize, crate::nn::Model>,
@@ -764,6 +770,12 @@ impl Env {
 
         // Distributed runtime builtins
         crate::dist_runtime::register_builtins(self);
+
+        // BigInt engine builtins (U256, batch ops, EC)
+        crate::bigint_engine::register_builtins(self);
+
+        // Huge matrix engine builtins
+        crate::huge_matrix::register_builtins(self);
 
         // Math constants
         self.define("PI", Value::Float(std::f64::consts::PI));
@@ -4500,111 +4512,7 @@ fn builtin_modfield_batch_inv(_env: &mut Env, args: Vec<Value>) -> Result<Value,
     Ok(Value::Array(result.into_iter().map(Value::ModFieldElem).collect()))
 }
 
-// ─── Autograd builtins ─────────────────────────────────────────────────
-
-fn builtin_autograd_new(env: &mut Env, _a: Vec<Value>) -> Result<Value, String> {
-    env.autograd_tape = Some(crate::autograd::Tape::new()); env.autograd_adam = None; Ok(Value::Void)
-}
-fn builtin_autograd_tensor(env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
-    let val = match &args[0] { Value::Float(f) => *f, Value::Int(i) => *i as f64, Value::Array(a) => {
-        match &a[0] { Value::Float(f) => *f, Value::Int(i) => *i as f64, _ => 0.0 }
-    }, _ => 0.0 };
-    let tape = env.autograd_tape.as_mut().ok_or("Call autograd_new() first")?;
-    Ok(Value::Int(tape.var(val) as i128))
-}
-fn builtin_autograd_input(env: &mut Env, args: Vec<Value>) -> Result<Value, String> { builtin_autograd_tensor(env, args) }
-fn builtin_autograd_matmul(env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
-    let a = match &args[0] { Value::Int(i) => *i as usize, _ => return Err("expected int".into()) };
-    let b = match &args[1] { Value::Int(i) => *i as usize, _ => return Err("expected int".into()) };
-    Ok(Value::Int(env.autograd_tape.as_mut().ok_or("no tape")?.mul(a, b) as i128))
-}
-fn builtin_autograd_add(env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
-    let a = match &args[0] { Value::Int(i) => *i as usize, _ => return Err("expected int".into()) };
-    let b = match &args[1] { Value::Int(i) => *i as usize, _ => return Err("expected int".into()) };
-    Ok(Value::Int(env.autograd_tape.as_mut().ok_or("no tape")?.add(a, b) as i128))
-}
-fn builtin_autograd_mul(env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
-    let a = match &args[0] { Value::Int(i) => *i as usize, _ => return Err("expected int".into()) };
-    let b = match &args[1] { Value::Int(i) => *i as usize, _ => return Err("expected int".into()) };
-    Ok(Value::Int(env.autograd_tape.as_mut().ok_or("no tape")?.mul(a, b) as i128))
-}
-fn builtin_autograd_sub(env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
-    let a = match &args[0] { Value::Int(i) => *i as usize, _ => return Err("expected int".into()) };
-    let b = match &args[1] { Value::Int(i) => *i as usize, _ => return Err("expected int".into()) };
-    Ok(Value::Int(env.autograd_tape.as_mut().ok_or("no tape")?.sub(a, b) as i128))
-}
-fn builtin_autograd_div(env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
-    let a = match &args[0] { Value::Int(i) => *i as usize, _ => return Err("expected int".into()) };
-    let b = match &args[1] { Value::Int(i) => *i as usize, _ => return Err("expected int".into()) };
-    Ok(Value::Int(env.autograd_tape.as_mut().ok_or("no tape")?.div(a, b) as i128))
-}
-fn builtin_autograd_relu(env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
-    let a = match &args[0] { Value::Int(i) => *i as usize, _ => return Err("expected int".into()) };
-    let tape = env.autograd_tape.as_mut().ok_or("no tape")?;
-    let v = tape.value(a).max(0.0); Ok(Value::Int(tape.var(v) as i128))
-}
-fn builtin_autograd_sigmoid(env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
-    let a = match &args[0] { Value::Int(i) => *i as usize, _ => return Err("expected int".into()) };
-    let tape = env.autograd_tape.as_mut().ok_or("no tape")?;
-    let v = 1.0 / (1.0 + (-tape.value(a)).exp()); Ok(Value::Int(tape.var(v) as i128))
-}
-fn builtin_autograd_tanh(env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
-    let a = match &args[0] { Value::Int(i) => *i as usize, _ => return Err("expected int".into()) };
-    let tape = env.autograd_tape.as_mut().ok_or("no tape")?;
-    let v = tape.value(a).tanh(); Ok(Value::Int(tape.var(v) as i128))
-}
-fn builtin_autograd_softmax(env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
-    let a = match &args[0] { Value::Int(i) => *i as usize, _ => return Err("expected int".into()) };
-    let tape = env.autograd_tape.as_mut().ok_or("no tape")?;
-    Ok(Value::Int(tape.exp(a) as i128))
-}
-fn builtin_autograd_exp(env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
-    let a = match &args[0] { Value::Int(i) => *i as usize, _ => return Err("expected int".into()) };
-    Ok(Value::Int(env.autograd_tape.as_mut().ok_or("no tape")?.exp(a) as i128))
-}
-fn builtin_autograd_log(env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
-    let a = match &args[0] { Value::Int(i) => *i as usize, _ => return Err("expected int".into()) };
-    Ok(Value::Int(env.autograd_tape.as_mut().ok_or("no tape")?.log(a) as i128))
-}
-fn builtin_autograd_sum(env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
-    let a = match &args[0] { Value::Int(i) => *i as usize, _ => return Err("expected int".into()) };
-    Ok(Value::Float(env.autograd_tape.as_ref().ok_or("no tape")?.value(a)))
-}
-fn builtin_autograd_mean(env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
-    let a = match &args[0] { Value::Int(i) => *i as usize, _ => return Err("expected int".into()) };
-    Ok(Value::Float(env.autograd_tape.as_ref().ok_or("no tape")?.value(a)))
-}
-fn builtin_autograd_mse(env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
-    let a = match &args[0] { Value::Int(i) => *i as usize, _ => return Err("expected int".into()) };
-    let b = match &args[1] { Value::Int(i) => *i as usize, _ => return Err("expected int".into()) };
-    let tape = env.autograd_tape.as_mut().ok_or("no tape")?;
-    let d = tape.sub(a, b); Ok(Value::Int(tape.mul(d, d) as i128))
-}
-fn builtin_autograd_broadcast_add(env: &mut Env, args: Vec<Value>) -> Result<Value, String> { builtin_autograd_add(env, args) }
-fn builtin_autograd_backward(env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
-    let id = match &args[0] { Value::Int(i) => *i as usize, _ => return Err("expected int".into()) };
-    let grads = env.autograd_tape.as_mut().ok_or("no tape")?.backward(id);
-    Ok(Value::Array(grads.into_iter().map(Value::Float).collect()))
-}
-fn builtin_autograd_grad(env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
-    let o = match &args[0] { Value::Int(i) => *i as usize, _ => return Err("expected int".into()) };
-    let i = match &args[1] { Value::Int(i) => *i as usize, _ => return Err("expected int".into()) };
-    Ok(Value::Float(env.autograd_tape.as_ref().ok_or("no tape")?.grad(o, i)))
-}
-fn builtin_autograd_data(env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
-    let id = match &args[0] { Value::Int(i) => *i as usize, _ => return Err("expected int".into()) };
-    Ok(Value::Float(env.autograd_tape.as_ref().ok_or("no tape")?.value(id)))
-}
-fn builtin_autograd_zero_grad(env: &mut Env, _a: Vec<Value>) -> Result<Value, String> {
-    env.autograd_tape = Some(crate::autograd::Tape::new()); Ok(Value::Void)
-}
-fn builtin_autograd_adam_step(env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
-    let lr = match &args[0] { Value::Float(f) => *f, Value::Int(i) => *i as f64, _ => return Err("lr must be numeric".into()) };
-    let ids: Vec<usize> = args[1..].iter().map(|v| match v { Value::Int(i) => Ok(*i as usize), _ => Err("expected int".to_string()) }).collect::<Result<_,_>>()?;
-    let tape = env.autograd_tape.as_mut().ok_or("no tape")?;
-    let adam = env.autograd_adam.get_or_insert_with(|| crate::autograd::AdamOptimizer::new(lr));
-    adam.lr = lr; adam.step(tape, &ids, 0); Ok(Value::Void)
-}
+// Autograd builtins are defined in crate::autograd module
 
 #[cfg(test)]
 mod interpreter_tests {

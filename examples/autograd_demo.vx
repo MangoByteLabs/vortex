@@ -1,0 +1,28 @@
+fn main() {
+    autograd_new()
+
+    let W1 = autograd_tensor([0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8], [2, 4], true)
+    let b1 = autograd_tensor([0.0, 0.0, 0.0, 0.0], [4], true)
+    let W2 = autograd_tensor([0.1, 0.2, 0.3, 0.4], [4, 1], true)
+
+    let x = autograd_input([1.0, 0.5, 0.8, 0.2], [2, 2], false)
+    let target = autograd_input([1.0, 0.0], [2, 1], false)
+
+    let h = autograd_matmul(x, W1)
+    let h2 = autograd_broadcast_add(h, b1)
+    let h3 = autograd_relu(h2)
+    let y = autograd_matmul(h3, W2)
+    let loss = autograd_mse(y, target)
+
+    println("Loss before:")
+    println(autograd_data(loss))
+
+    autograd_backward(loss)
+
+    println("W1 gradient:")
+    println(autograd_grad(W1))
+
+    autograd_adam_step([W1, b1, W2], 0.01)
+
+    println("Training step complete")
+}

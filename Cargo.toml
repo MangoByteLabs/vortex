@@ -17,3 +17,4 @@ lazy_static = "1"
 
 [dev-dependencies]
 insta = "1.39"
+tempfile = "3"
