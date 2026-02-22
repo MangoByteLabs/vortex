@@ -1,0 +1,30 @@
+// Experiment tracking demo: automatically logs metrics, hyperparams, and checkpoints
+fn main() {
+    experiment_new("xor_classifier_v2")
+    experiment_log_param("architecture", "mlp_2_16_8_1")
+    experiment_log_param("optimizer", "adam")
+    experiment_log_param("learning_rate", 0.01)
+
+    let l1 = nn_linear(2, 16)
+    let r1 = nn_relu()
+    let l2 = nn_linear(16, 8)
+    let r2 = nn_relu()
+    let l3 = nn_linear(8, 1)
+    let sig = nn_sigmoid()
+    let model = nn_sequential([l1, r1, l2, r2, l3, sig])
+
+    let data = [[0.0, 0.0], [0.0, 1.0], [1.0, 0.0], [1.0, 1.0]]
+    let labels = [[0.0], [1.0], [1.0], [0.0]]
+
+    let i = 0
+    while i < 50 {
+        let losses = nn_train(model, data, labels, "adam", 1, 0.01)
+        let loss = losses[0]
+        experiment_log_metric(i, "loss", loss)
+        i = i + 1
+    }
+
+    experiment_checkpoint(model)
+    experiment_finish()
+    println("Experiment complete! Run: vortex experiments")
+}
