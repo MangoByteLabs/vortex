@@ -1,0 +1,38 @@
+// Python Interop Example
+// Demonstrates calling Python from Vortex
+
+fn main() {
+    // Check if Python is available
+    let available = py_available()
+    println(to_string(available))
+
+    if available {
+        // Import Python's math module
+        py_import("math", "math")
+        let pi = py_eval("math.pi")
+        println("Python pi: " + to_string(pi))
+
+        // Execute Python statements
+        py_exec("x = [1, 2, 3, 4, 5]")
+        py_exec("result = sum(x)")
+        let total = py_get("result")
+        println("Sum of [1,2,3,4,5] = " + to_string(total))
+
+        // Call a Python function
+        py_exec("def square(n): return n * n")
+        let sq = py_call("square", 7)
+        println("square(7) = " + to_string(sq))
+
+        // Multi-line Python code
+        py_exec("def fibonacci(n):\n    a, b = 0, 1\n    for _ in range(n):\n        a, b = b, a + b\n    return a")
+        let fib10 = py_call("fibonacci", 10)
+        println("fibonacci(10) = " + to_string(fib10))
+
+        // Set and get variables
+        py_set("greeting", "Hello from Vortex!")
+        let msg = py_get("greeting")
+        println("Python says: " + to_string(msg))
+
+        println("Python interop working!")
+    }
+}

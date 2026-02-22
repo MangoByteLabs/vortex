@@ -50,12 +50,14 @@ mod spiking;
 mod ssm;
 mod tiered_experts;
 mod fft;
+mod py_interop;
 mod python_bridge;
 mod runtime;
 mod gpu_pipeline;
 mod gpu_runtime;
 mod server;
 mod shape_check;
+mod shape_checker;
 mod swarm;
 mod typeck;
 mod matrix_of_thought;
@@ -68,12 +70,16 @@ mod debugger;
 mod lsp_server;
 mod package;
 mod nn;
+mod experiment;
+mod model_interop;
 mod tensor_engine;
 mod profiler;
 mod vm;
 mod registry;
 mod gpu_compute;
 mod gpu_exec;
+mod dist_runtime;
+mod jit;
 
 use codespan_reporting::files::SimpleFiles;
 use codespan_reporting::term;
@@ -96,6 +102,35 @@ fn main() {
     // Commands that don't need a file argument
     if command == "toolchain" {
         pipeline::print_toolchain_status();
+        return;
+    }
+
+    if command == "model" {
+        let sub_args: Vec<String> = args[2..].to_vec();
+        if let Err(e) = model_interop::cli_model_command(&sub_args) {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+        return;
+    }
+
+    if command == "experiments" {
+        if args.len() > 2 && args[2] == "show" {
+            if args.len() < 4 {
+                eprintln!("Usage: vortex experiments show <id>");
+                std::process::exit(1);
+            }
+            experiment::cli_show_experiment(&args[3], None);
+        } else if args.len() > 2 && args[2] == "compare" {
+            let ids: Vec<String> = args[3..].to_vec();
+            if ids.is_empty() {
+                eprintln!("Usage: vortex experiments compare <id1> <id2> ...");
+                std::process::exit(1);
+            }
+            experiment::cli_compare_experiments(&ids, None);
+        } else {
+            experiment::cli_list_experiments(None);
+        }
         return;
     }
 
@@ -373,6 +408,15 @@ fn main() {
                     match typeck::check(&program, file_id) {
                     Ok(()) => {
                         println!("Type check passed.");
+                        match shape_checker::check_shapes(&program) {
+                            Ok(()) => println!("Shape check passed."),
+                            Err(errors) => {
+                                for err in &errors {
+                                    eprintln!("{}", err);
+                                }
+                                std::process::exit(1);
+                            }
+                        }
                     }
                     Err(diagnostics) => {
                         for diag in &diagnostics {
@@ -693,9 +737,28 @@ fn main() {
                 }
             }
         }
+        "dist" => {
+            // dist run <file.vx> --workers=N
+            if args.len() < 4 || args[2] != "run" {
+                eprintln!("Usage: vortex dist run <file.vx> --workers=N");
+                std::process::exit(1);
+            }
+            let dist_file = &args[3];
+            let mut workers = 4usize;
+            for a in &args[4..] {
+                if let Some(w) = a.strip_prefix("--workers=") {
+                    workers = w.parse().unwrap_or(4);
+                }
+            }
+            println!("Launching {} distributed workers for {}", workers, dist_file);
+            if let Err(e) = dist_runtime::launch_local_workers(dist_file, workers) {
+                eprintln!("Distributed launch error: {}", e);
+                std::process::exit(1);
+            }
+        }
         _ => {
             eprintln!("Unknown command: {}", command);
-            eprintln!("Commands: run, check, parse, lex, codegen, compile, repl, serve, toolchain, bridge, diagnose, symbols, hover, definition, init, add, remove, install, publish, search, update");
+            eprintln!("Commands: run, check, parse, lex, codegen, compile, repl, serve, toolchain, bridge, diagnose, symbols, hover, definition, init, add, remove, install, publish, search, update, dist");
             std::process::exit(1);
         }
     }
