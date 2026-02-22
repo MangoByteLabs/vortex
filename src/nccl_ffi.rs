@@ -659,6 +659,7 @@ mod tests {
         let mut trainer = DataParallelTrainer::new(4, 64, 0.1);
         let r0 = trainer.step();
         // Run 4 more steps
+        #[allow(unused_assignments)]
         let mut last_result = r0;
         for _ in 0..4 {
             last_result = trainer.step();

@@ -471,8 +471,82 @@ fn main() {
         }
         _ => {
             eprintln!("Unknown command: {}", command);
-            eprintln!("Commands: run, check, parse, lex, codegen, compile, serve, toolchain, bridge, diagnose, symbols, hover, definition");
+            eprintln!("Commands: run, check, parse, lex, codegen, compile, repl, serve, toolchain, bridge, diagnose, symbols, hover, definition");
             std::process::exit(1);
         }
+    }
+}
+
+fn run_repl() {
+    use std::io::{self, BufRead, Write};
+    println!("Vortex REPL v0.1.0");
+    println!("Type :help for help, :quit to exit\n");
+    let mut env = interpreter::repl_env();
+    let stdin = io::stdin();
+    let mut buffer = String::new();
+    let mut continuation = false;
+    loop {
+        if continuation { print!("... "); } else { print!("vx> "); }
+        io::stdout().flush().ok();
+        let mut line = String::new();
+        match stdin.lock().read_line(&mut line) {
+            Ok(0) => break,
+            Ok(_) => {}
+            Err(_) => break,
+        }
+        let trimmed = line.trim();
+        if !continuation {
+            match trimmed {
+                ":quit" | ":q" => break,
+                ":help" | ":h" => {
+                    println!("Vortex REPL commands:");
+                    println!("  :quit    Exit the REPL");
+                    println!("  :env     Show defined variables");
+                    println!("  :help    Show this help");
+                    println!("\nEnter expressions, let bindings, or fn/struct definitions.");
+                    continue;
+                }
+                ":env" => {
+                    let vars = interpreter::repl_env_vars(&env);
+                    if vars.is_empty() { println!("(no variables defined)"); }
+                    else { for v in &vars { println!("  {}", v); } }
+                    continue;
+                }
+                "" => continue,
+                _ => {}
+            }
+        }
+        buffer.push_str(&line);
+        let open = buffer.matches('{').count();
+        let close = buffer.matches('}').count();
+        if open > close { continuation = true; continue; }
+        continuation = false;
+        let input = buffer.trim().to_string();
+        buffer.clear();
+        if input.is_empty() { continue; }
+        match interpreter::repl_eval_line(&mut env, &input) {
+            Ok(Some(result)) => println!("{}", result),
+            Ok(None) => {}
+            Err(e) => eprintln!("Error: {}", e),
+        }
+    }
+    println!("Goodbye!");
+}
+
+#[cfg(test)]
+mod repl_tests {
+    #[test]
+    fn test_repl_command_registered() {
+        let args = vec!["vortex".to_string(), "repl".to_string()];
+        assert_eq!(args[1], "repl");
+    }
+
+    #[test]
+    fn test_repl_env_and_eval() {
+        let mut env = crate::interpreter::repl_env();
+        let r = crate::interpreter::repl_eval_line(&mut env, "let x = 42");
+        assert!(r.is_ok());
+        let r = crate::interpreter::repl_eval_line(&mut env, "println(x)");
+        assert!(r.is_ok());
     }
 }

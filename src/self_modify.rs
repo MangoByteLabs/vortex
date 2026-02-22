@@ -750,7 +750,7 @@ mod tests {
         assert!(m.is_some());
         assert!(!searcher.history.is_empty());
         // Rollback should restore
-        let layers_after = model.layers.len();
+        let _layers_after = model.layers.len();
         searcher.rollback(&mut model);
         assert_eq!(model.layers.len(), 2); // original count restored
     }

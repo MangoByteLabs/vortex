@@ -14,8 +14,9 @@ use crate::self_modify;
 use crate::multiscale;
 use crate::tiered_experts;
 use crate::heterogeneous;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
+use std::path::PathBuf;
 
 /// Runtime value in the Vortex interpreter
 #[derive(Debug, Clone)]
@@ -85,7 +86,13 @@ impl fmt::Display for Value {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Value::Int(n) => write!(f, "{}", n),
-            Value::Float(n) => write!(f, "{}", n),
+            Value::Float(n) => {
+                if n.fract() == 0.0 && n.is_finite() {
+                    write!(f, "{:.1}", n)
+                } else {
+                    write!(f, "{}", n)
+                }
+            }
             Value::Bool(b) => write!(f, "{}", b),
             Value::String(s) => write!(f, "{}", s),
             Value::Array(elems) => {
@@ -198,6 +205,8 @@ pub(crate) struct Env {
     pub(crate) next_prob_layer_id: usize,
     pub(crate) swarms: HashMap<usize, crate::swarm::VortexSwarm>,
     pub(crate) next_swarm_id: usize,
+    loading_modules: HashSet<PathBuf>,
+    loaded_modules: HashSet<PathBuf>,
 }
 
 #[derive(Clone)]
@@ -248,6 +257,8 @@ impl Env {
             next_prob_layer_id: 0,
             swarms: HashMap::new(),
             next_swarm_id: 0,
+            loading_modules: HashSet::new(),
+            loaded_modules: HashSet::new(),
         };
         env.register_builtins();
         env
@@ -1991,6 +2002,101 @@ fn builtin_g1_scalar_mul(_env: &mut Env, args: Vec<Value>) -> Result<Value, Stri
     Ok(Value::Struct { name: "G1Point".to_string(), fields })
 }
 
+// --- Module import resolution ---
+
+fn resolve_module_path(path: &[Ident]) -> Result<PathBuf, String> {
+    let path_str: Vec<&str> = path.iter().map(|id| id.name.as_str()).collect();
+    let module_name = path_str.join(".");
+    let mut fs_path = PathBuf::new();
+    for segment in &path_str {
+        fs_path.push(segment);
+    }
+    let fs_path_with_ext = fs_path.with_extension("vx");
+    let stdlib_path = PathBuf::from("stdlib").join(&fs_path_with_ext);
+    if stdlib_path.exists() {
+        return Ok(stdlib_path);
+    }
+    if fs_path_with_ext.exists() {
+        return Ok(fs_path_with_ext);
+    }
+    Err(format!("module '{}' not found (looked in {})", module_name, stdlib_path.display()))
+}
+
+fn resolve_import(env: &mut Env, import: &ImportDecl) -> Result<(), String> {
+    let file_path = resolve_module_path(&import.path)?;
+    let canonical = file_path.canonicalize().unwrap_or_else(|_| file_path.clone());
+    if env.loading_modules.contains(&canonical) {
+        return Err(format!("circular import detected: '{}'",
+            import.path.iter().map(|id| id.name.as_str()).collect::<Vec<_>>().join(".")));
+    }
+    if env.loaded_modules.contains(&canonical) {
+        return Ok(());
+    }
+    let source = std::fs::read_to_string(&file_path)
+        .map_err(|e| format!("failed to read module '{}': {}", file_path.display(), e))?;
+    let tokens = crate::lexer::lex(&source);
+    let program = crate::parser::parse(tokens, 0)
+        .map_err(|diags| {
+            let msgs: Vec<String> = diags.iter().map(|d| d.message.clone()).collect();
+            format!("parse errors in module '{}': {}", file_path.display(), msgs.join(", "))
+        })?;
+    env.loading_modules.insert(canonical.clone());
+    let requested: Option<Vec<String>> = match &import.items {
+        ImportItems::Named(items) => Some(items.iter().map(|i| i.name.name.clone()).collect()),
+        ImportItems::Wildcard => None,
+    };
+    for item in &program.items {
+        let item_name = match &item.kind {
+            ItemKind::Function(f) => Some(f.name.name.clone()),
+            ItemKind::Struct(s) => Some(s.name.name.clone()),
+            ItemKind::Enum(e) => Some(e.name.name.clone()),
+            ItemKind::Const(c) => Some(c.name.name.clone()),
+            _ => None,
+        };
+        if let Some(name) = item_name {
+            let should_import = match &requested {
+                Some(names) => names.contains(&name),
+                None => true,
+            };
+            if should_import {
+                let alias = if let ImportItems::Named(items) = &import.items {
+                    items.iter().find(|i| i.name.name == name)
+                        .and_then(|i| i.alias.as_ref().map(|a| a.name.clone()))
+                } else { None };
+                let register_name = alias.unwrap_or(name.clone());
+                match &item.kind {
+                    ItemKind::Function(func) => {
+                        let params: Vec<String> = func.params.iter().map(|p| p.name.name.clone()).collect();
+                        env.functions.insert(register_name, FnDef::User { params, body: func.body.clone() });
+                    }
+                    ItemKind::Struct(s) => {
+                        let field_names: Vec<String> = s.fields.iter().map(|f| f.name.name.clone()).collect();
+                        env.struct_defs.insert(register_name, field_names);
+                    }
+                    ItemKind::Enum(e) => {
+                        for variant in &e.variants {
+                            let vn = variant.name.name.clone();
+                            if let crate::ast::EnumVariantKind::Unit = &variant.kind {
+                                env.define(&vn, Value::EnumVariant {
+                                    enum_name: register_name.clone(), variant: vn.clone(), fields: Vec::new(),
+                                });
+                            }
+                        }
+                    }
+                    ItemKind::Const(c) => {
+                        let val = eval_expr(env, &c.value)?;
+                        env.define(&register_name, val);
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    env.loading_modules.remove(&canonical);
+    env.loaded_modules.insert(canonical);
+    Ok(())
+}
+
 // --- Interpreter entry point ---
 
 pub fn interpret(program: &Program) -> Result<Vec<String>, String> {
@@ -2073,6 +2179,9 @@ pub fn interpret(program: &Program) -> Result<Vec<String>, String> {
                         );
                     }
                 }
+            }
+            ItemKind::Import(import_decl) => {
+                resolve_import(&mut env, import_decl)?;
             }
             _ => {}
         }
@@ -4470,7 +4579,7 @@ mod loop_and_builtin_tests {
     #[test]
     fn test_zero_grad_builtin() {
         let o = rv("fn main() {\nlet t = tape_new()\nlet x = tape_var(t, 3.0)\nlet y = tape_mul(t, x, x)\ntape_backward(t, y)\nlet g1 = tape_grad(t, x)\nzero_grad(t)\nlet g2 = tape_grad(t, x)\nprintln(g1)\nprintln(g2)\n}");
-        assert_eq!(o, vec!["6", "0"]);
+        assert_eq!(o, vec!["6.0", "0.0"]);
     }
 
     #[test]
@@ -4531,7 +4640,7 @@ mod phase1_2_tests {
     #[test]
     fn test_cast_int_to_float() {
         let o = rv("fn main() {\nlet x = 42\nlet y = x as f64\nprintln(y)\n}");
-        assert_eq!(o, vec!["42"]);
+        assert_eq!(o, vec!["42.0"]);
     }
 
     #[test]
@@ -5281,13 +5390,13 @@ mod tensor_ad_tests {
     #[test]
     fn test_tensor_param_creates_tracked() {
         let o = rv("fn main() {\ntensor_tape_new()\nlet w = tensor_param([1.0, 2.0, 3.0, 4.0], [2, 2])\nprintln(tensor_data(w))\n}");
-        assert_eq!(o, vec!["[1, 2, 3, 4]"]);
+        assert_eq!(o, vec!["[1.0, 2.0, 3.0, 4.0]"]);
     }
 
     #[test]
     fn test_tensor_input_creates_untracked() {
         let o = rv("fn main() {\ntensor_tape_new()\nlet x = tensor_input([1.0, 2.0], [1, 2])\nprintln(tensor_data(x))\n}");
-        assert_eq!(o, vec!["[1, 2]"]);
+        assert_eq!(o, vec!["[1.0, 2.0]"]);
     }
 
     #[test]
@@ -5299,7 +5408,7 @@ mod tensor_ad_tests {
     #[test]
     fn test_tensor_backward_produces_gradients() {
         let o = rv("fn main() {\ntensor_tape_new()\nlet w = tensor_param([1.0, 2.0, 3.0, 4.0], [2, 2])\nlet s = tensor_sum(w)\ntensor_backward(s)\nlet g = tensor_grad(w)\nprintln(g)\n}");
-        assert_eq!(o, vec!["[1, 1, 1, 1]"]);
+        assert_eq!(o, vec!["[1.0, 1.0, 1.0, 1.0]"]);
     }
 
     #[test]
@@ -5311,7 +5420,7 @@ mod tensor_ad_tests {
     #[test]
     fn test_tensor_zero_grad_resets() {
         let o = rv("fn main() {\ntensor_tape_new()\nlet w = tensor_param([1.0, 2.0], [1, 2])\nlet s = tensor_sum(w)\ntensor_backward(s)\ntensor_zero_grad([w])\nlet g = tensor_grad(w)\nprintln(g)\n}");
-        assert_eq!(o, vec!["[0, 0]"]);
+        assert_eq!(o, vec!["[0.0, 0.0]"]);
     }
 
     #[test]
@@ -5550,18 +5659,18 @@ mod math_builtin_tests {
     fn rv(s: &str) -> Vec<String> { let t = lexer::lex(s); let p = parser::parse(t, 0).unwrap(); interpret(&p).unwrap() }
 
     #[test]
-    fn test_sqrt() { assert_eq!(rv("fn main() { println(sqrt(9)) }"), vec!["3"]); }
+    fn test_sqrt() { assert_eq!(rv("fn main() { println(sqrt(9)) }"), vec!["3.0"]); }
 
     #[test]
     fn test_sin_cos() {
-        assert_eq!(rv("fn main() { println(sin(0)) }"), vec!["0"]);
-        assert_eq!(rv("fn main() { println(cos(0)) }"), vec!["1"]);
+        assert_eq!(rv("fn main() { println(sin(0)) }"), vec!["0.0"]);
+        assert_eq!(rv("fn main() { println(cos(0)) }"), vec!["1.0"]);
     }
 
     #[test]
     fn test_exp_log() {
-        assert_eq!(rv("fn main() { println(exp(0)) }"), vec!["1"]);
-        assert_eq!(rv("fn main() { println(log(1)) }"), vec!["0"]);
+        assert_eq!(rv("fn main() { println(exp(0)) }"), vec!["1.0"]);
+        assert_eq!(rv("fn main() { println(log(1)) }"), vec!["0.0"]);
     }
 
     #[test]
@@ -5577,9 +5686,9 @@ mod math_builtin_tests {
 
     #[test]
     fn test_floor_ceil_round() {
-        assert_eq!(rv("fn main() { println(floor(3.7)) }"), vec!["3"]);
-        assert_eq!(rv("fn main() { println(ceil(3.2)) }"), vec!["4"]);
-        assert_eq!(rv("fn main() { println(round(3.5)) }"), vec!["4"]);
+        assert_eq!(rv("fn main() { println(floor(3.7)) }"), vec!["3.0"]);
+        assert_eq!(rv("fn main() { println(ceil(3.2)) }"), vec!["4.0"]);
+        assert_eq!(rv("fn main() { println(round(3.5)) }"), vec!["4.0"]);
     }
 
     #[test]
@@ -5631,13 +5740,13 @@ mod math_builtin_tests {
 
     #[test]
     fn test_log2_log10() {
-        assert_eq!(rv("fn main() { println(log2(8)) }"), vec!["3"]);
-        assert_eq!(rv("fn main() { println(log10(1000)) }"), vec!["3"]);
+        assert_eq!(rv("fn main() { println(log2(8)) }"), vec!["3.0"]);
+        assert_eq!(rv("fn main() { println(log10(1000)) }"), vec!["3.0"]);
     }
 
     #[test]
     fn test_tan() {
-        assert_eq!(rv("fn main() { println(tan(0)) }"), vec!["0"]);
+        assert_eq!(rv("fn main() { println(tan(0)) }"), vec!["0.0"]);
     }
 }
 
@@ -5690,7 +5799,7 @@ mod import_tests {
         let tokens = lexer::lex(src);
         let program = parser::parse(tokens, 0).unwrap();
         let output = interpret(&program).unwrap();
-        assert_eq!(output, vec!["5", "0"]);
+        assert_eq!(output, vec!["5.0", "0.0"]);
     }
 
     #[test]

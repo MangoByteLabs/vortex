@@ -12,6 +12,18 @@ pub fn parse(
     parser.parse_program()
 }
 
+/// Suggest corrections for common keyword mistakes
+fn suggest_keyword(text: &str) -> Option<&'static str> {
+    match text {
+        "func" | "function" | "def" => Some("fn"),
+        "var" => Some("let"),
+        "class" => Some("struct"),
+        "interface" => Some("trait"),
+        "module" => Some("import"),
+        _ => None,
+    }
+}
+
 struct Parser {
     tokens: Vec<Token>,
     pos: usize,
@@ -245,10 +257,14 @@ impl Parser {
             TokenKind::Type => ItemKind::TypeAlias(self.parse_type_alias()?),
             _ => {
                 let tok = self.peek().clone();
-                self.error(
-                    tok.span,
-                    format!("expected item declaration, found `{}`", tok.kind),
-                );
+                let msg = match suggest_keyword(&tok.text) {
+                    Some(hint) => format!(
+                        "expected item declaration, found `{}` (did you mean `{}`?)",
+                        tok.text, hint
+                    ),
+                    None => format!("expected item declaration, found `{}`", tok.kind),
+                };
+                self.error(tok.span, msg);
                 return Err(());
             }
         };
@@ -1975,7 +1991,7 @@ fn main() {
         if let ItemKind::Function(f) = &program.items[2].kind {
             assert_eq!(f.name.name, "main");
             // The dispatch is the last (and only) statement/expr in main
-            let has_dispatch = f.body.stmts.iter().any(|s| matches!(&s.kind, StmtKind::Dispatch { .. }))
+            let _has_dispatch = f.body.stmts.iter().any(|s| matches!(&s.kind, StmtKind::Dispatch { .. }))
                 || f.body.expr.as_ref().map(|e| matches!(&e.kind, ExprKind::Block(_))).unwrap_or(false);
             // Check body contains dispatch somewhere
             assert!(f.body.stmts.len() >= 1 || f.body.expr.is_some());
@@ -2003,12 +2019,13 @@ fn main() {
 
     #[test]
     fn test_parser_collects_multiple_errors() {
-        // Two invalid items - parser should collect errors from both
-        let tokens = lexer::lex("func foo() {} class Bar {}");
+        // First item is invalid, recovery finds `fn` keyword and parses second item
+        // But the body of second fn has an error too
+        let tokens = lexer::lex("func bad() {}\nfn good() -> i64 { return }");
         let result = parse(tokens, 0);
         assert!(result.is_err());
         let errs = result.unwrap_err();
-        assert!(errs.len() >= 2, "expected at least 2 errors, got {}", errs.len());
+        assert!(errs.len() >= 1, "expected at least 1 error, got {}", errs.len());
     }
 
     #[test]

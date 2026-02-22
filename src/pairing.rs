@@ -879,7 +879,7 @@ mod tests {
     #[test]
     fn test_pairing_identity() {
         // e(O, Q) = 1 and e(P, O) = 1
-        let fp = bn254_field_prime();
+        let _fp = bn254_field_prime();
         let p_id = G1Point::identity();
         let q = G2Point::generator();
         assert!(pairing(&p_id, &q).is_one());

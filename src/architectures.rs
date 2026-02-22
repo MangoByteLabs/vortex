@@ -622,7 +622,7 @@ mod tests {
         let mut layer = ForwardForwardLayer::new(16, 16, 0.1);
         let x: Vec<f64> = (0..16).map(|i| 0.5 + 0.1 * i as f64).collect();
         let initial_out = layer.forward(&x);
-        let initial_goodness = ForwardForwardLayer::goodness(&initial_out);
+        let _initial_goodness = ForwardForwardLayer::goodness(&initial_out);
 
         for _ in 0..10 {
             layer.forward_learn(&x, true);

@@ -713,7 +713,7 @@ mod tests {
         let mut witness = vec![1.0];
         witness.extend_from_slice(&vals);
 
-        let proof = prove(&r1cs, &witness).unwrap();
+        let _proof = prove(&r1cs, &witness).unwrap();
 
         // Tampered witness should fail to produce a valid proof
         let mut bad_witness = witness.clone();

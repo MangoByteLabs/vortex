@@ -216,7 +216,7 @@ mod tests {
         let w_h = vec![0.0, 0.0, 0.0, 0.0]; // no recurrence for simpler test
         let w_x = vec![0.5, -0.3];
         let tau = vec![1.0, 1.0];
-        let dt = 0.01;
+        let _dt = 0.01;
         let steps = 100; // total time = 1.0
 
         // Euler integration of liquid cell

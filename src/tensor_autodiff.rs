@@ -980,7 +980,7 @@ mod tests {
     fn numerical_grad(
         tape_fn: &dyn Fn(&mut TensorTape, &[Vec<f64>]) -> (usize, Vec<usize>),
         param_data: &[Vec<f64>],
-        param_shapes: &[Vec<usize>],
+        _param_shapes: &[Vec<usize>],
         eps: f64,
     ) -> Vec<Vec<f64>> {
         let mut grads = Vec::new();
@@ -1193,7 +1193,7 @@ mod tests {
             let w2 = tape.new_tensor(w2_data.clone(), vec![4, 1], true);
             let b2 = tape.new_tensor(b2_data.clone(), vec![1, 1], true);
 
-            let mut total_loss_val = 0.0;
+            let _total_loss_val = 0.0;
             let mut loss_ids = Vec::new();
 
             for (inp, &tgt) in inputs.iter().zip(targets.iter()) {
