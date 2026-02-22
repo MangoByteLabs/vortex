@@ -66,7 +66,9 @@ mod verifiable_inference;
 mod prob_types;
 mod debugger;
 mod lsp_server;
+mod package;
 mod profiler;
+mod registry;
 
 use codespan_reporting::files::SimpleFiles;
 use codespan_reporting::term;
@@ -112,6 +114,190 @@ fn main() {
 
     if command == "repl" {
         run_repl();
+        return;
+    }
+
+    if command == "init" {
+        let name = if args.len() > 2 { args[2].clone() } else {
+            std::env::current_dir().ok()
+                .and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
+                .unwrap_or_else(|| "my-project".to_string())
+        };
+        let path = PathBuf::from("vortex.toml");
+        if path.exists() {
+            eprintln!("vortex.toml already exists");
+            std::process::exit(1);
+        }
+        let content = package::generate_manifest(&name);
+        fs::write(&path, &content).expect("failed to write vortex.toml");
+        println!("Created vortex.toml for '{}'", name);
+        return;
+    }
+
+    if command == "add" {
+        if args.len() < 3 {
+            eprintln!("Usage: vortex add <package> [version]");
+            std::process::exit(1);
+        }
+        let pkg_name = &args[2];
+        let version = if args.len() > 3 { args[3].clone() } else { "^0.1".to_string() };
+        let path = PathBuf::from("vortex.toml");
+        if !path.exists() {
+            eprintln!("No vortex.toml found. Run `vortex init` first.");
+            std::process::exit(1);
+        }
+        let content = fs::read_to_string(&path).expect("failed to read vortex.toml");
+        let updated = registry::add_dependency_to_manifest(&content, pkg_name, &version);
+        fs::write(&path, &updated).expect("failed to write vortex.toml");
+        println!("Added {} = \"{}\" to dependencies", pkg_name, version);
+        return;
+    }
+
+    if command == "remove" {
+        if args.len() < 3 {
+            eprintln!("Usage: vortex remove <package>");
+            std::process::exit(1);
+        }
+        let pkg_name = &args[2];
+        let path = PathBuf::from("vortex.toml");
+        if !path.exists() {
+            eprintln!("No vortex.toml found.");
+            std::process::exit(1);
+        }
+        let content = fs::read_to_string(&path).expect("failed to read vortex.toml");
+        match registry::remove_dependency_from_manifest(&content, pkg_name) {
+            Ok(updated) => {
+                fs::write(&path, &updated).expect("failed to write vortex.toml");
+                println!("Removed '{}' from dependencies", pkg_name);
+            }
+            Err(e) => {
+                eprintln!("Error: {}", e);
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
+
+    if command == "install" {
+        let path = PathBuf::from("vortex.toml");
+        if !path.exists() {
+            eprintln!("No vortex.toml found.");
+            std::process::exit(1);
+        }
+        let content = fs::read_to_string(&path).expect("failed to read vortex.toml");
+        let manifest = package::parse_manifest(&content).unwrap_or_else(|e| {
+            eprintln!("Error parsing vortex.toml: {}", e);
+            std::process::exit(1);
+        });
+        let reg = registry::Registry::new();
+        match registry::resolve_dependencies(&manifest.dependencies, &reg) {
+            Ok(lock) => {
+                let lock_content = lock.to_string();
+                fs::write("vortex.lock", &lock_content).expect("failed to write vortex.lock");
+                println!("Resolved {} dependencies", lock.packages.len());
+                for dep in &lock.packages {
+                    println!("  {} v{} ({})", dep.name, dep.version, dep.source);
+                }
+                // Download packages
+                for dep in &lock.packages {
+                    if dep.source.starts_with("git=") {
+                        let url = &dep.source[4..];
+                        let resolver = package::PackageResolver::new();
+                        if let Err(e) = resolver.install_package(url) {
+                            eprintln!("Warning: failed to install {}: {}", dep.name, e);
+                        }
+                    }
+                }
+                println!("Done.");
+            }
+            Err(e) => {
+                eprintln!("Error resolving dependencies: {}", e);
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
+
+    if command == "publish" {
+        let path = PathBuf::from("vortex.toml");
+        if !path.exists() {
+            eprintln!("No vortex.toml found.");
+            std::process::exit(1);
+        }
+        let content = fs::read_to_string(&path).expect("failed to read vortex.toml");
+        let manifest = package::parse_manifest(&content).unwrap_or_else(|e| {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        });
+        let reg = registry::Registry::new();
+        let meta = registry::PackageMeta {
+            name: manifest.name.clone(),
+            version: manifest.version.clone(),
+            description: manifest.description.clone(),
+            ..Default::default()
+        };
+        match reg.publish(&meta) {
+            Ok(()) => println!("Published {} v{}", manifest.name, manifest.version),
+            Err(e) => {
+                eprintln!("Publish error: {}", e);
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
+
+    if command == "search" {
+        if args.len() < 3 {
+            eprintln!("Usage: vortex search <query>");
+            std::process::exit(1);
+        }
+        let query = &args[2];
+        let reg = registry::Registry::new();
+        match reg.search(query) {
+            Ok(results) => {
+                if results.is_empty() {
+                    println!("No packages found for '{}'", query);
+                } else {
+                    for meta in &results {
+                        println!("{} v{} — {}", meta.name, meta.version, meta.description);
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("Search error: {}", e);
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
+
+    if command == "update" {
+        let path = PathBuf::from("vortex.toml");
+        if !path.exists() {
+            eprintln!("No vortex.toml found.");
+            std::process::exit(1);
+        }
+        let content = fs::read_to_string(&path).expect("failed to read vortex.toml");
+        let manifest = package::parse_manifest(&content).unwrap_or_else(|e| {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        });
+        let reg = registry::Registry::new();
+        // Remove existing lock file to force re-resolution
+        let _ = fs::remove_file("vortex.lock");
+        match registry::resolve_dependencies(&manifest.dependencies, &reg) {
+            Ok(lock) => {
+                fs::write("vortex.lock", lock.to_string()).expect("failed to write vortex.lock");
+                println!("Updated {} dependencies", lock.packages.len());
+                for dep in &lock.packages {
+                    println!("  {} v{}", dep.name, dep.version);
+                }
+            }
+            Err(e) => {
+                eprintln!("Error: {}", e);
+                std::process::exit(1);
+            }
+        }
         return;
     }
 
@@ -471,7 +657,7 @@ fn main() {
         }
         _ => {
             eprintln!("Unknown command: {}", command);
-            eprintln!("Commands: run, check, parse, lex, codegen, compile, repl, serve, toolchain, bridge, diagnose, symbols, hover, definition");
+            eprintln!("Commands: run, check, parse, lex, codegen, compile, repl, serve, toolchain, bridge, diagnose, symbols, hover, definition, init, add, remove, install, publish, search, update");
             std::process::exit(1);
         }
     }

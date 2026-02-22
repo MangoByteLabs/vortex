@@ -1,0 +1,8 @@
+[package]
+name = "crypto"
+version = "0.1.0"
+description = "Cryptographic primitives for Vortex"
+entry_point = "src/lib.vx"
+
+[dependencies]
+math = { path = "../math" }

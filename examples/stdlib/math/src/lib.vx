@@ -1,0 +1,40 @@
+pub fn abs(x: i64) -> i64 {
+    if x < 0 { return 0 - x }
+    return x
+}
+
+pub fn max(a: i64, b: i64) -> i64 {
+    if a > b { return a }
+    return b
+}
+
+pub fn min(a: i64, b: i64) -> i64 {
+    if a < b { return a }
+    return b
+}
+
+pub fn clamp(x: i64, lo: i64, hi: i64) -> i64 {
+    if x < lo { return lo }
+    if x > hi { return hi }
+    return x
+}
+
+pub fn pow(base: i64, exp: i64) -> i64 {
+    let result = 1
+    let i = 0
+    while i < exp {
+        let result = result * base
+        let i = i + 1
+    }
+    return result
+}
+
+pub fn factorial(n: i64) -> i64 {
+    if n <= 1 { return 1 }
+    return n * factorial(n - 1)
+}
+
+pub fn gcd(a: i64, b: i64) -> i64 {
+    if b == 0 { return a }
+    return gcd(b, a - (a / b) * b)
+}
