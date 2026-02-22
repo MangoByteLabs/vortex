@@ -15,6 +15,7 @@ mod nccl_ffi;
 mod ctcheck;
 mod ct_verify;
 mod flash_attention;
+mod formal_verify;
 mod fusion;
 mod heterogeneous;
 pub mod crypto;

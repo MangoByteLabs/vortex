@@ -654,6 +654,9 @@ impl Env {
 
         // Multi-backend compilation builtins
         crate::backends::register_builtins(self);
+
+        // Formal verification builtins
+        crate::formal_verify::register_builtins(self);
     }
 }
 
