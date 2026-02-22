@@ -67,8 +67,11 @@ mod prob_types;
 mod debugger;
 mod lsp_server;
 mod package;
+mod nn;
 mod profiler;
+mod vm;
 mod registry;
+mod gpu_compute;
 
 use codespan_reporting::files::SimpleFiles;
 use codespan_reporting::term;
@@ -495,6 +498,39 @@ fn main() {
                         Ok(_output) => {}
                         Err(e) => {
                             eprintln!("Runtime error: {}", e);
+                            std::process::exit(1);
+                        }
+                    }
+                }
+                Err(diagnostics) => {
+                    for diag in &diagnostics {
+                        term::emit(&mut writer.lock(), &config, &files, diag).unwrap();
+                    }
+                    std::process::exit(1);
+                }
+            }
+        }
+        "vm" => {
+            let tokens = lexer::lex(&source);
+            match parser::parse(tokens, file_id) {
+                Ok(program) => {
+                    let file_dir = PathBuf::from(filename)
+                        .parent()
+                        .map(|p| p.to_path_buf())
+                        .unwrap_or_else(|| PathBuf::from("."));
+                    let mut resolver = module::ModuleResolver::new(file_dir);
+                    let program = match resolver.resolve_imports(&program) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            eprintln!("Import error: {}", e);
+                            std::process::exit(1);
+                        }
+                    };
+
+                    match vm::vm_run(&program) {
+                        Ok(_output) => {}
+                        Err(e) => {
+                            eprintln!("VM runtime error: {}", e);
                             std::process::exit(1);
                         }
                     }

@@ -1,0 +1,14 @@
+fn main() {
+    println("Training CNN on synthetic MNIST-like data...")
+    let conv = nn_conv2d(1, 4, 3)
+    let fc = nn_linear(4, 10)
+    let model = nn_sequential([conv, fc])
+
+    println("Model created. Running forward pass on synthetic 8x8 image...")
+    let input = tensor_randn_nn([1, 8, 8])
+    let output = nn_forward(model, input)
+    println("Output:")
+    println(output)
+
+    println("CNN forward pass complete.")
+}

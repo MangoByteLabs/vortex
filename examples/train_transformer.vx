@@ -1,0 +1,8 @@
+fn main() {
+    println("Building transformer...")
+    let model = nn_transformer(64, 4, 256, 2)
+    let input = tensor_randn_nn([1, 10, 64])
+    let output = nn_forward(model, input)
+    println("Output shape:")
+    println(output)
+}

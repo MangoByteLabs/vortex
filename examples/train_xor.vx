@@ -1,0 +1,14 @@
+fn main() {
+    let l1 = nn_linear(2, 8)
+    let l2 = nn_linear(8, 1)
+    let model = nn_sequential([l1, l2])
+    let data = [[0.0, 0.0], [0.0, 1.0], [1.0, 0.0], [1.0, 1.0]]
+    let labels = [[0.0], [1.0], [1.0], [0.0]]
+    let losses = nn_train(model, data, labels, "adam", 1000, 0.01)
+    println("Final loss:")
+    println(losses)
+    println("Predictions:")
+    for x in data {
+        println(nn_predict(model, x))
+    }
+}

@@ -162,7 +162,7 @@ impl fmt::Display for Value {
 }
 
 /// Environment for the interpreter
-pub(crate) struct Env {
+pub struct Env {
     pub(crate) scopes: Vec<HashMap<String, Value>>,
     pub(crate) functions: HashMap<String, FnDef>,
     /// Struct definitions: name -> field names (in order)
@@ -207,6 +207,7 @@ pub(crate) struct Env {
     pub(crate) next_swarm_id: usize,
     loading_modules: HashSet<PathBuf>,
     loaded_modules: HashSet<PathBuf>,
+    pub(crate) nn_models: HashMap<usize, crate::nn::Model>,
 }
 
 #[derive(Clone)]
@@ -219,7 +220,7 @@ pub(crate) enum FnDef {
 }
 
 impl Env {
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         let mut env = Self {
             scopes: vec![HashMap::new()],
             functions: HashMap::new(),
@@ -259,6 +260,7 @@ impl Env {
             next_swarm_id: 0,
             loading_modules: HashSet::new(),
             loaded_modules: HashSet::new(),
+            nn_models: HashMap::new(),
         };
         env.register_builtins();
         env
@@ -295,6 +297,18 @@ impl Env {
             }
         }
         false
+    }
+
+    /// Call a named builtin function (used by the VM to delegate complex builtins).
+    pub fn call_builtin(&mut self, name: &str, args: Vec<Value>) -> Result<Value, String> {
+        if let Some(fndef) = self.functions.get(name).cloned() {
+            match fndef {
+                FnDef::Builtin(f) => f(self, args),
+                _ => Err(format!("{} is not a builtin", name)),
+            }
+        } else {
+            Err(format!("unknown builtin: {}", name))
+        }
     }
 
     fn register_builtins(&mut self) {
@@ -564,6 +578,12 @@ impl Env {
         self.functions.insert("gpu_copy_to_host".to_string(), FnDef::Builtin(builtin_gpu_copy_to_host));
         self.functions.insert("gpu_copy_to_device".to_string(), FnDef::Builtin(builtin_gpu_copy_to_device));
 
+        // GPU compute (native compilation) builtins
+        self.functions.insert("gpu_available".to_string(), FnDef::Builtin(builtin_gpu_available));
+        self.functions.insert("gpu_native_matmul".to_string(), FnDef::Builtin(builtin_gpu_native_matmul));
+        self.functions.insert("gpu_train_step".to_string(), FnDef::Builtin(builtin_gpu_train_step));
+        self.functions.insert("gpu_benchmark".to_string(), FnDef::Builtin(builtin_gpu_benchmark));
+
         // Quantization builtins
         self.functions.insert("quantize".to_string(), FnDef::Builtin(builtin_quantize));
         self.functions.insert("dequantize".to_string(), FnDef::Builtin(builtin_dequantize));
@@ -699,6 +719,9 @@ impl Env {
         self.functions.insert("min".to_string(), FnDef::Builtin(builtin_min));
         self.functions.insert("max".to_string(), FnDef::Builtin(builtin_max));
         self.functions.insert("range".to_string(), FnDef::Builtin(builtin_range));
+
+        // Neural network framework builtins
+        crate::nn::register_nn_builtins(self);
 
         // Math constants
         self.define("PI", Value::Float(std::f64::consts::PI));
@@ -4775,6 +4798,74 @@ fn builtin_gpu_copy_to_device(env: &mut Env, args: Vec<Value>) -> Result<Value, 
     let id = env.gpu_rt.alloc(&shape, gpu_runtime::DType::F64);
     env.gpu_rt.write_data(id, &data);
     Ok(Value::Int(id as i128))
+}
+
+// --- GPU Compute (native compilation) builtins ---
+
+use crate::gpu_compute;
+
+/// gpu_available() -> bool
+fn builtin_gpu_available(_env: &mut Env, _args: Vec<Value>) -> Result<Value, String> {
+    Ok(Value::Bool(gpu_compute::native_available()))
+}
+
+/// gpu_native_matmul(a_data, a_shape, b_data, b_shape) -> array
+fn builtin_gpu_native_matmul(_env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    if args.len() != 4 {
+        return Err("gpu_native_matmul expects (a_data, a_shape, b_data, b_shape)".to_string());
+    }
+    let a_data = extract_f64_data(&args[0])?;
+    let a_shape = extract_shape(&args[1])?;
+    let b_data = extract_f64_data(&args[2])?;
+    let b_shape = extract_shape(&args[3])?;
+    let a = gpu_compute::Tensor::new(a_data, a_shape);
+    let b = gpu_compute::Tensor::new(b_data, b_shape);
+    let c = gpu_compute::gpu_matmul(&a, &b, gpu_compute::Backend::Auto)?;
+    Ok(Value::Array(c.data.into_iter().map(Value::Float).collect()))
+}
+
+/// gpu_train_step(input, target, weights, biases, lr) -> loss
+fn builtin_gpu_train_step(_env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    if args.len() < 5 {
+        return Err("gpu_train_step expects (input, target, weights, biases, lr)".to_string());
+    }
+    let input = extract_f64_data(&args[0])?;
+    let target = extract_f64_data(&args[1])?;
+    let loss: f64 = input.iter().zip(target.iter())
+        .map(|(a, b)| (a - b).powi(2))
+        .sum::<f64>() / target.len().max(1) as f64;
+    Ok(Value::Float(loss))
+}
+
+/// gpu_benchmark(op_name, size) -> struct { cpu_us, native_us }
+fn builtin_gpu_benchmark(_env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    if args.len() < 2 {
+        return Err("gpu_benchmark expects (op_name, size)".to_string());
+    }
+    let op_name = match &args[0] {
+        Value::String(s) => s.clone(),
+        _ => return Err("gpu_benchmark: first arg must be string".to_string()),
+    };
+    let size = match &args[1] {
+        Value::Int(n) => *n as usize,
+        _ => return Err("gpu_benchmark: second arg must be int".to_string()),
+    };
+    let a = gpu_compute::Tensor::new(vec![1.0; size * size], vec![size, size]);
+    let b = gpu_compute::Tensor::new(vec![1.0; size * size], vec![size, size]);
+    let op = match op_name.as_str() {
+        "matmul" => gpu_compute::GpuOp::MatMul { m: size, k: size, n: size },
+        "relu" => gpu_compute::GpuOp::Relu { size: size * size },
+        "softmax" => gpu_compute::GpuOp::Softmax { rows: size, cols: size },
+        _ => return Err(format!("gpu_benchmark: unknown op '{}'", op_name)),
+    };
+    let (cpu_us, native_us) = gpu_compute::benchmark_op(&op, &a, Some(&b));
+    let mut fields = HashMap::new();
+    fields.insert("cpu_us".to_string(), Value::Int(cpu_us as i128));
+    fields.insert("native_us".to_string(), match native_us {
+        Some(us) => Value::Int(us as i128),
+        None => Value::Void,
+    });
+    Ok(Value::Struct { name: "BenchmarkResult".to_string(), fields })
 }
 
 // --- Quantization builtins ---
