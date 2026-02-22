@@ -213,6 +213,8 @@ pub struct Env {
     /// AST of @gpu annotated functions for JIT compilation
     gpu_functions: HashMap<String, crate::ast::Function>,
     pub(crate) experiment_manager: Option<crate::experiment::ExperimentManager>,
+    pub(crate) autograd_tape: Option<crate::autograd::Tape>,
+    pub(crate) autograd_adam: Option<crate::autograd::AdamOptimizer>,
 }
 
 #[derive(Clone)]
@@ -269,6 +271,8 @@ impl Env {
             jit_engine: crate::jit::JitEngine::new(),
             gpu_functions: HashMap::new(),
             experiment_manager: None,
+            autograd_tape: None,
+            autograd_adam: None,
         };
         env.register_builtins();
         env
@@ -626,7 +630,8 @@ impl Env {
         self.functions.insert("tensor_adam".to_string(), FnDef::Builtin(builtin_tensor_adam));
         self.functions.insert("tensor_zero_grad".to_string(), FnDef::Builtin(builtin_tensor_zero_grad));
 
-        // Autograd builtins - placeholder (registered externally when available)
+        // autograd builtins (TODO: implement)
+        // self.functions.insert("autograd_new".into(), FnDef::Builtin(builtin_autograd_new));
 
         // SpikeSSMFormer architecture builtins
         self.functions.insert("spike_ssm_new".to_string(), FnDef::Builtin(builtin_spike_ssm_new));
@@ -732,7 +737,8 @@ impl Env {
 
         // Neural network framework builtins
         crate::nn::register_nn_builtins(self);
-        // Model interop and experiment builtins - registered externally when available
+        // Model interop builtins
+        crate::model_interop::register_model_interop_builtins(self);
 
         // Distributed runtime builtins
         crate::dist_runtime::register_builtins(self);
@@ -5978,27 +5984,3 @@ mod import_tests {
         assert_eq!(output, vec!["2.5"]);
     }
 }
-fn get_autograd_tape(env: &mut Env) -> Result<&mut crate::autograd::Tape, String> { env.autograd_tape.as_mut().ok_or_else(|| "No autograd tape. Call autograd_new() first.".into()) }
-fn builtin_autograd_new(env: &mut Env, _a: Vec<Value>) -> Result<Value, String> { env.autograd_tape = Some(crate::autograd::Tape::new()); env.autograd_adam = None; Ok(Value::Void) }
-fn builtin_autograd_tensor(env: &mut Env, args: Vec<Value>) -> Result<Value, String> { if args.len() < 2 || args.len() > 3 { return Err("autograd_tensor: (data, shape, [rg])".into()); } let data = flatten_value_to_f64(&args[0])?; let shape = value_to_usize_vec(&args[1])?; let rg = if args.len() == 3 { match &args[2] { Value::Bool(b) => *b, _ => true } } else { true }; let tape = get_autograd_tape(env)?; let id = if rg { tape.parameter(data, shape) } else { tape.input(data, shape) }; Ok(Value::Int(id as i128)) }
-fn builtin_autograd_input(env: &mut Env, args: Vec<Value>) -> Result<Value, String> { if args.len() != 2 { return Err("(data, shape)".into()); } let data = flatten_value_to_f64(&args[0])?; let shape = value_to_usize_vec(&args[1])?; Ok(Value::Int(get_autograd_tape(env)?.input(data, shape) as i128)) }
-fn builtin_autograd_matmul(env: &mut Env, args: Vec<Value>) -> Result<Value, String> { if args.len() != 2 { return Err("2 args".into()); } let (a, b) = (value_to_tensor_id(&args[0])?, value_to_tensor_id(&args[1])?); Ok(Value::Int(get_autograd_tape(env)?.matmul(a, b) as i128)) }
-fn builtin_autograd_add(env: &mut Env, args: Vec<Value>) -> Result<Value, String> { if args.len() != 2 { return Err("2 args".into()); } let (a, b) = (value_to_tensor_id(&args[0])?, value_to_tensor_id(&args[1])?); Ok(Value::Int(get_autograd_tape(env)?.add(a, b) as i128)) }
-fn builtin_autograd_mul(env: &mut Env, args: Vec<Value>) -> Result<Value, String> { if args.len() != 2 { return Err("2 args".into()); } let (a, b) = (value_to_tensor_id(&args[0])?, value_to_tensor_id(&args[1])?); Ok(Value::Int(get_autograd_tape(env)?.mul(a, b) as i128)) }
-fn builtin_autograd_sub(env: &mut Env, args: Vec<Value>) -> Result<Value, String> { if args.len() != 2 { return Err("2 args".into()); } let (a, b) = (value_to_tensor_id(&args[0])?, value_to_tensor_id(&args[1])?); Ok(Value::Int(get_autograd_tape(env)?.sub(a, b) as i128)) }
-fn builtin_autograd_div(env: &mut Env, args: Vec<Value>) -> Result<Value, String> { if args.len() != 2 { return Err("2 args".into()); } let (a, b) = (value_to_tensor_id(&args[0])?, value_to_tensor_id(&args[1])?); Ok(Value::Int(get_autograd_tape(env)?.div(a, b) as i128)) }
-fn builtin_autograd_relu(env: &mut Env, args: Vec<Value>) -> Result<Value, String> { if args.len() != 1 { return Err("1 arg".into()); } Ok(Value::Int(get_autograd_tape(env)?.relu(value_to_tensor_id(&args[0])?) as i128)) }
-fn builtin_autograd_sigmoid(env: &mut Env, args: Vec<Value>) -> Result<Value, String> { if args.len() != 1 { return Err("1 arg".into()); } Ok(Value::Int(get_autograd_tape(env)?.sigmoid(value_to_tensor_id(&args[0])?) as i128)) }
-fn builtin_autograd_tanh(env: &mut Env, args: Vec<Value>) -> Result<Value, String> { if args.len() != 1 { return Err("1 arg".into()); } Ok(Value::Int(get_autograd_tape(env)?.tanh_op(value_to_tensor_id(&args[0])?) as i128)) }
-fn builtin_autograd_softmax(env: &mut Env, args: Vec<Value>) -> Result<Value, String> { if args.len() != 2 { return Err("2 args".into()); } let (a, ax) = (value_to_tensor_id(&args[0])?, value_to_tensor_id(&args[1])?); Ok(Value::Int(get_autograd_tape(env)?.softmax(a, ax) as i128)) }
-fn builtin_autograd_exp(env: &mut Env, args: Vec<Value>) -> Result<Value, String> { if args.len() != 1 { return Err("1 arg".into()); } Ok(Value::Int(get_autograd_tape(env)?.exp(value_to_tensor_id(&args[0])?) as i128)) }
-fn builtin_autograd_log(env: &mut Env, args: Vec<Value>) -> Result<Value, String> { if args.len() != 1 { return Err("1 arg".into()); } Ok(Value::Int(get_autograd_tape(env)?.log(value_to_tensor_id(&args[0])?) as i128)) }
-fn builtin_autograd_sum(env: &mut Env, args: Vec<Value>) -> Result<Value, String> { if args.len() != 1 { return Err("1 arg".into()); } Ok(Value::Int(get_autograd_tape(env)?.sum(value_to_tensor_id(&args[0])?, None) as i128)) }
-fn builtin_autograd_mean(env: &mut Env, args: Vec<Value>) -> Result<Value, String> { if args.len() != 1 { return Err("1 arg".into()); } Ok(Value::Int(get_autograd_tape(env)?.mean(value_to_tensor_id(&args[0])?, None) as i128)) }
-fn builtin_autograd_mse(env: &mut Env, args: Vec<Value>) -> Result<Value, String> { if args.len() != 2 { return Err("2 args".into()); } let (a, b) = (value_to_tensor_id(&args[0])?, value_to_tensor_id(&args[1])?); Ok(Value::Int(get_autograd_tape(env)?.mse(a, b) as i128)) }
-fn builtin_autograd_broadcast_add(env: &mut Env, args: Vec<Value>) -> Result<Value, String> { if args.len() != 2 { return Err("2 args".into()); } let (a, b) = (value_to_tensor_id(&args[0])?, value_to_tensor_id(&args[1])?); Ok(Value::Int(get_autograd_tape(env)?.broadcast_add(a, b) as i128)) }
-fn builtin_autograd_backward(env: &mut Env, args: Vec<Value>) -> Result<Value, String> { if args.len() != 1 { return Err("1 arg".into()); } get_autograd_tape(env)?.backward(value_to_tensor_id(&args[0])?); Ok(Value::Void) }
-fn builtin_autograd_grad(env: &mut Env, args: Vec<Value>) -> Result<Value, String> { if args.len() != 1 { return Err("1 arg".into()); } let n = value_to_tensor_id(&args[0])?; match get_autograd_tape(env)?.get_grad(n) { Some(g) => Ok(Value::Array(g.into_iter().map(Value::Float).collect())), None => Ok(Value::Array(vec![])) } }
-fn builtin_autograd_data(env: &mut Env, args: Vec<Value>) -> Result<Value, String> { if args.len() != 1 { return Err("1 arg".into()); } let d = get_autograd_tape(env)?.get_data(value_to_tensor_id(&args[0])?).to_vec(); Ok(Value::Array(d.into_iter().map(Value::Float).collect())) }
-fn builtin_autograd_zero_grad(env: &mut Env, _a: Vec<Value>) -> Result<Value, String> { get_autograd_tape(env)?.zero_grad(); Ok(Value::Void) }
-fn builtin_autograd_adam_step(env: &mut Env, args: Vec<Value>) -> Result<Value, String> { if args.len() != 2 { return Err("(param_ids, lr)".into()); } let param_ids = value_to_id_array(&args[0])?; let lr = match &args[1] { Value::Float(f) => *f, Value::Int(i) => *i as f64, _ => return Err("lr: number".into()) }; let tape = env.autograd_tape.as_ref().ok_or("No autograd tape")?; let grads: Vec<Vec<f64>> = param_ids.iter().map(|&p| tape.get_grad(p).unwrap_or_else(|| vec![0.0; tape.get_data(p).len()])).collect(); let sizes: Vec<usize> = param_ids.iter().map(|&p| tape.get_data(p).len()).collect(); if env.autograd_adam.is_none() { env.autograd_adam = Some(crate::autograd::AdamOptimizer::new(lr, &sizes)); } let adam = env.autograd_adam.as_mut().unwrap(); adam.lr = lr; let tape = env.autograd_tape.as_mut().unwrap(); adam.step(tape, &param_ids, &grads); Ok(Value::Void) }

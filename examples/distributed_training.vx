@@ -1,0 +1,17 @@
+fn main() {
+    let rank = dist_rank()
+    let world = dist_world_size()
+    println("Worker " + to_string(rank) + "/" + to_string(world))
+
+    let model = nn_sequential([nn_linear(4, 8), nn_relu(), nn_linear(8, 2)])
+
+    let data = [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0], [0.0, 0.0, 0.0, 1.0]]
+    let labels = [[1.0, 0.0], [0.0, 1.0], [1.0, 0.0], [0.0, 1.0]]
+
+    let losses = dist_train(model, data, labels, 100, 0.01)
+
+    if rank == 0 {
+        println("Training complete")
+        println("Final loss: " + to_string(losses))
+    }
+}

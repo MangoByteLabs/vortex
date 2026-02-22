@@ -71,6 +71,16 @@ pub enum Annotation {
     Scan(Option<Vec<(Ident, Expr)>>),
     /// @recurrent - marks for sequential recurrent execution
     Recurrent,
+    /// @gpu - mark for GPU execution
+    Gpu,
+    /// @jit - mark for JIT compilation
+    Jit,
+    /// @distributed - mark for distributed execution
+    Distributed,
+    /// @inline - mark for inlining
+    Inline,
+    /// @custom(name, args) - custom annotation
+    Custom(String, Vec<String>),
 }
 
 /// Struct definition
@@ -588,6 +598,11 @@ impl fmt::Display for Annotation {
             }
             Annotation::Scan(None) => write!(f, "@scan"),
             Annotation::Recurrent => write!(f, "@recurrent"),
+            Annotation::Gpu => write!(f, "@gpu"),
+            Annotation::Jit => write!(f, "@jit"),
+            Annotation::Inline => write!(f, "@inline"),
+            Annotation::Distributed => write!(f, "@distributed"),
+            Annotation::Custom(name, _) => write!(f, "@{}", name),
         }
     }
 }

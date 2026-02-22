@@ -80,6 +80,7 @@ mod gpu_compute;
 mod gpu_exec;
 mod dist_runtime;
 mod jit;
+mod autograd;
 
 use codespan_reporting::files::SimpleFiles;
 use codespan_reporting::term;
