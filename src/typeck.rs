@@ -986,8 +986,24 @@ fn infer_expr(env: &mut TypeEnv, expr: &Expr) -> Type {
         }
 
         ExprKind::StructLiteral { name, fields } => {
-            for (_, fexpr) in fields {
-                infer_expr(env, fexpr);
+            if let Some(def_fields) = env.struct_fields.get(&name.name).cloned() {
+                for (fname, fexpr) in fields {
+                    let val_ty = infer_expr(env, fexpr);
+                    if let Some((_, expected_ty)) = def_fields.iter().find(|(n, _)| n == &fname.name) {
+                        env.unify(expected_ty, &val_ty, fexpr.span);
+                    } else {
+                        env.error(fname.span, format!("struct `{}` has no field `{}`", name.name, fname.name));
+                    }
+                }
+                for (def_name, _) in &def_fields {
+                    if !fields.iter().any(|(f, _)| f.name == *def_name) {
+                        env.error(expr.span, format!("missing field `{}` in struct `{}`", def_name, name.name));
+                    }
+                }
+            } else {
+                for (_, fexpr) in fields {
+                    infer_expr(env, fexpr);
+                }
             }
             Type::Named(name.name.clone())
         }

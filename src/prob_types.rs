@@ -1,7 +1,6 @@
 /// Probabilistic types: distributions, uncertainty propagation, calibration checking,
 /// Bayesian layers, and probabilistic models.
 
-use std::collections::HashMap;
 use crate::interpreter::{Env, FnDef, Value};
 
 // ── Deterministic PRNG ──────────────────────────────────────────────

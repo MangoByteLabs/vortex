@@ -271,10 +271,10 @@ impl PhotonicCompiler {
             .collect();
 
         // Copy matrix into working array
-        let mut a: Vec<Vec<f64>> = matrix.to_vec();
+        let a: Vec<Vec<f64>> = matrix.to_vec();
 
         // Identity V (n x n)
-        let mut v: Vec<Vec<f64>> = (0..n)
+        let v: Vec<Vec<f64>> = (0..n)
             .map(|i| {
                 let mut row = vec![0.0; n];
                 row[i] = 1.0;

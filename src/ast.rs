@@ -1,4 +1,4 @@
-use crate::lexer::Span;
+pub use crate::lexer::Span;
 use std::fmt;
 
 /// A complete Vortex program (one source file)

@@ -2,8 +2,6 @@
 ///
 /// Implements generative modeling via energy functions and contrastive divergence training.
 
-use std::collections::HashMap;
-
 // ── EnergyFunction trait ──────────────────────────────────────────────
 
 pub trait EnergyFunction {

@@ -1526,7 +1526,7 @@ pub fn validate_mlir(mlir: &str) -> Vec<MLIRValidationError> {
     let mut region_stack: Vec<(usize, &str)> = Vec::new(); // (line, kind)
     // Track if each func/kernel region has a terminator
     let mut func_has_terminator = false;
-    let mut in_func = false;
+    let mut _in_func = false;
 
     for (i, line) in lines.iter().enumerate() {
         let trimmed = line.trim();
@@ -1556,11 +1556,11 @@ pub fn validate_mlir(mlir: &str) -> Vec<MLIRValidationError> {
         // Track region opens
         if trimmed.ends_with('{') || trimmed.ends_with("kernel {") {
             let kind = if trimmed.starts_with("func.func") {
-                in_func = true;
+                _in_func = true;
                 func_has_terminator = false;
                 "func"
             } else if trimmed.starts_with("gpu.func") {
-                in_func = true;
+                _in_func = true;
                 func_has_terminator = false;
                 "gpu.func"
             } else if trimmed.starts_with("gpu.module") {
@@ -1611,7 +1611,7 @@ pub fn validate_mlir(mlir: &str) -> Vec<MLIRValidationError> {
                     });
                 }
                 if kind == "func" || kind == "gpu.func" {
-                    in_func = false;
+                    _in_func = false;
                 }
             }
         }

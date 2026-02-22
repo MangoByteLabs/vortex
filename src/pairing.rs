@@ -1,4 +1,4 @@
-use crate::crypto::{BigUint256, mod_add, mod_sub, mod_mul, mod_inv, mod_pow};
+use crate::crypto::{BigUint256, mod_add, mod_sub, mod_mul, mod_inv};
 use crate::fields::{Fp2, Fp6, Fp12, bn254_field_prime};
 
 // ---------------------------------------------------------------------------

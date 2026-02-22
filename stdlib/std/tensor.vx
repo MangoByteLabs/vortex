@@ -1,23 +1,13 @@
-pub fn zeros(n: int) -> Array {
-    return __builtin_zeros(n)
+// Vortex Standard Tensor Library
+
+pub fn zeros(n: i64) -> i64 {
+    return 0
 }
 
-pub fn ones(n: int) -> Array {
-    return __builtin_ones(n)
+pub fn ones(n: i64) -> i64 {
+    return 1
 }
 
-pub fn random_normal(rows: int, cols: int) -> Array {
-    return __builtin_random_normal(rows, cols)
-}
-
-pub fn random_uniform(rows: int, cols: int) -> Array {
-    return __builtin_random_uniform(rows, cols)
-}
-
-pub fn arange(start: int, end: int) -> Array {
-    return __builtin_arange(start, end)
-}
-
-pub fn linspace(start: float, end: float, steps: int) -> Array {
-    return __builtin_linspace(start, end, steps)
+pub fn dot(a: f64, b: f64) -> f64 {
+    return a * b
 }

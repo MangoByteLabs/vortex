@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 mod adaptive_inference;
 mod architectures;
 mod autotuner;
@@ -62,6 +64,9 @@ mod synthesis;
 mod provenance;
 mod verifiable_inference;
 mod prob_types;
+mod debugger;
+mod lsp_server;
+mod profiler;
 
 use codespan_reporting::files::SimpleFiles;
 use codespan_reporting::term;
@@ -99,6 +104,12 @@ fn main() {
         return;
     }
 
+    if command == "lsp" {
+        let mut server = lsp_server::LspServer::new();
+        server.run();
+        return;
+    }
+
     if args.len() < 3 {
         eprintln!("Usage: vortex {} <file.vx>", command);
         std::process::exit(1);
@@ -121,6 +132,20 @@ fn main() {
     let config = term::Config::default();
 
     match command.as_str() {
+        "debug" => {
+            if let Err(e) = debugger::Debugger::run(&source, filename) {
+                eprintln!("Debugger error: {}", e);
+                std::process::exit(1);
+            }
+            return;
+        }
+        "profile" => {
+            if let Err(e) = profiler::Profiler::run(&source, filename) {
+                eprintln!("Profiler error: {}", e);
+                std::process::exit(1);
+            }
+            return;
+        }
         "lex" => {
             let tokens = lexer::lex(&source);
             for tok in &tokens {

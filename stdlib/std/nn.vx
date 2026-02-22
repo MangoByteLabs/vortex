@@ -1,58 +1,21 @@
-pub struct Linear {
-    weight: Array
-    bias: Array
-    in_features: int
-    out_features: int
+// Vortex Standard Neural Network Library
+
+pub fn relu(x: f64) -> f64 {
+    if x > 0.0 { x } else { 0.0 }
 }
 
-impl Linear {
-    fn new(in_features: int, out_features: int) -> Linear {
-        let weight = random_normal(in_features, out_features)
-        let bias = zeros(out_features)
-        Linear { weight: weight, bias: bias, in_features: in_features, out_features: out_features }
-    }
-
-    fn forward(self: Linear, x: Array) -> Array {
-        return matmul(x, self.weight) + self.bias
-    }
+pub fn sigmoid(x: f64) -> f64 {
+    return 1.0 / (1.0 + exp(-x))
 }
 
-pub struct LayerNorm {
-    gamma: Array
-    beta: Array
-    eps: float
-    dim: int
+pub fn tanh_act(x: f64) -> f64 {
+    return (exp(x) - exp(-x)) / (exp(x) + exp(-x))
 }
 
-impl LayerNorm {
-    fn new(dim: int) -> LayerNorm {
-        LayerNorm { gamma: ones(dim), beta: zeros(dim), eps: 0.00001, dim: dim }
-    }
-
-    fn forward(self: LayerNorm, x: Array) -> Array {
-        return layer_norm(x, self.gamma, self.beta, self.eps)
-    }
+pub fn gelu(x: f64) -> f64 {
+    return 0.5 * x * (1.0 + tanh_act(0.7978845608 * (x + 0.044715 * x * x * x)))
 }
 
-pub struct Embedding {
-    weight: Array
-    num_embeddings: int
-    dim: int
-}
-
-pub struct MultiHeadAttention {
-    q_proj: Linear
-    k_proj: Linear
-    v_proj: Linear
-    o_proj: Linear
-    num_heads: int
-    head_dim: int
-}
-
-pub struct TransformerBlock {
-    attn: MultiHeadAttention
-    ffn_up: Linear
-    ffn_down: Linear
-    norm1: LayerNorm
-    norm2: LayerNorm
+pub fn swish(x: f64) -> f64 {
+    return x * sigmoid(x)
 }

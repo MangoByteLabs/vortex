@@ -173,7 +173,7 @@ fn attention_at_positions(
     for &pos in spike_positions {
         let q = matvec(&weights.wq, &x[pos]);
         // Compute attention scores
-        let mut scores: Vec<f64> = keys.iter().map(|k| dot(&q, k) / scale).collect();
+        let scores: Vec<f64> = keys.iter().map(|k| dot(&q, k) / scale).collect();
         // Softmax
         let max_s = scores.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
         let exps: Vec<f64> = scores.iter().map(|s| (s - max_s).exp()).collect();

@@ -117,8 +117,6 @@ pub fn reduce_grad_to_shape(grad: &[f64], grad_shape: &[usize], target_shape: &[
     for flat_idx in 0..grad_numel {
         // Convert flat_idx to multi-dim index in grad_shape
         let mut remaining = flat_idx;
-        let mut target_flat = 0;
-        let mut target_stride = 1;
         // Compute from right to left
         let mut coords = vec![0usize; ndim];
         for d in (0..ndim).rev() {
@@ -133,8 +131,7 @@ pub fn reduce_grad_to_shape(grad: &[f64], grad_shape: &[usize], target_shape: &[
             tf += c * ts;
             ts *= padded[d];
         }
-        target_flat = tf;
-        result[target_flat] += grad[flat_idx];
+        result[tf] += grad[flat_idx];
     }
     result
 }
@@ -151,10 +148,6 @@ fn elementwise_broadcast(a_data: &[f64], a_shape: &[usize], b_data: &[f64], b_sh
 
     for i in 0..numel {
         let mut remaining = i;
-        let mut a_flat = 0;
-        let mut b_flat = 0;
-        let mut a_stride = 1;
-        let mut b_stride = 1;
         let mut coords = vec![0usize; ndim];
         for d in (0..ndim).rev() {
             coords[d] = remaining % out_shape[d];

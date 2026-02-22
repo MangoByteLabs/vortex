@@ -6,7 +6,6 @@
 //! separate kernels.
 
 use crate::ast::*;
-use crate::lexer::Span;
 use std::collections::HashMap;
 use std::fmt::Write;
 

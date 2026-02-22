@@ -4,8 +4,6 @@
 /// that allow reconstructing activations from outputs during the backward pass,
 /// eliminating the need to store intermediate activations.
 
-use std::collections::HashMap;
-
 use crate::interpreter::{Env, FnDef, Value};
 
 // ── Helpers ─────────────────────────────────────────────────────────────

@@ -7,9 +7,8 @@
 //! - `vortex definition <file> <name>` — find definition of symbol
 
 use crate::ast::*;
-use crate::lexer::{self, Span, Token, TokenKind};
+use crate::lexer::{self, Span, TokenKind};
 use crate::parser;
-use logos::Logos;
 use std::collections::HashMap;
 
 // ─── Diagnostic types ───────────────────────────────────────────────────────

@@ -496,7 +496,7 @@ impl AdaptiveModel {
             let layer = ModelLayer::new(hidden_dim, hidden_dim, strategy.clone());
             layers.push((strategy, layer, exit));
         }
-        layers
+        let _ = layers
             .into_iter()
             .map(|(s, l, e)| (s, l, e))
             .collect::<Vec<_>>();

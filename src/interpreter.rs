@@ -5,7 +5,6 @@ use crate::gpu_runtime;
 use crate::local_learn;
 use crate::memory;
 use crate::modmath;
-use crate::ode;
 use crate::spiking;
 use crate::ssm;
 use crate::tensor_autodiff;
@@ -458,6 +457,7 @@ impl Env {
         self.functions.insert("append_file".to_string(), FnDef::Builtin(builtin_append_file));
         self.functions.insert("file_exists".to_string(), FnDef::Builtin(builtin_file_exists));
         self.functions.insert("read_lines".to_string(), FnDef::Builtin(builtin_read_lines));
+        self.functions.insert("load_csv".to_string(), FnDef::Builtin(builtin_load_csv));
         self.functions.insert("read_bytes".to_string(), FnDef::Builtin(builtin_read_bytes));
         self.functions.insert("write_bytes".to_string(), FnDef::Builtin(builtin_write_bytes));
 
@@ -3805,8 +3805,8 @@ fn builtin_read_file(_env: &mut Env, args: Vec<Value>) -> Result<Value, String> 
     if args.len() != 1 { return Err("read_file expects 1 argument: (path)".into()); }
     let path = match &args[0] { Value::String(s) => s.clone(), _ => return Err("read_file: path must be a string".into()) };
     match std::fs::read_to_string(&path) {
-        Ok(content) => Ok(Value::Result(Ok(Box::new(Value::String(content))))),
-        Err(e) => Ok(Value::Result(Err(Box::new(Value::String(e.to_string()))))),
+        Ok(contents) => Ok(Value::String(contents)),
+        Err(e) => Err(format!("read_file error: {}", e)),
     }
 }
 
@@ -3815,8 +3815,8 @@ fn builtin_write_file(_env: &mut Env, args: Vec<Value>) -> Result<Value, String>
     let path = match &args[0] { Value::String(s) => s.clone(), _ => return Err("write_file: path must be a string".into()) };
     let content = match &args[1] { Value::String(s) => s.clone(), _ => return Err("write_file: content must be a string".into()) };
     match std::fs::write(&path, &content) {
-        Ok(()) => Ok(Value::Result(Ok(Box::new(Value::Void)))),
-        Err(e) => Ok(Value::Result(Err(Box::new(Value::String(e.to_string()))))),
+        Ok(()) => Ok(Value::Void),
+        Err(e) => Err(format!("write_file error: {}", e)),
     }
 }
 
@@ -3825,13 +3825,14 @@ fn builtin_append_file(_env: &mut Env, args: Vec<Value>) -> Result<Value, String
     let path = match &args[0] { Value::String(s) => s.clone(), _ => return Err("append_file: path must be a string".into()) };
     let content = match &args[1] { Value::String(s) => s.clone(), _ => return Err("append_file: content must be a string".into()) };
     use std::io::Write;
-    match std::fs::OpenOptions::new().append(true).create(true).open(&path) {
-        Ok(mut f) => match f.write_all(content.as_bytes()) {
-            Ok(()) => Ok(Value::Result(Ok(Box::new(Value::Void)))),
-            Err(e) => Ok(Value::Result(Err(Box::new(Value::String(e.to_string()))))),
-        },
-        Err(e) => Ok(Value::Result(Err(Box::new(Value::String(e.to_string()))))),
-    }
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .map_err(|e| format!("append_file error: {}", e))?;
+    file.write_all(content.as_bytes())
+        .map_err(|e| format!("append_file error: {}", e))?;
+    Ok(Value::Void)
 }
 
 fn builtin_file_exists(_env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
@@ -3849,6 +3850,21 @@ fn builtin_read_lines(_env: &mut Env, args: Vec<Value>) -> Result<Value, String>
             Ok(Value::Array(lines))
         }
         Err(e) => Err(format!("read_lines: {}", e)),
+    }
+}
+
+fn builtin_load_csv(_env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    if args.len() != 1 { return Err("load_csv expects 1 argument: (path)".into()); }
+    let path = match &args[0] { Value::String(s) => s.clone(), _ => return Err("load_csv: path must be a string".into()) };
+    match std::fs::read_to_string(&path) {
+        Ok(contents) => {
+            let rows: Vec<Value> = contents.lines().map(|line| {
+                let cols: Vec<Value> = line.split(',').map(|c| Value::String(c.trim().to_string())).collect();
+                Value::Array(cols)
+            }).collect();
+            Ok(Value::Array(rows))
+        }
+        Err(e) => Err(format!("load_csv error: {}", e)),
     }
 }
 

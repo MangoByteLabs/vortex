@@ -4,7 +4,7 @@
 //! event-driven Vortex programs that "stay alive" indefinitely.
 
 use crate::ast::*;
-use crate::interpreter::{self, Env, FnDef, Value, eval_block};
+use crate::interpreter::{Env, FnDef, Value, eval_block};
 use crate::lexer;
 use crate::parser;
 use std::collections::{HashMap, VecDeque};
