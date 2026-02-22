@@ -189,6 +189,10 @@ pub(crate) struct Env {
     pub(crate) next_ebm_id: usize,
     pub(crate) mot_servers: HashMap<usize, crate::matrix_of_thought::MatrixOfThoughtServer>,
     pub(crate) next_mot_id: usize,
+    pub(crate) causal_models: HashMap<usize, crate::causal::StructuralCausalModel>,
+    pub(crate) next_causal_id: usize,
+    pub(crate) reversible_networks: HashMap<usize, crate::reversible::ReversibleNetwork>,
+    pub(crate) next_reversible_id: usize,
 }
 
 #[derive(Clone)]
@@ -229,6 +233,10 @@ impl Env {
             next_ebm_id: 0,
             mot_servers: HashMap::new(),
             next_mot_id: 0,
+            causal_models: HashMap::new(),
+            next_causal_id: 0,
+            reversible_networks: HashMap::new(),
+            next_reversible_id: 0,
         };
         env.register_builtins();
         env
@@ -620,6 +628,24 @@ impl Env {
 
         // Matrix-of-Thought reasoning builtins
         crate::matrix_of_thought::register_builtins(self);
+
+        // Causal inference builtins
+        crate::causal::register_builtins(self);
+
+        // Program synthesis builtins
+        crate::synthesis::register_builtins(self);
+
+        // Differentiable data structures builtins
+        crate::diff_structures::register_builtins(self);
+
+        // Reversible computation builtins
+        crate::reversible::register_builtins(self);
+
+        // Provenance and privacy builtins
+        crate::provenance::register_builtins(self);
+
+        // Multi-backend compilation builtins
+        crate::backends::register_builtins(self);
     }
 }
 
