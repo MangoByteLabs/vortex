@@ -1,0 +1,30 @@
+// Neuro-Symbolic Reasoning Demo
+fn main() {
+    let r = reasoner_new(16)
+    println("Created neuro-symbolic reasoner")
+
+    // Add facts
+    reasoner_add_fact(r, "parent(alice, bob)")
+    reasoner_add_fact(r, "parent(bob, charlie)")
+    reasoner_add_fact(r, "parent(charlie, diana)")
+    println("Added family facts")
+
+    // Add rules
+    reasoner_add_rule(r, ["parent(?x, ?y)", "parent(?y, ?z)"], "grandparent(?x, ?z)", 1.0)
+    reasoner_add_rule(r, ["parent(?x, ?y)"], "ancestor(?x, ?y)", 0.9)
+    println("Added reasoning rules")
+
+    // Forward chain to derive new facts
+    let derived = reasoner_forward_chain(r, 5)
+    println("Derived facts via forward chaining:")
+    println(derived)
+
+    // Backward chain to prove a goal
+    let can_prove = reasoner_backward_chain(r, "grandparent(alice, charlie)")
+    println("Can prove grandparent(alice, charlie)?")
+    println(can_prove)
+
+    let cannot_prove = reasoner_backward_chain(r, "grandparent(diana, alice)")
+    println("Can prove grandparent(diana, alice)?")
+    println(cannot_prove)
+}

@@ -1,0 +1,34 @@
+// World Model Demo: predict future states and reason about counterfactuals
+fn main() {
+    let world = world_model_new(8, 4)
+    println("Created world model (8-dim state, 4-dim action)")
+
+    let state = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8]
+    let action = [1.0, 0.0, 0.0, 0.0]
+
+    // Predict next state
+    let next = world_model_step(world, state, action)
+    println("Current state:")
+    println(state)
+    println("After action [1,0,0,0]:")
+    println(next)
+
+    // Imagine a trajectory
+    let actions = [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0]]
+    let trajectory = world_model_imagine(world, state, actions)
+    println("Imagined trajectory (3 steps):")
+    println(trajectory)
+
+    // Counterfactual reasoning
+    println("What if we took a different action?")
+    let factual = [[1.0, 0.0, 0.0, 0.0]]
+    let counter = [[-1.0, 0.0, 0.0, 0.0]]
+    let result = world_model_counterfactual(world, state, factual, counter)
+    println("Factual vs counterfactual outcomes:")
+    println(result)
+
+    // Reward prediction
+    let reward = world_model_reward(world, state, action)
+    println("Predicted reward:")
+    println(reward)
+}
