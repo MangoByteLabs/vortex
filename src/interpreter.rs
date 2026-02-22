@@ -670,6 +670,28 @@ impl Env {
 
         // Swarm intelligence builtins
         crate::swarm::register_builtins(self);
+
+        // Math builtins
+        self.functions.insert("sqrt".to_string(), FnDef::Builtin(builtin_sqrt));
+        self.functions.insert("sin".to_string(), FnDef::Builtin(builtin_sin));
+        self.functions.insert("cos".to_string(), FnDef::Builtin(builtin_cos));
+        self.functions.insert("tan".to_string(), FnDef::Builtin(builtin_tan));
+        self.functions.insert("exp".to_string(), FnDef::Builtin(builtin_exp));
+        self.functions.insert("log".to_string(), FnDef::Builtin(builtin_log));
+        self.functions.insert("log2".to_string(), FnDef::Builtin(builtin_log2));
+        self.functions.insert("log10".to_string(), FnDef::Builtin(builtin_log10));
+        self.functions.insert("abs".to_string(), FnDef::Builtin(builtin_abs));
+        self.functions.insert("pow".to_string(), FnDef::Builtin(builtin_pow));
+        self.functions.insert("floor".to_string(), FnDef::Builtin(builtin_floor));
+        self.functions.insert("ceil".to_string(), FnDef::Builtin(builtin_ceil));
+        self.functions.insert("round".to_string(), FnDef::Builtin(builtin_round));
+        self.functions.insert("min".to_string(), FnDef::Builtin(builtin_min));
+        self.functions.insert("max".to_string(), FnDef::Builtin(builtin_max));
+        self.functions.insert("range".to_string(), FnDef::Builtin(builtin_range));
+
+        // Math constants
+        self.define("PI", Value::Float(std::f64::consts::PI));
+        self.define("E", Value::Float(std::f64::consts::E));
     }
 }
 
@@ -5345,4 +5367,207 @@ fn builtin_hetero_layer_stats(env: &mut Env, args: Vec<Value>) -> Result<Value, 
         Value::Int(stats.total_params as i128),
         Value::Int(stats.type_counts.len() as i128),
     ]))
+}
+
+// --- Math builtins ---
+
+fn val_to_f64_math(v: &Value) -> Result<f64, String> {
+    match v {
+        Value::Float(f) => Ok(*f),
+        Value::Int(n) => Ok(*n as f64),
+        _ => Err("expected numeric value".to_string()),
+    }
+}
+
+fn math_unary(args: Vec<Value>, f: fn(f64) -> f64, name: &str) -> Result<Value, String> {
+    if args.len() != 1 { return Err(format!("{} expects 1 argument", name)); }
+    Ok(Value::Float(f(val_to_f64_math(&args[0])?)))
+}
+
+fn builtin_sqrt(_env: &mut Env, args: Vec<Value>) -> Result<Value, String> { math_unary(args, f64::sqrt, "sqrt") }
+fn builtin_sin(_env: &mut Env, args: Vec<Value>) -> Result<Value, String> { math_unary(args, f64::sin, "sin") }
+fn builtin_cos(_env: &mut Env, args: Vec<Value>) -> Result<Value, String> { math_unary(args, f64::cos, "cos") }
+fn builtin_tan(_env: &mut Env, args: Vec<Value>) -> Result<Value, String> { math_unary(args, f64::tan, "tan") }
+fn builtin_exp(_env: &mut Env, args: Vec<Value>) -> Result<Value, String> { math_unary(args, f64::exp, "exp") }
+fn builtin_log(_env: &mut Env, args: Vec<Value>) -> Result<Value, String> { math_unary(args, f64::ln, "log") }
+fn builtin_log2(_env: &mut Env, args: Vec<Value>) -> Result<Value, String> { math_unary(args, f64::log2, "log2") }
+fn builtin_log10(_env: &mut Env, args: Vec<Value>) -> Result<Value, String> { math_unary(args, f64::log10, "log10") }
+fn builtin_floor(_env: &mut Env, args: Vec<Value>) -> Result<Value, String> { math_unary(args, f64::floor, "floor") }
+fn builtin_ceil(_env: &mut Env, args: Vec<Value>) -> Result<Value, String> { math_unary(args, f64::ceil, "ceil") }
+fn builtin_round(_env: &mut Env, args: Vec<Value>) -> Result<Value, String> { math_unary(args, f64::round, "round") }
+
+fn builtin_abs(_env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    if args.len() != 1 { return Err("abs expects 1 argument".to_string()); }
+    match &args[0] {
+        Value::Int(n) => Ok(Value::Int(n.abs())),
+        Value::Float(f) => Ok(Value::Float(f.abs())),
+        _ => Err("abs expects a numeric value".to_string()),
+    }
+}
+
+fn builtin_pow(_env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    if args.len() != 2 { return Err("pow expects 2 arguments: (base, exp)".to_string()); }
+    match (&args[0], &args[1]) {
+        (Value::Int(base), Value::Int(exp)) if *exp >= 0 => {
+            Ok(Value::Int(base.pow(*exp as u32)))
+        }
+        _ => {
+            let base = val_to_f64_math(&args[0])?;
+            let exp = val_to_f64_math(&args[1])?;
+            Ok(Value::Float(base.powf(exp)))
+        }
+    }
+}
+
+fn builtin_min(_env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    if args.len() != 2 { return Err("min expects 2 arguments".to_string()); }
+    match (&args[0], &args[1]) {
+        (Value::Int(a), Value::Int(b)) => Ok(Value::Int(*a.min(b))),
+        _ => {
+            let a = val_to_f64_math(&args[0])?;
+            let b = val_to_f64_math(&args[1])?;
+            Ok(Value::Float(a.min(b)))
+        }
+    }
+}
+
+fn builtin_max(_env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    if args.len() != 2 { return Err("max expects 2 arguments".to_string()); }
+    match (&args[0], &args[1]) {
+        (Value::Int(a), Value::Int(b)) => Ok(Value::Int(*a.max(b))),
+        _ => {
+            let a = val_to_f64_math(&args[0])?;
+            let b = val_to_f64_math(&args[1])?;
+            Ok(Value::Float(a.max(b)))
+        }
+    }
+}
+
+fn builtin_range(_env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    match args.len() {
+        2 => {
+            let start = value_to_int(&args[0])?;
+            let end = value_to_int(&args[1])?;
+            let elems: Vec<Value> = if start <= end {
+                (start..end).map(Value::Int).collect()
+            } else {
+                Vec::new()
+            };
+            Ok(Value::Array(elems))
+        }
+        3 => {
+            let start = value_to_int(&args[0])?;
+            let end = value_to_int(&args[1])?;
+            let step = value_to_int(&args[2])?;
+            if step == 0 { return Err("range: step cannot be zero".to_string()); }
+            let mut elems = Vec::new();
+            let mut i = start;
+            if step > 0 {
+                while i < end { elems.push(Value::Int(i)); i += step; }
+            } else {
+                while i > end { elems.push(Value::Int(i)); i += step; }
+            }
+            Ok(Value::Array(elems))
+        }
+        _ => Err("range expects 2 or 3 arguments: (start, end) or (start, end, step)".to_string()),
+    }
+}
+
+#[cfg(test)]
+mod math_builtin_tests {
+    use crate::lexer;
+    use crate::parser;
+    use crate::interpreter::interpret;
+    fn rv(s: &str) -> Vec<String> { let t = lexer::lex(s); let p = parser::parse(t, 0).unwrap(); interpret(&p).unwrap() }
+
+    #[test]
+    fn test_sqrt() { assert_eq!(rv("fn main() { println(sqrt(9)) }"), vec!["3"]); }
+
+    #[test]
+    fn test_sin_cos() {
+        assert_eq!(rv("fn main() { println(sin(0)) }"), vec!["0"]);
+        assert_eq!(rv("fn main() { println(cos(0)) }"), vec!["1"]);
+    }
+
+    #[test]
+    fn test_exp_log() {
+        assert_eq!(rv("fn main() { println(exp(0)) }"), vec!["1"]);
+        assert_eq!(rv("fn main() { println(log(1)) }"), vec!["0"]);
+    }
+
+    #[test]
+    fn test_abs() {
+        assert_eq!(rv("fn main() { println(abs(-5)) }"), vec!["5"]);
+        assert_eq!(rv("fn main() { println(abs(3)) }"), vec!["3"]);
+    }
+
+    #[test]
+    fn test_pow() {
+        assert_eq!(rv("fn main() { println(pow(2, 10)) }"), vec!["1024"]);
+    }
+
+    #[test]
+    fn test_floor_ceil_round() {
+        assert_eq!(rv("fn main() { println(floor(3.7)) }"), vec!["3"]);
+        assert_eq!(rv("fn main() { println(ceil(3.2)) }"), vec!["4"]);
+        assert_eq!(rv("fn main() { println(round(3.5)) }"), vec!["4"]);
+    }
+
+    #[test]
+    fn test_min_max() {
+        assert_eq!(rv("fn main() { println(min(3, 7)) }"), vec!["3"]);
+        assert_eq!(rv("fn main() { println(max(3, 7)) }"), vec!["7"]);
+    }
+
+    #[test]
+    fn test_range_basic() {
+        assert_eq!(rv("fn main() { println(range(0, 5)) }"), vec!["[0, 1, 2, 3, 4]"]);
+    }
+
+    #[test]
+    fn test_range_step() {
+        assert_eq!(rv("fn main() { println(range(0, 10, 3)) }"), vec!["[0, 3, 6, 9]"]);
+    }
+
+    #[test]
+    fn test_range_negative_step() {
+        assert_eq!(rv("fn main() { println(range(5, 0, -1)) }"), vec!["[5, 4, 3, 2, 1]"]);
+    }
+
+    #[test]
+    fn test_for_range_loop() {
+        let o = rv("fn main() {\nvar s = 0\nfor i in range(0, 5) {\ns = s + i\n}\nprintln(s)\n}");
+        assert_eq!(o, vec!["10"]);
+    }
+
+    #[test]
+    fn test_pi_e_constants() {
+        let o = rv("fn main() { println(PI > 3.0) }");
+        assert_eq!(o, vec!["true"]);
+        let o = rv("fn main() { println(E > 2.0) }");
+        assert_eq!(o, vec!["true"]);
+    }
+
+    #[test]
+    fn test_closure_capture_and_exec() {
+        let o = rv("fn main() {\nlet x = 10\nlet f = |y| y + x\nprintln(f(5))\n}");
+        assert_eq!(o, vec!["15"]);
+    }
+
+    #[test]
+    fn test_closure_passed_as_argument() {
+        let o = rv("fn apply(f: fn(i64) -> i64, x: i64) -> i64 {\nreturn f(x)\n}\nfn main() {\nlet double = |x| x * 2\nprintln(apply(double, 5))\n}");
+        assert_eq!(o, vec!["10"]);
+    }
+
+    #[test]
+    fn test_log2_log10() {
+        assert_eq!(rv("fn main() { println(log2(8)) }"), vec!["3"]);
+        assert_eq!(rv("fn main() { println(log10(1000)) }"), vec!["3"]);
+    }
+
+    #[test]
+    fn test_tan() {
+        assert_eq!(rv("fn main() { println(tan(0)) }"), vec!["0"]);
+    }
 }
