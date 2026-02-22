@@ -197,6 +197,8 @@ pub(crate) struct Env {
     pub(crate) next_prob_id: usize,
     pub(crate) prob_layers: HashMap<usize, crate::prob_types::BayesianLayer>,
     pub(crate) next_prob_layer_id: usize,
+    pub(crate) swarms: HashMap<usize, crate::swarm::VortexSwarm>,
+    pub(crate) next_swarm_id: usize,
 }
 
 #[derive(Clone)]
@@ -245,6 +247,8 @@ impl Env {
             next_prob_id: 0,
             prob_layers: HashMap::new(),
             next_prob_layer_id: 0,
+            swarms: HashMap::new(),
+            next_swarm_id: 0,
         };
         env.register_builtins();
         env
@@ -646,6 +650,9 @@ impl Env {
         // Differentiable data structures builtins
         crate::diff_structures::register_builtins(self);
 
+        // Metabolic computing builtins
+        crate::metabolic::register_builtins(self);
+
         // Reversible computation builtins
         crate::reversible::register_builtins(self);
 
@@ -657,6 +664,12 @@ impl Env {
 
         // Formal verification builtins
         crate::formal_verify::register_builtins(self);
+
+        // Probabilistic types builtins
+        crate::prob_types::register_builtins(self);
+
+        // Swarm intelligence builtins
+        crate::swarm::register_builtins(self);
     }
 }
 

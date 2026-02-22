@@ -31,6 +31,7 @@ mod mcp_server;
 mod memory_safety;
 pub mod modmath;
 mod module;
+mod metabolic;
 mod multiscale;
 mod msm;
 mod ntt;
@@ -59,6 +60,7 @@ mod symbolic_reasoning;
 mod synthesis;
 mod provenance;
 mod verifiable_inference;
+mod prob_types;
 
 use codespan_reporting::files::SimpleFiles;
 use codespan_reporting::term;
