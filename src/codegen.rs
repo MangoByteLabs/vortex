@@ -734,6 +734,37 @@ impl CodeGen {
                     self.emit_line("}");
                 }
             }
+
+            StmtKind::Live { name, value } => {
+                let (ssa, _) = self.gen_expr(value);
+                self.emit_line(&format!("// live {} = {}", name.name, ssa));
+            }
+            StmtKind::Fuse { body } => {
+                self.emit_line("// fuse block start");
+                for s in &body.stmts { self.gen_stmt(s); }
+                self.emit_line("// fuse block end");
+            }
+            StmtKind::GpuLet { name, value } => {
+                let (ssa, _) = self.gen_expr(value);
+                self.emit_line(&format!("// gpu let {} = {}", name.name, ssa));
+            }
+            StmtKind::Parallel { body, .. } => {
+                for s in &body.stmts { self.gen_stmt(s); }
+            }
+            StmtKind::Train { .. } | StmtKind::Deterministic { .. } | StmtKind::Autocast { .. }
+            | StmtKind::Speculate { .. } | StmtKind::Topology { .. } | StmtKind::Mmap { .. }
+            | StmtKind::Explain { .. } | StmtKind::Quantize { .. } | StmtKind::Safe { .. }
+            | StmtKind::Consensus { .. } | StmtKind::SymbolicBlock { .. } | StmtKind::TemporalBlock { .. }
+            | StmtKind::Federated { .. } | StmtKind::SandboxBlock { .. } | StmtKind::Compress { .. }
+            | StmtKind::Metacognition { .. }
+            | StmtKind::TheoremBlock { .. } | StmtKind::ContinualLearn { .. }
+            | StmtKind::MultimodalBlock { .. } | StmtKind::WorldModelBlock { .. }
+            | StmtKind::SelfImproveBlock { .. } | StmtKind::MemoryBlock { .. }
+            | StmtKind::AttentionBlock { .. } | StmtKind::CurriculumBlock { .. }
+            | StmtKind::EnsembleBlock { .. } | StmtKind::AdversarialBlock { .. }
+            | StmtKind::TransferBlock { .. } | StmtKind::SparseBlock { .. }
+            | StmtKind::AsyncInferBlock { .. } | StmtKind::ProfileBlock { .. }
+            | StmtKind::ContractBlock { .. } => {}
         }
     }
 

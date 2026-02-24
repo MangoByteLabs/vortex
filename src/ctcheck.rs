@@ -153,6 +153,69 @@ impl CTChecker {
                     self.check_expr(arg);
                 }
             }
+            StmtKind::Live { value, .. } => {
+                self.check_expr(value);
+            }
+            StmtKind::Fuse { body } | StmtKind::Deterministic { body } => {
+                for s in &body.stmts { self.check_stmt(s); }
+            }
+            StmtKind::GpuLet { value, .. } => { self.check_expr(value); }
+            StmtKind::Parallel { iter, body, .. } => {
+                self.check_expr(iter);
+                for s in &body.stmts { self.check_stmt(s); }
+            }
+            StmtKind::Train { config, .. } => {
+                for (_, v) in config { self.check_expr(v); }
+            }
+            StmtKind::Autocast { body, .. }
+            | StmtKind::Speculate { body }
+            | StmtKind::Explain { body }
+            | StmtKind::Quantize { body, .. }  => {
+                for s in &body.stmts { self.check_stmt(s); }
+            }
+            StmtKind::Safe { body, config, .. } => {
+                for (_, v) in config { self.check_expr(v); }
+                for s in &body.stmts { self.check_stmt(s); }
+            }
+            StmtKind::Topology { config, .. } => {
+                for (_, v) in config { self.check_expr(v); }
+            }
+            StmtKind::Mmap { value, .. } => { self.check_expr(value); }
+            StmtKind::Consensus { body }
+            | StmtKind::SymbolicBlock { body }
+            | StmtKind::TemporalBlock { body }
+            | StmtKind::Federated { body }
+            | StmtKind::SandboxBlock { body }
+            | StmtKind::Metacognition { body } => {
+                for s in &body.stmts { self.check_stmt(s); }
+            }
+            StmtKind::Compress { body, .. } => {
+                for s in &body.stmts { self.check_stmt(s); }
+            }
+            StmtKind::TheoremBlock { body, .. }
+            | StmtKind::ContinualLearn { body }
+            | StmtKind::MultimodalBlock { body, .. }
+            | StmtKind::WorldModelBlock { body }
+            | StmtKind::SelfImproveBlock { body } => {
+                for s in &body.stmts { self.check_stmt(s); }
+            }
+            StmtKind::MemoryBlock { config, .. } => {
+                for (_, v) in config { self.check_expr(v); }
+            }
+            StmtKind::AttentionBlock { body }
+            | StmtKind::EnsembleBlock { body }
+            | StmtKind::AdversarialBlock { body }
+            | StmtKind::TransferBlock { body }
+            | StmtKind::SparseBlock { body }
+            | StmtKind::AsyncInferBlock { body }
+            | StmtKind::ProfileBlock { body }
+            | StmtKind::ContractBlock { body, .. } => {
+                for s in &body.stmts { self.check_stmt(s); }
+            }
+            StmtKind::CurriculumBlock { config, body } => {
+                for (_, v) in config { self.check_expr(v); }
+                for s in &body.stmts { self.check_stmt(s); }
+            }
         }
     }
 

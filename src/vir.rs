@@ -1222,6 +1222,41 @@ impl VirLowering {
                 Ok(())
             }
             crate::ast::StmtKind::Dispatch { .. } => Ok(()),
+            crate::ast::StmtKind::Live { .. }
+            | crate::ast::StmtKind::Fuse { .. }
+            | crate::ast::StmtKind::GpuLet { .. }
+            | crate::ast::StmtKind::Parallel { .. }
+            | crate::ast::StmtKind::Train { .. }
+            | crate::ast::StmtKind::Deterministic { .. }
+            | crate::ast::StmtKind::Autocast { .. }
+            | crate::ast::StmtKind::Speculate { .. }
+            | crate::ast::StmtKind::Topology { .. }
+            | crate::ast::StmtKind::Mmap { .. }
+            | crate::ast::StmtKind::Explain { .. }
+            | crate::ast::StmtKind::Quantize { .. }
+            | crate::ast::StmtKind::Safe { .. }
+            | crate::ast::StmtKind::Consensus { .. }
+            | crate::ast::StmtKind::SymbolicBlock { .. }
+            | crate::ast::StmtKind::TemporalBlock { .. }
+            | crate::ast::StmtKind::Federated { .. }
+            | crate::ast::StmtKind::SandboxBlock { .. }
+            | crate::ast::StmtKind::Compress { .. }
+            | crate::ast::StmtKind::Metacognition { .. }
+            | crate::ast::StmtKind::TheoremBlock { .. }
+            | crate::ast::StmtKind::ContinualLearn { .. }
+            | crate::ast::StmtKind::MultimodalBlock { .. }
+            | crate::ast::StmtKind::WorldModelBlock { .. }
+            | crate::ast::StmtKind::SelfImproveBlock { .. }
+            | crate::ast::StmtKind::MemoryBlock { .. }
+            | crate::ast::StmtKind::AttentionBlock { .. }
+            | crate::ast::StmtKind::CurriculumBlock { .. }
+            | crate::ast::StmtKind::EnsembleBlock { .. }
+            | crate::ast::StmtKind::AdversarialBlock { .. }
+            | crate::ast::StmtKind::TransferBlock { .. }
+            | crate::ast::StmtKind::SparseBlock { .. }
+            | crate::ast::StmtKind::AsyncInferBlock { .. }
+            | crate::ast::StmtKind::ProfileBlock { .. }
+            | crate::ast::StmtKind::ContractBlock { .. } => Ok(()),
         }
     }
 

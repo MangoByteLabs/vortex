@@ -34,6 +34,8 @@ pub enum Type {
     Var(usize),
     /// Error type (for recovery)
     Error,
+    /// Unique (linear/affine) type: must be used exactly once
+    Unique(Box<Type>),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -80,6 +82,7 @@ impl std::fmt::Display for Type {
             Type::Void => write!(f, "void"),
             Type::Var(n) => write!(f, "?{}", n),
             Type::Error => write!(f, "<error>"),
+            Type::Unique(inner) => write!(f, "unique {}", inner),
         }
     }
 }
@@ -136,7 +139,15 @@ struct TypeEnv {
     struct_fields: HashMap<String, Vec<(String, Type)>>,
     /// Substitution map for type variable unification
     substitutions: HashMap<usize, Type>,
+    /// Symbolic dimension substitutions: dim_name -> concrete size
+    dim_subs: HashMap<String, u64>,
+    /// Variables marked as unique (linear types)
+    unique_vars: HashSet<String>,
+    /// Variables that have been moved (consumed)
+    moved_vars: HashSet<String>,
 }
+
+use std::collections::HashSet;
 
 impl TypeEnv {
     fn new(file_id: FileId) -> Self {
@@ -152,6 +163,9 @@ impl TypeEnv {
             variant_info: HashMap::new(),
             struct_fields: HashMap::new(),
             substitutions: HashMap::new(),
+            dim_subs: HashMap::new(),
+            unique_vars: HashSet::new(),
+            moved_vars: HashSet::new(),
         }
     }
 
@@ -496,6 +510,7 @@ fn check_item(env: &mut TypeEnv, item: &Item) {
         ItemKind::Kernel(kernel) => check_kernel(env, kernel),
         ItemKind::Struct(s) => check_struct(env, s),
         ItemKind::Enum(e) => check_enum(env, e),
+        ItemKind::FieldDef(_) => { /* field defs are checked at runtime */ }
         _ => {}
     }
 }
@@ -681,6 +696,77 @@ fn check_stmt(env: &mut TypeEnv, stmt: &Stmt, expected_ret: &Type) {
             for arg in args {
                 let _ = infer_expr(env, arg);
             }
+        }
+        StmtKind::Live { name, value } => {
+            let val_ty = infer_expr(env, value);
+            env.define(&name.name, val_ty);
+        }
+        StmtKind::Fuse { body } | StmtKind::Deterministic { body } => {
+            for s in &body.stmts { check_stmt(env, s, expected_ret); }
+        }
+        StmtKind::GpuLet { name, value } => {
+            let val_ty = infer_expr(env, value);
+            env.define(&name.name, val_ty);
+        }
+        StmtKind::Parallel { var, iter, body } => {
+            let _iter_ty = infer_expr(env, iter);
+            env.define(&var.name, Type::Named("_".to_string()));
+            for s in &body.stmts { check_stmt(env, s, expected_ret); }
+        }
+        StmtKind::Train { config, .. } => {
+            for (_, v) in config { infer_expr(env, v); }
+        }
+        StmtKind::Autocast { body, .. }
+        | StmtKind::Speculate { body }
+        | StmtKind::Explain { body }
+        | StmtKind::Quantize { body, .. } => {
+            for s in &body.stmts { check_stmt(env, s, expected_ret); }
+        }
+        StmtKind::Safe { body, config, .. } => {
+            for (_, v) in config { infer_expr(env, v); }
+            for s in &body.stmts { check_stmt(env, s, expected_ret); }
+        }
+        StmtKind::Topology { config, .. } => {
+            for (_, v) in config { infer_expr(env, v); }
+        }
+        StmtKind::Mmap { name, value } => {
+            let val_ty = infer_expr(env, value);
+            env.define(&name.name, val_ty);
+        }
+        StmtKind::Consensus { body }
+        | StmtKind::SymbolicBlock { body }
+        | StmtKind::TemporalBlock { body }
+        | StmtKind::Federated { body }
+        | StmtKind::SandboxBlock { body }
+        | StmtKind::Metacognition { body } => {
+            for s in &body.stmts { check_stmt(env, s, expected_ret); }
+        }
+        StmtKind::Compress { body, .. } => {
+            for s in &body.stmts { check_stmt(env, s, expected_ret); }
+        }
+        StmtKind::TheoremBlock { body, .. }
+        | StmtKind::ContinualLearn { body }
+        | StmtKind::MultimodalBlock { body, .. }
+        | StmtKind::WorldModelBlock { body }
+        | StmtKind::SelfImproveBlock { body } => {
+            for s in &body.stmts { check_stmt(env, s, expected_ret); }
+        }
+        StmtKind::MemoryBlock { config, .. } => {
+            for (_, v) in config { infer_expr(env, v); }
+        }
+        StmtKind::AttentionBlock { body }
+        | StmtKind::EnsembleBlock { body }
+        | StmtKind::AdversarialBlock { body }
+        | StmtKind::TransferBlock { body }
+        | StmtKind::SparseBlock { body }
+        | StmtKind::AsyncInferBlock { body }
+        | StmtKind::ProfileBlock { body }
+        | StmtKind::ContractBlock { body, .. } => {
+            for s in &body.stmts { check_stmt(env, s, expected_ret); }
+        }
+        StmtKind::CurriculumBlock { config, body } => {
+            for (_, v) in config { infer_expr(env, v); }
+            for s in &body.stmts { check_stmt(env, s, expected_ret); }
         }
     }
 }
@@ -1341,6 +1427,98 @@ fn resolve_type_expr(env: &mut TypeEnv, ty: &TypeExpr) -> Type {
         TypeExprKind::SparseIndex { .. } => {
             Type::Named("SparseIndex".to_string())
         }
+        TypeExprKind::Unique(inner) => {
+            let inner_ty = resolve_type_expr(env, inner);
+            Type::Unique(Box::new(inner_ty))
+        }
+    }
+}
+
+/// Unify two shape dimension lists, binding symbolic dimensions as needed.
+fn unify_shapes(env: &mut TypeEnv, expected: &[Dim], actual: &[Dim], span: Span) {
+    if expected.len() != actual.len() {
+        env.errors.push(
+            Diagnostic::error()
+                .with_message(format!(
+                    "shape mismatch: expected {} dimensions, got {}",
+                    expected.len(), actual.len()
+                ))
+                .with_labels(vec![Label::primary(env.file_id, span.start..span.end)])
+        );
+        return;
+    }
+    for (e, a) in expected.iter().zip(actual.iter()) {
+        match (e, a) {
+            (Dim::Lit(a_val), Dim::Lit(b_val)) => {
+                if a_val != b_val {
+                    env.errors.push(
+                        Diagnostic::error()
+                            .with_message(format!(
+                                "shape dimension mismatch: expected {}, got {}",
+                                a_val, b_val
+                            ))
+                            .with_labels(vec![Label::primary(env.file_id, span.start..span.end)])
+                    );
+                }
+            }
+            (Dim::Sym(s), Dim::Lit(n)) => {
+                if let Some(existing) = env.dim_subs.get(s) {
+                    if existing != n {
+                        env.errors.push(
+                            Diagnostic::error()
+                                .with_message(format!(
+                                    "dimension '{}' already bound to {}, cannot unify with {}",
+                                    s, existing, n
+                                ))
+                                .with_labels(vec![Label::primary(env.file_id, span.start..span.end)])
+                        );
+                    }
+                } else {
+                    env.dim_subs.insert(s.clone(), *n);
+                }
+            }
+            (Dim::Lit(n), Dim::Sym(s)) => {
+                if let Some(existing) = env.dim_subs.get(s) {
+                    if existing != n {
+                        env.errors.push(
+                            Diagnostic::error()
+                                .with_message(format!(
+                                    "dimension '{}' already bound to {}, cannot unify with {}",
+                                    s, existing, n
+                                ))
+                                .with_labels(vec![Label::primary(env.file_id, span.start..span.end)])
+                        );
+                    }
+                } else {
+                    env.dim_subs.insert(s.clone(), *n);
+                }
+            }
+            (Dim::Sym(s1), Dim::Sym(s2)) => {
+                // If both are symbolic, try to resolve
+                if let Some(n) = env.dim_subs.get(s1).copied() {
+                    if let Some(m) = env.dim_subs.get(s2).copied() {
+                        if n != m {
+                            env.errors.push(
+                                Diagnostic::error()
+                                    .with_message(format!(
+                                        "dimension conflict: {} = {} but {} = {}",
+                                        s1, n, s2, m
+                                    ))
+                                    .with_labels(vec![Label::primary(env.file_id, span.start..span.end)])
+                            );
+                        }
+                    } else {
+                        env.dim_subs.insert(s2.clone(), n);
+                    }
+                } else if let Some(m) = env.dim_subs.get(s2).copied() {
+                    env.dim_subs.insert(s1.clone(), m);
+                }
+                // Both unbound: just constrain them to be equal (we could add an equivalence class)
+            }
+            (Dim::Dynamic, _) | (_, Dim::Dynamic) => {
+                // Dynamic matches anything
+            }
+        }
     }
 }
 
@@ -1688,5 +1866,68 @@ mod tests {
              }",
         );
         assert!(errs.iter().any(|d| d.message.contains("type mismatch")));
+    }
+
+    #[test]
+    fn test_shape_unification_basic() {
+        let mut env = TypeEnv::new(0);
+        let expected = vec![Dim::Sym("M".into()), Dim::Sym("K".into())];
+        let actual = vec![Dim::Lit(4), Dim::Lit(8)];
+        unify_shapes(&mut env, &expected, &actual, Span::new(0, 1));
+        assert!(env.errors.is_empty());
+        assert_eq!(env.dim_subs.get("M"), Some(&4));
+        assert_eq!(env.dim_subs.get("K"), Some(&8));
+    }
+
+    #[test]
+    fn test_shape_unification_conflict() {
+        let mut env = TypeEnv::new(0);
+        // First bind K = 8
+        env.dim_subs.insert("K".into(), 8);
+        // Then try K = 9 → error
+        let expected = vec![Dim::Sym("K".into())];
+        let actual = vec![Dim::Lit(9)];
+        unify_shapes(&mut env, &expected, &actual, Span::new(0, 1));
+        assert!(!env.errors.is_empty());
+    }
+
+    #[test]
+    fn test_shape_dimension_mismatch() {
+        let mut env = TypeEnv::new(0);
+        let expected = vec![Dim::Lit(4), Dim::Lit(8)];
+        let actual = vec![Dim::Lit(4), Dim::Lit(16)];
+        unify_shapes(&mut env, &expected, &actual, Span::new(0, 1));
+        assert!(!env.errors.is_empty());
+        assert!(env.errors[0].message.contains("dimension mismatch"));
+    }
+
+    #[test]
+    fn test_unique_type_resolves() {
+        // Just verify that unique type parses and resolves without crash
+        let mut env = TypeEnv::new(0);
+        let ty = resolve_type_expr(&mut env, &TypeExpr {
+            kind: TypeExprKind::Unique(Box::new(TypeExpr {
+                kind: TypeExprKind::Named(Ident::new("i64".into(), Span::new(0, 3))),
+                span: Span::new(0, 3),
+            })),
+            span: Span::new(0, 10),
+        });
+        assert!(matches!(ty, Type::Unique(_)));
+    }
+
+    #[test]
+    fn test_diff_fn_parses_and_checks() {
+        let src = "diff fn loss(w: f64, x: f64) -> f64 { return w * x }";
+        let tokens = lexer::lex(src);
+        let program = parser::parse(tokens, 0).unwrap();
+        check(&program, 0).expect("type check should pass");
+    }
+
+    #[test]
+    fn test_verifiable_fn_parses_and_checks() {
+        let src = "#[verifiable]\nfn hash_sum(a: i64, b: i64) -> i64 { return a + b }";
+        let tokens = lexer::lex(src);
+        let program = parser::parse(tokens, 0).unwrap();
+        check(&program, 0).expect("type check should pass");
     }
 }

@@ -161,6 +161,9 @@ fn call_vortex_fn(env: &mut Env, fn_name: &str, args: Vec<Value>) -> Result<Valu
             }
         }
         FnDef::Builtin(f) => f(env, args),
+        FnDef::GradWrapper { fn_name, order: _ } => {
+            crate::interpreter::eval_block(env, &crate::ast::Block { stmts: vec![], expr: None, span: crate::ast::Span::new(0, 0) })
+        }
     }
 }
 

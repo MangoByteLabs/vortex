@@ -34,6 +34,7 @@ mod memory;
 mod mcp_server;
 mod memory_safety;
 pub mod modmath;
+pub mod field_arithmetic;
 mod module;
 mod metabolic;
 mod multiscale;
@@ -98,6 +99,7 @@ mod vir;
 mod ptx_backend;
 mod net_runtime;
 mod fast_matrix;
+mod zkp;
 
 use codespan_reporting::files::SimpleFiles;
 use codespan_reporting::term;

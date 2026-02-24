@@ -1010,6 +1010,7 @@ fn ast_to_value(program: &Program) -> Value {
                 ItemKind::Import(_) => "import".to_string(),
                 ItemKind::Const(c) => format!("const:{}", c.name.name),
                 ItemKind::TypeAlias(t) => format!("type:{}", t.name.name),
+                ItemKind::FieldDef(fd) => format!("field:{}", fd.name.name),
             };
             Value::String(kind_str)
         })
@@ -1263,6 +1264,9 @@ impl Env {
                     Ok(Value::Return(v)) => Ok(*v),
                     other => other,
                 }
+            }
+            FnDef::GradWrapper { fn_name, order: _ } => {
+                Err(format!("GradWrapper '{}' not callable in meta engine", fn_name))
             }
         }
     }

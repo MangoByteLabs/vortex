@@ -155,7 +155,51 @@ impl Parser {
                 | TokenKind::Pub
                 | TokenKind::Const
                 | TokenKind::Type
+                | TokenKind::Field
+                | TokenKind::Diff
+                | TokenKind::Live
+                | TokenKind::Fuse
+                | TokenKind::Gpu
+                | TokenKind::Parallel
+                | TokenKind::Train
+                | TokenKind::Deterministic
+                | TokenKind::Autocast
+                | TokenKind::Speculate
+                | TokenKind::Stream
+                | TokenKind::Reward
+                | TokenKind::Topology
+                | TokenKind::Evolve
+                | TokenKind::Mmap
+                | TokenKind::Explain
+                | TokenKind::Cache
+                | TokenKind::Quantize
+                | TokenKind::Safe
+                | TokenKind::Consensus
+                | TokenKind::Symbolic
+                | TokenKind::Temporal
+                | TokenKind::Federated
+                | TokenKind::Sandbox
+                | TokenKind::Compress
+                | TokenKind::Alignment
+                | TokenKind::Metacognition
+                | TokenKind::Theorem
+                | TokenKind::Continual
+                | TokenKind::Multimodal
+                | TokenKind::WorldModel
+                | TokenKind::SelfImprove
+                | TokenKind::Intention
+                | TokenKind::Memory
+                | TokenKind::Attention
+                | TokenKind::Curriculum
+                | TokenKind::Ensemble
+                | TokenKind::Adversarial
+                | TokenKind::Transfer
+                | TokenKind::SparseScope
+                | TokenKind::AsyncInfer
+                | TokenKind::Profile
+                | TokenKind::Contract
                 | TokenKind::At
+                | TokenKind::Hash
                 | TokenKind::Eof => break,
                 _ => {
                     self.advance();
@@ -238,7 +282,56 @@ impl Parser {
         // Parse annotations before the item
         let annotations = self.parse_annotations()?;
 
+        // Handle #[verifiable] attribute syntax
+        if self.check(TokenKind::Hash) {
+            // Check for #[verifiable]
+            let saved = self.pos;
+            self.advance(); // eat #
+            if self.check(TokenKind::LBracket) {
+                self.advance(); // eat [
+                if self.check(TokenKind::Ident) && self.peek().text == "verifiable" {
+                    self.advance(); // eat verifiable
+                    let _ = self.expect(TokenKind::RBracket); // eat ]
+                    // Now parse the annotated item recursively
+                    let mut item = self.parse_item()?;
+                    if let ItemKind::Function(ref mut func) = item.kind {
+                        func.annotations.push(Annotation::Verifiable);
+                    }
+                    return Ok(item);
+                } else {
+                    self.pos = saved; // backtrack
+                }
+            } else {
+                self.pos = saved; // backtrack
+            }
+        }
+
         let is_pub = self.eat(TokenKind::Pub).is_some();
+
+        // Handle `diff fn` syntax
+        // Handle keyword-prefixed function declarations: diff fn, cache fn, reward fn, stream fn, evolve fn
+        let fn_annotation = match self.peek_kind() {
+            TokenKind::Diff => Some(Annotation::Diff),
+            TokenKind::Cache => Some(Annotation::Cache),
+            TokenKind::Reward => Some(Annotation::Reward),
+            TokenKind::Stream => Some(Annotation::StreamFn),
+            TokenKind::Evolve => Some(Annotation::Evolve),
+            TokenKind::Alignment => Some(Annotation::Alignment),
+            TokenKind::Intention => Some(Annotation::Intention),
+            TokenKind::Contract => Some(Annotation::Contract),
+            _ => None,
+        };
+        if let Some(annot) = fn_annotation {
+            self.advance(); // eat the keyword
+            let mut func = self.parse_function()?;
+            func.annotations.extend(annotations);
+            func.annotations.push(annot);
+            return Ok(Item {
+                kind: ItemKind::Function(func),
+                span: start.merge(self.tokens[self.pos.saturating_sub(1)].span),
+                is_pub,
+            });
+        }
 
         let kind = match self.peek_kind() {
             TokenKind::Fn => {
@@ -266,6 +359,7 @@ impl Parser {
             TokenKind::From => ItemKind::Import(self.parse_from_import()?),
             TokenKind::Const => ItemKind::Const(self.parse_const()?),
             TokenKind::Type => ItemKind::TypeAlias(self.parse_type_alias()?),
+            TokenKind::Field => ItemKind::FieldDef(self.parse_field_def()?),
             _ => {
                 let tok = self.peek().clone();
                 let msg = match suggest_keyword(&tok.text) {
@@ -670,6 +764,25 @@ impl Parser {
         })
     }
 
+    fn parse_field_def(&mut self) -> Result<FieldDef, ()> {
+        self.expect(TokenKind::Field)?;
+        let name = self.parse_ident()?;
+        self.expect(TokenKind::Eq)?;
+        // Expect a hex literal or int literal as the modulus
+        let tok = self.peek().clone();
+        let modulus = match tok.kind {
+            TokenKind::HexLiteral | TokenKind::IntLiteral => {
+                self.advance();
+                tok.text.clone()
+            }
+            _ => {
+                self.error(tok.span, "expected hex or integer literal for field modulus".to_string());
+                return Err(());
+            }
+        };
+        Ok(FieldDef { name, modulus })
+    }
+
     // --- Generics ---
 
     fn parse_optional_generics(&mut self) -> Result<Vec<GenericParam>, ()> {
@@ -797,6 +910,16 @@ impl Parser {
 
     fn parse_type(&mut self) -> Result<TypeExpr, ()> {
         let start = self.span();
+
+        // Unique (linear) types: unique T
+        if self.eat(TokenKind::Unique).is_some() {
+            let inner = self.parse_type()?;
+            let end = inner.span;
+            return Ok(TypeExpr {
+                kind: TypeExprKind::Unique(Box::new(inner)),
+                span: start.merge(end),
+            });
+        }
 
         // Reference types: &T, &mut T
         if self.eat(TokenKind::Amp).is_some() {
@@ -1068,6 +1191,297 @@ impl Parser {
         let start = self.span();
 
         match self.peek_kind() {
+            TokenKind::Live => {
+                self.advance();
+                let name = self.parse_ident()?;
+                self.expect(TokenKind::Eq)?;
+                let value = self.parse_expr()?;
+                Ok(Stmt {
+                    span: start.merge(value.span),
+                    kind: StmtKind::Live { name, value },
+                })
+            }
+            TokenKind::Fuse => {
+                self.advance();
+                let body = self.parse_block()?;
+                Ok(Stmt {
+                    span: start.merge(body.span),
+                    kind: StmtKind::Fuse { body },
+                })
+            }
+            TokenKind::Gpu => {
+                self.advance();
+                self.expect(TokenKind::Let)?;
+                let name = self.parse_ident()?;
+                self.expect(TokenKind::Eq)?;
+                let value = self.parse_expr()?;
+                Ok(Stmt {
+                    span: start.merge(value.span),
+                    kind: StmtKind::GpuLet { name, value },
+                })
+            }
+            TokenKind::Parallel => {
+                self.advance();
+                self.expect(TokenKind::For)?;
+                let var = self.parse_ident()?;
+                self.expect(TokenKind::In)?;
+                let iter = self.parse_expr()?;
+                let body = self.parse_block()?;
+                Ok(Stmt {
+                    span: start.merge(body.span),
+                    kind: StmtKind::Parallel { var, iter, body },
+                })
+            }
+            TokenKind::Train => {
+                self.advance();
+                self.expect(TokenKind::LBrace)?;
+                let mut config = Vec::new();
+                while !self.check(TokenKind::RBrace) && !self.check(TokenKind::Eof) {
+                    let key = self.parse_ident()?;
+                    self.expect(TokenKind::Colon)?;
+                    let val = self.parse_expr()?;
+                    config.push((key, val));
+                    self.eat(TokenKind::Comma);
+                }
+                let end = self.expect(TokenKind::RBrace)?;
+                Ok(Stmt {
+                    span: start.merge(end.span),
+                    kind: StmtKind::Train { config },
+                })
+            }
+            TokenKind::Deterministic => {
+                self.advance();
+                let body = self.parse_block()?;
+                Ok(Stmt {
+                    span: start.merge(body.span),
+                    kind: StmtKind::Deterministic { body },
+                })
+            }
+            TokenKind::Autocast => {
+                self.advance();
+                self.expect(TokenKind::LParen)?;
+                let dtype = self.parse_ident()?;
+                self.expect(TokenKind::RParen)?;
+                let body = self.parse_block()?;
+                Ok(Stmt {
+                    span: start.merge(body.span),
+                    kind: StmtKind::Autocast { dtype, body },
+                })
+            }
+            TokenKind::Speculate => {
+                self.advance();
+                let body = self.parse_block()?;
+                Ok(Stmt {
+                    span: start.merge(body.span),
+                    kind: StmtKind::Speculate { body },
+                })
+            }
+            TokenKind::Topology => {
+                self.advance();
+                self.expect(TokenKind::LBrace)?;
+                let mut config = Vec::new();
+                while !self.check(TokenKind::RBrace) && !self.check(TokenKind::Eof) {
+                    let key = self.parse_ident()?;
+                    self.expect(TokenKind::Colon)?;
+                    let val = self.parse_expr()?;
+                    config.push((key, val));
+                    self.eat(TokenKind::Comma);
+                }
+                let end = self.expect(TokenKind::RBrace)?;
+                Ok(Stmt {
+                    span: start.merge(end.span),
+                    kind: StmtKind::Topology { config },
+                })
+            }
+            TokenKind::Mmap => {
+                self.advance();
+                let name = self.parse_ident()?;
+                self.expect(TokenKind::Eq)?;
+                let value = self.parse_expr()?;
+                Ok(Stmt {
+                    span: start.merge(value.span),
+                    kind: StmtKind::Mmap { name, value },
+                })
+            }
+            TokenKind::Explain => {
+                self.advance();
+                let body = self.parse_block()?;
+                Ok(Stmt {
+                    span: start.merge(body.span),
+                    kind: StmtKind::Explain { body },
+                })
+            }
+            TokenKind::Quantize => {
+                self.advance();
+                self.expect(TokenKind::LParen)?;
+                let dtype = self.parse_ident()?;
+                self.expect(TokenKind::RParen)?;
+                let body = self.parse_block()?;
+                Ok(Stmt {
+                    span: start.merge(body.span),
+                    kind: StmtKind::Quantize { dtype, body },
+                })
+            }
+            TokenKind::Safe => {
+                self.advance();
+                self.expect(TokenKind::LParen)?;
+                let mut config = Vec::new();
+                while !self.check(TokenKind::RParen) && !self.check(TokenKind::Eof) {
+                    let key = self.parse_ident()?;
+                    self.expect(TokenKind::Colon)?;
+                    let val = self.parse_expr()?;
+                    config.push((key, val));
+                    self.eat(TokenKind::Comma);
+                }
+                self.expect(TokenKind::RParen)?;
+                let body = self.parse_block()?;
+                Ok(Stmt {
+                    span: start.merge(body.span),
+                    kind: StmtKind::Safe { config, body },
+                })
+            }
+            TokenKind::Consensus => {
+                self.advance();
+                let body = self.parse_block()?;
+                Ok(Stmt { span: start.merge(body.span), kind: StmtKind::Consensus { body } })
+            }
+            TokenKind::Symbolic => {
+                self.advance();
+                let body = self.parse_block()?;
+                Ok(Stmt { span: start.merge(body.span), kind: StmtKind::SymbolicBlock { body } })
+            }
+            TokenKind::Temporal => {
+                self.advance();
+                let body = self.parse_block()?;
+                Ok(Stmt { span: start.merge(body.span), kind: StmtKind::TemporalBlock { body } })
+            }
+            TokenKind::Federated => {
+                self.advance();
+                let body = self.parse_block()?;
+                Ok(Stmt { span: start.merge(body.span), kind: StmtKind::Federated { body } })
+            }
+            TokenKind::Sandbox => {
+                self.advance();
+                let body = self.parse_block()?;
+                Ok(Stmt { span: start.merge(body.span), kind: StmtKind::SandboxBlock { body } })
+            }
+            TokenKind::Compress => {
+                self.advance();
+                self.expect(TokenKind::LParen)?;
+                let ratio = self.parse_expr()?;
+                self.expect(TokenKind::RParen)?;
+                let body = self.parse_block()?;
+                Ok(Stmt { span: start.merge(body.span), kind: StmtKind::Compress { ratio, body } })
+            }
+            TokenKind::Metacognition => {
+                self.advance();
+                let body = self.parse_block()?;
+                Ok(Stmt { span: start.merge(body.span), kind: StmtKind::Metacognition { body } })
+            }
+            TokenKind::Theorem => {
+                self.advance();
+                // Optional name
+                let name = if self.check(TokenKind::Ident) {
+                    Some(self.parse_ident()?)
+                } else { None };
+                let body = self.parse_block()?;
+                Ok(Stmt { span: start.merge(body.span), kind: StmtKind::TheoremBlock { name, body } })
+            }
+            TokenKind::Continual => {
+                self.advance();
+                let body = self.parse_block()?;
+                Ok(Stmt { span: start.merge(body.span), kind: StmtKind::ContinualLearn { body } })
+            }
+            TokenKind::Multimodal => {
+                self.advance();
+                // Optional modalities list: multimodal(vision, audio, text) { }
+                let modalities = if self.eat(TokenKind::LParen).is_some() {
+                    let mut mods = Vec::new();
+                    while !self.check(TokenKind::RParen) && !self.check(TokenKind::Eof) {
+                        mods.push(self.parse_ident()?);
+                        self.eat(TokenKind::Comma);
+                    }
+                    self.expect(TokenKind::RParen)?;
+                    mods
+                } else { Vec::new() };
+                let body = self.parse_block()?;
+                Ok(Stmt { span: start.merge(body.span), kind: StmtKind::MultimodalBlock { modalities, body } })
+            }
+            TokenKind::WorldModel => {
+                self.advance();
+                let body = self.parse_block()?;
+                Ok(Stmt { span: start.merge(body.span), kind: StmtKind::WorldModelBlock { body } })
+            }
+            TokenKind::SelfImprove => {
+                self.advance();
+                let body = self.parse_block()?;
+                Ok(Stmt { span: start.merge(body.span), kind: StmtKind::SelfImproveBlock { body } })
+            }
+            TokenKind::Memory => {
+                self.advance();
+                self.expect(TokenKind::LBrace)?;
+                let mut config = Vec::new();
+                while !self.check(TokenKind::RBrace) && !self.check(TokenKind::Eof) {
+                    let key = self.parse_ident()?;
+                    self.expect(TokenKind::Colon)?;
+                    let val = self.parse_expr()?;
+                    config.push((key, val));
+                    self.eat(TokenKind::Comma);
+                }
+                let end = self.expect(TokenKind::RBrace)?;
+                Ok(Stmt { span: start.merge(end.span), kind: StmtKind::MemoryBlock { config } })
+            }
+            TokenKind::Attention => {
+                self.advance();
+                let body = self.parse_block()?;
+                Ok(Stmt { span: start.merge(body.span), kind: StmtKind::AttentionBlock { body } })
+            }
+            TokenKind::Curriculum => {
+                self.advance();
+                let mut config = Vec::new();
+                if self.eat(TokenKind::LParen).is_some() {
+                    while !self.check(TokenKind::RParen) && !self.check(TokenKind::Eof) {
+                        let key = self.parse_ident()?;
+                        self.expect(TokenKind::Colon)?;
+                        let val = self.parse_expr()?;
+                        config.push((key, val));
+                        self.eat(TokenKind::Comma);
+                    }
+                    self.expect(TokenKind::RParen)?;
+                }
+                let body = self.parse_block()?;
+                Ok(Stmt { span: start.merge(body.span), kind: StmtKind::CurriculumBlock { config, body } })
+            }
+            TokenKind::Ensemble => {
+                self.advance();
+                let body = self.parse_block()?;
+                Ok(Stmt { span: start.merge(body.span), kind: StmtKind::EnsembleBlock { body } })
+            }
+            TokenKind::Adversarial => {
+                self.advance();
+                let body = self.parse_block()?;
+                Ok(Stmt { span: start.merge(body.span), kind: StmtKind::AdversarialBlock { body } })
+            }
+            TokenKind::Transfer => {
+                self.advance();
+                let body = self.parse_block()?;
+                Ok(Stmt { span: start.merge(body.span), kind: StmtKind::TransferBlock { body } })
+            }
+            TokenKind::SparseScope => {
+                self.advance();
+                let body = self.parse_block()?;
+                Ok(Stmt { span: start.merge(body.span), kind: StmtKind::SparseBlock { body } })
+            }
+            TokenKind::AsyncInfer => {
+                self.advance();
+                let body = self.parse_block()?;
+                Ok(Stmt { span: start.merge(body.span), kind: StmtKind::AsyncInferBlock { body } })
+            }
+            TokenKind::Profile => {
+                self.advance();
+                let body = self.parse_block()?;
+                Ok(Stmt { span: start.merge(body.span), kind: StmtKind::ProfileBlock { body } })
+            }
             TokenKind::Let => {
                 self.advance();
                 let name = self.parse_ident()?;

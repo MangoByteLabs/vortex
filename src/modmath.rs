@@ -833,6 +833,10 @@ fn compute_sqrt_exp(modulus: &[u64; 4]) -> Option<[u64; 4]> {
 }
 
 /// Initialize field parameters for a given modulus.
+pub fn init_field_params_pub(modulus: [u64; 4], name: &'static str) -> FieldParams {
+    init_field_params(modulus, name)
+}
+
 fn init_field_params(modulus: [u64; 4], name: &'static str) -> FieldParams {
     let inv = compute_inv(modulus[0]);
     let r_mod_p = compute_r_mod_p(&modulus);
@@ -906,7 +910,8 @@ pub static M31_FIELD: LazyLock<FieldParams> = LazyLock::new(|| {
 /// Look up a field by name.
 pub fn field_by_name(name: &str) -> Option<&'static FieldParams> {
     match name {
-        "secp256k1" => Some(&*SECP256K1_FIELD),
+        "secp256k1" | "secp256k1_field" | "fp" => Some(&*SECP256K1_FIELD),
+        "secp256k1_order" | "secp256k1_n" | "fn" | "scalar" => Some(&*crate::field_arithmetic::SECP256K1_ORDER),
         "bn254" => Some(&*BN254_FIELD),
         "bls12_381" | "bls12-381" => Some(&*BLS12_381_FIELD),
         "goldilocks" => Some(&*GOLDILOCKS_FIELD),

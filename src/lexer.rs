@@ -111,6 +111,94 @@ pub enum TokenKind {
     SparseIndex,
     #[token("dispatch")]
     Dispatch,
+    #[token("field")]
+    Field,
+    #[token("diff")]
+    Diff,
+    #[token("unique")]
+    Unique,
+    #[token("live")]
+    Live,
+    #[token("fuse")]
+    Fuse,
+    #[token("gpu")]
+    Gpu,
+    #[token("parallel")]
+    Parallel,
+    #[token("train")]
+    Train,
+    #[token("deterministic")]
+    Deterministic,
+    #[token("autocast")]
+    Autocast,
+    #[token("speculate")]
+    Speculate,
+    #[token("stream")]
+    Stream,
+    #[token("reward")]
+    Reward,
+    #[token("topology")]
+    Topology,
+    #[token("evolve")]
+    Evolve,
+    #[token("mmap")]
+    Mmap,
+    #[token("explain")]
+    Explain,
+    #[token("cache")]
+    Cache,
+    #[token("quantize")]
+    Quantize,
+    #[token("safe")]
+    Safe,
+    #[token("consensus")]
+    Consensus,
+    #[token("symbolic")]
+    Symbolic,
+    #[token("temporal")]
+    Temporal,
+    #[token("federated")]
+    Federated,
+    #[token("sandbox")]
+    Sandbox,
+    #[token("compress")]
+    Compress,
+    #[token("alignment")]
+    Alignment,
+    #[token("metacognition")]
+    Metacognition,
+    #[token("theorem")]
+    Theorem,
+    #[token("continual")]
+    Continual,
+    #[token("multimodal")]
+    Multimodal,
+    #[token("world_model")]
+    WorldModel,
+    #[token("self_improve")]
+    SelfImprove,
+    #[token("intention")]
+    Intention,
+    #[token("memory")]
+    Memory,
+    #[token("attention")]
+    Attention,
+    #[token("curriculum")]
+    Curriculum,
+    #[token("ensemble")]
+    Ensemble,
+    #[token("adversarial")]
+    Adversarial,
+    #[token("transfer")]
+    Transfer,
+    #[token("sparse")]
+    SparseScope,
+    #[token("async_infer")]
+    AsyncInfer,
+    #[token("profile")]
+    Profile,
+    #[token("contract")]
+    Contract,
 
     // Arithmetic operators
     #[token("+")]
@@ -290,6 +378,50 @@ impl fmt::Display for TokenKind {
             TokenKind::Sparse => write!(f, "Sparse"),
             TokenKind::SparseIndex => write!(f, "SparseIndex"),
             TokenKind::Dispatch => write!(f, "dispatch"),
+            TokenKind::Field => write!(f, "field"),
+            TokenKind::Diff => write!(f, "diff"),
+            TokenKind::Unique => write!(f, "unique"),
+            TokenKind::Live => write!(f, "live"),
+            TokenKind::Fuse => write!(f, "fuse"),
+            TokenKind::Gpu => write!(f, "gpu"),
+            TokenKind::Parallel => write!(f, "parallel"),
+            TokenKind::Train => write!(f, "train"),
+            TokenKind::Deterministic => write!(f, "deterministic"),
+            TokenKind::Autocast => write!(f, "autocast"),
+            TokenKind::Speculate => write!(f, "speculate"),
+            TokenKind::Stream => write!(f, "stream"),
+            TokenKind::Reward => write!(f, "reward"),
+            TokenKind::Topology => write!(f, "topology"),
+            TokenKind::Evolve => write!(f, "evolve"),
+            TokenKind::Mmap => write!(f, "mmap"),
+            TokenKind::Explain => write!(f, "explain"),
+            TokenKind::Cache => write!(f, "cache"),
+            TokenKind::Quantize => write!(f, "quantize"),
+            TokenKind::Safe => write!(f, "safe"),
+            TokenKind::Consensus => write!(f, "consensus"),
+            TokenKind::Symbolic => write!(f, "symbolic"),
+            TokenKind::Temporal => write!(f, "temporal"),
+            TokenKind::Federated => write!(f, "federated"),
+            TokenKind::Sandbox => write!(f, "sandbox"),
+            TokenKind::Compress => write!(f, "compress"),
+            TokenKind::Alignment => write!(f, "alignment"),
+            TokenKind::Metacognition => write!(f, "metacognition"),
+            TokenKind::Theorem => write!(f, "theorem"),
+            TokenKind::Continual => write!(f, "continual"),
+            TokenKind::Multimodal => write!(f, "multimodal"),
+            TokenKind::WorldModel => write!(f, "world_model"),
+            TokenKind::SelfImprove => write!(f, "self_improve"),
+            TokenKind::Intention => write!(f, "intention"),
+            TokenKind::Memory => write!(f, "memory"),
+            TokenKind::Attention => write!(f, "attention"),
+            TokenKind::Curriculum => write!(f, "curriculum"),
+            TokenKind::Ensemble => write!(f, "ensemble"),
+            TokenKind::Adversarial => write!(f, "adversarial"),
+            TokenKind::Transfer => write!(f, "transfer"),
+            TokenKind::SparseScope => write!(f, "sparse"),
+            TokenKind::AsyncInfer => write!(f, "async_infer"),
+            TokenKind::Profile => write!(f, "profile"),
+            TokenKind::Contract => write!(f, "contract"),
             TokenKind::Plus => write!(f, "+"),
             TokenKind::Minus => write!(f, "-"),
             TokenKind::Star => write!(f, "*"),

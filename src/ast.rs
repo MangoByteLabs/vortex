@@ -26,6 +26,7 @@ pub enum ItemKind {
     Import(ImportDecl),
     Const(ConstDecl),
     TypeAlias(TypeAlias),
+    FieldDef(FieldDef),
 }
 
 /// A regular function
@@ -81,6 +82,32 @@ pub enum Annotation {
     Inline,
     /// @custom(name, args) - custom annotation
     Custom(String, Vec<String>),
+    /// diff - marks function as differentiable
+    Diff,
+    /// #[verifiable] - marks function for ZK proof generation
+    Verifiable,
+    /// cache - semantic memoization
+    Cache,
+    /// reward - RLHF reward function (bounded [0,1])
+    Reward,
+    /// stream - streaming generator function
+    StreamFn,
+    /// evolve - self-modifying function
+    Evolve,
+    /// quantize(dtype) - quantization annotation
+    Quantize(String),
+    /// safe(config) - computation bounds
+    SafeAnnotation,
+    /// alignment - RLHF/DPO alignment function
+    Alignment,
+    /// bounded_recursion(N) - provable termination
+    BoundedRecursion(u64),
+    /// intention - goal-directed function
+    Intention,
+    /// contract - design-by-contract (pre/post conditions)
+    Contract,
+    /// gradient_surgery - gradient manipulation function
+    GradientSurgery,
 }
 
 /// Struct definition
@@ -183,6 +210,13 @@ pub struct ConstDecl {
     pub value: Expr,
 }
 
+/// Field definition (prime field type)
+#[derive(Debug, Clone)]
+pub struct FieldDef {
+    pub name: Ident,
+    pub modulus: String,
+}
+
 /// Type alias
 #[derive(Debug, Clone)]
 pub struct TypeAlias {
@@ -281,6 +315,160 @@ pub enum StmtKind {
         index: Box<Expr>,
         targets: Vec<Ident>,
         args: Vec<Expr>,
+    },
+    /// live name = expr — hot-swappable model binding
+    Live {
+        name: Ident,
+        value: Expr,
+    },
+    /// fuse { body } — guaranteed kernel fusion block
+    Fuse {
+        body: Block,
+    },
+    /// gpu let name = expr — GPU memory ownership binding
+    GpuLet {
+        name: Ident,
+        value: Expr,
+    },
+    /// parallel for var in iter { body } — distributed parallel loop
+    Parallel {
+        var: Ident,
+        iter: Expr,
+        body: Block,
+    },
+    /// train { config pairs } — first-class training loop
+    Train {
+        config: Vec<(Ident, Expr)>,
+    },
+    /// deterministic { body } — reproducibility scope
+    Deterministic {
+        body: Block,
+    },
+    /// autocast(dtype) { body } — mixed precision scope
+    Autocast {
+        dtype: Ident,
+        body: Block,
+    },
+    /// speculate { body } — speculative execution (multiple paths)
+    Speculate {
+        body: Block,
+    },
+    /// topology { config } — network topology definition
+    Topology {
+        config: Vec<(Ident, Expr)>,
+    },
+    /// mmap name = expr — memory-mapped model loading
+    Mmap {
+        name: Ident,
+        value: Expr,
+    },
+    /// explain { body } — interpretability/XAI block
+    Explain {
+        body: Block,
+    },
+    /// quantize(dtype) { body } — quantization scope
+    Quantize {
+        dtype: Ident,
+        body: Block,
+    },
+    /// safe(config) { body } — computation bounds
+    Safe {
+        config: Vec<(Ident, Expr)>,
+        body: Block,
+    },
+    /// consensus { body } — multi-model voting
+    Consensus {
+        body: Block,
+    },
+    /// symbolic { body } — hybrid neural-symbolic scope
+    SymbolicBlock {
+        body: Block,
+    },
+    /// temporal { body } — time-aware computation scope
+    TemporalBlock {
+        body: Block,
+    },
+    /// federated { body } — privacy-preserving training scope
+    Federated {
+        body: Block,
+    },
+    /// sandbox { body } — capability-restricted execution
+    SandboxBlock {
+        body: Block,
+    },
+    /// compress(ratio) { body } — model compression scope
+    Compress {
+        ratio: Expr,
+        body: Block,
+    },
+    /// metacognition { body } — self-reasoning scope
+    Metacognition {
+        body: Block,
+    },
+    /// theorem { body } — formal verification scope
+    TheoremBlock {
+        name: Option<Ident>,
+        body: Block,
+    },
+    /// continual { body } — online learning without catastrophic forgetting
+    ContinualLearn {
+        body: Block,
+    },
+    /// multimodal { body } — multi-modal fusion scope
+    MultimodalBlock {
+        modalities: Vec<Ident>,
+        body: Block,
+    },
+    /// world_model { body } — internal world simulation
+    WorldModelBlock {
+        body: Block,
+    },
+    /// self_improve { body } — recursive self-improvement with bounds
+    SelfImproveBlock {
+        body: Block,
+    },
+    /// memory { config } — hierarchical memory system
+    MemoryBlock {
+        config: Vec<(Ident, Expr)>,
+    },
+    /// attention { body } — custom attention mechanism scope
+    AttentionBlock {
+        body: Block,
+    },
+    /// curriculum { body } — curriculum learning scope
+    CurriculumBlock {
+        config: Vec<(Ident, Expr)>,
+        body: Block,
+    },
+    /// ensemble { body } — model ensemble scope
+    EnsembleBlock {
+        body: Block,
+    },
+    /// adversarial { body } — adversarial training scope
+    AdversarialBlock {
+        body: Block,
+    },
+    /// transfer { body } — transfer learning scope
+    TransferBlock {
+        body: Block,
+    },
+    /// sparse { body } — sparse computation scope
+    SparseBlock {
+        body: Block,
+    },
+    /// async_infer { body } — asynchronous inference scope
+    AsyncInferBlock {
+        body: Block,
+    },
+    /// profile { body } — profiling scope
+    ProfileBlock {
+        body: Block,
+    },
+    /// contract fn — design-by-contract function annotation handled as stmt
+    ContractBlock {
+        pre: Vec<Expr>,
+        post: Vec<Expr>,
+        body: Block,
     },
 }
 
@@ -486,6 +674,8 @@ pub enum TypeExprKind {
     Sparse(Box<TypeExpr>),
     /// SparseIndex type: SparseIndex[B, k]
     SparseIndex { batch: Box<Expr>, k: Box<Expr> },
+    /// Unique (linear) type: unique T
+    Unique(Box<TypeExpr>),
 }
 
 /// A type argument can be a type or a value (for const generics / shapes)
@@ -591,6 +781,7 @@ impl fmt::Display for Item {
             ItemKind::Import(i) => write!(f, "{}", i),
             ItemKind::Const(c) => write!(f, "{}", c),
             ItemKind::TypeAlias(t) => write!(f, "{}", t),
+            ItemKind::FieldDef(fd) => write!(f, "field {} = {}", fd.name.name, fd.modulus),
         }
     }
 }
@@ -614,6 +805,19 @@ impl fmt::Display for Annotation {
             Annotation::Inline => write!(f, "@inline"),
             Annotation::Distributed => write!(f, "@distributed"),
             Annotation::Custom(name, _) => write!(f, "@{}", name),
+            Annotation::Diff => write!(f, "diff"),
+            Annotation::Verifiable => write!(f, "#[verifiable]"),
+            Annotation::Cache => write!(f, "cache"),
+            Annotation::Reward => write!(f, "reward"),
+            Annotation::StreamFn => write!(f, "stream"),
+            Annotation::Evolve => write!(f, "evolve"),
+            Annotation::Quantize(d) => write!(f, "quantize({})", d),
+            Annotation::SafeAnnotation => write!(f, "safe"),
+            Annotation::Alignment => write!(f, "alignment"),
+            Annotation::BoundedRecursion(n) => write!(f, "bounded_recursion({})", n),
+            Annotation::Intention => write!(f, "intention"),
+            Annotation::Contract => write!(f, "contract"),
+            Annotation::GradientSurgery => write!(f, "gradient_surgery"),
         }
     }
 }
@@ -930,6 +1134,43 @@ impl fmt::Display for Stmt {
             }
             StmtKind::Break => write!(f, "break"),
             StmtKind::Continue => write!(f, "continue"),
+            StmtKind::Live { name, value } => {
+                write!(f, "live {} = {}", name.name, value)
+            }
+            StmtKind::Fuse { .. } => write!(f, "fuse {{ ... }}"),
+            StmtKind::GpuLet { name, value } => write!(f, "gpu let {} = {}", name.name, value),
+            StmtKind::Parallel { var, .. } => write!(f, "parallel for {} in ... {{ ... }}", var.name),
+            StmtKind::Train { .. } => write!(f, "train {{ ... }}"),
+            StmtKind::Deterministic { .. } => write!(f, "deterministic {{ ... }}"),
+            StmtKind::Autocast { dtype, .. } => write!(f, "autocast({}) {{ ... }}", dtype.name),
+            StmtKind::Speculate { .. } => write!(f, "speculate {{ ... }}"),
+            StmtKind::Topology { .. } => write!(f, "topology {{ ... }}"),
+            StmtKind::Mmap { name, .. } => write!(f, "mmap {} = ...", name.name),
+            StmtKind::Explain { .. } => write!(f, "explain {{ ... }}"),
+            StmtKind::Quantize { dtype, .. } => write!(f, "quantize({}) {{ ... }}", dtype.name),
+            StmtKind::Safe { .. } => write!(f, "safe {{ ... }}"),
+            StmtKind::Consensus { .. } => write!(f, "consensus {{ ... }}"),
+            StmtKind::SymbolicBlock { .. } => write!(f, "symbolic {{ ... }}"),
+            StmtKind::TemporalBlock { .. } => write!(f, "temporal {{ ... }}"),
+            StmtKind::Federated { .. } => write!(f, "federated {{ ... }}"),
+            StmtKind::SandboxBlock { .. } => write!(f, "sandbox {{ ... }}"),
+            StmtKind::Compress { .. } => write!(f, "compress {{ ... }}"),
+            StmtKind::Metacognition { .. } => write!(f, "metacognition {{ ... }}"),
+            StmtKind::TheoremBlock { .. } => write!(f, "theorem {{ ... }}"),
+            StmtKind::ContinualLearn { .. } => write!(f, "continual {{ ... }}"),
+            StmtKind::MultimodalBlock { .. } => write!(f, "multimodal {{ ... }}"),
+            StmtKind::WorldModelBlock { .. } => write!(f, "world_model {{ ... }}"),
+            StmtKind::SelfImproveBlock { .. } => write!(f, "self_improve {{ ... }}"),
+            StmtKind::MemoryBlock { .. } => write!(f, "memory {{ ... }}"),
+            StmtKind::AttentionBlock { .. } => write!(f, "attention {{ ... }}"),
+            StmtKind::CurriculumBlock { .. } => write!(f, "curriculum {{ ... }}"),
+            StmtKind::EnsembleBlock { .. } => write!(f, "ensemble {{ ... }}"),
+            StmtKind::AdversarialBlock { .. } => write!(f, "adversarial {{ ... }}"),
+            StmtKind::TransferBlock { .. } => write!(f, "transfer {{ ... }}"),
+            StmtKind::SparseBlock { .. } => write!(f, "sparse {{ ... }}"),
+            StmtKind::AsyncInferBlock { .. } => write!(f, "async_infer {{ ... }}"),
+            StmtKind::ProfileBlock { .. } => write!(f, "profile {{ ... }}"),
+            StmtKind::ContractBlock { .. } => write!(f, "contract {{ ... }}"),
             StmtKind::Dispatch { index, targets, args } => {
                 write!(f, "dispatch {} -> [", index)?;
                 for (i, t) in targets.iter().enumerate() {
@@ -1153,6 +1394,7 @@ impl fmt::Display for TypeExpr {
             }
             TypeExprKind::Sparse(inner) => write!(f, "Sparse<{}>", inner),
             TypeExprKind::SparseIndex { batch, k } => write!(f, "SparseIndex[{}, {}]", batch, k),
+            TypeExprKind::Unique(inner) => write!(f, "unique {}", inner),
         }
     }
 }
