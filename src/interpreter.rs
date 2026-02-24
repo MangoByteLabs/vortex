@@ -361,6 +361,12 @@ pub struct Env {
     pub(crate) profile_data: Vec<(String, f64)>,
     pub(crate) contract_functions: std::collections::HashSet<String>,
     pub(crate) gradient_surgery_functions: std::collections::HashSet<String>,
+    /// Functions marked @persistent_grad: stores gradient tapes keyed by function name
+    pub(crate) persistent_grad_tapes: HashMap<String, Vec<f64>>,
+    /// Functions marked @fuse: hints for kernel fusion
+    pub(crate) fuse_functions: std::collections::HashSet<String>,
+    /// Functions marked @constant_time: enforce constant-time execution
+    pub(crate) constant_time_functions: std::collections::HashSet<String>,
 }
 
 #[derive(Clone, Default)]
@@ -533,6 +539,9 @@ impl Env {
             profile_data: Vec::new(),
             contract_functions: HashSet::new(),
             gradient_surgery_functions: HashSet::new(),
+            persistent_grad_tapes: HashMap::new(),
+            fuse_functions: HashSet::new(),
+            constant_time_functions: HashSet::new(),
         };
         env.register_builtins();
         env
@@ -2799,6 +2808,23 @@ pub fn interpret(program: &Program) -> Result<Vec<String>, String> {
                 if func.annotations.iter().any(|a| matches!(a, Annotation::GradientSurgery)) {
                     env.gradient_surgery_functions.insert(func.name.name.clone());
                 }
+                if func.annotations.iter().any(|a| matches!(a, Annotation::PersistentGrad)) {
+                    // Initialize persistent gradient tape for this function
+                    env.persistent_grad_tapes
+                        .entry(func.name.name.clone())
+                        .or_insert_with(Vec::new);
+                }
+                if func.annotations.iter().any(|a| matches!(a, Annotation::Fuse)) {
+                    eprintln!("kernel fusion hint detected for {}", func.name.name);
+                    env.fuse_functions.insert(func.name.name.clone());
+                }
+                if func.annotations.iter().any(|a| matches!(a, Annotation::ConstantTime)) {
+                    eprintln!("constant-time mode for {}", func.name.name);
+                    env.constant_time_functions.insert(func.name.name.clone());
+                }
+                // @adaptive, @zk_provable, @hot_modify, @bounded_update, @tiered,
+                // @multiscale, @local_learning, @sparse_dispatch, @heterogeneous_dispatch
+                // are acknowledged here; full backend support is wired separately.
                 env.functions.insert(
                     func.name.name.clone(),
                     FnDef::User {

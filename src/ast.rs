@@ -1529,3 +1529,24 @@ impl fmt::Display for Block {
         write!(f, "}}")
     }
 }
+
+#[cfg(test)]
+mod annotation_tests {
+    use super::*;
+
+    #[test]
+    fn test_new_annotation_display() {
+        assert_eq!(format!("{}", Annotation::PersistentGrad), "@persistent_grad");
+        assert_eq!(format!("{}", Annotation::Adaptive), "@adaptive");
+        assert_eq!(format!("{}", Annotation::Fuse), "@fuse");
+        assert_eq!(format!("{}", Annotation::ZkProvable), "@zk_provable");
+        assert_eq!(format!("{}", Annotation::ConstantTime), "@constant_time");
+        assert_eq!(format!("{}", Annotation::HotModify), "@hot_modify");
+        assert_eq!(format!("{}", Annotation::HeterogeneousDispatch), "@heterogeneous_dispatch");
+        assert_eq!(format!("{}", Annotation::BoundedUpdate(0.01)), "@bounded_update(0.01)");
+        assert_eq!(format!("{}", Annotation::SparseDispatch(0.01)), "@sparse_dispatch(0.01)");
+        assert_eq!(format!("{}", Annotation::LocalLearning("ForwardForward".to_string())), "@local_learning(ForwardForward)");
+        assert_eq!(format!("{}", Annotation::Tiered(vec!["gpu".to_string(), "cpu".to_string()])), "@tiered(gpu, cpu)");
+        assert_eq!(format!("{}", Annotation::Multiscale { fast: 1, medium: 4, slow: 16 }), "@multiscale(fast=1, medium=4, slow=16)");
+    }
+}

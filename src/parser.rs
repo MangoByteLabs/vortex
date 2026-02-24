@@ -243,6 +243,178 @@ impl Parser {
                 "distributed" => {
                     annotations.push(Annotation::Distributed);
                 }
+                "persistent_grad" => {
+                    annotations.push(Annotation::PersistentGrad);
+                }
+                "bounded_update" => {
+                    // @bounded_update(0.1)
+                    if self.check(TokenKind::LParen) {
+                        self.advance(); // eat (
+                        // parse float or int literal
+                        let eps = if let Some(tok) = self.tokens.get(self.pos) {
+                            match &tok.kind {
+                                TokenKind::FloatLiteral => {
+                                    let v: f64 = tok.text.parse().unwrap_or(0.0);
+                                    self.pos += 1;
+                                    v
+                                }
+                                TokenKind::IntLiteral => {
+                                    let v: f64 = tok.text.parse().unwrap_or(0.0);
+                                    self.pos += 1;
+                                    v
+                                }
+                                _ => 0.0,
+                            }
+                        } else {
+                            0.0
+                        };
+                        let _ = self.expect(TokenKind::RParen);
+                        annotations.push(Annotation::BoundedUpdate(eps));
+                    } else {
+                        annotations.push(Annotation::Custom("bounded_update".to_string(), vec![]));
+                    }
+                }
+                "adaptive" => {
+                    annotations.push(Annotation::Adaptive);
+                }
+                "fuse" => {
+                    annotations.push(Annotation::Fuse);
+                }
+                "zk_provable" => {
+                    annotations.push(Annotation::ZkProvable);
+                }
+                "constant_time" => {
+                    annotations.push(Annotation::ConstantTime);
+                }
+                "tiered" => {
+                    // @tiered(gpu, cpu, ssd)
+                    if self.check(TokenKind::LParen) {
+                        self.advance(); // eat (
+                        let mut tiers = Vec::new();
+                        while !self.check(TokenKind::RParen) && !self.at_end() {
+                            if let Some(tok) = self.tokens.get(self.pos) {
+                                match &tok.kind {
+                                    TokenKind::Ident => {
+                                        tiers.push(tok.text.to_string());
+                                        self.pos += 1;
+                                    }
+                                    TokenKind::Comma => {
+                                        self.pos += 1;
+                                    }
+                                    _ => { self.pos += 1; }
+                                }
+                            } else {
+                                break;
+                            }
+                        }
+                        let _ = self.expect(TokenKind::RParen);
+                        annotations.push(Annotation::Tiered(tiers));
+                    } else {
+                        annotations.push(Annotation::Custom("tiered".to_string(), vec![]));
+                    }
+                }
+                "multiscale" => {
+                    // @multiscale(fast=1, medium=4, slow=16)
+                    if self.check(TokenKind::LParen) {
+                        self.advance(); // eat (
+                        let mut fast = 1u32;
+                        let mut medium = 4u32;
+                        let mut slow = 16u32;
+                        while !self.check(TokenKind::RParen) && !self.at_end() {
+                            if let Some(tok) = self.tokens.get(self.pos) {
+                                match &tok.kind {
+                                    TokenKind::Ident => {
+                                        let key = tok.text.to_string();
+                                        self.pos += 1;
+                                        // expect =
+                                        if self.check(TokenKind::Eq) {
+                                            self.pos += 1;
+                                        }
+                                        // expect int literal
+                                        let val = if let Some(t) = self.tokens.get(self.pos) {
+                                            if matches!(t.kind, TokenKind::IntLiteral) {
+                                                let v: u32 = t.text.parse().unwrap_or(1);
+                                                self.pos += 1;
+                                                v
+                                            } else {
+                                                1
+                                            }
+                                        } else { 1 };
+                                        match key.as_str() {
+                                            "fast" => fast = val,
+                                            "medium" => medium = val,
+                                            "slow" => slow = val,
+                                            _ => {}
+                                        }
+                                    }
+                                    TokenKind::Comma => { self.pos += 1; }
+                                    _ => { self.pos += 1; }
+                                }
+                            } else {
+                                break;
+                            }
+                        }
+                        let _ = self.expect(TokenKind::RParen);
+                        annotations.push(Annotation::Multiscale { fast, medium, slow });
+                    } else {
+                        annotations.push(Annotation::Custom("multiscale".to_string(), vec![]));
+                    }
+                }
+                "local_learning" => {
+                    // @local_learning(ForwardForward)
+                    if self.check(TokenKind::LParen) {
+                        self.advance(); // eat (
+                        let rule = if let Some(tok) = self.tokens.get(self.pos) {
+                            match &tok.kind {
+                                TokenKind::Ident => {
+                                    let s = tok.text.to_string();
+                                    self.pos += 1;
+                                    s
+                                }
+                                _ => "unknown".to_string(),
+                            }
+                        } else {
+                            "unknown".to_string()
+                        };
+                        let _ = self.expect(TokenKind::RParen);
+                        annotations.push(Annotation::LocalLearning(rule));
+                    } else {
+                        annotations.push(Annotation::Custom("local_learning".to_string(), vec![]));
+                    }
+                }
+                "hot_modify" => {
+                    annotations.push(Annotation::HotModify);
+                }
+                "sparse_dispatch" => {
+                    // @sparse_dispatch(0.01)
+                    if self.check(TokenKind::LParen) {
+                        self.advance(); // eat (
+                        let sparsity = if let Some(tok) = self.tokens.get(self.pos) {
+                            match &tok.kind {
+                                TokenKind::FloatLiteral => {
+                                    let v: f64 = tok.text.parse().unwrap_or(0.0);
+                                    self.pos += 1;
+                                    v
+                                }
+                                TokenKind::IntLiteral => {
+                                    let v: f64 = tok.text.parse().unwrap_or(0.0);
+                                    self.pos += 1;
+                                    v
+                                }
+                                _ => 0.0,
+                            }
+                        } else {
+                            0.0
+                        };
+                        let _ = self.expect(TokenKind::RParen);
+                        annotations.push(Annotation::SparseDispatch(sparsity));
+                    } else {
+                        annotations.push(Annotation::Custom("sparse_dispatch".to_string(), vec![]));
+                    }
+                }
+                "heterogeneous_dispatch" => {
+                    annotations.push(Annotation::HeterogeneousDispatch);
+                }
                 other => {
                     annotations.push(Annotation::Custom(other.to_string(), vec![]));
                 }

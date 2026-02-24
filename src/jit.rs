@@ -11,7 +11,8 @@ use std::fmt::Write as FmtWrite;
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Command, Output};
+use std::time::Duration;
 
 /// Represents a compiled native function
 #[derive(Debug, Clone)]
@@ -128,20 +129,24 @@ impl JitEngine {
         // 3. Lower through mlir-opt
         let lowered_path = work_dir.join("lowered.mlir");
         let mlir_opt = find_tool("mlir-opt").unwrap();
-        let opt_result = Command::new(&mlir_opt)
-            .arg(&mlir_path)
-            .arg("--canonicalize")
-            .arg("--cse")
-            .arg("--convert-scf-to-cf")
-            .arg("--convert-func-to-llvm")
-            .arg("--convert-arith-to-llvm")
-            .arg("--convert-cf-to-llvm")
-            .arg("--finalize-memref-to-llvm")
-            .arg("--reconcile-unrealized-casts")
-            .arg("-o")
-            .arg(&lowered_path)
-            .output()
-            .map_err(|e| format!("mlir-opt failed to execute: {}", e))?;
+        let opt_result = command_output_timeout(
+            {
+                let mut c = Command::new(&mlir_opt);
+                c.arg(&mlir_path)
+                    .arg("--canonicalize")
+                    .arg("--cse")
+                    .arg("--convert-scf-to-cf")
+                    .arg("--convert-func-to-llvm")
+                    .arg("--convert-arith-to-llvm")
+                    .arg("--convert-cf-to-llvm")
+                    .arg("--finalize-memref-to-llvm")
+                    .arg("--reconcile-unrealized-casts")
+                    .arg("-o")
+                    .arg(&lowered_path);
+                c
+            }
+        )
+        .map_err(|e| format!("mlir-opt failed to execute: {}", e))?;
 
         if !opt_result.status.success() {
             let stderr = String::from_utf8_lossy(&opt_result.stderr);
@@ -151,13 +156,17 @@ impl JitEngine {
         // 4. Translate to LLVM IR
         let llvm_path = work_dir.join("output.ll");
         let mlir_translate = find_tool("mlir-translate").unwrap();
-        let translate_result = Command::new(&mlir_translate)
-            .arg("--mlir-to-llvmir")
-            .arg(&lowered_path)
-            .arg("-o")
-            .arg(&llvm_path)
-            .output()
-            .map_err(|e| format!("mlir-translate failed to execute: {}", e))?;
+        let translate_result = command_output_timeout(
+            {
+                let mut c = Command::new(&mlir_translate);
+                c.arg("--mlir-to-llvmir")
+                    .arg(&lowered_path)
+                    .arg("-o")
+                    .arg(&llvm_path);
+                c
+            }
+        )
+        .map_err(|e| format!("mlir-translate failed to execute: {}", e))?;
 
         if !translate_result.status.success() {
             let stderr = String::from_utf8_lossy(&translate_result.stderr);
@@ -167,14 +176,18 @@ impl JitEngine {
         // 5. Compile to shared object
         let so_path = work_dir.join(format!("lib{}.so", fn_name));
         let clang = find_tool("clang").unwrap();
-        let clang_result = Command::new(&clang)
-            .arg("-shared")
-            .arg("-O2")
-            .arg("-o")
-            .arg(&so_path)
-            .arg(&llvm_path)
-            .output()
-            .map_err(|e| format!("clang failed to execute: {}", e))?;
+        let clang_result = command_output_timeout(
+            {
+                let mut c = Command::new(&clang);
+                c.arg("-shared")
+                    .arg("-O2")
+                    .arg("-o")
+                    .arg(&so_path)
+                    .arg(&llvm_path);
+                c
+            }
+        )
+        .map_err(|e| format!("clang failed to execute: {}", e))?;
 
         if !clang_result.status.success() {
             let stderr = String::from_utf8_lossy(&clang_result.stderr);
@@ -200,10 +213,14 @@ impl JitEngine {
     pub fn execute(&self, compiled: &CompiledFn, args: &[f64]) -> Result<JitResult, String> {
         let str_args: Vec<String> = args.iter().map(|a| format!("{}", a)).collect();
 
-        let output = Command::new(&compiled.runner_path)
-            .args(&str_args)
-            .output()
-            .map_err(|e| format!("runner execution failed: {}", e))?;
+        let output = command_output_timeout(
+            {
+                let mut c = Command::new(&compiled.runner_path);
+                c.args(&str_args);
+                c
+            }
+        )
+        .map_err(|e| format!("runner execution failed: {}", e))?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -570,14 +587,18 @@ fn generate_runner(
 
     // Compile the runner
     let clang = find_tool("clang").unwrap();
-    let result = Command::new(&clang)
-        .arg("-o")
-        .arg(&runner_bin_path)
-        .arg(&runner_c_path)
-        .arg("-ldl")
-        .arg("-O2")
-        .output()
-        .map_err(|e| format!("clang runner compilation failed: {}", e))?;
+    let result = command_output_timeout(
+        {
+            let mut c = Command::new(&clang);
+            c.arg("-o")
+                .arg(&runner_bin_path)
+                .arg(&runner_c_path)
+                .arg("-ldl")
+                .arg("-O2");
+            c
+        }
+    )
+    .map_err(|e| format!("clang runner compilation failed: {}", e))?;
 
     if !result.status.success() {
         let stderr = String::from_utf8_lossy(&result.stderr);
@@ -585,6 +606,37 @@ fn generate_runner(
     }
 
     Ok(runner_bin_path)
+}
+
+/// Run a `Command` capturing stdout/stderr with a 30-second timeout.
+/// This prevents tests from hanging indefinitely when external tools stall.
+fn command_output_timeout(mut cmd: Command) -> Result<Output, String> {
+    let mut child = cmd
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("failed to spawn: {}", e))?;
+
+    let timeout = Duration::from_secs(30);
+    let start = std::time::Instant::now();
+
+    loop {
+        match child.try_wait().map_err(|e| format!("wait error: {}", e))? {
+            Some(_) => break,
+            None => {
+                if start.elapsed() >= timeout {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err("process timed out after 30 seconds".to_string());
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
+    }
+
+    child
+        .wait_with_output()
+        .map_err(|e| format!("failed to collect output: {}", e))
 }
 
 /// Find a tool by trying versioned and unversioned names
