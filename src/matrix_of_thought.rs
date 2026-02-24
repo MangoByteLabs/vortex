@@ -1017,6 +1017,457 @@ fn builtin_cog_messages_for(env: &mut Env, args: Vec<Value>) -> Result<Value, St
     }).collect()))
 }
 
+// ── ExpertType ──────────────────────────────────────────────────────────
+// Maps to the heterogeneous compute units described in design doc §3.
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ExpertType {
+    /// Exact integer arithmetic — no floating-point error.
+    SymbolicALU,
+    /// Energy-based Langevin sampler — explores diverse solutions.
+    EBMSampler,
+    /// Key-value lookup over external memory (bandwidth-bound).
+    RetrievalLookup,
+    /// ZK-circuit generation (Montgomery arithmetic).
+    ZKCircuit,
+    /// Standard cross-attention (tensor cores).
+    DenseAttention,
+    /// Recursive sub-ThoughtMatrix with reduced budget.
+    SubThoughtMatrix,
+}
+
+impl ExpertType {
+    pub fn all() -> &'static [ExpertType] {
+        &[
+            ExpertType::SymbolicALU,
+            ExpertType::EBMSampler,
+            ExpertType::RetrievalLookup,
+            ExpertType::ZKCircuit,
+            ExpertType::DenseAttention,
+            ExpertType::SubThoughtMatrix,
+        ]
+    }
+
+    /// Map from the design-doc thought categories to ExpertType.
+    pub fn from_thought_type(tt: ThoughtType) -> Self {
+        match tt {
+            ThoughtType::Analytical   => ExpertType::SymbolicALU,
+            ThoughtType::Creative     => ExpertType::EBMSampler,
+            ThoughtType::Retrieval    => ExpertType::RetrievalLookup,
+            ThoughtType::Verification => ExpertType::ZKCircuit,
+            ThoughtType::Synthesis    => ExpertType::DenseAttention,
+            ThoughtType::Refinement   => ExpertType::SubThoughtMatrix,
+        }
+    }
+}
+
+// ── MotNode: 5D-coordinate thought node ─────────────────────────────────
+// A richer node used by the standalone MoT API.  The existing ThoughtNode
+// inside ThoughtMatrix uses a flat index; MotNode adds the 5D coords and
+// an explicit dimension tag as specified in design doc §2.
+
+#[derive(Debug, Clone)]
+pub struct MotNode {
+    pub id: u64,
+    /// Semantic embedding of this thought.
+    pub content: Vec<f64>,
+    /// Which axis (dimension) this node lives on.
+    pub dimension: ThoughtDimension,
+    /// Position in 5D thought-space:
+    /// [hypothesis, abstraction, modality, confidence, temporal]
+    pub coords: [u32; 5],
+    /// Certainty score in [0, 1].
+    pub confidence: f64,
+    /// Outgoing edges (child ids).
+    pub children: Vec<u64>,
+    /// Incoming edges (parent ids / provenance).
+    pub parents: Vec<u64>,
+    /// Which expert produced this node.
+    pub expert_type: ExpertType,
+}
+
+impl MotNode {
+    pub fn new(
+        id: u64,
+        content: Vec<f64>,
+        dimension: ThoughtDimension,
+        coords: [u32; 5],
+        confidence: f64,
+        expert_type: ExpertType,
+    ) -> Self {
+        Self { id, content, dimension, coords, confidence, children: Vec::new(), parents: Vec::new(), expert_type }
+    }
+}
+
+// ── MotMatrix ────────────────────────────────────────────────────────────
+// The design-doc ThoughtMatrix with a priority-queue frontier.
+
+pub struct MotMatrix {
+    /// All nodes, keyed by id.
+    pub nodes: HashMap<u64, MotNode>,
+    /// Priority frontier: (value, node_id).  Sorted descending by value.
+    pub frontier: Vec<(f64, u64)>,
+    /// Dimensions to explore.
+    pub dimensions: [ThoughtDimension; 5],
+    /// Remaining compute budget in milliseconds.
+    pub budget_ms: u64,
+    next_id: u64,
+    rng: Rng,
+}
+
+impl MotMatrix {
+    pub fn new(budget_ms: u64) -> Self {
+        Self {
+            nodes: HashMap::new(),
+            frontier: Vec::new(),
+            dimensions: [
+                ThoughtDimension::Hypothesis,
+                ThoughtDimension::Abstraction,
+                ThoughtDimension::Modality,
+                ThoughtDimension::Confidence,
+                ThoughtDimension::Temporal,
+            ],
+            budget_ms,
+            next_id: 0,
+            rng: Rng::new(0xc0ffee),
+        }
+    }
+
+    fn alloc_id(&mut self) -> u64 {
+        let id = self.next_id;
+        self.next_id += 1;
+        id
+    }
+
+    /// Insert a node and push it onto the frontier with its confidence as priority.
+    pub fn insert(&mut self, node: MotNode) {
+        let prio = node.confidence;
+        let id = node.id;
+        self.nodes.insert(id, node);
+        self.frontier.push((prio, id));
+        self.frontier.sort_unstable_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
+    }
+
+    /// Pop the highest-priority node from the frontier.
+    pub fn pop_frontier(&mut self) -> Option<u64> {
+        if self.frontier.is_empty() { return None; }
+        let (_, id) = self.frontier.remove(0);
+        Some(id)
+    }
+
+    /// Average confidence of all nodes currently on the frontier.
+    pub fn frontier_avg_confidence(&self) -> f64 {
+        if self.frontier.is_empty() { return 0.0; }
+        self.frontier.iter().map(|(p, _)| p).sum::<f64>() / self.frontier.len() as f64
+    }
+
+    /// Create one root node per dimension from the initial query embedding.
+    pub fn seed_from_query(&mut self, content: &[f64]) {
+        // Collect dimensions first to avoid simultaneous borrows.
+        let dims: Vec<ThoughtDimension> = self.dimensions.to_vec();
+        for (i, dim) in dims.into_iter().enumerate() {
+            let id = self.alloc_id();
+            let mut coords = [0u32; 5];
+            coords[i] = 0;
+            let expert = match dim {
+                ThoughtDimension::Hypothesis  => ExpertType::SymbolicALU,
+                ThoughtDimension::Abstraction => ExpertType::DenseAttention,
+                ThoughtDimension::Modality    => ExpertType::EBMSampler,
+                ThoughtDimension::Confidence  => ExpertType::RetrievalLookup,
+                ThoughtDimension::Temporal    => ExpertType::DenseAttention,
+            };
+            let node = MotNode::new(id, content.to_vec(), dim, coords, 0.5, expert);
+            self.insert(node);
+        }
+    }
+}
+
+// ── expert_dispatch ───────────────────────────────────────────────────────
+// Routes a MotNode to the appropriate computation.  Returns a new node
+// with updated content and confidence.
+
+pub fn expert_dispatch(node: &MotNode, expert_type: ExpertType, rng: &mut Rng) -> MotNode {
+    let mut content = node.content.clone();
+    let confidence;
+
+    match expert_type {
+        ExpertType::SymbolicALU => {
+            // Exact integer-like rounding — sharpen signal.
+            for v in content.iter_mut() {
+                *v = v.round();
+            }
+            confidence = (node.confidence * 1.1).min(1.0);
+        }
+        ExpertType::EBMSampler => {
+            // Langevin-style: add small noise to explore energy landscape.
+            for v in content.iter_mut() {
+                *v += rng.normal() * 0.05;
+            }
+            confidence = node.confidence * 0.95 + rng.uniform() * 0.1;
+        }
+        ExpertType::RetrievalLookup => {
+            // Simulate lookup: normalise content vector.
+            let mag: f64 = content.iter().map(|x| x * x).sum::<f64>().sqrt().max(1e-10);
+            for v in content.iter_mut() { *v /= mag; }
+            confidence = (node.confidence * 1.05).min(1.0);
+        }
+        ExpertType::ZKCircuit => {
+            // Simulate ZK step: hash-compress into a commitment vector.
+            let hash_seed: f64 = content.iter().enumerate().map(|(i, v)| v * (i + 1) as f64).sum();
+            for (i, v) in content.iter_mut().enumerate() {
+                *v = (hash_seed * (i + 1) as f64).sin() * 0.5 + 0.5;
+            }
+            confidence = (node.confidence * 1.15).min(1.0);
+        }
+        ExpertType::DenseAttention => {
+            // Simulate attention: weighted self-average.
+            let mean: f64 = content.iter().sum::<f64>() / content.len().max(1) as f64;
+            for v in content.iter_mut() { *v = 0.9 * *v + 0.1 * mean; }
+            confidence = (node.confidence + 0.05).min(1.0);
+        }
+        ExpertType::SubThoughtMatrix => {
+            // Recursive sub-matrix: simulate by averaging + slight boost.
+            let mean: f64 = content.iter().sum::<f64>() / content.len().max(1) as f64;
+            for v in content.iter_mut() { *v = (*v + mean) * 0.5; }
+            confidence = (node.confidence * 1.08).min(1.0);
+        }
+    }
+
+    let mut out = MotNode::new(
+        node.id,                 // same id (caller may re-key)
+        content,
+        node.dimension,
+        node.coords,
+        confidence.clamp(0.0, 1.0),
+        expert_type,
+    );
+    out.parents = node.parents.clone();
+    out.children = node.children.clone();
+    out
+}
+
+// ── expand_thought ────────────────────────────────────────────────────────
+// Generates child thoughts across the five dimensions from a parent node.
+// Returns the new MotNode children (not yet inserted into any matrix).
+
+pub fn expand_thought(parent: &MotNode, rng: &mut Rng, next_id: &mut u64) -> Vec<MotNode> {
+    let mut children = Vec::new();
+
+    match parent.dimension {
+        ThoughtDimension::Hypothesis => {
+            // Generate 3 competing alternative hypotheses.
+            for k in 0..3u32 {
+                let id = *next_id;
+                *next_id += 1;
+                let mut coords = parent.coords;
+                coords[0] = k + 1;
+                let mut content = parent.content.clone();
+                for v in content.iter_mut() { *v += rng.normal() * 0.15; }
+                let node = MotNode::new(id, content, ThoughtDimension::Hypothesis, coords,
+                    (parent.confidence * 0.9 + rng.uniform() * 0.1).clamp(0.0, 1.0),
+                    ExpertType::SymbolicALU);
+                children.push(node);
+            }
+        }
+        ThoughtDimension::Abstraction => {
+            // Shift one level up (more abstract) and one level down (more concrete).
+            for (dir, delta) in [(0u32, 1i32), (1u32, -1i32)] {
+                let id = *next_id;
+                *next_id += 1;
+                let mut coords = parent.coords;
+                coords[1] = (coords[1] as i32 + delta).max(0) as u32;
+                let scale = if delta > 0 { 0.5 } else { 1.5 };
+                let content = parent.content.iter().map(|v| v * scale).collect();
+                let node = MotNode::new(id, content, ThoughtDimension::Abstraction, coords,
+                    parent.confidence * 0.95,
+                    if dir == 0 { ExpertType::DenseAttention } else { ExpertType::SymbolicALU });
+                children.push(node);
+            }
+        }
+        ThoughtDimension::Modality => {
+            // Apply symbolic, statistical, and analogical reasoning.
+            let experts = [ExpertType::SymbolicALU, ExpertType::EBMSampler, ExpertType::DenseAttention];
+            for (k, &exp) in experts.iter().enumerate() {
+                let id = *next_id;
+                *next_id += 1;
+                let mut coords = parent.coords;
+                coords[2] = k as u32;
+                let child_base = MotNode::new(id, parent.content.clone(), ThoughtDimension::Modality,
+                    coords, parent.confidence * 0.9, exp);
+                let processed = expert_dispatch(&child_base, exp, rng);
+                children.push(processed);
+            }
+        }
+        ThoughtDimension::Confidence => {
+            if parent.confidence < 0.5 {
+                // Low confidence: gather 5 pieces of evidence.
+                for k in 0..5u32 {
+                    let id = *next_id;
+                    *next_id += 1;
+                    let mut coords = parent.coords;
+                    coords[3] = k;
+                    let mut content = parent.content.clone();
+                    for v in content.iter_mut() { *v += rng.normal() * 0.05; }
+                    let node = MotNode::new(id, content, ThoughtDimension::Confidence, coords,
+                        (parent.confidence + 0.05).min(1.0),
+                        ExpertType::RetrievalLookup);
+                    children.push(node);
+                }
+            }
+            // If confidence >= 0.5: no expansion needed (high confidence).
+        }
+        ThoughtDimension::Temporal => {
+            // Project into past and future.
+            for (k, scale) in [(0u32, 0.8f64), (1u32, 1.2f64)] {
+                let id = *next_id;
+                *next_id += 1;
+                let mut coords = parent.coords;
+                coords[4] = k;
+                let content = parent.content.iter().map(|v| v * scale).collect();
+                let node = MotNode::new(id, content, ThoughtDimension::Temporal, coords,
+                    parent.confidence * 0.9,
+                    ExpertType::DenseAttention);
+                children.push(node);
+            }
+        }
+    }
+
+    children
+}
+
+// ── convergence_check ─────────────────────────────────────────────────────
+// Returns true when the matrix has converged: the frontier's top nodes all
+// have high confidence and agree well with each other (low variance).
+
+pub fn convergence_check(matrix: &MotMatrix) -> bool {
+    if matrix.frontier.is_empty() {
+        return true; // nothing left to explore
+    }
+
+    // Look at the top-k frontier entries.
+    let top_k = matrix.frontier.iter().take(5).collect::<Vec<_>>();
+    let avg_conf: f64 = top_k.iter().map(|(p, _)| p).sum::<f64>() / top_k.len() as f64;
+
+    if avg_conf < 0.9 {
+        return false; // confidence not high enough yet
+    }
+
+    // Check agreement: variance of frontier confidence scores.
+    let variance: f64 = top_k.iter()
+        .map(|(p, _)| (p - avg_conf).powi(2))
+        .sum::<f64>() / top_k.len() as f64;
+
+    // Converged when high average confidence AND low variance (agreement > 0.8).
+    variance < 0.04 // std-dev < 0.2 → agreement ~0.8+
+}
+
+// ── run_matrix ────────────────────────────────────────────────────────────
+// Main entry point.  Expands a query into a ThoughtMatrix and returns the
+// synthesised answer embedding with its confidence.
+
+pub struct MatrixAnswer {
+    pub content: Vec<f64>,
+    pub confidence: f64,
+    pub nodes_explored: usize,
+    pub depth_reached: usize,
+    pub converged: bool,
+}
+
+pub fn run_matrix(initial_query: &[f64], depth: usize, budget_ms: u64) -> MatrixAnswer {
+    let mut matrix = MotMatrix::new(budget_ms);
+    matrix.seed_from_query(initial_query);
+
+    let mut rng = Rng::new(0xdecaf);
+    let mut next_id = matrix.next_id;
+    let mut depth_reached = 0usize;
+    let mut converged = false;
+
+    // Simulate a budget timer via node-expansion count (1 expansion ≈ 1ms).
+    let max_expansions = budget_ms as usize;
+    let mut expansions = 0usize;
+
+    'outer: for d in 0..depth {
+        // Collect frontier ids for this level.
+        let frontier_ids: Vec<u64> = matrix.frontier.iter().map(|(_, id)| *id).collect();
+        if frontier_ids.is_empty() { break; }
+
+        for node_id in frontier_ids {
+            if expansions >= max_expansions { break 'outer; }
+
+            // Phase 1 quick exit: trivial confidence.
+            if d == 0 {
+                let conf = matrix.nodes.get(&node_id).map(|n| n.confidence).unwrap_or(0.0);
+                if conf > 0.95 {
+                    converged = true;
+                    break 'outer;
+                }
+            }
+
+            // Pop the node and dispatch to its expert.
+            if let Some(node) = matrix.nodes.get(&node_id).cloned() {
+                let processed = expert_dispatch(&node, node.expert_type, &mut rng);
+
+                // Generate children.
+                let children = expand_thought(&processed, &mut rng, &mut next_id);
+                let parent_id = processed.id;
+
+                // Re-insert the processed node.
+                matrix.nodes.insert(parent_id, processed);
+
+                for mut child in children {
+                    child.parents.push(parent_id);
+                    let child_id = child.id;
+                    matrix.nodes.get_mut(&parent_id).map(|p| p.children.push(child_id));
+                    matrix.insert(child);
+                    expansions += 1;
+                    if expansions >= max_expansions { break; }
+                }
+            }
+
+            // Remove processed node from frontier.
+            matrix.frontier.retain(|(_, id)| *id != node_id);
+        }
+
+        depth_reached = d + 1;
+
+        // Convergence check after each depth level.
+        if convergence_check(&matrix) {
+            converged = true;
+            break;
+        }
+    }
+
+    matrix.next_id = next_id;
+
+    // Synthesise: weighted average of all nodes by confidence.
+    let dim = initial_query.len();
+    let mut weighted = vec![0.0f64; dim];
+    let mut total_w = 0.0f64;
+    for node in matrix.nodes.values() {
+        if node.confidence > 0.0 {
+            let w = node.confidence;
+            for (i, v) in node.content.iter().enumerate() {
+                if i < dim { weighted[i] += v * w; }
+            }
+            total_w += w;
+        }
+    }
+    if total_w > 0.0 {
+        for v in &mut weighted { *v /= total_w; }
+    }
+    let avg_conf = if total_w > 0.0 {
+        matrix.nodes.values().map(|n| n.confidence).sum::<f64>() / matrix.nodes.len() as f64
+    } else { 0.0 };
+
+    MatrixAnswer {
+        content: weighted,
+        confidence: avg_conf,
+        nodes_explored: matrix.nodes.len(),
+        depth_reached,
+        converged,
+    }
+}
+
 // ── Tests ───────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -1202,5 +1653,212 @@ mod tests {
         assert!(avg_conf > 0.0);
         assert!(avg_depth > 0.0);
         assert!(explored > 0);
+    }
+
+    // ── New tests for ExpertType, MotNode, MotMatrix, standalone fns ─────
+
+    #[test]
+    fn test_expert_type_all_has_six_variants() {
+        assert_eq!(ExpertType::all().len(), 6);
+    }
+
+    #[test]
+    fn test_expert_type_from_thought_type_mapping() {
+        assert_eq!(ExpertType::from_thought_type(ThoughtType::Analytical),   ExpertType::SymbolicALU);
+        assert_eq!(ExpertType::from_thought_type(ThoughtType::Creative),     ExpertType::EBMSampler);
+        assert_eq!(ExpertType::from_thought_type(ThoughtType::Retrieval),    ExpertType::RetrievalLookup);
+        assert_eq!(ExpertType::from_thought_type(ThoughtType::Verification), ExpertType::ZKCircuit);
+        assert_eq!(ExpertType::from_thought_type(ThoughtType::Synthesis),    ExpertType::DenseAttention);
+        assert_eq!(ExpertType::from_thought_type(ThoughtType::Refinement),   ExpertType::SubThoughtMatrix);
+    }
+
+    #[test]
+    fn test_mot_node_has_five_d_coords() {
+        let node = MotNode::new(
+            42, vec![1.0, 2.0], ThoughtDimension::Hypothesis,
+            [1, 2, 3, 4, 5], 0.7, ExpertType::SymbolicALU,
+        );
+        assert_eq!(node.id, 42);
+        assert_eq!(node.coords, [1, 2, 3, 4, 5]);
+        assert_eq!(node.dimension, ThoughtDimension::Hypothesis);
+        assert!((node.confidence - 0.7).abs() < 1e-10);
+        assert_eq!(node.expert_type, ExpertType::SymbolicALU);
+    }
+
+    #[test]
+    fn test_mot_matrix_seed_creates_five_root_nodes() {
+        let mut matrix = MotMatrix::new(100);
+        matrix.seed_from_query(&[1.0, 2.0, 3.0]);
+        assert_eq!(matrix.nodes.len(), 5); // one per dimension
+        assert_eq!(matrix.frontier.len(), 5);
+    }
+
+    #[test]
+    fn test_mot_matrix_frontier_sorted_descending() {
+        let mut matrix = MotMatrix::new(100);
+        matrix.seed_from_query(&[1.0, 1.0]);
+        // Frontier must be non-empty and priorities must be non-increasing.
+        let priorities: Vec<f64> = matrix.frontier.iter().map(|(p, _)| *p).collect();
+        for w in priorities.windows(2) {
+            assert!(w[0] >= w[1], "frontier must be sorted descending: {:?}", priorities);
+        }
+    }
+
+    #[test]
+    fn test_expert_dispatch_symbolic_alu_rounds_content() {
+        let mut rng = Rng::new(1);
+        let node = MotNode::new(0, vec![1.4, 2.6, -0.7], ThoughtDimension::Hypothesis,
+            [0; 5], 0.6, ExpertType::SymbolicALU);
+        let out = expert_dispatch(&node, ExpertType::SymbolicALU, &mut rng);
+        assert!((out.content[0] - 1.0).abs() < 1e-10, "expected 1.0 got {}", out.content[0]);
+        assert!((out.content[1] - 3.0).abs() < 1e-10, "expected 3.0 got {}", out.content[1]);
+        assert!((out.content[2] - (-1.0)).abs() < 1e-10, "expected -1.0 got {}", out.content[2]);
+        assert!(out.confidence >= node.confidence); // confidence boosted
+    }
+
+    #[test]
+    fn test_expert_dispatch_retrieval_normalises_content() {
+        let mut rng = Rng::new(2);
+        let node = MotNode::new(1, vec![3.0, 4.0], ThoughtDimension::Confidence,
+            [0; 5], 0.5, ExpertType::RetrievalLookup);
+        let out = expert_dispatch(&node, ExpertType::RetrievalLookup, &mut rng);
+        let mag: f64 = out.content.iter().map(|x| x * x).sum::<f64>().sqrt();
+        assert!((mag - 1.0).abs() < 1e-9, "content should be unit-normalised, mag={}", mag);
+    }
+
+    #[test]
+    fn test_expert_dispatch_confidence_clamped() {
+        let mut rng = Rng::new(3);
+        let node = MotNode::new(2, vec![1.0], ThoughtDimension::Hypothesis,
+            [0; 5], 1.0, ExpertType::ZKCircuit);
+        let out = expert_dispatch(&node, ExpertType::ZKCircuit, &mut rng);
+        assert!(out.confidence <= 1.0, "confidence must not exceed 1.0");
+        assert!(out.confidence >= 0.0, "confidence must be non-negative");
+    }
+
+    #[test]
+    fn test_expand_thought_hypothesis_generates_three_children() {
+        let parent = MotNode::new(0, vec![1.0, 0.5], ThoughtDimension::Hypothesis,
+            [0; 5], 0.6, ExpertType::SymbolicALU);
+        let mut rng = Rng::new(10);
+        let mut next_id = 1u64;
+        let children = expand_thought(&parent, &mut rng, &mut next_id);
+        assert_eq!(children.len(), 3, "Hypothesis should produce 3 alternatives");
+        assert_eq!(next_id, 4); // IDs 1, 2, 3 allocated
+    }
+
+    #[test]
+    fn test_expand_thought_abstraction_generates_two_children() {
+        let parent = MotNode::new(0, vec![2.0, 2.0], ThoughtDimension::Abstraction,
+            [0, 1, 0, 0, 0], 0.7, ExpertType::DenseAttention);
+        let mut rng = Rng::new(11);
+        let mut next_id = 1u64;
+        let children = expand_thought(&parent, &mut rng, &mut next_id);
+        assert_eq!(children.len(), 2, "Abstraction should shift up and down");
+    }
+
+    #[test]
+    fn test_expand_thought_modality_generates_three_children() {
+        let parent = MotNode::new(0, vec![1.0, 1.0], ThoughtDimension::Modality,
+            [0; 5], 0.6, ExpertType::EBMSampler);
+        let mut rng = Rng::new(12);
+        let mut next_id = 1u64;
+        let children = expand_thought(&parent, &mut rng, &mut next_id);
+        assert_eq!(children.len(), 3, "Modality: symbolic, statistical, analogical");
+    }
+
+    #[test]
+    fn test_expand_thought_confidence_low_generates_five_evidence_nodes() {
+        let parent = MotNode::new(0, vec![0.5], ThoughtDimension::Confidence,
+            [0; 5], 0.3, ExpertType::RetrievalLookup); // confidence < 0.5
+        let mut rng = Rng::new(13);
+        let mut next_id = 1u64;
+        let children = expand_thought(&parent, &mut rng, &mut next_id);
+        assert_eq!(children.len(), 5, "Low-confidence nodes should gather 5 evidence pieces");
+    }
+
+    #[test]
+    fn test_expand_thought_confidence_high_generates_no_children() {
+        let parent = MotNode::new(0, vec![0.5], ThoughtDimension::Confidence,
+            [0; 5], 0.8, ExpertType::RetrievalLookup); // confidence >= 0.5
+        let mut rng = Rng::new(14);
+        let mut next_id = 1u64;
+        let children = expand_thought(&parent, &mut rng, &mut next_id);
+        assert_eq!(children.len(), 0, "High-confidence nodes should not expand");
+    }
+
+    #[test]
+    fn test_expand_thought_temporal_generates_past_and_future() {
+        let parent = MotNode::new(0, vec![1.0, 2.0], ThoughtDimension::Temporal,
+            [0; 5], 0.6, ExpertType::DenseAttention);
+        let mut rng = Rng::new(15);
+        let mut next_id = 1u64;
+        let children = expand_thought(&parent, &mut rng, &mut next_id);
+        assert_eq!(children.len(), 2, "Temporal should project into past and future");
+    }
+
+    #[test]
+    fn test_convergence_check_empty_frontier_returns_true() {
+        let matrix = MotMatrix::new(50);
+        assert!(convergence_check(&matrix), "empty frontier means converged");
+    }
+
+    #[test]
+    fn test_convergence_check_low_confidence_returns_false() {
+        let mut matrix = MotMatrix::new(50);
+        // Insert nodes with low confidence.
+        for i in 0..5u64 {
+            let node = MotNode::new(i, vec![1.0], ThoughtDimension::Hypothesis,
+                [0; 5], 0.4, ExpertType::SymbolicALU);
+            matrix.insert(node);
+        }
+        assert!(!convergence_check(&matrix), "low-confidence frontier should not converge");
+    }
+
+    #[test]
+    fn test_convergence_check_high_confidence_low_variance_returns_true() {
+        let mut matrix = MotMatrix::new(50);
+        // Insert nodes with very high and consistent confidence.
+        for i in 0..5u64 {
+            let node = MotNode::new(i, vec![1.0], ThoughtDimension::Hypothesis,
+                [0; 5], 0.95, ExpertType::SymbolicALU);
+            matrix.insert(node);
+        }
+        assert!(convergence_check(&matrix), "high uniform confidence should converge");
+    }
+
+    #[test]
+    fn test_run_matrix_returns_answer_with_correct_dimensions() {
+        let query = vec![1.0, 2.0, 3.0, 4.0];
+        let answer = run_matrix(&query, 3, 50);
+        assert_eq!(answer.content.len(), query.len(), "answer should match query dimension");
+        assert!(answer.confidence >= 0.0 && answer.confidence <= 1.0);
+        assert!(answer.nodes_explored > 0);
+    }
+
+    #[test]
+    fn test_run_matrix_explores_more_nodes_with_higher_budget() {
+        let query = vec![1.0, 2.0, 3.0];
+        let small = run_matrix(&query, 5, 10);
+        let large  = run_matrix(&query, 5, 200);
+        assert!(large.nodes_explored >= small.nodes_explored,
+            "larger budget should explore at least as many nodes: small={} large={}",
+            small.nodes_explored, large.nodes_explored);
+    }
+
+    #[test]
+    fn test_run_matrix_zero_budget_still_seeds_nodes() {
+        let query = vec![1.0, 2.0];
+        let answer = run_matrix(&query, 3, 0);
+        // Even with zero budget, the 5 seed nodes are created.
+        assert!(answer.nodes_explored >= 5);
+    }
+
+    #[test]
+    fn test_run_matrix_depth_zero_returns_seeded_answer() {
+        let query = vec![0.5, 0.5];
+        let answer = run_matrix(&query, 0, 100);
+        assert_eq!(answer.content.len(), 2);
+        assert_eq!(answer.depth_reached, 0);
     }
 }
