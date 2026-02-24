@@ -227,6 +227,12 @@ pub enum TokenKind {
     Newline,
 
     // Literals
+    #[regex(r"0x[0-9a-fA-F][0-9a-fA-F_]*n", priority = 5)]
+    HexBigIntLiteral,
+
+    #[regex(r"[0-9][0-9_]*n", priority = 4)]
+    BigIntLiteral,
+
     #[regex(r"0x[0-9a-fA-F][0-9a-fA-F_]*", priority = 3)]
     HexLiteral,
 
@@ -330,6 +336,8 @@ impl fmt::Display for TokenKind {
             TokenKind::Question => write!(f, "?"),
             TokenKind::Hash => write!(f, "#"),
             TokenKind::Newline => write!(f, "\\n"),
+            TokenKind::HexBigIntLiteral => write!(f, "hex bigint literal"),
+            TokenKind::BigIntLiteral => write!(f, "bigint literal"),
             TokenKind::HexLiteral => write!(f, "hex literal"),
             TokenKind::FloatLiteral => write!(f, "float literal"),
             TokenKind::IntLiteral => write!(f, "int literal"),

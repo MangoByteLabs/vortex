@@ -306,6 +306,8 @@ pub struct Expr {
 pub enum ExprKind {
     /// Integer literal: 42, 0xFF
     IntLiteral(u128),
+    /// Big integer literal: 123n, 0xdeadbeefn
+    BigIntLiteral(String),
     /// Float literal: 3.14
     FloatLiteral(f64),
     /// String literal: "hello"
@@ -962,6 +964,7 @@ impl fmt::Display for Expr {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match &self.kind {
             ExprKind::IntLiteral(n) => write!(f, "{}", n),
+            ExprKind::BigIntLiteral(s) => write!(f, "{}n", s),
             ExprKind::FloatLiteral(n) => write!(f, "{}", n),
             ExprKind::StringLiteral(s) => write!(f, "\"{}\"", s),
             ExprKind::BoolLiteral(b) => write!(f, "{}", b),

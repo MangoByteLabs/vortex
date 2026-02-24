@@ -584,6 +584,15 @@ pub fn register_builtins(env: &mut Env) {
     env.functions.insert("mot_reason_verified".to_string(), FnDef::Builtin(builtin_mot_reason_verified));
     env.functions.insert("mot_learn".to_string(), FnDef::Builtin(builtin_mot_learn));
     env.functions.insert("mot_stats".to_string(), FnDef::Builtin(builtin_mot_stats));
+
+    // Cognitive Matrix builtins
+    env.functions.insert("cog_matrix_new".to_string(), FnDef::Builtin(builtin_cog_matrix_new));
+    env.functions.insert("cog_bind_model".to_string(), FnDef::Builtin(builtin_cog_bind_model));
+    env.functions.insert("cog_contribute".to_string(), FnDef::Builtin(builtin_cog_contribute));
+    env.functions.insert("cog_reason".to_string(), FnDef::Builtin(builtin_cog_reason));
+    env.functions.insert("cog_learn".to_string(), FnDef::Builtin(builtin_cog_learn));
+    env.functions.insert("cog_stats".to_string(), FnDef::Builtin(builtin_cog_stats));
+    env.functions.insert("cog_messages_for".to_string(), FnDef::Builtin(builtin_cog_messages_for));
 }
 
 fn builtin_mot_engine_new(env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
@@ -680,6 +689,332 @@ fn builtin_mot_stats(env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
         Value::Float(avg_depth),
         Value::Float(explored as f64),
     ]))
+}
+
+// ── Cognitive Binding: Models connect intelligence through the Matrix ───
+
+/// A shared cognitive space where multiple models bind their reasoning.
+pub struct CognitiveMatrix {
+    shared_thoughts: ThoughtMatrix,
+    bound_models: Vec<BoundModel>,
+    collective_routing: HashMap<ThoughtType, f64>,
+    streams: Vec<ThoughtStream>,
+    device_budget: f64,
+    collective_lr: f64,
+    reasoning_history: Vec<CollectiveResult>,
+    max_history: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct BoundModel {
+    pub id: usize,
+    pub name: String,
+    pub embedding_dim: usize,
+    pub trust_score: f64,
+    pub specialization: ThoughtType,
+    pub contribution_count: usize,
+    pub avg_confidence: f64,
+}
+
+#[derive(Debug, Clone)]
+pub struct ThoughtStream {
+    pub from_model: usize,
+    pub to_model: usize,
+    pub bandwidth: f64,
+    pub messages: Vec<StreamMessage>,
+    pub active: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct StreamMessage {
+    pub embedding: Vec<f64>,
+    pub thought_type: ThoughtType,
+    pub confidence: f64,
+    pub timestamp: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct CollectiveResult {
+    pub query: Vec<f64>,
+    pub answer: Vec<f64>,
+    pub confidence: f64,
+    pub contributing_models: Vec<usize>,
+    pub thought_types_used: Vec<ThoughtType>,
+    pub depth_reached: usize,
+    pub energy_used: f64,
+}
+
+impl CognitiveMatrix {
+    pub fn new(dimensions: usize, device_budget: f64) -> Self {
+        let mut matrix = ThoughtMatrix::new(ThoughtDimension::all().to_vec());
+        let _ = dimensions;
+        let mut routing = HashMap::new();
+        for tt in ThoughtType::all() {
+            routing.insert(*tt, 1.0 / ThoughtType::all().len() as f64);
+        }
+        Self {
+            shared_thoughts: matrix,
+            bound_models: Vec::new(),
+            collective_routing: routing,
+            streams: Vec::new(),
+            device_budget,
+            collective_lr: 0.01,
+            reasoning_history: Vec::new(),
+            max_history: 1000,
+        }
+    }
+
+    pub fn bind_model(&mut self, name: &str, embedding_dim: usize, specialization: ThoughtType) -> usize {
+        let id = self.bound_models.len();
+        self.bound_models.push(BoundModel {
+            id, name: name.to_string(), embedding_dim,
+            trust_score: 0.5, specialization,
+            contribution_count: 0, avg_confidence: 0.0,
+        });
+        for existing in 0..id {
+            self.streams.push(ThoughtStream {
+                from_model: id, to_model: existing,
+                bandwidth: 1.0, messages: Vec::new(), active: true,
+            });
+            self.streams.push(ThoughtStream {
+                from_model: existing, to_model: id,
+                bandwidth: 1.0, messages: Vec::new(), active: true,
+            });
+        }
+        id
+    }
+
+    pub fn unbind_model(&mut self, model_id: usize) {
+        self.streams.retain(|s| s.from_model != model_id && s.to_model != model_id);
+    }
+
+    pub fn contribute_thought(&mut self, model_id: usize, embedding: Vec<f64>, thought_type: ThoughtType, confidence: f64) -> usize {
+        let node_id = self.shared_thoughts.add_root(embedding.clone(), thought_type);
+        self.shared_thoughts.nodes[node_id].confidence = confidence;
+        if model_id < self.bound_models.len() {
+            self.bound_models[model_id].contribution_count += 1;
+            let count = self.bound_models[model_id].contribution_count as f64;
+            let prev = self.bound_models[model_id].avg_confidence;
+            self.bound_models[model_id].avg_confidence = prev + (confidence - prev) / count;
+        }
+        let timestamp = self.shared_thoughts.nodes.len();
+        for stream in self.streams.iter_mut() {
+            if stream.from_model == model_id && stream.active {
+                stream.messages.push(StreamMessage {
+                    embedding: embedding.clone(), thought_type, confidence, timestamp,
+                });
+            }
+        }
+        node_id
+    }
+
+    pub fn collective_reason(&mut self, query: &[f64], max_depth: usize) -> CollectiveResult {
+        let mut energy_remaining = self.device_budget;
+        let energy_per_step = 1.0;
+        let mut contributing_models = Vec::new();
+        let mut thought_types_used = Vec::new();
+
+        for model in &self.bound_models {
+            if energy_remaining < energy_per_step { break; }
+            let scaled = scale_embedding(query, model.embedding_dim);
+            let node_id = self.shared_thoughts.add_root(scaled, model.specialization);
+            self.shared_thoughts.nodes[node_id].confidence = model.trust_score;
+            contributing_models.push(model.id);
+            if !thought_types_used.contains(&model.specialization) {
+                thought_types_used.push(model.specialization);
+            }
+            energy_remaining -= energy_per_step;
+        }
+
+        let mut depth = 0;
+        while depth < max_depth && energy_remaining > energy_per_step {
+            let n = self.shared_thoughts.nodes.len();
+            for i in 0..n {
+                if energy_remaining < energy_per_step { break; }
+                if self.shared_thoughts.nodes[i].children.is_empty() {
+                    self.shared_thoughts.expand(i);
+                    energy_remaining -= energy_per_step;
+                }
+            }
+            self.shared_thoughts.prune(0.2);
+            depth += 1;
+        }
+
+        let (answer, confidence) = self.synthesize_answer(query);
+        let result = CollectiveResult {
+            query: query.to_vec(), answer, confidence,
+            contributing_models, thought_types_used,
+            depth_reached: depth,
+            energy_used: self.device_budget - energy_remaining,
+        };
+        if self.reasoning_history.len() < self.max_history {
+            self.reasoning_history.push(result.clone());
+        }
+        result
+    }
+
+    fn synthesize_answer(&self, query: &[f64]) -> (Vec<f64>, f64) {
+        if self.shared_thoughts.nodes.is_empty() {
+            return (query.to_vec(), 0.0);
+        }
+        let mut weighted_sum = vec![0.0; query.len()];
+        let mut total_weight = 0.0;
+        for node in &self.shared_thoughts.nodes {
+            if node.confidence > 0.1 {
+                let weight = node.confidence;
+                for (i, v) in node.content.iter().enumerate() {
+                    if i < weighted_sum.len() { weighted_sum[i] += v * weight; }
+                }
+                total_weight += weight;
+            }
+        }
+        if total_weight > 0.0 {
+            for v in &mut weighted_sum { *v /= total_weight; }
+        }
+        let avg_conf = if total_weight > 0.0 {
+            total_weight / self.shared_thoughts.nodes.iter().filter(|n| n.confidence > 0.1).count().max(1) as f64
+        } else { 0.0 };
+        (weighted_sum, avg_conf)
+    }
+
+    pub fn collective_learn(&mut self, feedback: f64) {
+        for model in &mut self.bound_models {
+            if model.contribution_count > 0 {
+                let delta = self.collective_lr * (feedback - model.trust_score);
+                model.trust_score = (model.trust_score + delta).clamp(0.01, 1.0);
+            }
+        }
+        for (tt, weight) in self.collective_routing.iter_mut() {
+            let usage = self.bound_models.iter()
+                .filter(|m| m.specialization == *tt)
+                .map(|m| m.avg_confidence)
+                .sum::<f64>();
+            *weight = (*weight + self.collective_lr * (usage * feedback - *weight)).max(0.01);
+        }
+    }
+
+    pub fn get_messages_for(&self, model_id: usize) -> Vec<&StreamMessage> {
+        let mut msgs = Vec::new();
+        for stream in &self.streams {
+            if stream.to_model == model_id && stream.active {
+                for msg in &stream.messages { msgs.push(msg); }
+            }
+        }
+        msgs
+    }
+
+    pub fn model_count(&self) -> usize { self.bound_models.len() }
+
+    pub fn stats(&self) -> (usize, f64, usize, usize) {
+        let n = self.bound_models.len();
+        let avg_trust = if n > 0 { self.bound_models.iter().map(|m| m.trust_score).sum::<f64>() / n as f64 } else { 0.0 };
+        (n, avg_trust, self.shared_thoughts.nodes.len(), self.streams.iter().filter(|s| s.active).count())
+    }
+}
+
+fn scale_embedding(input: &[f64], target_dim: usize) -> Vec<f64> {
+    if input.len() == target_dim { return input.to_vec(); }
+    let mut result = vec![0.0; target_dim];
+    for i in 0..target_dim { result[i] = input[i % input.len()]; }
+    result
+}
+
+fn builtin_cog_matrix_new(env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    if args.len() != 2 { return Err("cog_matrix_new(dimensions, device_budget)".into()); }
+    let dims = match &args[0] { Value::Int(n) => *n as usize, _ => return Err("dims must be int".into()) };
+    let budget = match &args[1] { Value::Float(f) => *f, Value::Int(n) => *n as f64, _ => return Err("budget must be number".into()) };
+    let id = env.next_mot_id;
+    env.next_mot_id += 1;
+    env.cog_matrices.insert(id, CognitiveMatrix::new(dims, budget));
+    Ok(Value::Int(id as i128))
+}
+
+fn builtin_cog_bind_model(env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    if args.len() != 4 { return Err("cog_bind_model(matrix_id, name, embed_dim, specialization)".into()); }
+    let mid = match &args[0] { Value::Int(n) => *n as usize, _ => return Err("id must be int".into()) };
+    let name = match &args[1] { Value::String(s) => s.clone(), _ => return Err("name must be string".into()) };
+    let edim = match &args[2] { Value::Int(n) => *n as usize, _ => return Err("embed_dim must be int".into()) };
+    let spec = match &args[3] {
+        Value::String(s) => match s.as_str() {
+            "analytical" => ThoughtType::Analytical, "creative" => ThoughtType::Creative,
+            "retrieval" => ThoughtType::Retrieval, "verification" => ThoughtType::Verification,
+            "synthesis" => ThoughtType::Synthesis, "refinement" => ThoughtType::Refinement,
+            _ => ThoughtType::Analytical,
+        },
+        _ => return Err("specialization must be string".into()),
+    };
+    let matrix = env.cog_matrices.get_mut(&mid).ok_or("matrix not found")?;
+    let model_id = matrix.bind_model(&name, edim, spec);
+    Ok(Value::Int(model_id as i128))
+}
+
+fn builtin_cog_contribute(env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    if args.len() != 4 { return Err("cog_contribute(matrix_id, model_id, embedding, confidence)".into()); }
+    let mid = match &args[0] { Value::Int(n) => *n as usize, _ => return Err("id must be int".into()) };
+    let model_id = match &args[1] { Value::Int(n) => *n as usize, _ => return Err("model_id must be int".into()) };
+    let embedding: Vec<f64> = match &args[2] {
+        Value::Array(arr) => arr.iter().map(|v| match v { Value::Float(f) => *f, Value::Int(n) => *n as f64, _ => 0.0 }).collect(),
+        _ => return Err("embedding must be array".into()),
+    };
+    let confidence = match &args[3] { Value::Float(f) => *f, Value::Int(n) => *n as f64, _ => return Err("confidence must be number".into()) };
+    let matrix = env.cog_matrices.get_mut(&mid).ok_or("matrix not found")?;
+    let tt = if model_id < matrix.bound_models.len() { matrix.bound_models[model_id].specialization } else { ThoughtType::Analytical };
+    let node_id = matrix.contribute_thought(model_id, embedding, tt, confidence);
+    Ok(Value::Int(node_id as i128))
+}
+
+fn builtin_cog_reason(env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    if args.len() != 3 { return Err("cog_reason(matrix_id, query, max_depth)".into()); }
+    let mid = match &args[0] { Value::Int(n) => *n as usize, _ => return Err("id must be int".into()) };
+    let query: Vec<f64> = match &args[1] {
+        Value::Array(arr) => arr.iter().map(|v| match v { Value::Float(f) => *f, Value::Int(n) => *n as f64, _ => 0.0 }).collect(),
+        _ => return Err("query must be array".into()),
+    };
+    let depth = match &args[2] { Value::Int(n) => *n as usize, _ => return Err("depth must be int".into()) };
+    let matrix = env.cog_matrices.get_mut(&mid).ok_or("matrix not found")?;
+    let result = matrix.collective_reason(&query, depth);
+    Ok(Value::Array(vec![
+        Value::Array(result.answer.iter().map(|v| Value::Float(*v)).collect()),
+        Value::Float(result.confidence),
+        Value::Int(result.depth_reached as i128),
+        Value::Float(result.energy_used),
+        Value::Int(result.contributing_models.len() as i128),
+    ]))
+}
+
+fn builtin_cog_learn(env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    if args.len() != 2 { return Err("cog_learn(matrix_id, feedback)".into()); }
+    let mid = match &args[0] { Value::Int(n) => *n as usize, _ => return Err("id must be int".into()) };
+    let feedback = match &args[1] { Value::Float(f) => *f, Value::Int(n) => *n as f64, _ => return Err("feedback must be number".into()) };
+    let matrix = env.cog_matrices.get_mut(&mid).ok_or("matrix not found")?;
+    matrix.collective_learn(feedback);
+    Ok(Value::Void)
+}
+
+fn builtin_cog_stats(env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    if args.len() != 1 { return Err("cog_stats(matrix_id)".into()); }
+    let mid = match &args[0] { Value::Int(n) => *n as usize, _ => return Err("id must be int".into()) };
+    let matrix = env.cog_matrices.get(&mid).ok_or("matrix not found")?;
+    let (models, trust, thoughts, streams) = matrix.stats();
+    Ok(Value::Array(vec![
+        Value::Int(models as i128), Value::Float(trust),
+        Value::Int(thoughts as i128), Value::Int(streams as i128),
+    ]))
+}
+
+fn builtin_cog_messages_for(env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    if args.len() != 2 { return Err("cog_messages_for(matrix_id, model_id)".into()); }
+    let mid = match &args[0] { Value::Int(n) => *n as usize, _ => return Err("id must be int".into()) };
+    let model_id = match &args[1] { Value::Int(n) => *n as usize, _ => return Err("model_id must be int".into()) };
+    let matrix = env.cog_matrices.get(&mid).ok_or("matrix not found")?;
+    let msgs = matrix.get_messages_for(model_id);
+    Ok(Value::Array(msgs.iter().map(|m| {
+        Value::Tuple(vec![
+            Value::Array(m.embedding.iter().map(|v| Value::Float(*v)).collect()),
+            Value::Float(m.confidence),
+            Value::Int(m.timestamp as i128),
+        ])
+    }).collect()))
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────

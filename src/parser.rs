@@ -1458,6 +1458,23 @@ impl Parser {
         let start = tok.span;
 
         match tok.kind {
+            TokenKind::BigIntLiteral => {
+                self.advance();
+                let digits = tok.text.replace('_', "").trim_end_matches('n').to_string();
+                Ok(Expr {
+                    kind: ExprKind::BigIntLiteral(digits),
+                    span: start,
+                })
+            }
+            TokenKind::HexBigIntLiteral => {
+                self.advance();
+                let hex_str = tok.text.replace('_', "");
+                let hex_digits = hex_str.trim_start_matches("0x").trim_end_matches('n').to_string();
+                Ok(Expr {
+                    kind: ExprKind::BigIntLiteral(format!("0x{}", hex_digits)),
+                    span: start,
+                })
+            }
             TokenKind::IntLiteral => {
                 self.advance();
                 let value: u128 = tok.text.replace('_', "").parse().unwrap_or(0);

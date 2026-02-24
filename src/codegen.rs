@@ -741,6 +741,11 @@ impl CodeGen {
 
     fn gen_expr(&mut self, expr: &Expr) -> (String, MLIRType) {
         match &expr.kind {
+            ExprKind::BigIntLiteral(_s) => {
+                let ssa = self.fresh_ssa();
+                self.emit_line(&format!("{} = arith.constant 0 : i64", ssa));
+                (ssa, MLIRType::I64)
+            }
             ExprKind::IntLiteral(n) => {
                 let ssa = self.fresh_ssa();
                 self.emit_line(&format!(

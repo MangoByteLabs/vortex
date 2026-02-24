@@ -1227,6 +1227,11 @@ impl VirLowering {
 
     fn lower_expr(&mut self, expr: &crate::ast::Expr) -> Result<VirId, String> {
         match &expr.kind {
+            crate::ast::ExprKind::BigIntLiteral(_s) => {
+                // BigInt literals in VIR - store as 0 for now (interpreted at runtime)
+                let id = self.cur_fn().emit(VirInstKind::ConstInt(0), VirType::I64);
+                Ok(id)
+            }
             crate::ast::ExprKind::IntLiteral(n) => {
                 let id = self.cur_fn().emit(VirInstKind::ConstInt(*n as i128), VirType::I64);
                 Ok(id)

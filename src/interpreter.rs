@@ -235,6 +235,10 @@ pub struct Env {
     pub(crate) trait_defs: HashMap<String, Vec<(String, bool)>>,
     /// Trait implementations: (trait_name, type_name) -> registered
     pub(crate) trait_impls: HashMap<(String, String), bool>,
+    /// Cognitive matrices for MatrixOfThought binding
+    pub(crate) cog_matrices: HashMap<usize, crate::matrix_of_thought::CognitiveMatrix>,
+    /// Networking runtime
+    pub(crate) net_runtime: crate::net_runtime::NetRuntime,
 }
 
 #[derive(Clone)]
@@ -309,6 +313,8 @@ impl Env {
             next_thought_channel_id: 0,
             trait_defs: HashMap::new(),
             trait_impls: HashMap::new(),
+            cog_matrices: HashMap::new(),
+            net_runtime: crate::net_runtime::NetRuntime::new(),
         };
         env.register_builtins();
         env
@@ -859,6 +865,9 @@ impl Env {
 
         // Vortex IR
         crate::vir::register_builtins(self);
+
+        // Networking
+        crate::net_runtime::register_builtins(self);
 
         // Math constants
         self.define("PI", Value::Float(std::f64::consts::PI));
@@ -2733,6 +2742,21 @@ fn eval_stmt(env: &mut Env, stmt: &Stmt) -> Result<Value, String> {
 pub(crate) fn eval_expr(env: &mut Env, expr: &Expr) -> Result<Value, String> {
     match &expr.kind {
         ExprKind::IntLiteral(n) => Ok(Value::Int(*n as i128)),
+        ExprKind::BigIntLiteral(s) => {
+            let bi = if s.starts_with("0x") || s.starts_with("0X") {
+                crate::crypto::BigUint256::from_hex(s).unwrap_or_else(|| crate::crypto::BigUint256::from_u64(0))
+            } else {
+                // Parse decimal string into BigUint256 via u128 (covers most cases)
+                let val: u128 = s.parse().unwrap_or(0);
+                let mut bi = crate::crypto::BigUint256::from_u64(0);
+                bi.limbs[0] = val as u32;
+                bi.limbs[1] = (val >> 32) as u32;
+                bi.limbs[2] = (val >> 64) as u32;
+                bi.limbs[3] = (val >> 96) as u32;
+                bi
+            };
+            Ok(Value::BigInt(bi))
+        }
         ExprKind::FloatLiteral(n) => Ok(Value::Float(*n)),
         ExprKind::StringLiteral(s) => Ok(Value::String(s.clone())),
         ExprKind::BoolLiteral(b) => Ok(Value::Bool(*b)),

@@ -96,6 +96,7 @@ mod meta_compiler;
 mod agi_core;
 mod vir;
 mod ptx_backend;
+mod net_runtime;
 
 use codespan_reporting::files::SimpleFiles;
 use codespan_reporting::term;

@@ -688,6 +688,7 @@ fn check_stmt(env: &mut TypeEnv, stmt: &Stmt, expected_ret: &Type) {
 fn infer_expr(env: &mut TypeEnv, expr: &Expr) -> Type {
     match &expr.kind {
         ExprKind::IntLiteral(_) => Type::Scalar(ScalarType::I64),
+        ExprKind::BigIntLiteral(_) => Type::Scalar(ScalarType::I64),
         ExprKind::FloatLiteral(_) => Type::Scalar(ScalarType::F64),
         ExprKind::StringLiteral(_) => Type::Named("String".to_string()),
         ExprKind::BoolLiteral(_) => Type::Scalar(ScalarType::Bool),
