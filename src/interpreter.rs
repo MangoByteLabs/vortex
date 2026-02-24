@@ -60,6 +60,7 @@ pub enum Value {
     },
     /// A sparse tensor
     SparseTensor(crate::sparse::SparseTensor),
+    Tensor(crate::tensor_engine::FastTensor),
     /// A sparse index
     SparseIdx(crate::sparse::SparseIndex),
     /// A closure (lambda) with captured environment
@@ -138,6 +139,7 @@ impl fmt::Display for Value {
             Value::SpikeTrain(st) => write!(f, "<SpikeTrain {}x{}>", st.timesteps, st.neurons),
             Value::DiffMemory(m) => write!(f, "<Memory C={} K={} V={}>", m.capacity, m.key_dim, m.val_dim),
             Value::SparseTensor(st) => write!(f, "SparseTensor(nnz={})", st.values.len()),
+            Value::Tensor(t) => write!(f, "Tensor<{:?}>[{}]", t.dtype, t.shape.iter().map(|s| s.to_string()).collect::<Vec<_>>().join(", ")),
             Value::SparseIdx(si) => write!(f, "SparseIndex(batch={}, k={})", si.batch_size, si.k),
             Value::Void => write!(f, "()"),
             Value::Closure { params, .. } => write!(f, "<closure({})>", params.join(", ")),
@@ -221,6 +223,18 @@ pub struct Env {
     pub(crate) experiment_manager: Option<crate::experiment::ExperimentManager>,
     pub(crate) autograd_tape: Option<crate::autograd::Tape>,
     pub(crate) autograd_adam: Option<crate::autograd::AdamOptimizer>,
+    pub(crate) energy_budgets: HashMap<usize, crate::energy_compute::EnergyBudget>,
+    pub(crate) next_energy_budget_id: usize,
+    pub(crate) event_driven_executors: HashMap<usize, crate::energy_compute::EventDrivenExecutor>,
+    pub(crate) next_event_driven_id: usize,
+    pub(crate) neuromorphic_layers: HashMap<usize, crate::energy_compute::NeuromorphicLayer>,
+    pub(crate) next_neuromorphic_id: usize,
+    pub(crate) thought_channels: HashMap<usize, crate::thought_protocol::ThoughtChannel>,
+    pub(crate) next_thought_channel_id: usize,
+    /// Trait definitions: trait_name -> (method_name, has_default_body)
+    pub(crate) trait_defs: HashMap<String, Vec<(String, bool)>>,
+    /// Trait implementations: (trait_name, type_name) -> registered
+    pub(crate) trait_impls: HashMap<(String, String), bool>,
 }
 
 #[derive(Clone)]
@@ -285,6 +299,16 @@ impl Env {
             experiment_manager: None,
             autograd_tape: None,
             autograd_adam: None,
+            energy_budgets: HashMap::new(),
+            next_energy_budget_id: 0,
+            event_driven_executors: HashMap::new(),
+            next_event_driven_id: 0,
+            neuromorphic_layers: HashMap::new(),
+            next_neuromorphic_id: 0,
+            thought_channels: HashMap::new(),
+            next_thought_channel_id: 0,
+            trait_defs: HashMap::new(),
+            trait_impls: HashMap::new(),
         };
         env.register_builtins();
         env
@@ -534,7 +558,9 @@ impl Env {
 
         // Option builtins
         self.functions.insert("some".to_string(), FnDef::Builtin(builtin_some));
+        self.functions.insert("Some".to_string(), FnDef::Builtin(builtin_some));
         self.functions.insert("none".to_string(), FnDef::Builtin(builtin_none));
+        self.functions.insert("None".to_string(), FnDef::Builtin(builtin_none));
         self.functions.insert("unwrap".to_string(), FnDef::Builtin(builtin_unwrap));
         self.functions.insert("unwrap_or".to_string(), FnDef::Builtin(builtin_unwrap_or));
         self.functions.insert("is_some".to_string(), FnDef::Builtin(builtin_is_some));
@@ -542,7 +568,9 @@ impl Env {
 
         // Result builtins
         self.functions.insert("ok".to_string(), FnDef::Builtin(builtin_ok));
+        self.functions.insert("Ok".to_string(), FnDef::Builtin(builtin_ok));
         self.functions.insert("err".to_string(), FnDef::Builtin(builtin_err));
+        self.functions.insert("Err".to_string(), FnDef::Builtin(builtin_err));
         self.functions.insert("is_ok".to_string(), FnDef::Builtin(builtin_is_ok));
         self.functions.insert("is_err".to_string(), FnDef::Builtin(builtin_is_err));
 
@@ -641,6 +669,20 @@ impl Env {
         self.functions.insert("tensor_sgd".to_string(), FnDef::Builtin(builtin_tensor_sgd));
         self.functions.insert("tensor_adam".to_string(), FnDef::Builtin(builtin_tensor_adam));
         self.functions.insert("tensor_zero_grad".to_string(), FnDef::Builtin(builtin_tensor_zero_grad));
+        self.functions.insert("ft_tensor".to_string(), FnDef::Builtin(ft_builtin_tensor));
+        self.functions.insert("ft_tensor_zeros".to_string(), FnDef::Builtin(ft_builtin_tensor_zeros));
+        self.functions.insert("ft_tensor_ones".to_string(), FnDef::Builtin(ft_builtin_tensor_ones));
+        self.functions.insert("ft_tensor_rand".to_string(), FnDef::Builtin(ft_builtin_tensor_rand));
+        self.functions.insert("ft_tensor_shape".to_string(), FnDef::Builtin(ft_builtin_tensor_shape));
+        self.functions.insert("ft_tensor_dtype".to_string(), FnDef::Builtin(ft_builtin_tensor_dtype));
+        self.functions.insert("ft_tensor_reshape".to_string(), FnDef::Builtin(ft_builtin_tensor_reshape));
+        self.functions.insert("ft_tensor_add".to_string(), FnDef::Builtin(ft_builtin_tensor_add));
+        self.functions.insert("ft_tensor_mul".to_string(), FnDef::Builtin(ft_builtin_tensor_mul));
+        self.functions.insert("ft_tensor_matmul_dense".to_string(), FnDef::Builtin(ft_builtin_tensor_matmul_dense));
+        self.functions.insert("ft_tensor_transpose".to_string(), FnDef::Builtin(ft_builtin_tensor_transpose));
+        self.functions.insert("ft_tensor_slice".to_string(), FnDef::Builtin(ft_builtin_tensor_slice));
+        self.functions.insert("ft_tensor_to_array".to_string(), FnDef::Builtin(ft_builtin_tensor_to_array));
+        self.functions.insert("ft_tensor_from_array".to_string(), FnDef::Builtin(ft_builtin_tensor_from_array));
 
         // Autograd builtins
         self.functions.insert("autograd_new".into(), FnDef::Builtin(crate::autograd::builtin_autograd_new));
@@ -717,6 +759,7 @@ impl Env {
 
         // Energy-based model builtins
         crate::energy_models::register_builtins(self);
+        crate::energy_compute::register_builtins(self);
 
         // Matrix-of-Thought reasoning builtins
         crate::matrix_of_thought::register_builtins(self);
@@ -753,6 +796,7 @@ impl Env {
 
         // Novel architecture builtins
         crate::novel_arch::register_builtins(self);
+
 
         // Math builtins
         self.functions.insert("sqrt".to_string(), FnDef::Builtin(builtin_sqrt));
@@ -791,6 +835,30 @@ impl Env {
 
         // Meta-engine: self-evolving code builtins
         crate::meta_engine::register_builtins(self);
+
+        // Pillar 5: Continuous Mathematics (manifolds)
+        crate::manifold::register_builtins(self);
+
+        // Pillar 4: Formal Neural Specifications
+        crate::neural_specs::register_builtins(self);
+
+        // Pillar 2: Architecture as First-Class Data
+        crate::arch_graph::register_builtins(self);
+
+        // Pillar 1: LLM-to-LLM Binary Protocol
+        crate::thought_protocol::register_builtins(self);
+
+        // Pillar 3: Differentiable Meta-Learning
+        crate::diff_meta::register_builtins(self);
+
+        // Pillar 7: Self-Improving Compiler
+        crate::meta_compiler::register_builtins(self);
+
+        // Pillar 8: AGI Emergence Core
+        crate::agi_core::register_builtins(self);
+
+        // Vortex IR
+        crate::vir::register_builtins(self);
 
         // Math constants
         self.define("PI", Value::Float(std::f64::consts::PI));
@@ -2143,8 +2211,35 @@ fn resolve_import(env: &mut Env, import: &ImportDecl) -> Result<(), String> {
             ItemKind::Struct(s) => Some(s.name.name.clone()),
             ItemKind::Enum(e) => Some(e.name.name.clone()),
             ItemKind::Const(c) => Some(c.name.name.clone()),
+            ItemKind::Trait(t) => Some(t.name.name.clone()),
             _ => None,
         };
+        // Always import impl blocks (they apply globally)
+        if let ItemKind::Impl(impl_block) = &item.kind {
+            let type_name = match &impl_block.target.kind {
+                crate::ast::TypeExprKind::Named(id) => id.name.clone(),
+                crate::ast::TypeExprKind::Generic { name, .. } => name.name.clone(),
+                _ => continue,
+            };
+            if let Some(trait_type) = &impl_block.trait_name {
+                let trait_name = match &trait_type.kind {
+                    crate::ast::TypeExprKind::Named(id) => id.name.clone(),
+                    crate::ast::TypeExprKind::Generic { name, .. } => name.name.clone(),
+                    _ => String::new(),
+                };
+                if !trait_name.is_empty() {
+                    env.trait_impls.insert((trait_name, type_name.clone()), true);
+                }
+            }
+            for method_item in &impl_block.methods {
+                if let ItemKind::Function(func) = &method_item.kind {
+                    let params: Vec<String> = func.params.iter().map(|p| p.name.name.clone()).collect();
+                    let qualified = format!("{}::{}", type_name, func.name.name);
+                    env.functions.insert(qualified, FnDef::User { params, body: func.body.clone() });
+                }
+            }
+            continue;
+        }
         if let Some(name) = item_name {
             let should_import = match &requested {
                 Some(names) => names.contains(&name),
@@ -2178,6 +2273,19 @@ fn resolve_import(env: &mut Env, import: &ImportDecl) -> Result<(), String> {
                     ItemKind::Const(c) => {
                         let val = eval_expr(env, &c.value)?;
                         env.define(&register_name, val);
+                    }
+                    ItemKind::Trait(trait_def) => {
+                        let mut methods = Vec::new();
+                        for method in &trait_def.methods {
+                            let has_default = method.body.is_some();
+                            methods.push((method.name.name.clone(), has_default));
+                            if let Some(body) = &method.body {
+                                let params: Vec<String> = method.params.iter().map(|p| p.name.name.clone()).collect();
+                                let qualified = format!("{}::{}", register_name, method.name.name);
+                                env.functions.insert(qualified, FnDef::User { params, body: body.clone() });
+                            }
+                        }
+                        env.trait_defs.insert(register_name, methods);
                     }
                     _ => {}
                 }
@@ -2289,11 +2397,44 @@ pub fn interpret(program: &Program) -> Result<Vec<String>, String> {
                 }
             }
             ItemKind::Impl(impl_block) => {
-                // Get the target type name
+                // Get the target type name (works for both `impl Foo` and `impl Foo<T>`)
                 let type_name = match &impl_block.target.kind {
                     crate::ast::TypeExprKind::Named(id) => id.name.clone(),
+                    crate::ast::TypeExprKind::Generic { name, .. } => name.name.clone(),
                     _ => continue,
                 };
+
+                // If this is a trait impl, record it and inject default methods
+                if let Some(trait_type) = &impl_block.trait_name {
+                    let trait_name = match &trait_type.kind {
+                        crate::ast::TypeExprKind::Named(id) => id.name.clone(),
+                        crate::ast::TypeExprKind::Generic { name, .. } => name.name.clone(),
+                        _ => String::new(),
+                    };
+                    if !trait_name.is_empty() {
+                        env.trait_impls.insert((trait_name.clone(), type_name.clone()), true);
+
+                        // Collect implemented method names
+                        let implemented: HashSet<String> = impl_block.methods.iter()
+                            .filter_map(|m| if let ItemKind::Function(f) = &m.kind { Some(f.name.name.clone()) } else { None })
+                            .collect();
+
+                        // Inject default methods from trait that weren't overridden
+                        if let Some(trait_methods) = env.trait_defs.get(&trait_name).cloned() {
+                            for (method_name, _has_default) in &trait_methods {
+                                if !implemented.contains(method_name) {
+                                    // Look for default impl registered as Trait::method
+                                    let default_key = format!("{}::{}", trait_name, method_name);
+                                    if let Some(default_fn) = env.functions.get(&default_key).cloned() {
+                                        let qualified = format!("{}::{}", type_name, method_name);
+                                        env.functions.insert(qualified, default_fn);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
                 // Register each method as TypeName::method_name
                 for method_item in &impl_block.methods {
                     if let ItemKind::Function(func) = &method_item.kind {
@@ -2308,6 +2449,27 @@ pub fn interpret(program: &Program) -> Result<Vec<String>, String> {
                         );
                     }
                 }
+            }
+            ItemKind::Trait(trait_def) => {
+                let trait_name = trait_def.name.name.clone();
+                let mut methods = Vec::new();
+                for method in &trait_def.methods {
+                    let has_default = method.body.is_some();
+                    methods.push((method.name.name.clone(), has_default));
+                    // Register default implementations as Trait::method
+                    if let Some(body) = &method.body {
+                        let params: Vec<String> = method.params.iter().map(|p| p.name.name.clone()).collect();
+                        let qualified = format!("{}::{}", trait_name, method.name.name);
+                        env.functions.insert(
+                            qualified,
+                            FnDef::User {
+                                params,
+                                body: body.clone(),
+                            },
+                        );
+                    }
+                }
+                env.trait_defs.insert(trait_name, methods);
             }
             ItemKind::Import(import_decl) => {
                 resolve_import(&mut env, import_decl)?;
@@ -2403,11 +2565,13 @@ fn eval_stmt(env: &mut Env, stmt: &Stmt) -> Result<Value, String> {
     match &stmt.kind {
         StmtKind::Let { name, value, .. } => {
             let val = eval_expr(env, value)?;
+            if matches!(&val, Value::Return(_)) { return Ok(val); }
             env.define(&name.name, val);
             Ok(Value::Void)
         }
         StmtKind::Var { name, value, .. } => {
             let val = eval_expr(env, value)?;
+            if matches!(&val, Value::Return(_)) { return Ok(val); }
             env.define(&name.name, val);
             Ok(Value::Void)
         }
@@ -2574,7 +2738,29 @@ pub(crate) fn eval_expr(env: &mut Env, expr: &Expr) -> Result<Value, String> {
         ExprKind::BoolLiteral(b) => Ok(Value::Bool(*b)),
 
         ExprKind::Ident(id) => {
-            env.get(&id.name).ok_or_else(|| format!("undefined variable: {}", id.name))
+            if let Some(val) = env.get(&id.name) {
+                Ok(val)
+            } else if let Some(func_def) = env.functions.get(&id.name).cloned() {
+                // Allow named functions to be used as first-class values
+                match func_def {
+                    FnDef::User { params, body } => Ok(Value::Function {
+                        name: id.name.clone(),
+                        params,
+                        body,
+                    }),
+                    FnDef::Builtin(f) => {
+                        // Wrap builtin as a closure-like value
+                        // Store the name so apply_closure can look it up
+                        Ok(Value::Function {
+                            name: id.name.clone(),
+                            params: vec![],
+                            body: Block { stmts: vec![], expr: None, span: crate::ast::Span { start: 0, end: 0 } },
+                        })
+                    }
+                }
+            } else {
+                Err(format!("undefined variable: {}", id.name))
+            }
         }
 
         ExprKind::Binary { lhs, op, rhs } => {
@@ -2889,6 +3075,14 @@ pub(crate) fn eval_expr(env: &mut Env, expr: &Expr) -> Result<Value, String> {
                 if pattern_matches(&arm.pattern, &val) {
                     env.push_scope();
                     bind_pattern(env, &arm.pattern, &val);
+                    // Check guard if present
+                    if let Some(guard) = &arm.guard {
+                        let guard_val = eval_expr(env, guard)?;
+                        if !matches!(guard_val, Value::Bool(true)) {
+                            env.pop_scope();
+                            continue;
+                        }
+                    }
                     let result = eval_expr(env, &arm.body)?;
                     env.pop_scope();
                     return Ok(result);
@@ -3003,6 +3197,36 @@ fn pattern_matches(pattern: &Pattern, value: &Value) -> bool {
             }
             false
         }
+        Pattern::StructVariant { name, fields } => {
+            if let Value::EnumVariant { variant, fields: val_fields, .. } = value {
+                if variant != &name.name { return false; }
+                true
+            } else if let Value::Struct { name: sn, fields: sf } = value {
+                if sn != &name.name { return false; }
+                for (field_name, field_pat) in fields {
+                    if let Some(val) = sf.get(&field_name.name) {
+                        if !pattern_matches(field_pat, val) { return false; }
+                    } else {
+                        return false;
+                    }
+                }
+                true
+            } else {
+                false
+            }
+        }
+        Pattern::Or(patterns) => {
+            patterns.iter().any(|p| pattern_matches(p, value))
+        }
+        Pattern::Tuple(patterns) => {
+            if let Value::Tuple(values) = value {
+                if patterns.len() != values.len() { return false; }
+                patterns.iter().zip(values.iter()).all(|(p, v)| pattern_matches(p, v))
+            } else {
+                false
+            }
+        }
+        Pattern::Rest => true,
     }
 }
 
@@ -3025,6 +3249,31 @@ fn bind_pattern(env: &mut Env, pattern: &Pattern, value: &Value) {
             }
         }
         Pattern::Wildcard | Pattern::Literal(_) => {}
+        Pattern::StructVariant { name: _, fields } => {
+            if let Value::Struct { fields: sf, .. } = value {
+                for (field_name, field_pat) in fields {
+                    if let Some(val) = sf.get(&field_name.name) {
+                        bind_pattern(env, field_pat, val);
+                    }
+                }
+            }
+        }
+        Pattern::Or(patterns) => {
+            for p in patterns {
+                if pattern_matches(p, value) {
+                    bind_pattern(env, p, value);
+                    break;
+                }
+            }
+        }
+        Pattern::Tuple(patterns) => {
+            if let Value::Tuple(values) = value {
+                for (p, v) in patterns.iter().zip(values.iter()) {
+                    bind_pattern(env, p, v);
+                }
+            }
+        }
+        Pattern::Rest => {}
     }
 }
 
@@ -4000,7 +4249,27 @@ fn apply_closure(env: &mut Env, closure: &Value, args: Vec<Value>) -> Result<Val
         Value::Closure { params, body, env: captured_env } => {
             call_closure(env, params, body, captured_env, args)
         }
-        Value::Function { params, body, .. } => {
+        Value::Function { name, params, body } => {
+            // If params is empty but we have a name, look up the actual function
+            if params.is_empty() && !name.is_empty() {
+                if let Some(func_def) = env.functions.get(name).cloned() {
+                    return match func_def {
+                        FnDef::Builtin(f) => f(env, args),
+                        FnDef::User { params, body } => {
+                            env.push_scope();
+                            for (param, val) in params.iter().zip(args.iter()) {
+                                env.define(param, val.clone());
+                            }
+                            let result = eval_block(env, &body)?;
+                            env.pop_scope();
+                            match result {
+                                Value::Return(v) => Ok(*v),
+                                other => Ok(other),
+                            }
+                        }
+                    };
+                }
+            }
             env.push_scope();
             for (param, val) in params.iter().zip(args.iter()) {
                 env.define(param, val.clone());
@@ -4552,6 +4821,242 @@ fn builtin_autograd_data(env: &mut Env, args: Vec<Value>) -> Result<Value, Strin
 fn builtin_autograd_zero_grad(env: &mut Env, _a: Vec<Value>) -> Result<Value, String> { env.autograd_tape = Some(crate::autograd::Tape::new()); Ok(Value::Void) }
 fn builtin_autograd_adam_step(env: &mut Env, args: Vec<Value>) -> Result<Value, String> { let lr = match &args[0] { Value::Float(f) => *f, Value::Int(i) => *i as f64, _ => return Err("lr".into()) }; let ids: Vec<usize> = args[1..].iter().map(|v| match v { Value::Int(i) => Ok(*i as usize), _ => Err("e".to_string()) }).collect::<Result<_,_>>()?; let tape = env.autograd_tape.as_mut().ok_or("no tape")?; let psizes: Vec<usize> = ids.iter().map(|&id| tape.get_data(id).len()).collect(); let grads: Vec<Vec<f64>> = ids.iter().map(|&id| tape.get_grad(id).unwrap_or_else(|| vec![0.0; tape.get_data(id).len()])).collect(); let adam = env.autograd_adam.get_or_insert_with(|| crate::autograd::AdamOptimizer::new(lr, &psizes)); adam.lr = lr; adam.step(tape, &ids, &grads); Ok(Value::Void) }
 
+
+// --- First-class Tensor builtins ---
+
+fn ft_builtin_tensor(_env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    if args.len() != 2 { return Err("tensor expects 2 arguments: (data, shape)".to_string()); }
+    let data: Vec<f64> = match &args[0] {
+        Value::Array(arr) => arr.iter().map(|v| match v {
+            Value::Float(f) => Ok(*f),
+            Value::Int(i) => Ok(*i as f64),
+            _ => Err("tensor: data elements must be numbers".to_string()),
+        }).collect::<Result<Vec<_>, _>>()?,
+        _ => return Err("tensor: first argument must be an array".to_string()),
+    };
+    let shape: Vec<usize> = match &args[1] {
+        Value::Array(arr) => arr.iter().map(|v| match v {
+            Value::Int(i) => Ok(*i as usize),
+            Value::Float(f) => Ok(*f as usize),
+            _ => Err("tensor: shape elements must be integers".to_string()),
+        }).collect::<Result<Vec<_>, _>>()?,
+        _ => return Err("tensor: second argument must be a shape array".to_string()),
+    };
+    let expected: usize = shape.iter().product();
+    if data.len() != expected {
+        return Err(format!("tensor: data length {} doesn't match shape {:?} (expected {})", data.len(), shape, expected));
+    }
+    Ok(Value::Tensor(crate::tensor_engine::FastTensor::from_f64(shape, &data)))
+}
+
+fn ft_builtin_tensor_zeros(_env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    if args.len() != 1 { return Err("tensor_zeros expects 1 argument: (shape)".to_string()); }
+    let shape: Vec<usize> = match &args[0] {
+        Value::Array(arr) => arr.iter().map(|v| match v {
+            Value::Int(i) => Ok(*i as usize),
+            Value::Float(f) => Ok(*f as usize),
+            _ => Err("tensor_zeros: shape elements must be integers".to_string()),
+        }).collect::<Result<Vec<_>, _>>()?,
+        _ => return Err("tensor_zeros: argument must be a shape array".to_string()),
+    };
+    Ok(Value::Tensor(crate::tensor_engine::FastTensor::zeros(shape, crate::tensor_engine::DType::F64)))
+}
+
+fn ft_builtin_tensor_ones(_env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    if args.len() != 1 { return Err("tensor_ones expects 1 argument: (shape)".to_string()); }
+    let shape: Vec<usize> = match &args[0] {
+        Value::Array(arr) => arr.iter().map(|v| match v {
+            Value::Int(i) => Ok(*i as usize),
+            Value::Float(f) => Ok(*f as usize),
+            _ => Err("tensor_ones: shape elements must be integers".to_string()),
+        }).collect::<Result<Vec<_>, _>>()?,
+        _ => return Err("tensor_ones: argument must be a shape array".to_string()),
+    };
+    let numel: usize = shape.iter().product();
+    let data = vec![1.0f64; numel];
+    Ok(Value::Tensor(crate::tensor_engine::FastTensor::from_f64(shape, &data)))
+}
+
+fn ft_builtin_tensor_rand(_env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    if args.len() != 1 { return Err("tensor_rand expects 1 argument: (shape)".to_string()); }
+    let shape: Vec<usize> = match &args[0] {
+        Value::Array(arr) => arr.iter().map(|v| match v {
+            Value::Int(i) => Ok(*i as usize),
+            Value::Float(f) => Ok(*f as usize),
+            _ => Err("tensor_rand: shape elements must be integers".to_string()),
+        }).collect::<Result<Vec<_>, _>>()?,
+        _ => return Err("tensor_rand: argument must be a shape array".to_string()),
+    };
+    let numel: usize = shape.iter().product();
+    let mut seed: u64 = 42 + numel as u64;
+    let data: Vec<f64> = (0..numel).map(|i| {
+        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        seed = seed.wrapping_add(i as u64);
+        (seed >> 33) as f64 / (1u64 << 31) as f64
+    }).collect();
+    Ok(Value::Tensor(crate::tensor_engine::FastTensor::from_f64(shape, &data)))
+}
+
+fn ft_builtin_tensor_shape(_env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    if args.len() != 1 { return Err("tensor_shape expects 1 argument".to_string()); }
+    match &args[0] {
+        Value::Tensor(t) => Ok(Value::Array(t.shape.iter().map(|&s| Value::Int(s as i128)).collect())),
+        _ => Err("tensor_shape: argument must be a tensor".to_string()),
+    }
+}
+
+fn ft_builtin_tensor_dtype(_env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    if args.len() != 1 { return Err("tensor_dtype expects 1 argument".to_string()); }
+    match &args[0] {
+        Value::Tensor(t) => Ok(Value::String(format!("{:?}", t.dtype))),
+        _ => Err("tensor_dtype: argument must be a tensor".to_string()),
+    }
+}
+
+fn ft_builtin_tensor_reshape(_env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    if args.len() != 2 { return Err("tensor_reshape expects 2 arguments: (tensor, new_shape)".to_string()); }
+    let t = match &args[0] {
+        Value::Tensor(t) => t.clone(),
+        _ => return Err("tensor_reshape: first argument must be a tensor".to_string()),
+    };
+    let new_shape: Vec<usize> = match &args[1] {
+        Value::Array(arr) => arr.iter().map(|v| match v {
+            Value::Int(i) => Ok(*i as usize),
+            Value::Float(f) => Ok(*f as usize),
+            _ => Err("tensor_reshape: shape elements must be integers".to_string()),
+        }).collect::<Result<Vec<_>, _>>()?,
+        _ => return Err("tensor_reshape: second argument must be a shape array".to_string()),
+    };
+    let old_numel: usize = t.shape.iter().product();
+    let new_numel: usize = new_shape.iter().product();
+    if old_numel != new_numel {
+        return Err(format!("tensor_reshape: cannot reshape {} elements into {:?} ({} elements)", old_numel, new_shape, new_numel));
+    }
+    let strides = crate::tensor_engine::FastTensor::zeros(new_shape.clone(), t.dtype).strides;
+    Ok(Value::Tensor(crate::tensor_engine::FastTensor {
+        data: t.data,
+        shape: new_shape,
+        strides,
+        dtype: t.dtype,
+        layout: t.layout,
+    }))
+}
+
+fn ft_tensor_extract_f64(t: &crate::tensor_engine::FastTensor) -> Vec<f64> {
+    t.as_f64_slice().to_vec()
+}
+
+fn ft_builtin_tensor_add(_env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    if args.len() != 2 { return Err("tensor_add expects 2 arguments".to_string()); }
+    let a = match &args[0] { Value::Tensor(t) => t.clone(), _ => return Err("tensor_add: first argument must be a tensor".to_string()) };
+    let b = match &args[1] { Value::Tensor(t) => t.clone(), _ => return Err("tensor_add: second argument must be a tensor".to_string()) };
+    if a.shape != b.shape { return Err(format!("tensor_add: shape mismatch {:?} vs {:?}", a.shape, b.shape)); }
+    let ad = ft_tensor_extract_f64(&a);
+    let bd = ft_tensor_extract_f64(&b);
+    let result: Vec<f64> = ad.iter().zip(bd.iter()).map(|(x, y)| x + y).collect();
+    Ok(Value::Tensor(crate::tensor_engine::FastTensor::from_f64(a.shape, &result)))
+}
+
+fn ft_builtin_tensor_mul(_env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    if args.len() != 2 { return Err("tensor_mul expects 2 arguments".to_string()); }
+    let a = match &args[0] { Value::Tensor(t) => t.clone(), _ => return Err("tensor_mul: first argument must be a tensor".to_string()) };
+    let b = match &args[1] { Value::Tensor(t) => t.clone(), _ => return Err("tensor_mul: second argument must be a tensor".to_string()) };
+    if a.shape != b.shape { return Err(format!("tensor_mul: shape mismatch {:?} vs {:?}", a.shape, b.shape)); }
+    let ad = ft_tensor_extract_f64(&a);
+    let bd = ft_tensor_extract_f64(&b);
+    let result: Vec<f64> = ad.iter().zip(bd.iter()).map(|(x, y)| x * y).collect();
+    Ok(Value::Tensor(crate::tensor_engine::FastTensor::from_f64(a.shape, &result)))
+}
+
+fn ft_builtin_tensor_matmul_dense(_env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    if args.len() != 2 { return Err("tensor_matmul_dense expects 2 arguments".to_string()); }
+    let a = match &args[0] { Value::Tensor(t) => t.clone(), _ => return Err("tensor_matmul_dense: first argument must be a tensor".to_string()) };
+    let b = match &args[1] { Value::Tensor(t) => t.clone(), _ => return Err("tensor_matmul_dense: second argument must be a tensor".to_string()) };
+    if a.shape.len() != 2 || b.shape.len() != 2 {
+        return Err("tensor_matmul_dense: both tensors must be 2D".to_string());
+    }
+    let (m, k1) = (a.shape[0], a.shape[1]);
+    let (k2, n) = (b.shape[0], b.shape[1]);
+    if k1 != k2 { return Err(format!("tensor_matmul_dense: inner dimensions don't match: {} vs {}", k1, k2)); }
+    let ad = ft_tensor_extract_f64(&a);
+    let bd = ft_tensor_extract_f64(&b);
+    let mut result = vec![0.0f64; m * n];
+    for i in 0..m {
+        for j in 0..n {
+            let mut sum = 0.0;
+            for kk in 0..k1 {
+                sum += ad[i * k1 + kk] * bd[kk * n + j];
+            }
+            result[i * n + j] = sum;
+        }
+    }
+    Ok(Value::Tensor(crate::tensor_engine::FastTensor::from_f64(vec![m, n], &result)))
+}
+
+fn ft_builtin_tensor_transpose(_env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    if args.len() != 1 { return Err("tensor_transpose expects 1 argument".to_string()); }
+    let t = match &args[0] { Value::Tensor(t) => t.clone(), _ => return Err("tensor_transpose: argument must be a tensor".to_string()) };
+    if t.shape.len() != 2 { return Err("tensor_transpose: tensor must be 2D".to_string()); }
+    let (rows, cols) = (t.shape[0], t.shape[1]);
+    let data = ft_tensor_extract_f64(&t);
+    let mut result = vec![0.0f64; rows * cols];
+    for i in 0..rows {
+        for j in 0..cols {
+            result[j * rows + i] = data[i * cols + j];
+        }
+    }
+    Ok(Value::Tensor(crate::tensor_engine::FastTensor::from_f64(vec![cols, rows], &result)))
+}
+
+fn ft_builtin_tensor_slice(_env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    if args.len() != 4 { return Err("tensor_slice expects 4 arguments: (tensor, dim, start, end)".to_string()); }
+    let t = match &args[0] { Value::Tensor(t) => t.clone(), _ => return Err("tensor_slice: first argument must be a tensor".to_string()) };
+    let dim = match &args[1] { Value::Int(i) => *i as usize, _ => return Err("tensor_slice: dim must be an integer".to_string()) };
+    let start = match &args[2] { Value::Int(i) => *i as usize, _ => return Err("tensor_slice: start must be an integer".to_string()) };
+    let end = match &args[3] { Value::Int(i) => *i as usize, _ => return Err("tensor_slice: end must be an integer".to_string()) };
+    if dim >= t.shape.len() { return Err(format!("tensor_slice: dim {} out of bounds for {}D tensor", dim, t.shape.len())); }
+    if end > t.shape[dim] || start > end { return Err("tensor_slice: invalid slice bounds".to_string()); }
+    let data = ft_tensor_extract_f64(&t);
+    let mut new_shape = t.shape.clone();
+    new_shape[dim] = end - start;
+    let outer: usize = t.shape[..dim].iter().product();
+    let inner: usize = t.shape[dim + 1..].iter().product();
+    let dim_size = t.shape[dim];
+    let mut result = Vec::with_capacity(new_shape.iter().product());
+    for o in 0..outer {
+        for d in start..end {
+            for i in 0..inner {
+                result.push(data[o * dim_size * inner + d * inner + i]);
+            }
+        }
+    }
+    Ok(Value::Tensor(crate::tensor_engine::FastTensor::from_f64(new_shape, &result)))
+}
+
+fn ft_builtin_tensor_to_array(_env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    if args.len() != 1 { return Err("tensor_to_array expects 1 argument".to_string()); }
+    match &args[0] {
+        Value::Tensor(t) => {
+            let data = ft_tensor_extract_f64(t);
+            Ok(Value::Array(data.iter().map(|&v| Value::Float(v)).collect()))
+        }
+        _ => Err("tensor_to_array: argument must be a tensor".to_string()),
+    }
+}
+
+fn ft_builtin_tensor_from_array(_env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    if args.len() != 1 { return Err("tensor_from_array expects 1 argument".to_string()); }
+    let data: Vec<f64> = match &args[0] {
+        Value::Array(arr) => arr.iter().map(|v| match v {
+            Value::Float(f) => Ok(*f),
+            Value::Int(i) => Ok(*i as f64),
+            _ => Err("tensor_from_array: elements must be numbers".to_string()),
+        }).collect::<Result<Vec<_>, _>>()?,
+        _ => return Err("tensor_from_array: argument must be an array".to_string()),
+    };
+    let len = data.len();
+    Ok(Value::Tensor(crate::tensor_engine::FastTensor::from_f64(vec![len], &data)))
+}
 #[cfg(test)]
 mod interpreter_tests {
     use crate::lexer;

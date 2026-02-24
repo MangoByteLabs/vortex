@@ -1042,6 +1042,27 @@ fn infer_expr(env: &mut TypeEnv, expr: &Expr) -> Type {
                         }
                     }
                     Pattern::Literal(_) => {}
+                    Pattern::StructVariant { name, .. } => {
+                        covered_variants.push(name.name.clone());
+                    }
+                    Pattern::Or(pats) => {
+                        for p in pats {
+                            match p {
+                                Pattern::Variant { name, .. } => { covered_variants.push(name.name.clone()); }
+                                Pattern::Ident(id) => {
+                                    if env.variant_info.contains_key(&id.name) {
+                                        covered_variants.push(id.name.clone());
+                                    } else {
+                                        has_wildcard = true;
+                                    }
+                                }
+                                Pattern::Wildcard => { has_wildcard = true; }
+                                _ => {}
+                            }
+                        }
+                    }
+                    Pattern::Tuple(_) => {}
+                    Pattern::Rest => { has_wildcard = true; }
                 }
             }
 

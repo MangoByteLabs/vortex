@@ -511,6 +511,7 @@ pub enum ShapeDim {
 #[derive(Debug, Clone)]
 pub struct MatchArm {
     pub pattern: Pattern,
+    pub guard: Option<Box<Expr>>,
     pub body: Expr,
     pub span: Span,
 }
@@ -525,6 +526,14 @@ pub enum Pattern {
     Ident(Ident),
     /// Enum variant: Some(x), None
     Variant { name: Ident, fields: Vec<Pattern> },
+    /// Struct variant: Name { field: pat }
+    StructVariant { name: Ident, fields: Vec<(Ident, Pattern)> },
+    /// Or pattern: pat1 | pat2
+    Or(Vec<Pattern>),
+    /// Tuple pattern: (a, b, c)
+    Tuple(Vec<Pattern>),
+    /// Rest pattern: ..
+    Rest,
 }
 
 // --- Block ---
@@ -1193,6 +1202,30 @@ impl fmt::Display for Pattern {
                 }
                 Ok(())
             }
+            Pattern::StructVariant { name, fields } => {
+                write!(f, "{} {{ ", name.name)?;
+                for (i, (fname, pat)) in fields.iter().enumerate() {
+                    if i > 0 { write!(f, ", ")?; }
+                    write!(f, "{}: {}", fname.name, pat)?;
+                }
+                write!(f, " }}")
+            }
+            Pattern::Or(pats) => {
+                for (i, p) in pats.iter().enumerate() {
+                    if i > 0 { write!(f, " | ")?; }
+                    write!(f, "{}", p)?;
+                }
+                Ok(())
+            }
+            Pattern::Tuple(pats) => {
+                write!(f, "(")?;
+                for (i, p) in pats.iter().enumerate() {
+                    if i > 0 { write!(f, ", ")?; }
+                    write!(f, "{}", p)?;
+                }
+                write!(f, ")")
+            }
+            Pattern::Rest => write!(f, ".."),
         }
     }
 }

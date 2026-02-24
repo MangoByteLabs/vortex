@@ -761,6 +761,17 @@ impl Parser {
         while !self.check(TokenKind::RParen) && !self.at_end() {
             let start = self.span();
             let name = self.parse_ident()?;
+            // Handle 'self' parameter without type annotation
+            if name.name == "self" && !self.check(TokenKind::Colon) {
+                params.push(Param {
+                    name: name.clone(),
+                    ty: TypeExpr { kind: TypeExprKind::Named(Ident { name: "Self".to_string(), span: name.span }), span: name.span },
+                    default: None,
+                    span: start.merge(name.span),
+                });
+                if !self.eat(TokenKind::Comma).is_some() { break; }
+                continue;
+            }
             self.expect(TokenKind::Colon)?;
             let ty = self.parse_type()?;
             let default = if self.eat(TokenKind::Eq).is_some() {
@@ -1689,12 +1700,26 @@ impl Parser {
         let mut arms = Vec::new();
         while !self.check(TokenKind::RBrace) && !self.at_end() {
             let arm_start = self.span();
-            let pattern = self.parse_pattern()?;
+            let mut pattern = self.parse_pattern()?;
+            // Handle or-patterns: pat1 | pat2 | ...
+            if self.check(TokenKind::Pipe) {
+                let mut patterns = vec![pattern];
+                while self.eat(TokenKind::Pipe).is_some() {
+                    patterns.push(self.parse_pattern()?);
+                }
+                pattern = Pattern::Or(patterns);
+            }
+            let guard = if self.eat(TokenKind::If).is_some() {
+                Some(Box::new(self.parse_expr()?))
+            } else {
+                None
+            };
             self.expect(TokenKind::FatArrow)?;
             let body = self.parse_expr()?;
             let arm_end = body.span;
             arms.push(MatchArm {
                 pattern,
+                guard,
                 body,
                 span: arm_start.merge(arm_end),
             });
@@ -1731,6 +1756,23 @@ impl Parser {
                     }
                     self.expect(TokenKind::RParen)?;
                     Ok(Pattern::Variant { name: ident, fields })
+                } else if self.check(TokenKind::LBrace) {
+                    // Struct variant pattern: Name { field: pattern, ... }
+                    self.advance();
+                    let mut fields = Vec::new();
+                    while !self.check(TokenKind::RBrace) && !self.at_end() {
+                        let field_name = self.parse_ident()?;
+                        if self.eat(TokenKind::Colon).is_some() {
+                            let pat = self.parse_pattern()?;
+                            fields.push((field_name, pat));
+                        } else {
+                            // Shorthand: { x } means { x: x }
+                            fields.push((field_name.clone(), Pattern::Ident(field_name)));
+                        }
+                        if !self.eat(TokenKind::Comma).is_some() { break; }
+                    }
+                    self.expect(TokenKind::RBrace)?;
+                    Ok(Pattern::StructVariant { name: ident, fields })
                 } else {
                     Ok(Pattern::Ident(ident))
                 }
@@ -1746,6 +1788,20 @@ impl Parser {
             TokenKind::True | TokenKind::False => {
                 let expr = self.parse_primary()?;
                 Ok(Pattern::Literal(expr))
+            }
+            TokenKind::LParen => {
+                self.advance();
+                let mut pats = Vec::new();
+                while !self.check(TokenKind::RParen) && !self.at_end() {
+                    pats.push(self.parse_pattern()?);
+                    if !self.eat(TokenKind::Comma).is_some() { break; }
+                }
+                self.expect(TokenKind::RParen)?;
+                Ok(Pattern::Tuple(pats))
+            }
+            TokenKind::DotDot => {
+                self.advance();
+                Ok(Pattern::Rest)
             }
             _ => {
                 let tok = self.peek().clone();
