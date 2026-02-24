@@ -97,6 +97,7 @@ mod agi_core;
 mod vir;
 mod ptx_backend;
 mod net_runtime;
+mod fast_matrix;
 
 use codespan_reporting::files::SimpleFiles;
 use codespan_reporting::term;

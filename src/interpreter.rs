@@ -869,6 +869,9 @@ impl Env {
         // Networking
         crate::net_runtime::register_builtins(self);
 
+        // Fast matrix algebra (Monarch, Butterfly, Sparse Attention, Low-Rank)
+        crate::fast_matrix::register_builtins(self);
+
         // Math constants
         self.define("PI", Value::Float(std::f64::consts::PI));
         self.define("E", Value::Float(std::f64::consts::E));
