@@ -36,6 +36,51 @@ impl fmt::Display for ReduceOp {
     }
 }
 
+/// Fused activation for FusedLinear operations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum FusedActivation {
+    None,
+    Relu,
+    Gelu,
+    Silu,
+    Tanh,
+    Sigmoid,
+}
+
+impl fmt::Display for FusedActivation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            FusedActivation::None => write!(f, "none"),
+            FusedActivation::Relu => write!(f, "relu"),
+            FusedActivation::Gelu => write!(f, "gelu"),
+            FusedActivation::Silu => write!(f, "silu"),
+            FusedActivation::Tanh => write!(f, "tanh"),
+            FusedActivation::Sigmoid => write!(f, "sigmoid"),
+        }
+    }
+}
+
+/// Quantization scheme for compressed tensor operations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum QuantScheme {
+    /// Symmetric: value = quantized * scale
+    Symmetric,
+    /// Asymmetric: value = (quantized - zero_point) * scale
+    Asymmetric,
+    /// Group quantization: separate scale per group of N elements
+    Group(usize),
+}
+
+impl fmt::Display for QuantScheme {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            QuantScheme::Symmetric => write!(f, "symmetric"),
+            QuantScheme::Asymmetric => write!(f, "asymmetric"),
+            QuantScheme::Group(n) => write!(f, "group({})", n),
+        }
+    }
+}
+
 /// A dimension in a tensor shape.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum VirDim {
@@ -62,6 +107,7 @@ impl fmt::Display for VirDim {
 pub enum VirType {
     Void,
     Bool,
+    I4,  // 4-bit integer for quantized models
     I8,
     I16,
     I32,
@@ -93,7 +139,7 @@ impl VirType {
     pub fn is_int(&self) -> bool {
         matches!(
             self,
-            VirType::I8 | VirType::I16 | VirType::I32 | VirType::I64 | VirType::I128
+            VirType::I4 | VirType::I8 | VirType::I16 | VirType::I32 | VirType::I64 | VirType::I128
         )
     }
 
@@ -116,6 +162,7 @@ impl fmt::Display for VirType {
         match self {
             VirType::Void => write!(f, "void"),
             VirType::Bool => write!(f, "bool"),
+            VirType::I4 => write!(f, "i4"),
             VirType::I8 => write!(f, "i8"),
             VirType::I16 => write!(f, "i16"),
             VirType::I32 => write!(f, "i32"),
@@ -250,6 +297,38 @@ pub enum VirInstKind {
     Tanh(VirId),
     Gelu(VirId),
     Softmax(VirId, usize),
+    LayerNorm { input: VirId, gamma: VirId, beta: VirId, eps: f64 },
+    RMSNorm { input: VirId, gamma: VirId, eps: f64 },
+
+    // -- Fused high-performance operations --
+    /// Flash Attention: O(N) memory instead of O(N^2). Tiled, fused.
+    FlashAttention {
+        q: VirId, k: VirId, v: VirId,
+        mask: Option<VirId>,
+        scale: f64,
+        causal: bool,
+    },
+    /// Fused matmul + bias + activation in one kernel launch
+    FusedLinear {
+        input: VirId, weight: VirId, bias: Option<VirId>,
+        activation: FusedActivation,
+    },
+    /// Fused multi-head attention (Q/K/V projection + attention + output projection)
+    FusedMHA {
+        input: VirId, wq: VirId, wk: VirId, wv: VirId, wo: VirId,
+        num_heads: usize, head_dim: usize, causal: bool,
+    },
+    /// Speculative decoding: draft with small model, verify with large model
+    SpecDecode {
+        draft_logits: VirId, target_logits: VirId,
+        draft_tokens: VirId, temperature: f64,
+    },
+    /// Quantize tensor to lower precision
+    Quantize { input: VirId, target_dtype: VirType, scheme: QuantScheme },
+    /// Dequantize tensor back to float
+    Dequantize { input: VirId, scale: VirId, zero_point: Option<VirId> },
+    /// Quantized matmul (INT4/INT8 with accumulation in FP32)
+    QMatMul { a: VirId, b: VirId, a_scale: VirId, b_scale: VirId },
 
     // -- Control flow --
     Phi(Vec<(VirId, usize)>),
@@ -352,6 +431,30 @@ impl VirInstKind {
                 v
             }
             VirInstKind::Transpose(t, _) => vec![*t],
+
+            VirInstKind::LayerNorm { input, gamma, beta, .. } => vec![*input, *gamma, *beta],
+            VirInstKind::RMSNorm { input, gamma, .. } => vec![*input, *gamma],
+            VirInstKind::FlashAttention { q, k, v, mask, .. } => {
+                let mut r = vec![*q, *k, *v];
+                if let Some(m) = mask { r.push(*m); }
+                r
+            }
+            VirInstKind::FusedLinear { input, weight, bias, .. } => {
+                let mut r = vec![*input, *weight];
+                if let Some(b) = bias { r.push(*b); }
+                r
+            }
+            VirInstKind::FusedMHA { input, wq, wk, wv, wo, .. } => vec![*input, *wq, *wk, *wv, *wo],
+            VirInstKind::SpecDecode { draft_logits, target_logits, draft_tokens, .. } => {
+                vec![*draft_logits, *target_logits, *draft_tokens]
+            }
+            VirInstKind::Quantize { input, .. } => vec![*input],
+            VirInstKind::Dequantize { input, scale, zero_point } => {
+                let mut r = vec![*input, *scale];
+                if let Some(zp) = zero_point { r.push(*zp); }
+                r
+            }
+            VirInstKind::QMatMul { a, b, a_scale, b_scale } => vec![*a, *b, *a_scale, *b_scale],
 
             VirInstKind::Phi(pairs) => pairs.iter().map(|(id, _)| *id).collect(),
             VirInstKind::Call(_, args) => args.clone(),
@@ -501,6 +604,41 @@ impl fmt::Display for VirInst {
             VirInstKind::Tanh(a) => write!(f, "tanh %{}", a),
             VirInstKind::Gelu(a) => write!(f, "gelu %{}", a),
             VirInstKind::Softmax(a, axis) => write!(f, "softmax %{}, axis={}", a, axis),
+            VirInstKind::LayerNorm { input, gamma, beta, eps } => {
+                write!(f, "layernorm %{}, gamma=%{}, beta=%{}, eps={}", input, gamma, beta, eps)
+            }
+            VirInstKind::RMSNorm { input, gamma, eps } => {
+                write!(f, "rmsnorm %{}, gamma=%{}, eps={}", input, gamma, eps)
+            }
+            VirInstKind::FlashAttention { q, k, v, mask, scale, causal } => {
+                write!(f, "flash_attention q=%{}, k=%{}, v=%{}", q, k, v)?;
+                if let Some(m) = mask { write!(f, ", mask=%{}", m)?; }
+                write!(f, ", scale={}, causal={}", scale, causal)
+            }
+            VirInstKind::FusedLinear { input, weight, bias, activation } => {
+                write!(f, "fused_linear %{} @ %{}", input, weight)?;
+                if let Some(b) = bias { write!(f, " + %{}", b)?; }
+                write!(f, ", act={}", activation)
+            }
+            VirInstKind::FusedMHA { input, wq, wk, wv, wo, num_heads, head_dim, causal } => {
+                write!(f, "fused_mha %{}, wq=%{}, wk=%{}, wv=%{}, wo=%{}, heads={}, dim={}, causal={}",
+                    input, wq, wk, wv, wo, num_heads, head_dim, causal)
+            }
+            VirInstKind::SpecDecode { draft_logits, target_logits, draft_tokens, temperature } => {
+                write!(f, "spec_decode draft=%{}, target=%{}, tokens=%{}, temp={}",
+                    draft_logits, target_logits, draft_tokens, temperature)
+            }
+            VirInstKind::Quantize { input, target_dtype, scheme } => {
+                write!(f, "quantize %{} to {}, scheme={}", input, target_dtype, scheme)
+            }
+            VirInstKind::Dequantize { input, scale, zero_point } => {
+                write!(f, "dequantize %{}, scale=%{}", input, scale)?;
+                if let Some(zp) = zero_point { write!(f, ", zp=%{}", zp)?; }
+                Ok(())
+            }
+            VirInstKind::QMatMul { a, b, a_scale, b_scale } => {
+                write!(f, "qmatmul %{} @ %{}, scales=(%{}, %{})", a, b, a_scale, b_scale)
+            }
             VirInstKind::Phi(pairs) => {
                 write!(f, "phi")?;
                 for (i, (val, bb)) in pairs.iter().enumerate() {
@@ -1816,6 +1954,34 @@ fn rewrite_uses(kind: &mut VirInstKind, map: &HashMap<VirId, VirId>) {
         VirInstKind::Transpose(t, _) => {
             r(t, map);
         }
+        VirInstKind::LayerNorm { input, gamma, beta, .. } => {
+            r(input, map); r(gamma, map); r(beta, map);
+        }
+        VirInstKind::RMSNorm { input, gamma, .. } => {
+            r(input, map); r(gamma, map);
+        }
+        VirInstKind::FlashAttention { q, k, v, mask, .. } => {
+            r(q, map); r(k, map); r(v, map);
+            if let Some(m) = mask { r(m, map); }
+        }
+        VirInstKind::FusedLinear { input, weight, bias, .. } => {
+            r(input, map); r(weight, map);
+            if let Some(b) = bias { r(b, map); }
+        }
+        VirInstKind::FusedMHA { input, wq, wk, wv, wo, .. } => {
+            r(input, map); r(wq, map); r(wk, map); r(wv, map); r(wo, map);
+        }
+        VirInstKind::SpecDecode { draft_logits, target_logits, draft_tokens, .. } => {
+            r(draft_logits, map); r(target_logits, map); r(draft_tokens, map);
+        }
+        VirInstKind::Quantize { input, .. } => { r(input, map); }
+        VirInstKind::Dequantize { input, scale, zero_point } => {
+            r(input, map); r(scale, map);
+            if let Some(zp) = zero_point { r(zp, map); }
+        }
+        VirInstKind::QMatMul { a, b, a_scale, b_scale } => {
+            r(a, map); r(b, map); r(a_scale, map); r(b_scale, map);
+        }
         VirInstKind::Alloca(_)
         | VirInstKind::ConstInt(_)
         | VirInstKind::ConstFloat(_)
@@ -1825,11 +1991,142 @@ fn rewrite_uses(kind: &mut VirInstKind, map: &HashMap<VirId, VirId>) {
 }
 
 /// Run all optimization passes in the standard order.
+/// Advanced kernel fusion: fuse matmul + bias + activation into FusedLinear.
+/// Also fuse Q/K/V projections + attention into FusedMHA.
+pub fn advanced_fusion(module: &mut VirModule) {
+    for func in &mut module.functions {
+        for bb in &mut func.blocks {
+            let mut producer: HashMap<VirId, usize> = HashMap::new();
+            for (i, inst) in bb.insts.iter().enumerate() {
+                producer.insert(inst.id, i);
+            }
+
+            // Pass 1: Fuse matmul + add (bias) + activation → FusedLinear
+            let mut fused_linear_targets: Vec<(usize, Option<usize>, Option<usize>, FusedActivation)> = Vec::new();
+            for (i, inst) in bb.insts.iter().enumerate() {
+                // Look for activation(add(matmul(x, w), bias)) or activation(matmul(x, w))
+                let (inner_id, act) = match &inst.kind {
+                    VirInstKind::Relu(a) => (*a, FusedActivation::Relu),
+                    VirInstKind::Gelu(a) => (*a, FusedActivation::Gelu),
+                    VirInstKind::Sigmoid(a) => (*a, FusedActivation::Sigmoid),
+                    VirInstKind::Tanh(a) => (*a, FusedActivation::Tanh),
+                    _ => continue,
+                };
+                // Check if inner is an Add (bias)
+                if let Some(&add_idx) = producer.get(&inner_id) {
+                    if let VirInstKind::Add(mm_id, bias_id) = &bb.insts[add_idx].kind {
+                        if let Some(&mm_idx) = producer.get(mm_id) {
+                            if matches!(bb.insts[mm_idx].kind, VirInstKind::MatMul(_, _)) {
+                                fused_linear_targets.push((mm_idx, Some(add_idx), Some(i), act));
+                                continue;
+                            }
+                        }
+                    }
+                }
+                // Check if inner is directly a MatMul (no bias)
+                if let Some(&mm_idx) = producer.get(&inner_id) {
+                    if matches!(bb.insts[mm_idx].kind, VirInstKind::MatMul(_, _)) {
+                        fused_linear_targets.push((mm_idx, None, Some(i), act));
+                    }
+                }
+            }
+
+            // Apply FusedLinear fusions (reverse order to preserve indices)
+            for (mm_idx, add_idx, act_idx, activation) in fused_linear_targets.into_iter().rev() {
+                let (input, weight) = match &bb.insts[mm_idx].kind {
+                    VirInstKind::MatMul(a, b) => (*a, *b),
+                    _ => continue,
+                };
+                let bias = add_idx.and_then(|ai| {
+                    if let VirInstKind::Add(_, b) = &bb.insts[ai].kind {
+                        Some(*b)
+                    } else { None }
+                });
+                let final_idx = act_idx.unwrap_or(add_idx.unwrap_or(mm_idx));
+                let fused_ty = bb.insts[final_idx].ty.clone();
+                let fused_id = bb.insts[final_idx].id;
+
+                bb.insts[final_idx] = VirInst {
+                    id: fused_id,
+                    kind: VirInstKind::FusedLinear { input, weight, bias, activation },
+                    ty: fused_ty,
+                };
+
+                // Remove intermediates if not used elsewhere
+                let mut to_remove = Vec::new();
+                if let Some(ai) = add_idx {
+                    let add_id = bb.insts[ai].id;
+                    let used = bb.insts.iter().enumerate().any(|(j, inst)| j != final_idx && inst.kind.uses().contains(&add_id));
+                    if !used { to_remove.push(ai); }
+                }
+                let mm_id_val = bb.insts[mm_idx].id;
+                let mm_used = bb.insts.iter().enumerate().any(|(j, inst)| {
+                    j != final_idx && add_idx.map_or(true, |ai| j != ai) && inst.kind.uses().contains(&mm_id_val)
+                });
+                if !mm_used { to_remove.push(mm_idx); }
+                to_remove.sort_unstable();
+                to_remove.dedup();
+                for idx in to_remove.into_iter().rev() {
+                    bb.insts.remove(idx);
+                }
+            }
+        }
+    }
+}
+
+/// Fuse attention patterns: detect softmax(Q@K^T / sqrt(d)) @ V and replace with FlashAttention.
+pub fn attention_fusion(module: &mut VirModule) {
+    for func in &mut module.functions {
+        for bb in &mut func.blocks {
+            let mut producer: HashMap<VirId, usize> = HashMap::new();
+            for (i, inst) in bb.insts.iter().enumerate() {
+                producer.insert(inst.id, i);
+            }
+
+            // Look for pattern: matmul(softmax(matmul(Q, K_t)), V)
+            let mut attention_targets: Vec<(usize, VirId, VirId, VirId)> = Vec::new(); // (final_idx, q, k, v)
+            for (i, inst) in bb.insts.iter().enumerate() {
+                // outer matmul: attn_weights @ V
+                if let VirInstKind::MatMul(weights_id, v) = &inst.kind {
+                    if let Some(&softmax_idx) = producer.get(weights_id) {
+                        if let VirInstKind::Softmax(scores_id, _) = &bb.insts[softmax_idx].kind {
+                            if let Some(&inner_mm_idx) = producer.get(scores_id) {
+                                if let VirInstKind::MatMul(q, k_t) = &bb.insts[inner_mm_idx].kind {
+                                    attention_targets.push((i, *q, *k_t, *v));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Replace with FlashAttention
+            for (final_idx, q, k, v) in attention_targets.into_iter().rev() {
+                let fused_ty = bb.insts[final_idx].ty.clone();
+                let fused_id = bb.insts[final_idx].id;
+                bb.insts[final_idx] = VirInst {
+                    id: fused_id,
+                    kind: VirInstKind::FlashAttention {
+                        q, k, v,
+                        mask: None,
+                        scale: 1.0, // caller should set proper scale
+                        causal: false,
+                    },
+                    ty: fused_ty,
+                };
+            }
+        }
+    }
+}
+
 pub fn optimize(module: &mut VirModule) {
     constant_fold(module);
     common_subexpression_eliminate(module);
     dead_code_eliminate(module);
     tensor_fusion(module);
+    advanced_fusion(module);
+    attention_fusion(module);
+    dead_code_eliminate(module); // clean up after fusion
 }
 
 // ---------------------------------------------------------------------------

@@ -754,6 +754,71 @@ impl PtxBackend {
                     idx
                 ))
             }
+
+            // -- Fused high-performance operations --
+            VirInstKind::FlashAttention { q, k, v, mask, scale, causal } => {
+                let rq = self.get_reg(*q)?;
+                let rk = self.get_reg(*k)?;
+                let rv = self.get_reg(*v)?;
+                let mut code = format!("// flash_attention q={}, k={}, v={}, scale={}, causal={}\n", rq, rk, rv, scale, causal);
+                code.push_str(&format!("    call ({dst}), __vortex_flash_attention, ({rq}, {rk}, {rv}"));
+                if let Some(m) = mask { let rm = self.get_reg(*m)?; code.push_str(&format!(", {rm}")); }
+                code.push_str(");");
+                Ok(code)
+            }
+            VirInstKind::FusedLinear { input, weight, bias, activation } => {
+                let ri = self.get_reg(*input)?;
+                let rw = self.get_reg(*weight)?;
+                let mut code = format!("// fused_linear input={}, weight={}, act={}\n", ri, rw, activation);
+                code.push_str(&format!("    call ({dst}), __vortex_fused_linear_{activation}, ({ri}, {rw}"));
+                if let Some(b) = bias { let rb = self.get_reg(*b)?; code.push_str(&format!(", {rb}")); }
+                code.push_str(");");
+                Ok(code)
+            }
+            VirInstKind::FusedMHA { input, wq, wk, wv, wo, num_heads, head_dim, causal } => {
+                let ri = self.get_reg(*input)?;
+                let rwq = self.get_reg(*wq)?;
+                let rwk = self.get_reg(*wk)?;
+                let rwv = self.get_reg(*wv)?;
+                let rwo = self.get_reg(*wo)?;
+                Ok(format!("// fused_mha heads={num_heads}, dim={head_dim}, causal={causal}\n    call ({dst}), __vortex_fused_mha, ({ri}, {rwq}, {rwk}, {rwv}, {rwo});"))
+            }
+            VirInstKind::SpecDecode { draft_logits, target_logits, draft_tokens, temperature } => {
+                let rd = self.get_reg(*draft_logits)?;
+                let rt = self.get_reg(*target_logits)?;
+                let rk = self.get_reg(*draft_tokens)?;
+                Ok(format!("// spec_decode temp={}\n    call ({dst}), __vortex_spec_decode, ({rd}, {rt}, {rk});", temperature))
+            }
+            VirInstKind::LayerNorm { input, gamma, beta, eps } => {
+                let ri = self.get_reg(*input)?;
+                let rg = self.get_reg(*gamma)?;
+                let rb = self.get_reg(*beta)?;
+                Ok(format!("// layernorm eps={}\n    call ({dst}), __vortex_layernorm, ({ri}, {rg}, {rb});", eps))
+            }
+            VirInstKind::RMSNorm { input, gamma, eps } => {
+                let ri = self.get_reg(*input)?;
+                let rg = self.get_reg(*gamma)?;
+                Ok(format!("// rmsnorm eps={}\n    call ({dst}), __vortex_rmsnorm, ({ri}, {rg});", eps))
+            }
+            VirInstKind::Quantize { input, target_dtype, scheme } => {
+                let ri = self.get_reg(*input)?;
+                Ok(format!("// quantize to {} scheme={}\n    call ({dst}), __vortex_quantize, ({ri});", target_dtype, scheme))
+            }
+            VirInstKind::Dequantize { input, scale, zero_point } => {
+                let ri = self.get_reg(*input)?;
+                let rs = self.get_reg(*scale)?;
+                let mut code = format!("// dequantize\n    call ({dst}), __vortex_dequantize, ({ri}, {rs}");
+                if let Some(zp) = zero_point { let rz = self.get_reg(*zp)?; code.push_str(&format!(", {rz}")); }
+                code.push_str(");");
+                Ok(code)
+            }
+            VirInstKind::QMatMul { a, b, a_scale, b_scale } => {
+                let ra = self.get_reg(*a)?;
+                let rb = self.get_reg(*b)?;
+                let ras = self.get_reg(*a_scale)?;
+                let rbs = self.get_reg(*b_scale)?;
+                Ok(format!("// quantized matmul\n    call ({dst}), __vortex_qmatmul, ({ra}, {rb}, {ras}, {rbs});"))
+            }
         }
     }
 
@@ -801,6 +866,7 @@ impl PtxBackend {
         match ty {
             VirType::Void => PtxType::S32, // placeholder
             VirType::Bool => PtxType::Pred,
+            VirType::I4 => PtxType::S8,  // pack 2 per byte
             VirType::I8 => PtxType::S8,
             VirType::I16 => PtxType::S16,
             VirType::I32 => PtxType::S32,
