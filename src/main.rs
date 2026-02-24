@@ -100,6 +100,9 @@ mod ptx_backend;
 mod net_runtime;
 mod fast_matrix;
 mod zkp;
+mod benchmarks;
+mod secret_type;
+mod field_type;
 
 use codespan_reporting::files::SimpleFiles;
 use codespan_reporting::term;
@@ -169,6 +172,12 @@ fn main() {
     if command == "lsp" {
         let mut server = lsp_server::LspServer::new();
         server.run();
+        return;
+    }
+
+    if command == "benchmark" {
+        let json_output = args.iter().any(|a| a == "--json");
+        benchmarks::run_suite(json_output);
         return;
     }
 

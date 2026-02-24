@@ -36,6 +36,10 @@ pub enum Type {
     Error,
     /// Unique (linear/affine) type: must be used exactly once
     Unique(Box<Type>),
+    /// Secret<T> — constant-time wrapper; branching on this is a type error
+    Secret(Box<Type>),
+    /// Field<P> — prime field element (modulus P known at compile time)
+    Field { modulus_hint: Option<u64> },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -83,6 +87,9 @@ impl std::fmt::Display for Type {
             Type::Var(n) => write!(f, "?{}", n),
             Type::Error => write!(f, "<error>"),
             Type::Unique(inner) => write!(f, "unique {}", inner),
+            Type::Secret(inner) => write!(f, "Secret<{}>", inner),
+            Type::Field { modulus_hint: Some(p) } => write!(f, "Field<{}>", p),
+            Type::Field { modulus_hint: None } => write!(f, "Field<?>"),
         }
     }
 }
@@ -306,6 +313,22 @@ impl TypeEnv {
                 })
             }
 
+            // Secret<T> unifies with Secret<T> structurally
+            (Type::Secret(t1), Type::Secret(t2)) => {
+                self.unify(t1, t2, span).map(|t| Type::Secret(Box::new(t)))
+            }
+
+            // Field<P> unifies with Field<P> when moduli match (or either is unknown)
+            (Type::Field { modulus_hint: m1 }, Type::Field { modulus_hint: m2 }) => {
+                match (m1, m2) {
+                    (Some(p1), Some(p2)) if p1 != p2 => {
+                        self.type_mismatch(span, &a, &b);
+                        None
+                    }
+                    _ => Some(Type::Field { modulus_hint: m1.or(*m2) }),
+                }
+            }
+
             _ => {
                 self.type_mismatch(span, &a, &b);
                 None
@@ -371,6 +394,8 @@ impl TypeEnv {
                 params: params.iter().map(|p| self.resolve_deep(p)).collect(),
                 ret: Box::new(self.resolve_deep(ret)),
             },
+            Type::Secret(inner) => Type::Secret(Box::new(self.resolve_deep(inner))),
+            Type::Unique(inner) => Type::Unique(Box::new(self.resolve_deep(inner))),
             _ => ty.clone(),
         }
     }
@@ -1000,6 +1025,14 @@ fn infer_expr(env: &mut TypeEnv, expr: &Expr) -> Type {
 
         ExprKind::If { cond, then_block, else_block } => {
             let cond_ty = infer_expr(env, cond);
+            // Secret<T> values must not be used in branch conditions
+            if matches!(&cond_ty, Type::Secret(_)) {
+                env.errors.push(
+                    Diagnostic::error()
+                        .with_message("cannot branch on Secret<T> — use ct_select() for constant-time selection")
+                        .with_labels(vec![Label::primary(env.file_id, cond.span.start..cond.span.end)])
+                );
+            }
             env.unify(&Type::Scalar(ScalarType::Bool), &cond_ty, cond.span);
 
             env.push_scope();
@@ -1231,6 +1264,11 @@ fn check_numeric_op(env: &mut TypeEnv, span: Span, lhs: &Type, rhs: &Type) -> Ty
         return lhs;
     }
 
+    // Field<P> arithmetic returns Field<P>
+    if matches!(&lhs, Type::Field { .. }) && matches!(&rhs, Type::Field { .. }) {
+        return env.unify(&lhs, &rhs, span).unwrap_or(lhs);
+    }
+
     // Named types (might be field elements or other numeric types)
     if matches!(&lhs, Type::Named(_)) || matches!(&rhs, Type::Named(_)) {
         return lhs;
@@ -1385,6 +1423,39 @@ fn resolve_type_expr(env: &mut TypeEnv, ty: &TypeExpr) -> Type {
                     elem: Box::new(elem),
                     shape,
                 }
+            } else if name.name == "Secret" {
+                // Secret<T> generic syntax
+                let inner = if let Some(TypeArg::Type(t)) = args.first() {
+                    resolve_type_expr(env, t)
+                } else {
+                    Type::Error
+                };
+                Type::Secret(Box::new(inner))
+            } else if name.name == "Field" {
+                // Field<P> generic syntax — P must be a compile-time integer
+                let modulus_hint = if let Some(TypeArg::Expr(e)) = args.first() {
+                    match &e.kind {
+                        ExprKind::IntLiteral(n) => Some(*n as u64),
+                        _ => {
+                            env.errors.push(
+                                Diagnostic::error()
+                                    .with_message("Field<P>: modulus P must be a compile-time constant integer")
+                                    .with_labels(vec![Label::primary(env.file_id, name.span.start..name.span.end)])
+                            );
+                            None
+                        }
+                    }
+                } else if let Some(TypeArg::Type(t)) = args.first() {
+                    // Also accept Type arg (user wrote Field<7> which parser may parse as Named)
+                    if let TypeExprKind::Named(id) = &t.kind {
+                        id.name.parse::<u64>().ok()
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+                Type::Field { modulus_hint }
             } else {
                 Type::Named(name.name.clone())
             }
@@ -1430,6 +1501,25 @@ fn resolve_type_expr(env: &mut TypeEnv, ty: &TypeExpr) -> Type {
         TypeExprKind::Unique(inner) => {
             let inner_ty = resolve_type_expr(env, inner);
             Type::Unique(Box::new(inner_ty))
+        }
+        TypeExprKind::Secret(inner) => {
+            let inner_ty = resolve_type_expr(env, inner);
+            Type::Secret(Box::new(inner_ty))
+        }
+        TypeExprKind::PrimeField { modulus } => {
+            // Evaluate compile-time constant modulus if possible
+            let modulus_hint = match &modulus.kind {
+                ExprKind::IntLiteral(n) => Some(*n as u64),
+                _ => None,
+            };
+            if modulus_hint.is_none() {
+                env.errors.push(
+                    Diagnostic::error()
+                        .with_message("Field<P>: modulus P must be a compile-time constant integer")
+                        .with_labels(vec![Label::primary(env.file_id, modulus.span.start..modulus.span.end)])
+                );
+            }
+            Type::Field { modulus_hint }
         }
     }
 }

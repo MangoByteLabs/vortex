@@ -108,6 +108,30 @@ pub enum Annotation {
     Contract,
     /// gradient_surgery - gradient manipulation function
     GradientSurgery,
+    /// @persistent_grad - gradient tape survives across invocations (continuous learning)
+    PersistentGrad,
+    /// @bounded_update(eps) - constrain L2 norm of weight updates to epsilon
+    BoundedUpdate(f64),
+    /// @adaptive - warp-cooperative adaptive depth with early exit
+    Adaptive,
+    /// @fuse - hint to fuse this kernel with adjacent ops
+    Fuse,
+    /// @zk_provable - compile to ZK-provable R1CS circuit
+    ZkProvable,
+    /// @constant_time - enforce constant-time execution (no branching on Secret<T>)
+    ConstantTime,
+    /// @tiered(gpu, cpu, ssd) - tiered expert storage annotation
+    Tiered(Vec<String>),
+    /// @multiscale(fast=1, medium=4, slow=16) - multi-timescale clock domains
+    Multiscale { fast: u32, medium: u32, slow: u32 },
+    /// @local_learning(rule) - local (non-backprop) learning rule
+    LocalLearning(String),
+    /// @hot_modify - mark architecture as dynamically modifiable
+    HotModify,
+    /// @sparse_dispatch(sparsity) - activate only top-k% tokens
+    SparseDispatch(f64),
+    /// @heterogeneous_dispatch - route tokens to different expert types
+    HeterogeneousDispatch,
 }
 
 /// Struct definition
@@ -676,6 +700,10 @@ pub enum TypeExprKind {
     SparseIndex { batch: Box<Expr>, k: Box<Expr> },
     /// Unique (linear) type: unique T
     Unique(Box<TypeExpr>),
+    /// Secret<T> - opaque wrapper preventing branching (constant-time guarantee)
+    Secret(Box<TypeExpr>),
+    /// Field<P> - prime field element with compile-time modulus P
+    PrimeField { modulus: Box<Expr> },
 }
 
 /// A type argument can be a type or a value (for const generics / shapes)
@@ -818,6 +846,18 @@ impl fmt::Display for Annotation {
             Annotation::Intention => write!(f, "intention"),
             Annotation::Contract => write!(f, "contract"),
             Annotation::GradientSurgery => write!(f, "gradient_surgery"),
+            Annotation::PersistentGrad => write!(f, "@persistent_grad"),
+            Annotation::BoundedUpdate(eps) => write!(f, "@bounded_update({})", eps),
+            Annotation::Adaptive => write!(f, "@adaptive"),
+            Annotation::Fuse => write!(f, "@fuse"),
+            Annotation::ZkProvable => write!(f, "@zk_provable"),
+            Annotation::ConstantTime => write!(f, "@constant_time"),
+            Annotation::Tiered(tiers) => write!(f, "@tiered({})", tiers.join(", ")),
+            Annotation::Multiscale { fast, medium, slow } => write!(f, "@multiscale(fast={}, medium={}, slow={})", fast, medium, slow),
+            Annotation::LocalLearning(rule) => write!(f, "@local_learning({})", rule),
+            Annotation::HotModify => write!(f, "@hot_modify"),
+            Annotation::SparseDispatch(k) => write!(f, "@sparse_dispatch({})", k),
+            Annotation::HeterogeneousDispatch => write!(f, "@heterogeneous_dispatch"),
         }
     }
 }
@@ -1395,6 +1435,8 @@ impl fmt::Display for TypeExpr {
             TypeExprKind::Sparse(inner) => write!(f, "Sparse<{}>", inner),
             TypeExprKind::SparseIndex { batch, k } => write!(f, "SparseIndex[{}, {}]", batch, k),
             TypeExprKind::Unique(inner) => write!(f, "unique {}", inner),
+            TypeExprKind::Secret(inner) => write!(f, "Secret<{}>", inner),
+            TypeExprKind::PrimeField { modulus } => write!(f, "Field<{}>", modulus),
         }
     }
 }
