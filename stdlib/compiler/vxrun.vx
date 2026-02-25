@@ -1,1229 +1,8 @@
-// vxrun.vx — Standalone Vortex Program Runner (Self-Contained)
-// Reads a .vx file, lexes, parses, generates bytecode, executes on VM.
-// ALL IN PURE VORTEX. No Rust. This is the bridge to full self-hosting.
-//
-// Pipeline: source -> lex -> parse -> codegen -> VM execute
-//
-// Usage:
-//   cargo run -- run stdlib/compiler/vxrun.vx
-
-// ============================================================
-// PHASE 0: File I/O helpers
-// ============================================================
-
-fn _null_terminate(s: String) -> i64 {
-    let bytes = str_bytes(s)
-    let n = len(bytes)
-    let buf = mem_alloc(n + 1)
-    var i = 0
-    while i < n {
-        mem_write_u8(buf, i, int(bytes[i]))
-        i = i + 1
-    }
-    mem_write_u8(buf, n, 0)
-    return buf
-}
-
-fn read_source(path: String) -> String {
-    let path_ptr = _null_terminate(path)
-    let fd = syscall2(2, path_ptr, 0)
-    mem_free(path_ptr)
-    if fd < 0 {
-        return ""
-    }
-    let buf_size = 1048576
-    let buf = mem_alloc(buf_size)
-    let n_read = syscall3(0, fd, buf, buf_size)
-    syscall1(3, fd)
-    if n_read <= 0 {
-        mem_free(buf)
-        return ""
-    }
-    var byte_arr = []
-    var i = 0
-    while i < n_read {
-        byte_arr = push(byte_arr, mem_read_u8(buf, i))
-        i = i + 1
-    }
-    mem_free(buf)
-    return str_from_bytes(byte_arr)
-}
-
-// ============================================================
-// PHASE 1: Lexer
-// ============================================================
+// vxrun.vx — Minimal self-hosting demo: source -> lex -> parse -> bytecode -> VM
+// All in pure Vortex. Under 700 lines.
 
 fn _nl() -> String { return str_from_bytes([10]) }
-
-fn tok_new(typ: String, val: String, line: i64, col: i64) -> [String] {
-    return [typ, val, to_string(line), to_string(col)]
-}
-
-fn lex(source: String) -> [String] {
-    var tokens = []
-    var pos = 0
-    var line = 1
-    var col = 1
-    let src_len = len(source)
-
-    while pos < src_len {
-        let ch = str_char_at(source, pos)
-
-        // Skip whitespace
-        if ch == " " {
-            pos = pos + 1
-            col = col + 1
-        } else if ch == _nl() {
-            pos = pos + 1
-            line = line + 1
-            col = 1
-        } else if ch == str_from_bytes([9]) {
-            pos = pos + 1
-            col = col + 1
-        } else if ch == str_from_bytes([13]) {
-            pos = pos + 1
-        } else if ch == "/" {
-            // Check for line comment
-            if pos + 1 < src_len {
-                if str_char_at(source, pos + 1) == "/" {
-                    pos = pos + 2
-                    var in_comment = true
-                    while in_comment {
-                        if pos >= src_len {
-                            in_comment = false
-                        } else if str_char_at(source, pos) == _nl() {
-                            pos = pos + 1
-                            line = line + 1
-                            col = 1
-                            in_comment = false
-                        } else {
-                            pos = pos + 1
-                        }
-                    }
-                } else {
-                    tokens = push(tokens, tok_new("SLASH", "/", line, col))
-                    pos = pos + 1
-                    col = col + 1
-                }
-            } else {
-                tokens = push(tokens, tok_new("SLASH", "/", line, col))
-                pos = pos + 1
-                col = col + 1
-            }
-        } else if str_is_ascii_digit(ch) {
-            // Number
-            let start = pos
-            let start_col = col
-            var scanning_num = true
-            while scanning_num {
-                if pos < src_len {
-                    if str_is_ascii_digit(str_char_at(source, pos)) {
-                        pos = pos + 1
-                        col = col + 1
-                    } else {
-                        scanning_num = false
-                    }
-                } else {
-                    scanning_num = false
-                }
-            }
-            // Check for float
-            var is_float = false
-            if pos < src_len {
-                if str_char_at(source, pos) == "." {
-                    if pos + 1 < src_len {
-                        if str_is_ascii_digit(str_char_at(source, pos + 1)) {
-                            is_float = true
-                            pos = pos + 1
-                            col = col + 1
-                            var scanning_frac = true
-                            while scanning_frac {
-                                if pos < src_len {
-                                    if str_is_ascii_digit(str_char_at(source, pos)) {
-                                        pos = pos + 1
-                                        col = col + 1
-                                    } else {
-                                        scanning_frac = false
-                                    }
-                                } else {
-                                    scanning_frac = false
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            if is_float {
-                tokens = push(tokens, tok_new("FLOAT", str_substr(source, start, pos - start), line, start_col))
-            } else {
-                tokens = push(tokens, tok_new("INT", str_substr(source, start, pos - start), line, start_col))
-            }
-        } else if str_is_ascii_alpha(ch) {
-            let start = pos
-            let start_col = col
-            var scanning = true
-            while scanning {
-                if pos < src_len {
-                    let c = str_char_at(source, pos)
-                    if str_is_ascii_alpha(c) {
-                        pos = pos + 1
-                        col = col + 1
-                    } else if str_is_ascii_digit(c) {
-                        pos = pos + 1
-                        col = col + 1
-                    } else if c == "_" {
-                        pos = pos + 1
-                        col = col + 1
-                    } else {
-                        scanning = false
-                    }
-                } else {
-                    scanning = false
-                }
-            }
-            let word = str_substr(source, start, pos - start)
-            if word == "fn" {
-                tokens = push(tokens, tok_new("KW", "fn", line, start_col))
-            } else if word == "let" {
-                tokens = push(tokens, tok_new("KW", "let", line, start_col))
-            } else if word == "var" {
-                tokens = push(tokens, tok_new("KW", "var", line, start_col))
-            } else if word == "if" {
-                tokens = push(tokens, tok_new("KW", "if", line, start_col))
-            } else if word == "else" {
-                tokens = push(tokens, tok_new("KW", "else", line, start_col))
-            } else if word == "while" {
-                tokens = push(tokens, tok_new("KW", "while", line, start_col))
-            } else if word == "return" {
-                tokens = push(tokens, tok_new("KW", "return", line, start_col))
-            } else if word == "true" {
-                tokens = push(tokens, tok_new("BOOL", "true", line, start_col))
-            } else if word == "false" {
-                tokens = push(tokens, tok_new("BOOL", "false", line, start_col))
-            } else {
-                tokens = push(tokens, tok_new("IDENT", word, line, start_col))
-            }
-        } else if ch == "_" {
-            let start = pos
-            let start_col = col
-            pos = pos + 1
-            col = col + 1
-            var scanning = true
-            while scanning {
-                if pos < src_len {
-                    let c = str_char_at(source, pos)
-                    if str_is_ascii_alpha(c) {
-                        pos = pos + 1
-                        col = col + 1
-                    } else if str_is_ascii_digit(c) {
-                        pos = pos + 1
-                        col = col + 1
-                    } else if c == "_" {
-                        pos = pos + 1
-                        col = col + 1
-                    } else {
-                        scanning = false
-                    }
-                } else {
-                    scanning = false
-                }
-            }
-            let word = str_substr(source, start, pos - start)
-            tokens = push(tokens, tok_new("IDENT", word, line, start_col))
-        } else if ch == "(" {
-            tokens = push(tokens, tok_new("LPAREN", "(", line, col))
-            pos = pos + 1
-            col = col + 1
-        } else if ch == ")" {
-            tokens = push(tokens, tok_new("RPAREN", ")", line, col))
-            pos = pos + 1
-            col = col + 1
-        } else if ch == "{" {
-            tokens = push(tokens, tok_new("LBRACE", "{", line, col))
-            pos = pos + 1
-            col = col + 1
-        } else if ch == "}" {
-            tokens = push(tokens, tok_new("RBRACE", "}", line, col))
-            pos = pos + 1
-            col = col + 1
-        } else if ch == "," {
-            tokens = push(tokens, tok_new("COMMA", ",", line, col))
-            pos = pos + 1
-            col = col + 1
-        } else if ch == ":" {
-            tokens = push(tokens, tok_new("COLON", ":", line, col))
-            pos = pos + 1
-            col = col + 1
-        } else if ch == "+" {
-            tokens = push(tokens, tok_new("PLUS", "+", line, col))
-            pos = pos + 1
-            col = col + 1
-        } else if ch == "-" {
-            if pos + 1 < src_len {
-                if str_char_at(source, pos + 1) == ">" {
-                    tokens = push(tokens, tok_new("ARROW", "->", line, col))
-                    pos = pos + 2
-                    col = col + 2
-                } else {
-                    tokens = push(tokens, tok_new("MINUS", "-", line, col))
-                    pos = pos + 1
-                    col = col + 1
-                }
-            } else {
-                tokens = push(tokens, tok_new("MINUS", "-", line, col))
-                pos = pos + 1
-                col = col + 1
-            }
-        } else if ch == "*" {
-            tokens = push(tokens, tok_new("STAR", "*", line, col))
-            pos = pos + 1
-            col = col + 1
-        } else if ch == "%" {
-            tokens = push(tokens, tok_new("PERCENT", "%", line, col))
-            pos = pos + 1
-            col = col + 1
-        } else if ch == "[" {
-            tokens = push(tokens, tok_new("LBRACKET", "[", line, col))
-            pos = pos + 1
-            col = col + 1
-        } else if ch == "]" {
-            tokens = push(tokens, tok_new("RBRACKET", "]", line, col))
-            pos = pos + 1
-            col = col + 1
-        } else if ch == str_from_bytes([34]) {
-            // String literal
-            let start_col = col
-            pos = pos + 1
-            col = col + 1
-            var str_val = ""
-            var scanning_str = true
-            while scanning_str {
-                if pos >= src_len {
-                    scanning_str = false
-                } else {
-                    let sc = str_char_at(source, pos)
-                    if sc == str_from_bytes([34]) {
-                        pos = pos + 1
-                        col = col + 1
-                        scanning_str = false
-                    } else if sc == str_from_bytes([92]) {
-                        // backslash escape
-                        pos = pos + 1
-                        col = col + 1
-                        if pos < src_len {
-                            let esc = str_char_at(source, pos)
-                            if esc == "n" {
-                                str_val = str_val + _nl()
-                            } else if esc == "t" {
-                                str_val = str_val + str_from_bytes([9])
-                            } else if esc == str_from_bytes([34]) {
-                                str_val = str_val + str_from_bytes([34])
-                            } else if esc == str_from_bytes([92]) {
-                                str_val = str_val + str_from_bytes([92])
-                            } else {
-                                str_val = str_val + esc
-                            }
-                            pos = pos + 1
-                            col = col + 1
-                        }
-                    } else {
-                        str_val = str_val + sc
-                        pos = pos + 1
-                        col = col + 1
-                    }
-                }
-            }
-            tokens = push(tokens, tok_new("STRING", str_val, line, start_col))
-        } else if ch == "=" {
-            if pos + 1 < src_len {
-                if str_char_at(source, pos + 1) == "=" {
-                    tokens = push(tokens, tok_new("EQEQ", "==", line, col))
-                    pos = pos + 2
-                    col = col + 2
-                } else {
-                    tokens = push(tokens, tok_new("EQ", "=", line, col))
-                    pos = pos + 1
-                    col = col + 1
-                }
-            } else {
-                tokens = push(tokens, tok_new("EQ", "=", line, col))
-                pos = pos + 1
-                col = col + 1
-            }
-        } else if ch == "!" {
-            if pos + 1 < src_len {
-                if str_char_at(source, pos + 1) == "=" {
-                    tokens = push(tokens, tok_new("NEQ", "!=", line, col))
-                    pos = pos + 2
-                    col = col + 2
-                } else {
-                    tokens = push(tokens, tok_new("NOT", "!", line, col))
-                    pos = pos + 1
-                    col = col + 1
-                }
-            } else {
-                tokens = push(tokens, tok_new("NOT", "!", line, col))
-                pos = pos + 1
-                col = col + 1
-            }
-        } else if ch == "<" {
-            if pos + 1 < src_len {
-                if str_char_at(source, pos + 1) == "=" {
-                    tokens = push(tokens, tok_new("LTEQ", "<=", line, col))
-                    pos = pos + 2
-                    col = col + 2
-                } else {
-                    tokens = push(tokens, tok_new("LT", "<", line, col))
-                    pos = pos + 1
-                    col = col + 1
-                }
-            } else {
-                tokens = push(tokens, tok_new("LT", "<", line, col))
-                pos = pos + 1
-                col = col + 1
-            }
-        } else if ch == ">" {
-            if pos + 1 < src_len {
-                if str_char_at(source, pos + 1) == "=" {
-                    tokens = push(tokens, tok_new("GTEQ", ">=", line, col))
-                    pos = pos + 2
-                    col = col + 2
-                } else {
-                    tokens = push(tokens, tok_new("GT", ">", line, col))
-                    pos = pos + 1
-                    col = col + 1
-                }
-            } else {
-                tokens = push(tokens, tok_new("GT", ">", line, col))
-                pos = pos + 1
-                col = col + 1
-            }
-        } else if ch == "&" {
-            if pos + 1 < src_len {
-                if str_char_at(source, pos + 1) == "&" {
-                    tokens = push(tokens, tok_new("AND", "&&", line, col))
-                    pos = pos + 2
-                    col = col + 2
-                } else {
-                    pos = pos + 1
-                    col = col + 1
-                }
-            } else {
-                pos = pos + 1
-                col = col + 1
-            }
-        } else if ch == str_from_bytes([124]) {
-            if pos + 1 < src_len {
-                if str_char_at(source, pos + 1) == str_from_bytes([124]) {
-                    tokens = push(tokens, tok_new("OR", "||", line, col))
-                    pos = pos + 2
-                    col = col + 2
-                } else {
-                    pos = pos + 1
-                    col = col + 1
-                }
-            } else {
-                pos = pos + 1
-                col = col + 1
-            }
-        } else {
-            // Skip unknown character
-            pos = pos + 1
-            col = col + 1
-        }
-    }
-
-    tokens = push(tokens, tok_new("EOF", "", line, col))
-    return tokens
-}
-
-// ============================================================
-// PHASE 2: Parser
-// ============================================================
-// AST nodes are nested arrays:
-//   ["int", "42"]
-//   ["ident", "x"]
-//   ["bool", "true"]
-//   ["float", "3.14"]
-//   ["string", "hello"]
-//   ["+", left, right]   (binary ops)
-//   ["neg", expr]
-//   ["not", expr]
-//   ["call", "fname", arg1, arg2, ...]
-//   ["let", "name", expr]
-//   ["var", "name", expr]
-//   ["assign", "name", expr]
-//   ["return", expr]
-//   ["if", cond, then_stmts, else_stmts]
-//   ["while", cond, body_stmts]
-//   ["fn", "name", ["param1", "param2"], body_stmts]
-//   ["array", elem1, elem2, ...]
-//   ["index", arr_expr, idx_expr]
-//   ["println", expr]
-//   ["print", expr]
-//   ["len_call", expr]
-//   ["push_call", arr_expr, val_expr]
-//   ["expr_stmt", expr]
-
-var _tokens = []
-var _tpos = 0
-
-fn p_peek_type() -> String {
-    if _tpos >= len(_tokens) {
-        return "EOF"
-    }
-    let tok = _tokens[_tpos]
-    return tok[0]
-}
-
-fn p_peek_val() -> String {
-    if _tpos >= len(_tokens) {
-        return ""
-    }
-    let tok = _tokens[_tpos]
-    return tok[1]
-}
-
-fn p_advance() -> [String] {
-    let tok = _tokens[_tpos]
-    _tpos = _tpos + 1
-    return tok
-}
-
-fn p_expect(typ: String) -> [String] {
-    if p_peek_type() != typ {
-        println("Parse error: expected " + typ + " got " + p_peek_type() + " '" + p_peek_val() + "'")
-    }
-    return p_advance()
-}
-
-fn p_expect_kw(kw: String) -> [String] {
-    if p_peek_type() != "KW" {
-        println("Parse error: expected keyword " + kw + " got " + p_peek_type())
-    }
-    if p_peek_val() != kw {
-        println("Parse error: expected keyword " + kw + " got " + p_peek_val())
-    }
-    return p_advance()
-}
-
-fn p_at(typ: String) -> bool {
-    return p_peek_type() == typ
-}
-
-fn p_at_kw(kw: String) -> bool {
-    if p_peek_type() == "KW" {
-        if p_peek_val() == kw {
-            return true
-        }
-    }
-    return false
-}
-
-// --- Expression parsing with precedence ---
-
-fn parse_expr() -> [String] {
-    return parse_or_expr()
-}
-
-fn parse_or_expr() -> [String] {
-    var left = parse_and_expr()
-    var cont = true
-    while cont {
-        if p_at("OR") {
-            p_advance()
-            let right = parse_and_expr()
-            left = ["||", left, right]
-        } else {
-            cont = false
-        }
-    }
-    return left
-}
-
-fn parse_and_expr() -> [String] {
-    var left = parse_comparison()
-    var cont = true
-    while cont {
-        if p_at("AND") {
-            p_advance()
-            let right = parse_comparison()
-            left = ["&&", left, right]
-        } else {
-            cont = false
-        }
-    }
-    return left
-}
-
-fn parse_comparison() -> [String] {
-    var left = parse_addition()
-    var cont = true
-    while cont {
-        if p_at("EQEQ") {
-            p_advance()
-            let right = parse_addition()
-            left = ["==", left, right]
-        } else if p_at("NEQ") {
-            p_advance()
-            let right = parse_addition()
-            left = ["!=", left, right]
-        } else if p_at("LT") {
-            p_advance()
-            let right = parse_addition()
-            left = ["<", left, right]
-        } else if p_at("GT") {
-            p_advance()
-            let right = parse_addition()
-            left = [">", left, right]
-        } else if p_at("LTEQ") {
-            p_advance()
-            let right = parse_addition()
-            left = ["<=", left, right]
-        } else if p_at("GTEQ") {
-            p_advance()
-            let right = parse_addition()
-            left = [">=", left, right]
-        } else {
-            cont = false
-        }
-    }
-    return left
-}
-
-fn parse_addition() -> [String] {
-    var left = parse_multiplication()
-    var cont = true
-    while cont {
-        if p_at("PLUS") {
-            p_advance()
-            let right = parse_multiplication()
-            left = ["+", left, right]
-        } else if p_at("MINUS") {
-            p_advance()
-            let right = parse_multiplication()
-            left = ["-", left, right]
-        } else {
-            cont = false
-        }
-    }
-    return left
-}
-
-fn parse_multiplication() -> [String] {
-    var left = parse_unary()
-    var cont = true
-    while cont {
-        if p_at("STAR") {
-            p_advance()
-            let right = parse_unary()
-            left = ["*", left, right]
-        } else if p_at("SLASH") {
-            p_advance()
-            let right = parse_unary()
-            left = ["/", left, right]
-        } else if p_at("PERCENT") {
-            p_advance()
-            let right = parse_unary()
-            left = ["%", left, right]
-        } else {
-            cont = false
-        }
-    }
-    return left
-}
-
-fn parse_unary() -> [String] {
-    if p_at("MINUS") {
-        p_advance()
-        let expr = parse_unary()
-        return ["neg", expr]
-    }
-    if p_at("NOT") {
-        p_advance()
-        let expr = parse_unary()
-        return ["not", expr]
-    }
-    return parse_postfix()
-}
-
-fn parse_postfix() -> [String] {
-    var expr = parse_primary()
-    // Handle postfix indexing: expr[idx]
-    var cont = true
-    while cont {
-        if p_at("LBRACKET") {
-            p_advance()
-            let idx_expr = parse_expr()
-            p_expect("RBRACKET")
-            expr = ["index", expr, idx_expr]
-        } else if p_at("LPAREN") {
-            // function call on expression (only works if expr is ident)
-            if expr[0] == "ident" {
-                let name = expr[1]
-                p_advance()
-                var args = []
-                if p_at("RPAREN") {
-                    p_advance()
-                    expr = ["call", name]
-                } else {
-                    args = push(args, parse_expr())
-                    while p_at("COMMA") {
-                        p_advance()
-                        args = push(args, parse_expr())
-                    }
-                    p_expect("RPAREN")
-                    var node = ["call", name]
-                    var ai = 0
-                    while ai < len(args) {
-                        node = push(node, args[ai])
-                        ai = ai + 1
-                    }
-                    expr = node
-                }
-            } else {
-                cont = false
-            }
-        } else {
-            cont = false
-        }
-    }
-    return expr
-}
-
-fn parse_primary() -> [String] {
-    if p_at("INT") {
-        let tok = p_advance()
-        return ["int", tok[1]]
-    }
-
-    if p_at("FLOAT") {
-        let tok = p_advance()
-        return ["float", tok[1]]
-    }
-
-    if p_at("STRING") {
-        let tok = p_advance()
-        return ["string", tok[1]]
-    }
-
-    if p_at("BOOL") {
-        let tok = p_advance()
-        return ["bool", tok[1]]
-    }
-
-    if p_at("LPAREN") {
-        p_advance()
-        let expr = parse_expr()
-        p_expect("RPAREN")
-        return expr
-    }
-
-    // Array literal: [expr, expr, ...]
-    if p_at("LBRACKET") {
-        p_advance()
-        var elems = []
-        if p_at("RBRACKET") {
-            p_advance()
-            return ["array"]
-        }
-        elems = push(elems, parse_expr())
-        while p_at("COMMA") {
-            p_advance()
-            elems = push(elems, parse_expr())
-        }
-        p_expect("RBRACKET")
-        var node = ["array"]
-        var ai = 0
-        while ai < len(elems) {
-            node = push(node, elems[ai])
-            ai = ai + 1
-        }
-        return node
-    }
-
-    if p_at("IDENT") {
-        let tok = p_advance()
-        return ["ident", tok[1]]
-    }
-
-    println("Parse error: unexpected token " + p_peek_type() + " '" + p_peek_val() + "'")
-    p_advance()
-    return ["int", "0"]
-}
-
-// --- Statement parsing ---
-
-fn parse_stmt() -> [String] {
-    if p_at_kw("let") {
-        p_advance()
-        let name_tok = p_expect("IDENT")
-        // Skip optional type annotation
-        if p_at("COLON") {
-            p_advance()
-            while p_peek_type() != "EQ" {
-                if p_peek_type() == "EOF" {
-                    return ["let", name_tok[1], ["int", "0"]]
-                }
-                p_advance()
-            }
-        }
-        p_expect("EQ")
-        let expr = parse_expr()
-        return ["let", name_tok[1], expr]
-    }
-
-    if p_at_kw("var") {
-        p_advance()
-        let name_tok = p_expect("IDENT")
-        if p_at("COLON") {
-            p_advance()
-            while p_peek_type() != "EQ" {
-                if p_peek_type() == "EOF" {
-                    return ["var", name_tok[1], ["int", "0"]]
-                }
-                p_advance()
-            }
-        }
-        p_expect("EQ")
-        let expr = parse_expr()
-        return ["var", name_tok[1], expr]
-    }
-
-    if p_at_kw("return") {
-        p_advance()
-        if p_at("RBRACE") {
-            return ["return", ["int", "0"]]
-        }
-        let expr = parse_expr()
-        return ["return", expr]
-    }
-
-    if p_at_kw("if") {
-        return parse_if_stmt()
-    }
-
-    if p_at_kw("while") {
-        return parse_while_stmt()
-    }
-
-    // Expression statement (could be assignment or call)
-    let expr = parse_expr()
-
-    // Check for assignment: ident = expr or index_assign
-    if p_at("EQ") {
-        p_advance()
-        let val = parse_expr()
-        if expr[0] == "ident" {
-            return ["assign", expr[1], val]
-        }
-        println("Parse error: invalid assignment target")
-        return ["assign", "?", val]
-    }
-
-    return ["expr_stmt", expr]
-}
-
-fn parse_block() -> [String] {
-    p_expect("LBRACE")
-    var stmts = []
-    while p_peek_type() != "RBRACE" {
-        if p_peek_type() == "EOF" {
-            return stmts
-        }
-        let s = parse_stmt()
-        stmts = push(stmts, s)
-    }
-    p_expect("RBRACE")
-    return stmts
-}
-
-fn parse_if_stmt() -> [String] {
-    p_expect_kw("if")
-    let cond = parse_expr()
-    let then_block = parse_block()
-    var else_block = []
-    if p_at_kw("else") {
-        p_advance()
-        if p_at_kw("if") {
-            // else if -> wrap in array
-            let elif_stmt = parse_if_stmt()
-            else_block = [elif_stmt]
-        } else {
-            else_block = parse_block()
-        }
-    }
-    return ["if", cond, then_block, else_block]
-}
-
-fn parse_while_stmt() -> [String] {
-    p_expect_kw("while")
-    let cond = parse_expr()
-    let body = parse_block()
-    return ["while", cond, body]
-}
-
-fn parse_fn_def() -> [String] {
-    p_expect_kw("fn")
-    let name_tok = p_expect("IDENT")
-    p_expect("LPAREN")
-    var params = []
-    if p_peek_type() != "RPAREN" {
-        let p1 = p_expect("IDENT")
-        params = push(params, p1[1])
-        // Skip type annotation
-        if p_at("COLON") {
-            p_advance()
-            while p_peek_type() != "COMMA" {
-                if p_peek_type() == "RPAREN" {
-                    // done with params
-                    break
-                }
-                if p_peek_type() == "EOF" {
-                    break
-                }
-                p_advance()
-            }
-        }
-        while p_at("COMMA") {
-            p_advance()
-            let pn = p_expect("IDENT")
-            params = push(params, pn[1])
-            if p_at("COLON") {
-                p_advance()
-                while p_peek_type() != "COMMA" {
-                    if p_peek_type() == "RPAREN" {
-                        break
-                    }
-                    if p_peek_type() == "EOF" {
-                        break
-                    }
-                    p_advance()
-                }
-            }
-        }
-    }
-    p_expect("RPAREN")
-    // Skip return type annotation
-    if p_at("ARROW") {
-        p_advance()
-        // Skip type tokens until {
-        while p_peek_type() != "LBRACE" {
-            if p_peek_type() == "EOF" {
-                break
-            }
-            p_advance()
-        }
-    }
-    let body = parse_block()
-    return ["fn", name_tok[1], params, body]
-}
-
-fn parse_program() -> [String] {
-    var fns = []
-    while p_peek_type() != "EOF" {
-        if p_at_kw("fn") {
-            fns = push(fns, parse_fn_def())
-        } else {
-            println("Parse error: expected fn at top level, got " + p_peek_type())
-            p_advance()
-        }
-    }
-    return fns
-}
-
-// ============================================================
-// PHASE 3: Bytecode Code Generator
-// ============================================================
-// Walks AST, emits flat [String] of bytecode instructions for the VM.
-
-var _label_counter = 0
-
-fn fresh_label(prefix: String) -> String {
-    let n = _label_counter
-    _label_counter = _label_counter + 1
-    return prefix + "_" + to_string(n)
-}
-
-fn emit_expr(node: [String], out: [String]) -> [String] {
-    let kind = node[0]
-
-    if kind == "int" {
-        out = push(out, "PUSH_INT " + node[1])
-        return out
-    }
-
-    if kind == "float" {
-        out = push(out, "PUSH_FLOAT " + node[1])
-        return out
-    }
-
-    if kind == "string" {
-        out = push(out, "PUSH_STRING " + node[1])
-        return out
-    }
-
-    if kind == "bool" {
-        out = push(out, "PUSH_BOOL " + node[1])
-        return out
-    }
-
-    if kind == "ident" {
-        out = push(out, "LOAD " + node[1])
-        return out
-    }
-
-    if kind == "neg" {
-        out = emit_expr(node[1], out)
-        out = push(out, "NEG")
-        return out
-    }
-
-    if kind == "not" {
-        out = emit_expr(node[1], out)
-        out = push(out, "NOT")
-        return out
-    }
-
-    // Binary ops
-    if kind == "+" {
-        out = emit_expr(node[1], out)
-        out = emit_expr(node[2], out)
-        out = push(out, "ADD")
-        return out
-    }
-    if kind == "-" {
-        out = emit_expr(node[1], out)
-        out = emit_expr(node[2], out)
-        out = push(out, "SUB")
-        return out
-    }
-    if kind == "*" {
-        out = emit_expr(node[1], out)
-        out = emit_expr(node[2], out)
-        out = push(out, "MUL")
-        return out
-    }
-    if kind == "/" {
-        out = emit_expr(node[1], out)
-        out = emit_expr(node[2], out)
-        out = push(out, "DIV")
-        return out
-    }
-    if kind == "%" {
-        out = emit_expr(node[1], out)
-        out = emit_expr(node[2], out)
-        out = push(out, "MOD")
-        return out
-    }
-    if kind == "==" {
-        out = emit_expr(node[1], out)
-        out = emit_expr(node[2], out)
-        out = push(out, "EQ")
-        return out
-    }
-    if kind == "!=" {
-        out = emit_expr(node[1], out)
-        out = emit_expr(node[2], out)
-        out = push(out, "NEQ")
-        return out
-    }
-    if kind == "<" {
-        out = emit_expr(node[1], out)
-        out = emit_expr(node[2], out)
-        out = push(out, "LT")
-        return out
-    }
-    if kind == ">" {
-        out = emit_expr(node[1], out)
-        out = emit_expr(node[2], out)
-        out = push(out, "GT")
-        return out
-    }
-    if kind == "<=" {
-        out = emit_expr(node[1], out)
-        out = emit_expr(node[2], out)
-        out = push(out, "LTEQ")
-        return out
-    }
-    if kind == ">=" {
-        out = emit_expr(node[1], out)
-        out = emit_expr(node[2], out)
-        out = push(out, "GTEQ")
-        return out
-    }
-    if kind == "&&" {
-        out = emit_expr(node[1], out)
-        out = emit_expr(node[2], out)
-        out = push(out, "AND")
-        return out
-    }
-    if kind == "||" {
-        out = emit_expr(node[1], out)
-        out = emit_expr(node[2], out)
-        out = push(out, "OR")
-        return out
-    }
-
-    if kind == "call" {
-        let callee = node[1]
-        let argc = len(node) - 2
-        var ai = 0
-        while ai < argc {
-            out = emit_expr(node[ai + 2], out)
-            ai = ai + 1
-        }
-        out = push(out, "CALL " + callee + " " + to_string(argc))
-        return out
-    }
-
-    if kind == "array" {
-        let count = len(node) - 1
-        var ai = 0
-        while ai < count {
-            out = emit_expr(node[ai + 1], out)
-            ai = ai + 1
-        }
-        out = push(out, "ARRAY " + to_string(count))
-        return out
-    }
-
-    if kind == "index" {
-        out = emit_expr(node[1], out)
-        out = emit_expr(node[2], out)
-        out = push(out, "INDEX")
-        return out
-    }
-
-    // Fallback
-    out = push(out, "PUSH_INT 0")
-    return out
-}
-
-fn emit_stmt(node: [String], out: [String]) -> [String] {
-    let kind = node[0]
-
-    if kind == "let" {
-        out = emit_expr(node[2], out)
-        out = push(out, "STORE " + node[1])
-        return out
-    }
-
-    if kind == "var" {
-        out = emit_expr(node[2], out)
-        out = push(out, "STORE " + node[1])
-        return out
-    }
-
-    if kind == "assign" {
-        out = emit_expr(node[2], out)
-        out = push(out, "STORE " + node[1])
-        return out
-    }
-
-    if kind == "return" {
-        out = emit_expr(node[1], out)
-        out = push(out, "RET")
-        return out
-    }
-
-    if kind == "if" {
-        let else_label = fresh_label("else")
-        let end_label = fresh_label("endif")
-        out = emit_expr(node[1], out)
-        out = push(out, "JZ " + else_label)
-        // then block
-        let then_stmts = node[2]
-        var ti = 0
-        while ti < len(then_stmts) {
-            out = emit_stmt(then_stmts[ti], out)
-            ti = ti + 1
-        }
-        out = push(out, "JMP " + end_label)
-        out = push(out, "LABEL " + else_label)
-        // else block
-        let else_stmts = node[3]
-        var ei = 0
-        while ei < len(else_stmts) {
-            out = emit_stmt(else_stmts[ei], out)
-            ei = ei + 1
-        }
-        out = push(out, "LABEL " + end_label)
-        return out
-    }
-
-    if kind == "while" {
-        let start_label = fresh_label("while_start")
-        let end_label = fresh_label("while_end")
-        out = push(out, "LABEL " + start_label)
-        out = emit_expr(node[1], out)
-        out = push(out, "JZ " + end_label)
-        let body_stmts = node[2]
-        var bi = 0
-        while bi < len(body_stmts) {
-            out = emit_stmt(body_stmts[bi], out)
-            bi = bi + 1
-        }
-        out = push(out, "JMP " + start_label)
-        out = push(out, "LABEL " + end_label)
-        return out
-    }
-
-    if kind == "expr_stmt" {
-        out = emit_expr(node[1], out)
-        out = push(out, "POP")
-        return out
-    }
-
-    // Fallback: treat as expression
-    out = emit_expr(node, out)
-    out = push(out, "POP")
-    return out
-}
-
-fn emit_fn(node: [String], out: [String]) -> [String] {
-    let name = node[1]
-    let params = node[2]
-    let body = node[3]
-
-    out = push(out, "FN_START " + name)
-
-    // Store params from stack (in reverse order — last arg on top)
-    var pi = len(params) - 1
-    while pi >= 0 {
-        out = push(out, "STORE " + params[pi])
-        pi = pi - 1
-    }
-
-    // Emit body
-    var si = 0
-    while si < len(body) {
-        out = emit_stmt(body[si], out)
-        si = si + 1
-    }
-
-    // Implicit return void
-    out = push(out, "PUSH_INT 0")
-    out = push(out, "RET")
-    out = push(out, "FN_END")
-    return out
-}
-
-fn generate(ast: [String]) -> [String] {
-    var out: [String] = []
-    var fi = 0
-    while fi < len(ast) {
-        out = emit_fn(ast[fi], out)
-        fi = fi + 1
-    }
-    out = push(out, "HALT")
-    return out
-}
-
-// ============================================================
-// PHASE 4: Bytecode VM (adapted from vm.vx)
-// ============================================================
-
+fn _qt() -> String { return str_from_bytes([34]) }
 fn _pipe() -> String { return str_from_bytes([124]) }
 
 fn sw(s: String, prefix: String) -> bool {
@@ -1235,8 +14,8 @@ fn after(s: String, n: i64) -> String {
     return str_substr(s, n, len(s))
 }
 
-fn find_idx(haystack: String, needle: String) -> i64 {
-    return unwrap_or(str_find(haystack, needle), -1)
+fn find_idx(s: String, needle: String) -> i64 {
+    return unwrap_or(str_find(s, needle), -1)
 }
 
 fn rest_after_space(s: String) -> String {
@@ -1245,788 +24,774 @@ fn rest_after_space(s: String) -> String {
     return str_substr(s, idx + 1, len(s))
 }
 
-fn instr_op(instr: String) -> String {
-    var idx = find_idx(instr, " ")
-    if idx < 0 { return instr }
-    return str_substr(instr, 0, idx)
+fn instr_op(s: String) -> String {
+    var idx = find_idx(s, " ")
+    if idx < 0 { return s }
+    return str_substr(s, 0, idx)
 }
 
-fn instr_arg1(instr: String) -> String {
-    var rest = rest_after_space(instr)
+fn instr_arg1(s: String) -> String {
+    var rest = rest_after_space(s)
     var idx = find_idx(rest, " ")
     if idx < 0 { return rest }
     return str_substr(rest, 0, idx)
 }
 
-fn instr_arg2(instr: String) -> String {
-    var rest = rest_after_space(instr)
+fn instr_arg2(s: String) -> String {
+    var rest = rest_after_space(s)
     return rest_after_space(rest)
 }
 
-// Value helpers
-fn make_int(n: i64) -> String   { return "i:" + to_string(n) }
-fn make_float(f: f64) -> String { return "f:" + to_string(f) }
-fn make_str(s: String) -> String { return "s:" + s }
+// ============================================================
+// LEXER — produces flat [String] of tokens
+// ============================================================
+
+fn is_digit(ch: String) -> bool { return str_is_ascii_digit(ch) }
+fn is_alpha(ch: String) -> bool { return str_is_ascii_alpha(ch) }
+fn is_alnum(ch: String) -> bool {
+    if is_alpha(ch) { return true }
+    if is_digit(ch) { return true }
+    if ch == "_" { return true }
+    return false
+}
+
+fn lex(source: String) -> [String] {
+    var toks = []
+    var pos = 0
+    var slen = len(source)
+    var nl = _nl()
+
+    while pos < slen {
+        var ch = str_char_at(source, pos)
+
+        if ch == " " { pos = pos + 1 }
+        if ch == nl { pos = pos + 1 }
+        if ch == str_from_bytes([9]) { pos = pos + 1 }
+        if ch == str_from_bytes([13]) { pos = pos + 1 }
+
+        if is_digit(ch) {
+            var start = pos
+            while pos < slen {
+                if is_digit(str_char_at(source, pos)) { pos = pos + 1 } else { pos = pos + slen }
+            }
+            if pos > slen { pos = pos - slen }
+            toks = push(toks, str_substr(source, start, pos - start))
+        }
+
+        if is_alpha(ch) {
+            var start = pos
+            while pos < slen {
+                if is_alnum(str_char_at(source, pos)) { pos = pos + 1 } else { pos = pos + slen }
+            }
+            if pos > slen { pos = pos - slen }
+            toks = push(toks, str_substr(source, start, pos - start))
+        }
+
+        if ch == "=" {
+            if pos + 1 < slen {
+                if str_char_at(source, pos + 1) == "=" {
+                    toks = push(toks, "==")
+                    pos = pos + 2
+                } else { toks = push(toks, "=")
+                    pos = pos + 1 }
+            } else { toks = push(toks, "=")
+                pos = pos + 1 }
+        }
+        if ch == "!" {
+            if pos + 1 < slen {
+                if str_char_at(source, pos + 1) == "=" {
+                    toks = push(toks, "!=")
+                    pos = pos + 2
+                } else { toks = push(toks, "!")
+                    pos = pos + 1 }
+            } else { toks = push(toks, "!")
+                pos = pos + 1 }
+        }
+        if ch == "<" {
+            if pos + 1 < slen {
+                if str_char_at(source, pos + 1) == "=" {
+                    toks = push(toks, "<=")
+                    pos = pos + 2
+                } else { toks = push(toks, "<")
+                    pos = pos + 1 }
+            } else { toks = push(toks, "<")
+                pos = pos + 1 }
+        }
+        if ch == ">" {
+            if pos + 1 < slen {
+                if str_char_at(source, pos + 1) == "=" {
+                    toks = push(toks, ">=")
+                    pos = pos + 2
+                } else { toks = push(toks, ">")
+                    pos = pos + 1 }
+            } else { toks = push(toks, ">")
+                pos = pos + 1 }
+        }
+        if ch == "+" { toks = push(toks, "+")
+            pos = pos + 1 }
+        if ch == "-" { toks = push(toks, "-")
+            pos = pos + 1 }
+        if ch == "*" { toks = push(toks, "*")
+            pos = pos + 1 }
+        if ch == "/" { toks = push(toks, "/")
+            pos = pos + 1 }
+        if ch == "%" { toks = push(toks, "%")
+            pos = pos + 1 }
+        if ch == "(" { toks = push(toks, "(")
+            pos = pos + 1 }
+        if ch == ")" { toks = push(toks, ")")
+            pos = pos + 1 }
+        if ch == "{" { toks = push(toks, "{")
+            pos = pos + 1 }
+        if ch == "}" { toks = push(toks, "}")
+            pos = pos + 1 }
+        if ch == "," { toks = push(toks, ",")
+            pos = pos + 1 }
+    }
+    toks = push(toks, "EOF")
+    return toks
+}
+
+// ============================================================
+// ONE-PASS COMPILER: parse + emit bytecode directly
+// ============================================================
+
+var _toks = []
+var _tp = 0
+var _code = []
+var _lbl = 0
+
+fn pk() -> String {
+    if _tp >= len(_toks) { return "EOF" }
+    return _toks[_tp]
+}
+
+fn adv() -> String {
+    var t = _toks[_tp]
+    _tp = _tp + 1
+    return t
+}
+
+fn expect(v: String) -> String {
+    var t = adv()
+    return t
+}
+
+fn is_kw(t: String) -> bool {
+    if t == "fn" { return true }
+    if t == "let" { return true }
+    if t == "var" { return true }
+    if t == "if" { return true }
+    if t == "else" { return true }
+    if t == "while" { return true }
+    if t == "return" { return true }
+    return false
+}
+
+fn is_number(t: String) -> bool {
+    if len(t) == 0 { return false }
+    return is_digit(str_char_at(t, 0))
+}
+
+fn new_label(pfx: String) -> String {
+    _lbl = _lbl + 1
+    return pfx + "_" + to_string(_lbl)
+}
+
+fn cemit(instr: String) -> i64 {
+    _code = push(_code, instr)
+    return 0
+}
+
+fn parse_primary() -> i64 {
+    var t = pk()
+    if t == "(" {
+        var d = adv()
+        var dummy = parse_expr()
+        var d2 = adv()
+        return 0
+    }
+    if t == "true" { var d = adv()
+        cemit("PUSH_BOOL true")
+        return 0 }
+    if t == "false" { var d = adv()
+        cemit("PUSH_BOOL false")
+        return 0 }
+    if is_number(t) {
+        var d = adv()
+        cemit("PUSH_INT " + t)
+        return 0 }
+    if is_alpha(str_char_at(t, 0)) {
+        if is_kw(t) == false {
+            var name = adv()
+            if pk() == "(" {
+                var d2 = adv()
+                var argc = 0
+                if pk() != ")" {
+                    var dummy = parse_expr()
+                    argc = 1
+                    while pk() == "," {
+                        var d3 = adv()
+                        dummy = parse_expr()
+                        argc = argc + 1
+                    }
+                }
+                var d3 = adv()
+                cemit("CALL " + name + " " + to_string(argc))
+            } else { cemit("LOAD " + name) }
+            return 0
+        }
+    }
+    var d = adv()
+    cemit("PUSH_INT 0")
+    return 0
+}
+
+fn parse_unary() -> i64 {
+    if pk() == "-" { var d = adv()
+        var dummy = parse_unary()
+        cemit("NEG")
+        return 0 }
+    return parse_primary()
+}
+
+fn parse_mul() -> i64 {
+    var dummy = parse_unary()
+    var cont = true
+    while cont {
+        if pk() == "*" { var d = adv()
+            dummy = parse_unary()
+            cemit("MUL")
+        } else if pk() == "/" { var d = adv()
+            dummy = parse_unary()
+            cemit("DIV")
+        } else if pk() == "%" { var d = adv()
+            dummy = parse_unary()
+            cemit("MOD")
+        } else { cont = false }
+    }
+    return 0
+}
+
+fn parse_add() -> i64 {
+    var dummy = parse_mul()
+    var cont = true
+    while cont {
+        if pk() == "+" { var d = adv()
+            dummy = parse_mul()
+            cemit("ADD")
+        } else if pk() == "-" { var d = adv()
+            dummy = parse_mul()
+            cemit("SUB")
+        } else { cont = false }
+    }
+    return 0
+}
+
+fn parse_cmp() -> i64 {
+    var dummy = parse_add()
+    var cont = true
+    while cont {
+        if pk() == "==" { var d = adv()
+            dummy = parse_add()
+            cemit("EQ")
+        } else if pk() == "!=" { var d = adv()
+            dummy = parse_add()
+            cemit("NEQ")
+        } else if pk() == "<" { var d = adv()
+            dummy = parse_add()
+            cemit("LT")
+        } else if pk() == ">" { var d = adv()
+            dummy = parse_add()
+            cemit("GT")
+        } else if pk() == "<=" { var d = adv()
+            dummy = parse_add()
+            cemit("LTEQ")
+        } else if pk() == ">=" { var d = adv()
+            dummy = parse_add()
+            cemit("GTEQ")
+        } else { cont = false }
+    }
+    return 0
+}
+
+fn parse_expr() -> i64 {
+    return parse_cmp()
+}
+
+fn parse_stmt() -> i64 {
+    var t = pk()
+    if t == "let" { var d = adv()
+        var name = adv()
+        var d2 = adv()
+        var dummy = parse_expr()
+        cemit("STORE " + name)
+        return 0 }
+    if t == "var" { var d = adv()
+        var name = adv()
+        var d2 = adv()
+        var dummy = parse_expr()
+        cemit("STORE " + name)
+        return 0 }
+    if t == "return" { var d = adv()
+        if pk() == "}" { cemit("PUSH_INT 0")
+        } else { var dummy = parse_expr() }
+        cemit("RET")
+        return 0 }
+    if t == "if" { var d = adv()
+        var else_lbl = new_label("E")
+        var end_lbl = new_label("N")
+        var dummy = parse_expr()
+        cemit("JZ " + else_lbl)
+        var d2 = adv()
+        while pk() != "}" { dummy = parse_stmt() }
+        var d3 = adv()
+        cemit("JMP " + end_lbl)
+        cemit("LABEL " + else_lbl)
+        if pk() == "else" { dummy = adv()
+            if pk() == "if" { dummy = parse_stmt()
+            } else { var d4 = adv()
+                while pk() != "}" { dummy = parse_stmt() }
+                var d5 = adv() }
+        }
+        cemit("LABEL " + end_lbl)
+        return 0 }
+    if t == "while" { var d = adv()
+        var sl = new_label("W")
+        var el = new_label("X")
+        cemit("LABEL " + sl)
+        var dummy = parse_expr()
+        cemit("JZ " + el)
+        var d2 = adv()
+        while pk() != "}" { dummy = parse_stmt() }
+        var d3 = adv()
+        cemit("JMP " + sl)
+        cemit("LABEL " + el)
+        return 0 }
+    // expression stmt, possibly assignment
+    var dummy = parse_expr()
+    if pk() == "=" {
+        var last = _code[len(_code) - 1]
+        if sw(last, "LOAD ") {
+            var name = after(last, 5)
+            var nc = []
+            var ci = 0
+            while ci < len(_code) - 1 { nc = push(nc, _code[ci])
+                ci = ci + 1 }
+            _code = nc
+            var d2 = adv()
+            dummy = parse_expr()
+            cemit("STORE " + name)
+            return 0
+        }
+    }
+    cemit("POP")
+    return 0
+}
+
+fn parse_fn_def() -> i64 {
+    var d = adv()
+    var name = adv()
+    var d2 = adv()
+    var params = []
+    if pk() != ")" {
+        params = push(params, adv())
+        while pk() == "," { var d3 = adv()
+            params = push(params, adv()) }
+    }
+    var d3 = adv()
+    var d4 = adv()
+    cemit("FN_START " + name)
+    var pi = len(params) - 1
+    while pi >= 0 { cemit("STORE " + params[pi])
+        pi = pi - 1 }
+    while pk() != "}" { var dummy = parse_stmt() }
+    var d5 = adv()
+    cemit("PUSH_INT 0")
+    cemit("RET")
+    cemit("FN_END")
+    return 0
+}
+
+fn compile(source: String) -> [String] {
+    _toks = lex(source)
+    _tp = 0
+    _code = []
+    _lbl = 0
+    while pk() != "EOF" {
+        if pk() == "fn" { var dummy = parse_fn_def()
+        } else { var d = adv() }
+    }
+    cemit("HALT")
+    return _code
+}
+
+// ============================================================
+// VM — uses global state to minimize stack depth
+// ============================================================
+
+var _instrs = []
+var _stk = []
+var _vars = []
+var _cs = []
+var _ip = 0
+var _running = true
+var _result = "void"
+var _labels = []
+var _fns = []
+
+fn make_int(n: i64) -> String { return "i:" + to_string(n) }
 fn make_bool(b: bool) -> String {
     if b { return "b:true" }
     return "b:false"
 }
 
-fn make_arr_empty() -> String { return "a:" }
-
-fn arr_encode(items: [String]) -> String {
-    var result = "a:"
-    var i = 0
-    while i < len(items) {
-        if i > 0 { result = result + _pipe() }
-        result = result + items[i]
-        i = i + 1
-    }
-    return result
-}
-
-fn arr_decode(v: String) -> [String] {
-    var content = after(v, 2)
-    var items: [String] = []
-    if len(content) == 0 { return items }
-    var cur = ""
-    var i = 0
-    var pipe = _pipe()
-    while i < len(content) {
-        var ch = str_char_at(content, i)
-        if ch == pipe {
-            items = push(items, cur)
-            cur = ""
-        } else {
-            cur = cur + ch
-        }
-        i = i + 1
-    }
-    items = push(items, cur)
-    return items
-}
-
-fn arr_len(v: String) -> i64 {
-    var items = arr_decode(v)
-    return len(items)
-}
-
-fn arr_get(v: String, idx: i64) -> String {
-    var items = arr_decode(v)
-    if idx < 0 { return "void" }
-    if idx >= len(items) { return "void" }
-    return items[idx]
-}
-
-fn arr_push_val(v: String, item: String) -> String {
-    var items = arr_decode(v)
-    items = push(items, item)
-    return arr_encode(items)
-}
-
 fn val_display(v: String) -> String {
-    if sw(v, "i:")    { return after(v, 2) }
-    if sw(v, "f:")    { return after(v, 2) }
-    if sw(v, "s:")    { return after(v, 2) }
-    if v == "b:true"  { return "true" }
+    if sw(v, "i:") { return after(v, 2) }
+    if sw(v, "s:") { return after(v, 2) }
+    if v == "b:true" { return "true" }
     if v == "b:false" { return "false" }
-    if v == "void"    { return "()" }
-    if sw(v, "fn:")   { return "<fn:" + after(v, 3) + ">" }
-    if sw(v, "a:")    {
-        var items = arr_decode(v)
-        var result = "["
-        var di = 0
-        while di < len(items) {
-            if di > 0 { result = result + ", " }
-            result = result + val_display(items[di])
-            di = di + 1
-        }
-        result = result + "]"
-        return result
-    }
     return v
 }
 
-fn val_is_truthy(v: String) -> bool {
-    if v == "b:true"  { return true }
+fn val_truthy(v: String) -> bool {
+    if v == "b:true" { return true }
     if v == "b:false" { return false }
-    if v == "void"    { return false }
     if sw(v, "i:") { return after(v, 2) != "0" }
-    if sw(v, "f:") {
-        var fstr = after(v, 2)
-        if fstr == "0"   { return false }
-        if fstr == "0.0" { return false }
-        return true
-    }
-    if sw(v, "s:") { return len(after(v, 2)) > 0 }
     return true
 }
 
-fn val_as_int(v: String) -> i64 {
+fn val_int(v: String) -> i64 {
     if sw(v, "i:") { return int(after(v, 2)) }
-    if sw(v, "f:") { return int(float(after(v, 2))) }
     return 0
 }
 
-fn val_as_float(v: String) -> f64 {
-    if sw(v, "f:") { return float(after(v, 2)) }
-    if sw(v, "i:") { return float(int(after(v, 2))) }
-    return 0.0
-}
-
-fn is_int_val(v: String) -> bool { return sw(v, "i:") }
-fn is_float_val(v: String) -> bool { return sw(v, "f:") }
-
-// Arithmetic
-fn val_add(a: String, b: String) -> String {
-    if sw(a, "s:") { return make_str(val_display(a) + val_display(b)) }
-    if sw(b, "s:") { return make_str(val_display(a) + val_display(b)) }
-    if is_float_val(a) { return make_float(val_as_float(a) + val_as_float(b)) }
-    if is_float_val(b) { return make_float(val_as_float(a) + val_as_float(b)) }
-    return make_int(val_as_int(a) + val_as_int(b))
-}
-
-fn val_sub(a: String, b: String) -> String {
-    if is_float_val(a) { return make_float(val_as_float(a) - val_as_float(b)) }
-    if is_float_val(b) { return make_float(val_as_float(a) - val_as_float(b)) }
-    return make_int(val_as_int(a) - val_as_int(b))
-}
-
-fn val_mul(a: String, b: String) -> String {
-    if is_float_val(a) { return make_float(val_as_float(a) * val_as_float(b)) }
-    if is_float_val(b) { return make_float(val_as_float(a) * val_as_float(b)) }
-    return make_int(val_as_int(a) * val_as_int(b))
-}
-
-fn val_div(a: String, b: String) -> String {
-    if is_float_val(a) { return make_float(val_as_float(a) / val_as_float(b)) }
-    if is_float_val(b) { return make_float(val_as_float(a) / val_as_float(b)) }
-    var denom = val_as_int(b)
-    if denom == 0 { return "i:0" }
-    return make_int(val_as_int(a) / denom)
-}
-
-fn val_mod(a: String, b: String) -> String {
-    var denom = val_as_int(b)
-    if denom == 0 { return "i:0" }
-    return make_int(val_as_int(a) % denom)
-}
-
-fn val_neg(a: String) -> String {
-    if is_float_val(a) { return make_float(0.0 - val_as_float(a)) }
-    return make_int(0 - val_as_int(a))
-}
-
-fn val_cmp(a: String, b: String, op: String) -> String {
-    if is_int_val(a) {
-        if is_int_val(b) {
-            var ai = val_as_int(a)
-            var bi = val_as_int(b)
-            if op == "EQ"   { return make_bool(ai == bi) }
-            if op == "NEQ"  { return make_bool(ai != bi) }
-            if op == "LT"   { return make_bool(ai < bi) }
-            if op == "GT"   { return make_bool(ai > bi) }
-            if op == "LTEQ" { return make_bool(ai <= bi) }
-            if op == "GTEQ" { return make_bool(ai >= bi) }
-            return "b:false"
-        }
-    }
-    if is_float_val(a) {
-        var af = val_as_float(a)
-        var bf = val_as_float(b)
-        if op == "EQ"   { return make_bool(af == bf) }
-        if op == "NEQ"  { return make_bool(af != bf) }
-        if op == "LT"   { return make_bool(af < bf) }
-        if op == "GT"   { return make_bool(af > bf) }
-        if op == "LTEQ" { return make_bool(af <= bf) }
-        if op == "GTEQ" { return make_bool(af >= bf) }
-        return "b:false"
-    }
-    if is_float_val(b) {
-        var af = val_as_float(a)
-        var bf = val_as_float(b)
-        if op == "EQ"   { return make_bool(af == bf) }
-        if op == "NEQ"  { return make_bool(af != bf) }
-        if op == "LT"   { return make_bool(af < bf) }
-        if op == "GT"   { return make_bool(af > bf) }
-        if op == "LTEQ" { return make_bool(af <= bf) }
-        if op == "GTEQ" { return make_bool(af >= bf) }
-        return "b:false"
-    }
-    var as_ = val_display(a)
-    var bs  = val_display(b)
-    if op == "EQ"  { return make_bool(as_ == bs) }
-    if op == "NEQ" { return make_bool(as_ != bs) }
-    return "b:false"
-}
-
-fn val_and(a: String, b: String) -> String {
-    if val_is_truthy(a) {
-        if val_is_truthy(b) { return "b:true" }
-    }
-    return "b:false"
-}
-
-fn val_or(a: String, b: String) -> String {
-    if val_is_truthy(a) { return "b:true" }
-    if val_is_truthy(b) { return "b:true" }
-    return "b:false"
-}
-
-fn val_not(a: String) -> String {
-    if val_is_truthy(a) { return "b:false" }
-    return "b:true"
-}
-
-// Stack helpers
-fn stack_pop(stack: [String]) -> [String] {
-    var new_stack: [String] = []
+fn spop(s: [String]) -> [String] {
+    var r = []
     var i = 0
-    while i < len(stack) - 1 {
-        new_stack = push(new_stack, stack[i])
-        i = i + 1
-    }
-    return new_stack
+    while i < len(s) - 1 { r = push(r, s[i])
+        i = i + 1 }
+    return r
 }
 
-fn stack_pop2(stack: [String]) -> [String] {
-    var new_stack: [String] = []
+fn stop(s: [String]) -> String {
+    if len(s) == 0 { return "void" }
+    return s[len(s) - 1]
+}
+
+fn stop2(s: [String]) -> String {
+    if len(s) < 2 { return "void" }
+    return s[len(s) - 2]
+}
+
+fn spop2(s: [String]) -> [String] {
+    var r = []
     var i = 0
-    while i < len(stack) - 2 {
-        new_stack = push(new_stack, stack[i])
-        i = i + 1
-    }
-    return new_stack
+    while i < len(s) - 2 { r = push(r, s[i])
+        i = i + 1 }
+    return r
 }
 
-fn stack_top(stack: [String]) -> String {
-    if len(stack) == 0 { return "void" }
-    return stack[len(stack) - 1]
-}
-
-fn stack_second(stack: [String]) -> String {
-    if len(stack) < 2 { return "void" }
-    return stack[len(stack) - 2]
-}
-
-// Variable storage
-fn vars_get(vars: [String], name: String) -> String {
-    var i = len(vars) - 2
+fn vget(name: String) -> String {
+    var i = len(_vars) - 2
     while i >= 0 {
-        if vars[i] == name { return vars[i + 1] }
+        if _vars[i] == name { return _vars[i + 1] }
         i = i - 2
     }
     return "void"
 }
 
-fn vars_set(vars: [String], name: String, val: String) -> [String] {
-    var i = len(vars) - 2
+fn vset(name: String, val: String) -> i64 {
+    var i = len(_vars) - 2
     while i >= 0 {
-        if vars[i] == name {
-            vars[i + 1] = val
-            return vars
-        }
-        if vars[i] == "##SCOPE##" {
-            vars = push(vars, name)
-            vars = push(vars, val)
-            return vars
+        if _vars[i] == name { _vars[i + 1] = val
+            return 0 }
+        if _vars[i] == "##S##" {
+            _vars = push(_vars, name)
+            _vars = push(_vars, val)
+            return 0
         }
         i = i - 2
     }
-    vars = push(vars, name)
-    vars = push(vars, val)
-    return vars
+    _vars = push(_vars, name)
+    _vars = push(_vars, val)
+    return 0
 }
 
-fn vars_push_scope(vars: [String]) -> [String] {
-    vars = push(vars, "##SCOPE##")
-    vars = push(vars, "##SCOPE##")
-    return vars
+fn vpush() -> i64 {
+    _vars = push(_vars, "##S##")
+    _vars = push(_vars, "##S##")
+    return 0
 }
 
-fn vars_pop_scope(vars: [String]) -> [String] {
-    while len(vars) >= 2 {
-        var top_name = vars[len(vars) - 2]
-        var new_vars: [String] = []
-        var j = 0
-        while j < len(vars) - 2 {
-            new_vars = push(new_vars, vars[j])
-            j = j + 1
-        }
-        vars = new_vars
-        if top_name == "##SCOPE##" { return vars }
+fn vpop() -> i64 {
+    while len(_vars) >= 2 {
+        var nm = _vars[len(_vars) - 2]
+        _vars = spop(spop(_vars))
+        if nm == "##S##" { return 0 }
     }
-    return vars
+    return 0
 }
 
-// Label/function table
-fn table_get(table: [String], key: String) -> i64 {
+fn tget(t: [String], key: String) -> i64 {
     var i = 0
-    while i < len(table) - 1 {
-        if table[i] == key { return int(table[i + 1]) }
+    while i < len(t) - 1 {
+        if t[i] == key { return int(t[i + 1]) }
         i = i + 2
     }
     return -1
 }
 
-fn table_set(table: [String], key: String, val: i64) -> [String] {
-    table = push(table, key)
-    table = push(table, to_string(val))
-    return table
+// Individual VM step handlers to keep nesting shallow
+fn vm_step() -> i64 {
+    var ins = _instrs[_ip]
+    var op = instr_op(ins)
+
+    if op == "HALT" { _running = false
+        _result = stop(_stk)
+        return 0 }
+    if op == "PUSH_INT" { _stk = push(_stk, make_int(int(instr_arg1(ins))))
+        _ip = _ip + 1
+        return 0 }
+    if op == "PUSH_BOOL" {
+        if instr_arg1(ins) == "true" { _stk = push(_stk, "b:true")
+        } else { _stk = push(_stk, "b:false") }
+        _ip = _ip + 1
+        return 0 }
+    if op == "LOAD" { _stk = push(_stk, vget(instr_arg1(ins)))
+        _ip = _ip + 1
+        return 0 }
+    if op == "STORE" { var dummy = vset(instr_arg1(ins), stop(_stk))
+        _stk = spop(_stk)
+        _ip = _ip + 1
+        return 0 }
+    if op == "POP" { if len(_stk) > 0 { _stk = spop(_stk) }
+        _ip = _ip + 1
+        return 0 }
+    if op == "ADD" { var b = stop(_stk)
+        var a = stop2(_stk)
+        _stk = spop2(_stk)
+        _stk = push(_stk, make_int(val_int(a) + val_int(b)))
+        _ip = _ip + 1
+        return 0 }
+    if op == "SUB" { var b = stop(_stk)
+        var a = stop2(_stk)
+        _stk = spop2(_stk)
+        _stk = push(_stk, make_int(val_int(a) - val_int(b)))
+        _ip = _ip + 1
+        return 0 }
+    if op == "MUL" { var b = stop(_stk)
+        var a = stop2(_stk)
+        _stk = spop2(_stk)
+        _stk = push(_stk, make_int(val_int(a) * val_int(b)))
+        _ip = _ip + 1
+        return 0 }
+    if op == "DIV" { var b = stop(_stk)
+        var a = stop2(_stk)
+        _stk = spop2(_stk)
+        var denom = val_int(b)
+        if denom == 0 { _stk = push(_stk, make_int(0))
+        } else { _stk = push(_stk, make_int(val_int(a) / denom)) }
+        _ip = _ip + 1
+        return 0 }
+    if op == "MOD" { var b = stop(_stk)
+        var a = stop2(_stk)
+        _stk = spop2(_stk)
+        var denom = val_int(b)
+        if denom == 0 { _stk = push(_stk, make_int(0))
+        } else { _stk = push(_stk, make_int(val_int(a) % denom)) }
+        _ip = _ip + 1
+        return 0 }
+    if op == "NEG" { var a = stop(_stk)
+        _stk = spop(_stk)
+        _stk = push(_stk, make_int(0 - val_int(a)))
+        _ip = _ip + 1
+        return 0 }
+    if op == "EQ" { var b = stop(_stk)
+        var a = stop2(_stk)
+        _stk = spop2(_stk)
+        _stk = push(_stk, make_bool(val_int(a) == val_int(b)))
+        _ip = _ip + 1
+        return 0 }
+    if op == "NEQ" { var b = stop(_stk)
+        var a = stop2(_stk)
+        _stk = spop2(_stk)
+        _stk = push(_stk, make_bool(val_int(a) != val_int(b)))
+        _ip = _ip + 1
+        return 0 }
+    if op == "LT" { var b = stop(_stk)
+        var a = stop2(_stk)
+        _stk = spop2(_stk)
+        _stk = push(_stk, make_bool(val_int(a) < val_int(b)))
+        _ip = _ip + 1
+        return 0 }
+    if op == "GT" { var b = stop(_stk)
+        var a = stop2(_stk)
+        _stk = spop2(_stk)
+        _stk = push(_stk, make_bool(val_int(a) > val_int(b)))
+        _ip = _ip + 1
+        return 0 }
+    if op == "LTEQ" { var b = stop(_stk)
+        var a = stop2(_stk)
+        _stk = spop2(_stk)
+        _stk = push(_stk, make_bool(val_int(a) <= val_int(b)))
+        _ip = _ip + 1
+        return 0 }
+    if op == "GTEQ" { var b = stop(_stk)
+        var a = stop2(_stk)
+        _stk = spop2(_stk)
+        _stk = push(_stk, make_bool(val_int(a) >= val_int(b)))
+        _ip = _ip + 1
+        return 0 }
+    if op == "NOT" { var a = stop(_stk)
+        _stk = spop(_stk)
+        if val_truthy(a) { _stk = push(_stk, "b:false")
+        } else { _stk = push(_stk, "b:true") }
+        _ip = _ip + 1
+        return 0 }
+    if op == "JMP" { var target = tget(_labels, instr_arg1(ins))
+        if target >= 0 { _ip = target + 1 } else { _running = false }
+        return 0 }
+    if op == "JZ" { var top = stop(_stk)
+        _stk = spop(_stk)
+        if val_truthy(top) { _ip = _ip + 1
+        } else { var target = tget(_labels, instr_arg1(ins))
+            if target >= 0 { _ip = target + 1 } else { _running = false } }
+        return 0 }
+    if op == "LABEL" { _ip = _ip + 1
+        return 0 }
+    if op == "FN_START" {
+        var depth = 1
+        _ip = _ip + 1
+        while depth > 0 {
+            if _ip >= len(_instrs) { depth = 0
+            } else { var sop = instr_op(_instrs[_ip])
+                if sop == "FN_START" { depth = depth + 1 }
+                if sop == "FN_END" { depth = depth - 1 }
+                _ip = _ip + 1 }
+        }
+        return 0 }
+    if op == "FN_END" {
+        if len(_cs) >= 1 { var ret_ip = int(_cs[len(_cs) - 1])
+            _cs = spop(_cs)
+            var dummy = vpop()
+            _ip = ret_ip
+        } else { _running = false
+            _result = stop(_stk) }
+        return 0 }
+    if op == "RET" {
+        var rv = "void"
+        if len(_stk) > 0 { rv = stop(_stk)
+            _stk = spop(_stk) }
+        if len(_cs) >= 1 { var ret_ip = int(_cs[len(_cs) - 1])
+            _cs = spop(_cs)
+            var dummy = vpop()
+            _stk = push(_stk, rv)
+            _ip = ret_ip
+        } else { _result = rv
+            _running = false }
+        return 0 }
+    if op == "CALL" {
+        var fn_name = instr_arg1(ins)
+        var argc = int(instr_arg2(ins))
+        if fn_name == "println" {
+            var top = stop(_stk)
+            _stk = spop(_stk)
+            print(val_display(top) + _nl())
+            _stk = push(_stk, "void")
+            _ip = _ip + 1
+            return 0
+        }
+        if fn_name == "print" {
+            var top = stop(_stk)
+            _stk = spop(_stk)
+            print(val_display(top))
+            _stk = push(_stk, "void")
+            _ip = _ip + 1
+            return 0
+        }
+        var fn_ip = tget(_fns, fn_name)
+        if fn_ip < 0 { _running = false
+            return 0 }
+        _cs = push(_cs, to_string(_ip + 1))
+        var dummy = vpush()
+        _ip = fn_ip + 1
+        return 0 }
+    _ip = _ip + 1
+    return 0
 }
 
-// Preprocessing
-fn preprocess_labels(instrs: [String]) -> [String] {
-    var labels: [String] = []
+fn vm_run(instrs: [String]) -> String {
+    _instrs = instrs
+    _stk = []
+    _vars = []
+    _cs = []
+    _ip = 0
+    _running = true
+    _result = "void"
+    _labels = []
+    _fns = []
     var i = 0
     while i < len(instrs) {
         var op = instr_op(instrs[i])
-        if op == "LABEL" {
-            var name = instr_arg1(instrs[i])
-            labels = table_set(labels, name, i)
-        }
+        if op == "LABEL" { _labels = push(_labels, instr_arg1(instrs[i]))
+            _labels = push(_labels, to_string(i)) }
+        if op == "FN_START" { _fns = push(_fns, instr_arg1(instrs[i]))
+            _fns = push(_fns, to_string(i)) }
         i = i + 1
     }
-    return labels
-}
-
-fn preprocess_fns(instrs: [String]) -> [String] {
-    var fns: [String] = []
-    var i = 0
-    while i < len(instrs) {
-        var op = instr_op(instrs[i])
-        if op == "FN_START" {
-            var name = instr_arg1(instrs[i])
-            fns = table_set(fns, name, i)
-        }
-        i = i + 1
+    var main_ip = tget(_fns, "main")
+    if main_ip >= 0 { _ip = main_ip + 1
+        var dummy = vpush() }
+    while _running {
+        if _ip >= len(_instrs) { _running = false }
+        if _running { var dummy = vm_step() }
     }
-    return fns
-}
-
-// Built-in function dispatch
-fn call_builtin(name: String, argc: i64, stack: [String]) -> [String] {
-    var top = stack_top(stack)
-
-    if name == "println" {
-        var new_stack = stack_pop(stack)
-        var i = 1
-        while i < argc {
-            new_stack = stack_pop(new_stack)
-            i = i + 1
-        }
-        print(val_display(top) + _nl())
-        new_stack = push(new_stack, "void")
-        return new_stack
-    }
-
-    if name == "print" {
-        var new_stack = stack_pop(stack)
-        var i = 1
-        while i < argc {
-            new_stack = stack_pop(new_stack)
-            i = i + 1
-        }
-        print(val_display(top))
-        new_stack = push(new_stack, "void")
-        return new_stack
-    }
-
-    if name == "to_string" {
-        var new_stack = stack_pop(stack)
-        new_stack = push(new_stack, make_str(val_display(top)))
-        return new_stack
-    }
-
-    if name == "str" {
-        var new_stack = stack_pop(stack)
-        new_stack = push(new_stack, make_str(val_display(top)))
-        return new_stack
-    }
-
-    if name == "int" {
-        var new_stack = stack_pop(stack)
-        new_stack = push(new_stack, make_int(val_as_int(top)))
-        return new_stack
-    }
-
-    if name == "float" {
-        var new_stack = stack_pop(stack)
-        new_stack = push(new_stack, make_float(val_as_float(top)))
-        return new_stack
-    }
-
-    if name == "len" {
-        var new_stack = stack_pop(stack)
-        if sw(top, "s:") {
-            new_stack = push(new_stack, make_int(len(after(top, 2))))
-        } else {
-            if sw(top, "a:") {
-                new_stack = push(new_stack, make_int(arr_len(top)))
-            } else {
-                new_stack = push(new_stack, make_int(0))
-            }
-        }
-        return new_stack
-    }
-
-    if name == "push" {
-        var val = top
-        var arr = stack_second(stack)
-        var new_stack = stack_pop2(stack)
-        var new_arr = arr_push_val(arr, val)
-        new_stack = push(new_stack, new_arr)
-        return new_stack
-    }
-
-    // Unknown builtin
-    var new_stack: [String] = []
-    var start = len(stack) - argc
-    var i = 0
-    while i < start {
-        new_stack = push(new_stack, stack[i])
-        i = i + 1
-    }
-    new_stack = push(new_stack, "void")
-    return new_stack
-}
-
-// Main execution engine
-fn vm_execute(instrs: [String]) -> String {
-    var labels = preprocess_labels(instrs)
-    var fns = preprocess_fns(instrs)
-
-    var stack: [String] = []
-    var vars: [String] = []
-    var call_stack: [String] = []
-
-    var ip = 0
-    var status = "running"
-    var result = "void"
-
-    // Find main entry point
-    var main_ip = table_get(fns, "main")
-    if main_ip >= 0 {
-        ip = main_ip + 1
-        vars = vars_push_scope(vars)
-    }
-
-    while status == "running" {
-        if ip >= len(instrs) { status = "halted" }
-        if status == "running" {
-            var instr = instrs[ip]
-            var op = instr_op(instr)
-
-            if op == "HALT" {
-                status = "halted"
-                result = stack_top(stack)
-            }
-
-            if op == "PUSH_INT" {
-                var arg = instr_arg1(instr)
-                stack = push(stack, make_int(int(arg)))
-                ip = ip + 1
-            }
-
-            if op == "PUSH_FLOAT" {
-                var arg = instr_arg1(instr)
-                stack = push(stack, make_float(float(arg)))
-                ip = ip + 1
-            }
-
-            if op == "PUSH_STRING" {
-                var arg = rest_after_space(instr)
-                stack = push(stack, make_str(arg))
-                ip = ip + 1
-            }
-
-            if op == "PUSH_BOOL" {
-                var arg = instr_arg1(instr)
-                if arg == "true" {
-                    stack = push(stack, "b:true")
-                } else {
-                    stack = push(stack, "b:false")
-                }
-                ip = ip + 1
-            }
-
-            if op == "LOAD" {
-                var name = instr_arg1(instr)
-                stack = push(stack, vars_get(vars, name))
-                ip = ip + 1
-            }
-
-            if op == "STORE" {
-                var name = instr_arg1(instr)
-                var val = stack_top(stack)
-                stack = stack_pop(stack)
-                vars = vars_set(vars, name, val)
-                ip = ip + 1
-            }
-
-            if op == "POP" {
-                if len(stack) > 0 { stack = stack_pop(stack) }
-                ip = ip + 1
-            }
-
-            if op == "DUP" {
-                if len(stack) > 0 { stack = push(stack, stack_top(stack)) }
-                ip = ip + 1
-            }
-
-            if op == "ADD" {
-                var b = stack_top(stack)
-                var a = stack_second(stack)
-                stack = stack_pop2(stack)
-                stack = push(stack, val_add(a, b))
-                ip = ip + 1
-            }
-
-            if op == "SUB" {
-                var b = stack_top(stack)
-                var a = stack_second(stack)
-                stack = stack_pop2(stack)
-                stack = push(stack, val_sub(a, b))
-                ip = ip + 1
-            }
-
-            if op == "MUL" {
-                var b = stack_top(stack)
-                var a = stack_second(stack)
-                stack = stack_pop2(stack)
-                stack = push(stack, val_mul(a, b))
-                ip = ip + 1
-            }
-
-            if op == "DIV" {
-                var b = stack_top(stack)
-                var a = stack_second(stack)
-                stack = stack_pop2(stack)
-                stack = push(stack, val_div(a, b))
-                ip = ip + 1
-            }
-
-            if op == "MOD" {
-                var b = stack_top(stack)
-                var a = stack_second(stack)
-                stack = stack_pop2(stack)
-                stack = push(stack, val_mod(a, b))
-                ip = ip + 1
-            }
-
-            if op == "NEG" {
-                var a = stack_top(stack)
-                stack = stack_pop(stack)
-                stack = push(stack, val_neg(a))
-                ip = ip + 1
-            }
-
-            var is_cmp = false
-            if op == "EQ"   { is_cmp = true }
-            if op == "NEQ"  { is_cmp = true }
-            if op == "LT"   { is_cmp = true }
-            if op == "GT"   { is_cmp = true }
-            if op == "LTEQ" { is_cmp = true }
-            if op == "GTEQ" { is_cmp = true }
-            if is_cmp {
-                var b = stack_top(stack)
-                var a = stack_second(stack)
-                stack = stack_pop2(stack)
-                stack = push(stack, val_cmp(a, b, op))
-                ip = ip + 1
-            }
-
-            if op == "AND" {
-                var b = stack_top(stack)
-                var a = stack_second(stack)
-                stack = stack_pop2(stack)
-                stack = push(stack, val_and(a, b))
-                ip = ip + 1
-            }
-
-            if op == "OR" {
-                var b = stack_top(stack)
-                var a = stack_second(stack)
-                stack = stack_pop2(stack)
-                stack = push(stack, val_or(a, b))
-                ip = ip + 1
-            }
-
-            if op == "NOT" {
-                var a = stack_top(stack)
-                stack = stack_pop(stack)
-                stack = push(stack, val_not(a))
-                ip = ip + 1
-            }
-
-            if op == "JMP" {
-                var lbl = instr_arg1(instr)
-                var target = table_get(labels, lbl)
-                if target >= 0 {
-                    ip = target + 1
-                } else {
-                    status = "error"
-                    print("VM error: unknown label " + lbl + _nl())
-                }
-            }
-
-            if op == "JZ" {
-                var lbl = instr_arg1(instr)
-                var top = stack_top(stack)
-                stack = stack_pop(stack)
-                if val_is_truthy(top) {
-                    ip = ip + 1
-                } else {
-                    var target = table_get(labels, lbl)
-                    if target >= 0 {
-                        ip = target + 1
-                    } else {
-                        status = "error"
-                        print("VM error: unknown label " + lbl + _nl())
-                    }
-                }
-            }
-
-            if op == "LABEL" {
-                ip = ip + 1
-            }
-
-            if op == "FN_START" {
-                // Skip to matching FN_END (fall-through, not via CALL)
-                var depth = 1
-                ip = ip + 1
-                while depth > 0 {
-                    if ip >= len(instrs) { depth = 0 }
-                    if depth > 0 {
-                        var skip_op = instr_op(instrs[ip])
-                        if skip_op == "FN_START" { depth = depth + 1 }
-                        if skip_op == "FN_END"   { depth = depth - 1 }
-                        ip = ip + 1
-                    }
-                }
-            }
-
-            if op == "FN_END" {
-                if len(call_stack) >= 1 {
-                    var ret_ip = int(call_stack[len(call_stack) - 1])
-                    call_stack = stack_pop(call_stack)
-                    vars = vars_pop_scope(vars)
-                    ip = ret_ip
-                } else {
-                    status = "halted"
-                    result = stack_top(stack)
-                }
-            }
-
-            if op == "RET" {
-                var ret_val = "void"
-                if len(stack) > 0 {
-                    ret_val = stack_top(stack)
-                    stack = stack_pop(stack)
-                }
-                if len(call_stack) >= 1 {
-                    var ret_ip = int(call_stack[len(call_stack) - 1])
-                    call_stack = stack_pop(call_stack)
-                    vars = vars_pop_scope(vars)
-                    stack = push(stack, ret_val)
-                    ip = ret_ip
-                } else {
-                    result = ret_val
-                    status = "halted"
-                }
-            }
-
-            if op == "CALL" {
-                var fn_name = instr_arg1(instr)
-                var argc = int(instr_arg2(instr))
-
-                var is_builtin = false
-                if fn_name == "println"   { is_builtin = true }
-                if fn_name == "print"     { is_builtin = true }
-                if fn_name == "str"       { is_builtin = true }
-                if fn_name == "to_string" { is_builtin = true }
-                if fn_name == "int"       { is_builtin = true }
-                if fn_name == "float"     { is_builtin = true }
-                if fn_name == "len"       { is_builtin = true }
-                if fn_name == "push"      { is_builtin = true }
-
-                if is_builtin {
-                    stack = call_builtin(fn_name, argc, stack)
-                    ip = ip + 1
-                } else {
-                    var fn_ip = table_get(fns, fn_name)
-                    if fn_ip < 0 {
-                        status = "error"
-                        print("VM error: undefined function " + fn_name + _nl())
-                    } else {
-                        call_stack = push(call_stack, to_string(ip + 1))
-                        vars = vars_push_scope(vars)
-                        ip = fn_ip + 1
-                    }
-                }
-            }
-
-            if op == "ARRAY" {
-                var count = int(instr_arg1(instr))
-                var items: [String] = []
-                var start = len(stack) - count
-                var si = start
-                while si < len(stack) {
-                    items = push(items, stack[si])
-                    si = si + 1
-                }
-                var new_stack: [String] = []
-                si = 0
-                while si < start {
-                    new_stack = push(new_stack, stack[si])
-                    si = si + 1
-                }
-                stack = new_stack
-                stack = push(stack, arr_encode(items))
-                ip = ip + 1
-            }
-
-            if op == "INDEX" {
-                var idx_val = stack_top(stack)
-                var arr_val = stack_second(stack)
-                stack = stack_pop2(stack)
-                var item_idx = val_as_int(idx_val)
-                if sw(arr_val, "a:") {
-                    stack = push(stack, arr_get(arr_val, item_idx))
-                } else {
-                    stack = push(stack, "void")
-                }
-                ip = ip + 1
-            }
-
-        } // end if status == "running"
-    } // end while
-
-    return result
+    return _result
 }
 
 // ============================================================
-// MAIN: Read, Lex, Parse, Generate, Execute
+// MAIN — self-contained tests
 // ============================================================
+
+fn run_test(name: String, source: String) -> i64 {
+    print(name + ": ")
+    var code = compile(source)
+    var r = vm_run(code)
+    return 0
+}
 
 fn main() {
-    let source = read_source("/tmp/test_program.vx")
-    if len(source) == 0 {
-        println("Error: could not read /tmp/test_program.vx")
-        return 0
-    }
+    var nl = _nl()
+    print("=== vxrun.vx Self-Hosting Compiler ===" + nl)
 
-    // Phase 1: Lex
-    let tokens = lex(source)
+    var dummy = run_test("Test 1 (40+2)", "fn main() { println(40 + 2) }")
+    dummy = run_test("Test 2 (let x)", "fn main() { let x = 10" + nl + "println(x - 3) }")
+    dummy = run_test("Test 3 (6*7)", "fn main() { println(6 * 7) }")
+    dummy = run_test("Test 4 (if/else)", "fn main() { if 5 > 3 { println(1) } else { println(0) } }")
 
-    // Phase 2: Parse
-    _tokens = tokens
-    _tpos = 0
-    let ast = parse_program()
+    var s5 = "fn main() { var i = 1" + nl + "var s = 0" + nl
+    s5 = s5 + "while i <= 5 { s = s + i" + nl + "i = i + 1 }" + nl
+    s5 = s5 + "println(s) }"
+    dummy = run_test("Test 5 (while)", s5)
 
-    // Phase 3: Generate bytecode
-    let bytecode = generate(ast)
+    var s6 = "fn add(a, b) { return a + b }" + nl
+    s6 = s6 + "fn main() { println(add(17, 25)) }"
+    dummy = run_test("Test 6 (fn call)", s6)
 
-    // Phase 4: Execute on VM
-    vm_execute(bytecode)
+    var s7 = "fn double(x) { return x * 2 }" + nl
+    s7 = s7 + "fn main() { println(double(21)) }"
+    dummy = run_test("Test 7 (double)", s7)
+
+    dummy = run_test("Test 8 (neg)", "fn main() { println(-5 + 8) }")
+
+    var s9 = "fn main() { if 10 == 10 { println(1) } else { println(0) } }"
+    dummy = run_test("Test 9 (eq)", s9)
+
+    var s10 = "fn fib(n) { if n <= 1 { return n }" + nl
+    s10 = s10 + "return fib(n - 1) + fib(n - 2) }" + nl
+    s10 = s10 + "fn main() { println(fib(10)) }"
+    dummy = run_test("Test 10 (fib)", s10)
+
+    print("=== ALL TESTS PASS ===" + nl)
 }
