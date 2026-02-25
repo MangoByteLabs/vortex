@@ -47,7 +47,9 @@ fn _exp(x: f64) -> f64 {
 
 fn _tanh(x: f64) -> f64 {
     var e2x = _exp(2.0 * x)
-    (e2x - 1.0) / (e2x + 1.0)
+    var num = e2x - 1.0
+    var den = e2x + 1.0
+    num / den
 }
 
 fn _silu(x: f64) -> f64 {
@@ -55,7 +57,9 @@ fn _silu(x: f64) -> f64 {
 }
 
 fn _gelu(x: f64) -> f64 {
-    0.5 * x * (1.0 + _tanh(0.7978845608 * (x + 0.044715 * x * x * x)))
+    var inner = 0.7978845608 * (x + 0.044715 * x * x * x)
+    var t = _tanh(inner)
+    0.5 * x * (1.0 + t)
 }
 
 fn _relu(x: f64) -> f64 {
@@ -118,10 +122,14 @@ fn _layer_bounds(g: [String], idx: i64) -> [i64] {
     var layer_num = 0
     var start = 0
     var i = 0
-    while i < len(g) {
+    var glen = len(g)
+    while i < glen {
         if g[i] == "|" {
             if layer_num == idx {
-                return [start, i]
+                var s = start
+                var e = i
+                var r = [s, e]
+                return r
             }
             layer_num = layer_num + 1
             start = i + 1
@@ -129,9 +137,13 @@ fn _layer_bounds(g: [String], idx: i64) -> [i64] {
         i = i + 1
     }
     if layer_num == idx {
-        return [start, len(g)]
+        var s = start
+        var e = glen
+        var r = [s, e]
+        return r
     }
-    [0, 0]
+    var r = [0, 0]
+    r
 }
 
 fn genome_get_layer(g: [String], idx: i64) -> [String] {
@@ -176,15 +188,8 @@ fn genome_swap_layers(g: [String], i: i64, j: i64) -> [String] {
     if j < 0 { return g }
     if i >= n { return g }
     if j >= n { return g }
-    var layers = []
-    var li = 0
-    while li < n {
-        layers = push(layers, li)
-        li = li + 1
-    }
-    // Rebuild with swapped order
     var out = []
-    li = 0
+    var li = 0
     while li < n {
         var src = li
         if li == i { src = j }
@@ -211,7 +216,6 @@ fn genome_mutate_param(g: [String], layer_idx: i64, param_idx: i64, new_val: Str
         var layer = genome_get_layer(g, li)
         if li == layer_idx {
             if param_idx < len(layer) {
-                // Rebuild layer with mutated param
                 var new_layer = []
                 var k = 0
                 while k < len(layer) {
@@ -328,7 +332,6 @@ fn mutate_add_residual(g: [String], from_layer: i64, to_layer: i64) -> [String] 
 fn mutate_add_moe(g: [String], layer_idx: i64, n_experts: i64, top_k: i64) -> [String] {
     var layer = genome_get_layer(g, layer_idx)
     if len(layer) == 0 { return g }
-    // Replace the layer with an MoE wrapper
     var moe_layer = ["moe", to_string(n_experts), to_string(top_k)]
     var n = genome_size(g)
     var out = []
@@ -372,7 +375,6 @@ fn mutate_random(g: [String], seed: i64) -> [String] {
         }
     }
     if choice == 3 {
-        // Try to change heads on a random layer
         var li = s % n
         return mutate_change_heads(g, li, (s % 4) + 1)
     }
@@ -386,142 +388,104 @@ fn mutate_random(g: [String], seed: i64) -> [String] {
 // Architecture Evaluation
 // ─────────────────────────────────────────────────────────────
 
+fn _gen_weight_str(dim_total: i64, scale_dim: i64, seed: i64) -> [String] {
+    // Returns [weight_string, new_seed]
+    var s = seed
+    var wdata = ""
+    var j = 0
+    var sc = _sqrt(float(scale_dim))
+    while j < dim_total {
+        s = _lcg(s)
+        var v = (_rand_f64(s) - 0.5) / sc
+        if j > 0 { wdata = wdata + " " }
+        wdata = wdata + to_string(v)
+        j = j + 1
+    }
+    var r = [wdata, to_string(s)]
+    r
+}
+
 fn genome_to_weights(g: [String], dim: i64, seed: i64) -> [String] {
-    // Generate weight arrays as name/data pairs
     var out = []
     var n = genome_size(g)
     var s = seed
     var li = 0
     while li < n {
         var layer = genome_get_layer(g, li)
-        if len(layer) == 0 {
-            li = li + 1
-            continue
-        }
-        var ltype = layer[0]
-        var name_prefix = "layer_" + to_string(li)
+        if len(layer) > 0 {
+            var ltype = layer[0]
+            var name_prefix = "layer_" + to_string(li)
 
-        if ltype == "linear" {
-            // dim x dim weights
-            out = push(out, name_prefix + "_w")
-            var wdata = ""
-            var j = 0
-            while j < dim * dim {
-                s = _lcg(s)
-                var v = (_rand_f64(s) - 0.5) / _sqrt(float(dim))
-                if j > 0 { wdata = wdata + " " }
-                wdata = wdata + to_string(v)
-                j = j + 1
+            if ltype == "linear" {
+                out = push(out, name_prefix + "_w")
+                var ws = _gen_weight_str(dim * dim, dim, s)
+                out = push(out, ws[0])
+                s = int(ws[1])
             }
-            out = push(out, wdata)
-        }
 
-        if ltype == "attention" {
-            // Wq, Wk, Wv, Wo — each dim x dim
-            var matrices = ["_wq", "_wk", "_wv", "_wo"]
-            var mi = 0
-            while mi < 4 {
-                out = push(out, name_prefix + matrices[mi])
-                var wdata = ""
+            if ltype == "attention" {
+                var matrices = ["_wq", "_wk", "_wv", "_wo"]
+                var mi = 0
+                while mi < 4 {
+                    out = push(out, name_prefix + matrices[mi])
+                    var ws = _gen_weight_str(dim * dim, dim, s)
+                    out = push(out, ws[0])
+                    s = int(ws[1])
+                    mi = mi + 1
+                }
+            }
+
+            if ltype == "ffn" {
+                var hdim = 16
+                if len(layer) > 1 { hdim = int(layer[1]) }
+                out = push(out, name_prefix + "_w1")
+                var ws1 = _gen_weight_str(dim * hdim, dim, s)
+                out = push(out, ws1[0])
+                s = int(ws1[1])
+                out = push(out, name_prefix + "_w2")
+                var ws2 = _gen_weight_str(hdim * dim, hdim, s)
+                out = push(out, ws2[0])
+                s = int(ws2[1])
+            }
+
+            if ltype == "norm" {
+                out = push(out, name_prefix + "_gamma")
+                var gdata = ""
                 var j = 0
-                while j < dim * dim {
-                    s = _lcg(s)
-                    var v = (_rand_f64(s) - 0.5) / _sqrt(float(dim))
-                    if j > 0 { wdata = wdata + " " }
-                    wdata = wdata + to_string(v)
+                while j < dim {
+                    if j > 0 { gdata = gdata + " " }
+                    gdata = gdata + "1.0"
                     j = j + 1
                 }
-                out = push(out, wdata)
-                mi = mi + 1
-            }
-        }
-
-        if ltype == "ffn" {
-            // W1: dim x hidden, W2: hidden x dim
-            var hidden = 16
-            if len(layer) > 1 { hidden = int(layer[1]) }
-            // W1
-            out = push(out, name_prefix + "_w1")
-            var wdata = ""
-            var j = 0
-            while j < dim * hidden {
-                s = _lcg(s)
-                var v = (_rand_f64(s) - 0.5) / _sqrt(float(dim))
-                if j > 0 { wdata = wdata + " " }
-                wdata = wdata + to_string(v)
-                j = j + 1
-            }
-            out = push(out, wdata)
-            // W2
-            out = push(out, name_prefix + "_w2")
-            wdata = ""
-            j = 0
-            while j < hidden * dim {
-                s = _lcg(s)
-                var v = (_rand_f64(s) - 0.5) / _sqrt(float(hidden))
-                if j > 0 { wdata = wdata + " " }
-                wdata = wdata + to_string(v)
-                j = j + 1
-            }
-            out = push(out, wdata)
-        }
-
-        if ltype == "norm" {
-            // gamma and beta, each dim
-            out = push(out, name_prefix + "_gamma")
-            var gdata = ""
-            var j = 0
-            while j < dim {
-                if j > 0 { gdata = gdata + " " }
-                gdata = gdata + "1.0"
-                j = j + 1
-            }
-            out = push(out, gdata)
-            out = push(out, name_prefix + "_beta")
-            var bdata = ""
-            j = 0
-            while j < dim {
-                if j > 0 { bdata = bdata + " " }
-                bdata = bdata + "0.0"
-                j = j + 1
-            }
-            out = push(out, bdata)
-        }
-
-        if ltype == "moe" {
-            // Gate weights: dim x n_experts
-            var n_experts = 4
-            if len(layer) > 1 { n_experts = int(layer[1]) }
-            out = push(out, name_prefix + "_gate")
-            var wdata = ""
-            var j = 0
-            while j < dim * n_experts {
-                s = _lcg(s)
-                var v = (_rand_f64(s) - 0.5) / _sqrt(float(dim))
-                if j > 0 { wdata = wdata + " " }
-                wdata = wdata + to_string(v)
-                j = j + 1
-            }
-            out = push(out, wdata)
-            // Each expert: dim x dim
-            var ei = 0
-            while ei < n_experts {
-                out = push(out, name_prefix + "_expert_" + to_string(ei))
-                wdata = ""
+                out = push(out, gdata)
+                out = push(out, name_prefix + "_beta")
+                var bdata = ""
                 j = 0
-                while j < dim * dim {
-                    s = _lcg(s)
-                    var v = (_rand_f64(s) - 0.5) / _sqrt(float(dim))
-                    if j > 0 { wdata = wdata + " " }
-                    wdata = wdata + to_string(v)
+                while j < dim {
+                    if j > 0 { bdata = bdata + " " }
+                    bdata = bdata + "0.0"
                     j = j + 1
                 }
-                out = push(out, wdata)
-                ei = ei + 1
+                out = push(out, bdata)
+            }
+
+            if ltype == "moe" {
+                var n_experts = 4
+                if len(layer) > 1 { n_experts = int(layer[1]) }
+                out = push(out, name_prefix + "_gate")
+                var wsg = _gen_weight_str(dim * n_experts, dim, s)
+                out = push(out, wsg[0])
+                s = int(wsg[1])
+                var ei = 0
+                while ei < n_experts {
+                    out = push(out, name_prefix + "_expert_" + to_string(ei))
+                    var wse = _gen_weight_str(dim * dim, dim, s)
+                    out = push(out, wse[0])
+                    s = int(wse[1])
+                    ei = ei + 1
+                }
             }
         }
-
-        // residual and gate don't need extra weights
         li = li + 1
     }
     out
@@ -529,9 +493,9 @@ fn genome_to_weights(g: [String], dim: i64, seed: i64) -> [String] {
 
 fn _decode_weight(weights: [String], name: String, size: i64) -> [f64] {
     var i = 0
-    while i < len(weights) - 1 {
+    var wlen = len(weights)
+    while i < wlen - 1 {
         if weights[i] == name {
-            // Parse space-separated floats
             var s = weights[i + 1]
             var result = []
             var current = ""
@@ -556,7 +520,6 @@ fn _decode_weight(weights: [String], name: String, size: i64) -> [f64] {
         }
         i = i + 2
     }
-    // Return zeros if not found
     var result = []
     var j = 0
     while j < size {
@@ -598,8 +561,8 @@ fn _layer_norm(v: [f64]) -> [f64] {
     var variance = 0.0
     i = 0
     while i < n {
-        var delta = v[i] - mean
-        variance = variance + delta * delta
+        var d = v[i] - mean
+        variance = variance + d * d
         i = i + 1
     }
     variance = variance / float(n)
@@ -607,7 +570,8 @@ fn _layer_norm(v: [f64]) -> [f64] {
     var out = []
     i = 0
     while i < n {
-        out = push(out, (v[i] - mean) / std)
+        var normalized = (v[i] - mean) / std
+        out = push(out, normalized)
         i = i + 1
     }
     out
@@ -642,147 +606,127 @@ fn _softmax(v: [f64]) -> [f64] {
 
 fn genome_forward(g: [String], weights: [String], input: [f64], dim: i64) -> [f64] {
     var hidden = input
-    // Pad or truncate to dim
     while len(hidden) < dim {
         hidden = push(hidden, 0.0)
     }
 
     var n = genome_size(g)
-    var layer_outputs = []
-    // Store outputs for residual connections (as flat concatenation, each dim floats)
-
     var li = 0
     while li < n {
         var layer = genome_get_layer(g, li)
-        if len(layer) == 0 {
-            li = li + 1
-            continue
-        }
-        var ltype = layer[0]
-        var prefix = "layer_" + to_string(li)
+        if len(layer) > 0 {
+            var ltype = layer[0]
+            var prefix = "layer_" + to_string(li)
 
-        if ltype == "linear" {
-            var w = _decode_weight(weights, prefix + "_w", dim * dim)
-            hidden = _matvec(w, hidden, dim, dim)
-            var i = 0
-            var activated = []
-            while i < len(hidden) {
-                activated = push(activated, _relu(hidden[i]))
-                i = i + 1
-            }
-            hidden = activated
-        }
-
-        if ltype == "attention" {
-            var n_heads = 2
-            if len(layer) > 1 { n_heads = int(layer[1]) }
-            var head_dim = dim / n_heads
-            if head_dim < 1 { head_dim = 1 }
-            var wq = _decode_weight(weights, prefix + "_wq", dim * dim)
-            var wk = _decode_weight(weights, prefix + "_wk", dim * dim)
-            var wv = _decode_weight(weights, prefix + "_wv", dim * dim)
-            var wo = _decode_weight(weights, prefix + "_wo", dim * dim)
-            var q = _matvec(wq, hidden, dim, dim)
-            var k = _matvec(wk, hidden, dim, dim)
-            var v = _matvec(wv, hidden, dim, dim)
-            // Simplified self-attention: score = q dot k / sqrt(dim)
-            var score = 0.0
-            var i = 0
-            while i < dim {
-                score = score + q[i] * k[i]
-                i = i + 1
-            }
-            score = score / _sqrt(float(dim))
-            // Apply softmax over single position (trivial for single vector)
-            // attn_out = score * v (scaled)
-            var attn_out = []
-            i = 0
-            while i < dim {
-                attn_out = push(attn_out, _tanh(score) * v[i])
-                i = i + 1
-            }
-            hidden = _matvec(wo, attn_out, dim, dim)
-        }
-
-        if ltype == "ffn" {
-            var hidden_dim = 16
-            if len(layer) > 1 { hidden_dim = int(layer[1]) }
-            var act = "silu"
-            if len(layer) > 2 { act = layer[2] }
-            var w1 = _decode_weight(weights, prefix + "_w1", dim * hidden_dim)
-            var w2 = _decode_weight(weights, prefix + "_w2", hidden_dim * dim)
-            var intermediate = _matvec(w1, hidden, hidden_dim, dim)
-            var activated = []
-            var i = 0
-            while i < len(intermediate) {
-                activated = push(activated, _activate(intermediate[i], act))
-                i = i + 1
-            }
-            hidden = _matvec(w2, activated, dim, hidden_dim)
-        }
-
-        if ltype == "norm" {
-            hidden = _layer_norm(hidden)
-        }
-
-        if ltype == "residual" {
-            // Skip connection: add stored output from_layer to current hidden
-            // For simplicity, just keep hidden as-is (true residual would need buffer)
-            // We scale slightly to show it's active
-            var i = 0
-            var out = []
-            while i < len(hidden) {
-                out = push(out, hidden[i] * 1.01)
-                i = i + 1
-            }
-            hidden = out
-        }
-
-        if ltype == "gate" {
-            // Gating: element-wise sigmoid
-            var i = 0
-            var out = []
-            while i < len(hidden) {
-                out = push(out, hidden[i] / (1.0 + _exp(0.0 - hidden[i])))
-                i = i + 1
-            }
-            hidden = out
-        }
-
-        if ltype == "moe" {
-            var n_experts = 4
-            if len(layer) > 1 { n_experts = int(layer[1]) }
-            var top_k = 2
-            if len(layer) > 2 { top_k = int(layer[2]) }
-            // Gate: select top-k experts
-            var gate_w = _decode_weight(weights, prefix + "_gate", dim * n_experts)
-            var gate_scores = _matvec(gate_w, hidden, n_experts, dim)
-            gate_scores = _softmax(gate_scores)
-            // Average top experts (simplified)
-            var result = []
-            var i = 0
-            while i < dim {
-                result = push(result, 0.0)
-                i = i + 1
-            }
-            var ei = 0
-            while ei < n_experts {
-                if ei < top_k {
-                    var ew = _decode_weight(weights, prefix + "_expert_" + to_string(ei), dim * dim)
-                    var expert_out = _matvec(ew, hidden, dim, dim)
-                    i = 0
-                    var new_result = []
-                    while i < dim {
-                        new_result = push(new_result, result[i] + gate_scores[ei] * expert_out[i])
-                        i = i + 1
-                    }
-                    result = new_result
+            if ltype == "linear" {
+                var w = _decode_weight(weights, prefix + "_w", dim * dim)
+                hidden = _matvec(w, hidden, dim, dim)
+                var activated = []
+                var i = 0
+                while i < len(hidden) {
+                    activated = push(activated, _relu(hidden[i]))
+                    i = i + 1
                 }
-                ei = ei + 1
+                hidden = activated
             }
-            hidden = result
-        }
 
+            if ltype == "attention" {
+                var wq = _decode_weight(weights, prefix + "_wq", dim * dim)
+                var wk = _decode_weight(weights, prefix + "_wk", dim * dim)
+                var wv = _decode_weight(weights, prefix + "_wv", dim * dim)
+                var wo = _decode_weight(weights, prefix + "_wo", dim * dim)
+                var q = _matvec(wq, hidden, dim, dim)
+                var k = _matvec(wk, hidden, dim, dim)
+                var v = _matvec(wv, hidden, dim, dim)
+                var score = 0.0
+                var i = 0
+                while i < dim {
+                    score = score + q[i] * k[i]
+                    i = i + 1
+                }
+                score = score / _sqrt(float(dim))
+                var attn_out = []
+                i = 0
+                while i < dim {
+                    attn_out = push(attn_out, _tanh(score) * v[i])
+                    i = i + 1
+                }
+                hidden = _matvec(wo, attn_out, dim, dim)
+            }
+
+            if ltype == "ffn" {
+                var hdim = 16
+                if len(layer) > 1 { hdim = int(layer[1]) }
+                var act = "silu"
+                if len(layer) > 2 { act = layer[2] }
+                var w1 = _decode_weight(weights, prefix + "_w1", dim * hdim)
+                var w2 = _decode_weight(weights, prefix + "_w2", hdim * dim)
+                var intermediate = _matvec(w1, hidden, hdim, dim)
+                var activated = []
+                var i = 0
+                while i < len(intermediate) {
+                    activated = push(activated, _activate(intermediate[i], act))
+                    i = i + 1
+                }
+                hidden = _matvec(w2, activated, dim, hdim)
+            }
+
+            if ltype == "norm" {
+                hidden = _layer_norm(hidden)
+            }
+
+            if ltype == "residual" {
+                var i = 0
+                var rout = []
+                while i < len(hidden) {
+                    rout = push(rout, hidden[i] * 1.01)
+                    i = i + 1
+                }
+                hidden = rout
+            }
+
+            if ltype == "gate" {
+                var i = 0
+                var gout = []
+                while i < len(hidden) {
+                    gout = push(gout, hidden[i] / (1.0 + _exp(0.0 - hidden[i])))
+                    i = i + 1
+                }
+                hidden = gout
+            }
+
+            if ltype == "moe" {
+                var n_experts = 4
+                if len(layer) > 1 { n_experts = int(layer[1]) }
+                var top_k = 2
+                if len(layer) > 2 { top_k = int(layer[2]) }
+                var gate_w = _decode_weight(weights, prefix + "_gate", dim * n_experts)
+                var gate_scores = _matvec(gate_w, hidden, n_experts, dim)
+                gate_scores = _softmax(gate_scores)
+                var moe_result = []
+                var i = 0
+                while i < dim {
+                    moe_result = push(moe_result, 0.0)
+                    i = i + 1
+                }
+                var ei = 0
+                while ei < n_experts {
+                    if ei < top_k {
+                        var ew = _decode_weight(weights, prefix + "_expert_" + to_string(ei), dim * dim)
+                        var expert_out = _matvec(ew, hidden, dim, dim)
+                        i = 0
+                        var new_moe = []
+                        while i < dim {
+                            new_moe = push(new_moe, moe_result[i] + gate_scores[ei] * expert_out[i])
+                            i = i + 1
+                        }
+                        moe_result = new_moe
+                    }
+                    ei = ei + 1
+                }
+                hidden = moe_result
+            }
+        }
         li = li + 1
     }
     hidden
@@ -794,23 +738,21 @@ fn genome_param_count(g: [String], dim: i64) -> i64 {
     var li = 0
     while li < n {
         var layer = genome_get_layer(g, li)
-        if len(layer) == 0 {
-            li = li + 1
-            continue
-        }
-        var ltype = layer[0]
-        if ltype == "linear" { total = total + dim * dim }
-        if ltype == "attention" { total = total + 4 * dim * dim }
-        if ltype == "ffn" {
-            var hidden_dim = 16
-            if len(layer) > 1 { hidden_dim = int(layer[1]) }
-            total = total + dim * hidden_dim + hidden_dim * dim
-        }
-        if ltype == "norm" { total = total + 2 * dim }
-        if ltype == "moe" {
-            var n_experts = 4
-            if len(layer) > 1 { n_experts = int(layer[1]) }
-            total = total + dim * n_experts + n_experts * dim * dim
+        if len(layer) > 0 {
+            var ltype = layer[0]
+            if ltype == "linear" { total = total + dim * dim }
+            if ltype == "attention" { total = total + 4 * dim * dim }
+            if ltype == "ffn" {
+                var hdim = 16
+                if len(layer) > 1 { hdim = int(layer[1]) }
+                total = total + dim * hdim + hdim * dim
+            }
+            if ltype == "norm" { total = total + 2 * dim }
+            if ltype == "moe" {
+                var n_experts = 4
+                if len(layer) > 1 { n_experts = int(layer[1]) }
+                total = total + dim * n_experts + n_experts * dim * dim
+            }
         }
         li = li + 1
     }
@@ -823,28 +765,25 @@ fn genome_flop_count(g: [String], dim: i64, seq_len: i64) -> i64 {
     var li = 0
     while li < n {
         var layer = genome_get_layer(g, li)
-        if len(layer) == 0 {
-            li = li + 1
-            continue
-        }
-        var ltype = layer[0]
-        if ltype == "linear" { total = total + 2 * dim * dim * seq_len }
-        if ltype == "attention" {
-            // 4 matvecs + attention scores
-            total = total + (4 * 2 * dim * dim + 2 * dim * seq_len) * seq_len
-        }
-        if ltype == "ffn" {
-            var hidden_dim = 16
-            if len(layer) > 1 { hidden_dim = int(layer[1]) }
-            total = total + 2 * (dim * hidden_dim + hidden_dim * dim) * seq_len
-        }
-        if ltype == "norm" { total = total + 5 * dim * seq_len }
-        if ltype == "moe" {
-            var n_experts = 4
-            if len(layer) > 1 { n_experts = int(layer[1]) }
-            var top_k = 2
-            if len(layer) > 2 { top_k = int(layer[2]) }
-            total = total + (dim * n_experts + top_k * 2 * dim * dim) * seq_len
+        if len(layer) > 0 {
+            var ltype = layer[0]
+            if ltype == "linear" { total = total + 2 * dim * dim * seq_len }
+            if ltype == "attention" {
+                total = total + (4 * 2 * dim * dim + 2 * dim * seq_len) * seq_len
+            }
+            if ltype == "ffn" {
+                var hdim = 16
+                if len(layer) > 1 { hdim = int(layer[1]) }
+                total = total + 2 * (dim * hdim + hdim * dim) * seq_len
+            }
+            if ltype == "norm" { total = total + 5 * dim * seq_len }
+            if ltype == "moe" {
+                var n_experts = 4
+                if len(layer) > 1 { n_experts = int(layer[1]) }
+                var top_k = 2
+                if len(layer) > 2 { top_k = int(layer[2]) }
+                total = total + (dim * n_experts + top_k * 2 * dim * dim) * seq_len
+            }
         }
         li = li + 1
     }
@@ -897,7 +836,6 @@ fn evolve_crossover(parent1: [String], parent2: [String], seed: i64) -> [String]
     var cut2 = s % n2
     if cut2 < 1 { cut2 = 1 }
 
-    // Take first cut1 layers from parent1, rest from parent2
     var out = []
     var i = 0
     while i < cut1 {
@@ -921,7 +859,6 @@ fn evolve_crossover(parent1: [String], parent2: [String], seed: i64) -> [String]
         }
         i = i + 1
     }
-    // Ensure at least 1 layer
     if genome_size(out) == 0 {
         out = genome_add_layer(out, "norm", [])
     }
@@ -929,8 +866,6 @@ fn evolve_crossover(parent1: [String], parent2: [String], seed: i64) -> [String]
 }
 
 fn evolve_tournament_select(genomes: [String], scores: [f64], tournament_size: i64, seed: i64) -> [String] {
-    // genomes is encoded as tab-separated genomes joined by "|||"
-    // scores is parallel array of fitness values
     var n = len(scores)
     if n == 0 { return genome_new() }
     var s = seed
@@ -946,31 +881,26 @@ fn evolve_tournament_select(genomes: [String], scores: [f64], tournament_size: i
         }
         ti = ti + 1
     }
-    // Decode the best genome from the flat list
     _decode_genome(genomes[best_idx])
 }
 
 fn evolve_fitness(g: [String], dim: i64, test_inputs: [f64], test_targets: [f64], seed: i64) -> f64 {
     var weights = genome_to_weights(g, dim, seed)
     var output = genome_forward(g, weights, test_inputs, dim)
-    // MSE between output and targets
     var mse = 0.0
     var n = len(output)
     if n > len(test_targets) { n = len(test_targets) }
     var i = 0
     while i < n {
-        var delta = output[i] - test_targets[i]
-        mse = mse + delta * delta
+        var d = output[i] - test_targets[i]
+        mse = mse + d * d
         i = i + 1
     }
     if n > 0 { mse = mse / float(n) }
-    // Fitness = negative loss (higher is better)
     0.0 - mse
 }
 
 fn evolve_population(genomes: [String], fitness_scores: [f64], pop_size: i64, seed: i64) -> [String] {
-    // genomes: encoded genomes as [String]
-    // Returns new population as [String] of encoded genomes
     var new_pop = []
     var s = seed
     var i = 0
@@ -981,7 +911,6 @@ fn evolve_population(genomes: [String], fitness_scores: [f64], pop_size: i64, se
         var p2 = evolve_tournament_select(genomes, fitness_scores, 2, s)
         s = _lcg(s)
         var child = evolve_crossover(p1, p2, s)
-        // 50% chance of mutation
         s = _lcg(s)
         if s % 2 == 0 {
             s = _lcg(s)
@@ -998,7 +927,6 @@ fn evolve_population(genomes: [String], fitness_scores: [f64], pop_size: i64, se
 // ─────────────────────────────────────────────────────────────
 
 fn nas_search(dim: i64, max_layers: i64, pop_size: i64, generations: i64, seed: i64) -> [String] {
-    // Generate initial population
     var pop = []
     var s = seed
     var i = 0
@@ -1025,7 +953,6 @@ fn nas_search(dim: i64, max_layers: i64, pop_size: i64, generations: i64, seed: 
         i = i + 1
     }
 
-    // Synthetic test data
     var test_inputs = []
     var test_targets = []
     i = 0
@@ -1037,7 +964,6 @@ fn nas_search(dim: i64, max_layers: i64, pop_size: i64, generations: i64, seed: 
         i = i + 1
     }
 
-    // Evolve
     var gen = 0
     while gen < generations {
         var scores = []
@@ -1054,16 +980,13 @@ fn nas_search(dim: i64, max_layers: i64, pop_size: i64, generations: i64, seed: 
         gen = gen + 1
     }
 
-    // Return best from final population
     var best_idx = 0
     var best_score = 0.0 - 999999.0
-    var scores = []
     i = 0
     while i < len(pop) {
         var g = _decode_genome(pop[i])
         s = _lcg(s)
         var fitness = evolve_fitness(g, dim, test_inputs, test_targets, s)
-        scores = push(scores, fitness)
         if fitness > best_score {
             best_score = fitness
             best_idx = i
@@ -1102,14 +1025,11 @@ fn nas_report(g: [String], dim: i64) -> String {
 // ─────────────────────────────────────────────────────────────
 
 fn genome_energy_cost(g: [String], dim: i64, seq_len: i64) -> f64 {
-    // Estimated energy in joules: FLOPs * energy_per_flop
-    // Using ~10 pJ/FLOP for modern GPU
     var flops = genome_flop_count(g, dim, seq_len)
     float(flops) * 0.00000000001
 }
 
 fn genome_pareto_front(genomes: [String], accuracies: [f64], energies: [f64]) -> [i64] {
-    // Find Pareto-optimal: no other solution dominates (better accuracy AND lower energy)
     var n = len(accuracies)
     var pareto = []
     var i = 0
@@ -1149,35 +1069,34 @@ fn main() {
     let seq = 4
 
     // Test 1: Create a genome [attention(2h, 4d), ffn(16, silu), norm]
-    print("Test 1: Create genome...")
+    println("Test 1: Create genome...")
     var g = genome_new()
     g = genome_add_layer(g, "attention", ["2", "4"])
     g = genome_add_layer(g, "ffn", ["16", "silu"])
     g = genome_add_layer(g, "norm", [])
     if genome_size(g) == 3 {
-        print("  PASS - genome has 3 layers")
+        println("  PASS - genome has 3 layers")
     } else {
-        print("  FAIL - expected 3 layers, got " + to_string(genome_size(g)))
+        println("  FAIL - expected 3 layers, got " + to_string(genome_size(g)))
         all_pass = false
     }
 
     // Test 2: Generate weights
-    print("Test 2: Generate weights...")
+    println("Test 2: Generate weights...")
     var weights = genome_to_weights(g, dim, 42)
     if len(weights) > 0 {
-        print("  PASS - generated " + to_string(len(weights) / 2) + " weight matrices")
+        println("  PASS - generated " + to_string(len(weights) / 2) + " weight matrices")
     } else {
-        print("  FAIL - no weights generated")
+        println("  FAIL - no weights generated")
         all_pass = false
     }
 
     // Test 3: Forward pass
-    print("Test 3: Forward pass...")
+    println("Test 3: Forward pass...")
     var input = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8]
     var output = genome_forward(g, weights, input, dim)
     if len(output) == dim {
-        print("  PASS - output dim = " + to_string(len(output)))
-        // Check output is not all zeros
+        println("  PASS - output dim = " + to_string(len(output)))
         var sum = 0.0
         var i = 0
         while i < len(output) {
@@ -1185,93 +1104,90 @@ fn main() {
             i = i + 1
         }
         if sum > 0.0 {
-            print("  PASS - output is non-trivial (sum abs = " + to_string(sum) + ")")
+            println("  PASS - output is non-trivial (sum abs = " + to_string(sum) + ")")
         } else {
-            print("  FAIL - output is all zeros")
+            println("  FAIL - output is all zeros")
             all_pass = false
         }
     } else {
-        print("  FAIL - output dim = " + to_string(len(output)) + " expected " + to_string(dim))
+        println("  FAIL - output dim = " + to_string(len(output)) + " expected " + to_string(dim))
         all_pass = false
     }
 
     // Test 4: Param count and FLOPs
-    print("Test 4: Parameter count and FLOPs...")
+    println("Test 4: Parameter count and FLOPs...")
     var params = genome_param_count(g, dim)
     var flops = genome_flop_count(g, dim, seq)
     if params > 0 {
-        print("  PASS - params = " + to_string(params))
+        println("  PASS - params = " + to_string(params))
     } else {
-        print("  FAIL - params = 0")
+        println("  FAIL - params = 0")
         all_pass = false
     }
     if flops > 0 {
-        print("  PASS - FLOPs = " + to_string(flops))
+        println("  PASS - FLOPs = " + to_string(flops))
     } else {
-        print("  FAIL - FLOPs = 0")
+        println("  FAIL - FLOPs = 0")
         all_pass = false
     }
 
     // Test 5: Mutations
-    print("Test 5: Mutations...")
+    println("Test 5: Mutations...")
     var g_orig_size = genome_size(g)
 
-    // Add a layer
     var g2 = mutate_add_ffn(g, 1, 32, "gelu")
     if genome_size(g2) == g_orig_size + 1 {
-        print("  PASS - add layer: " + to_string(genome_size(g2)) + " layers")
+        println("  PASS - add layer: " + to_string(genome_size(g2)) + " layers")
     } else {
-        print("  FAIL - add layer: expected " + to_string(g_orig_size + 1) + " got " + to_string(genome_size(g2)))
+        println("  FAIL - add layer: expected " + to_string(g_orig_size + 1) + " got " + to_string(genome_size(g2)))
         all_pass = false
     }
 
-    // Remove a layer
     var g3 = mutate_remove_layer(g2, 1)
     if genome_size(g3) == genome_size(g2) - 1 {
-        print("  PASS - remove layer: " + to_string(genome_size(g3)) + " layers")
+        println("  PASS - remove layer: " + to_string(genome_size(g3)) + " layers")
     } else {
-        print("  FAIL - remove layer")
+        println("  FAIL - remove layer")
         all_pass = false
     }
 
-    // Change heads
     var g4 = mutate_change_heads(g, 0, 4)
     var attn_layer = genome_get_layer(g4, 0)
     if len(attn_layer) > 1 {
         if attn_layer[1] == "4" {
-            print("  PASS - changed heads to 4")
+            println("  PASS - changed heads to 4")
         } else {
-            print("  FAIL - heads = " + attn_layer[1] + " expected 4")
+            println("  FAIL - heads = " + attn_layer[1] + " expected 4")
             all_pass = false
         }
     } else {
-        print("  FAIL - could not read attention layer")
+        println("  FAIL - could not read attention layer")
         all_pass = false
     }
 
     // Test 6: Verify mutation produces different genome
-    print("Test 6: Mutation produces different genome...")
+    println("Test 6: Mutation produces different genome...")
     if len(g) != len(g2) {
-        print("  PASS - genomes differ in size")
+        println("  PASS - genomes differ in size")
     } else {
-        print("  FAIL - genomes same size after mutation")
+        println("  FAIL - genomes same size after mutation")
         all_pass = false
     }
 
     // Test 7: NAS for 3 generations
-    print("Test 7: NAS search (3 generations, pop=4)...")
+    println("Test 7: NAS search (3 generations, pop=4)...")
     var best = nas_search(dim, 3, 4, 3, 123)
     var nas_size = genome_size(best)
     if nas_size > 0 {
-        print("  PASS - NAS found architecture with " + to_string(nas_size) + " layers")
-        print(nas_report(best, dim))
+        println("  PASS - NAS found architecture with " + to_string(nas_size) + " layers")
+        println(nas_report(best, dim))
     } else {
-        print("  FAIL - NAS returned empty genome")
+        println("  FAIL - NAS returned empty genome")
         all_pass = false
     }
 
     // Test 8: Energy cost comparison
-    print("Test 8: Energy cost comparison...")
+    println("Test 8: Energy cost comparison...")
     var small_g = genome_new()
     small_g = genome_add_layer(small_g, "ffn", ["8", "relu"])
 
@@ -1283,37 +1199,35 @@ fn main() {
     var e_small = genome_energy_cost(small_g, dim, seq)
     var e_big = genome_energy_cost(big_g, dim, seq)
     if e_big > e_small {
-        print("  PASS - bigger arch costs more energy (" + to_string(e_big) + " > " + to_string(e_small) + " J)")
+        println("  PASS - bigger arch costs more energy (" + to_string(e_big) + " > " + to_string(e_small) + " J)")
     } else {
-        print("  FAIL - energy comparison wrong")
+        println("  FAIL - energy comparison wrong")
         all_pass = false
     }
 
     // Test 9: Crossover
-    print("Test 9: Crossover...")
+    println("Test 9: Crossover...")
     var child = evolve_crossover(g, big_g, 77)
     var child_size = genome_size(child)
     if child_size > 0 {
-        print("  PASS - crossover produced " + to_string(child_size) + " layer offspring")
-        // Verify it can run forward pass
+        println("  PASS - crossover produced " + to_string(child_size) + " layer offspring")
         var cw = genome_to_weights(child, dim, 99)
         var co = genome_forward(child, cw, input, dim)
         if len(co) == dim {
-            print("  PASS - offspring forward pass works")
+            println("  PASS - offspring forward pass works")
         } else {
-            print("  FAIL - offspring forward pass broken")
+            println("  FAIL - offspring forward pass broken")
             all_pass = false
         }
     } else {
-        print("  FAIL - crossover produced empty genome")
+        println("  FAIL - crossover produced empty genome")
         all_pass = false
     }
 
-    // Final result
-    print("")
+    println("")
     if all_pass {
-        print("=== ALL TESTS PASSED ===")
+        println("=== ALL TESTS PASSED ===")
     } else {
-        print("=== SOME TESTS FAILED ===")
+        println("=== SOME TESTS FAILED ===")
     }
 }
