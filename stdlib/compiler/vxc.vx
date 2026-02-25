@@ -1,0 +1,2557 @@
+// vxc.vx — Vortex Compiler Driver (Self-Contained)
+// Compiles a minimal subset of Vortex to native Linux x86-64 ELF binaries.
+// No Rust. No external tools. Pure Vortex self-hosting.
+//
+// Supported language subset:
+//   - fn main() { ... } as entry point
+//   - fn name(params...) -> i64 { ... } user functions
+//   - let x = expr / var x = expr
+//   - x = expr (assignment)
+//   - println(expr) — prints integer + newline to stdout
+//   - print_str(expr) — prints string to stdout
+//   - String literals: "hello\n"
+//   - Array literals: [1, 2, 3]
+//   - Array indexing: arr[i]
+//   - Array assignment: arr[i] = val
+//   - len(arr) — array/string length
+//   - push(arr, val) — returns new array with val appended
+//   - if cond { ... } else { ... }
+//   - while cond { ... }
+//   - return expr
+//   - Integer arithmetic: + - * / %
+//   - Comparisons: == != < > <= >=
+//   - Function calls
+//
+// Pipeline: source -> lex -> parse -> x86-64 codegen -> ELF -> write binary
+//
+// Usage:
+//   cargo run -- run stdlib/compiler/vxc.vx
+//   /tmp/vortex_out   # prints 42
+
+// ============================================================
+// PHASE 1: File I/O helpers (from loader.vx pattern)
+// ============================================================
+
+fn _null_terminate(s: String) -> i64 {
+    let bytes = str_bytes(s)
+    let n = len(bytes)
+    let buf = mem_alloc(n + 1)
+    var i = 0
+    while i < n {
+        mem_write_u8(buf, i, int(bytes[i]))
+        i = i + 1
+    }
+    mem_write_u8(buf, n, 0)
+    return buf
+}
+
+fn read_source(path: String) -> String {
+    let path_ptr = _null_terminate(path)
+    let fd = syscall2(2, path_ptr, 0)
+    mem_free(path_ptr)
+    if fd < 0 {
+        return ""
+    }
+    let buf_size = 1048576
+    let buf = mem_alloc(buf_size)
+    let n_read = syscall3(0, fd, buf, buf_size)
+    syscall1(3, fd)
+    if n_read <= 0 {
+        mem_free(buf)
+        return ""
+    }
+    var byte_arr = []
+    var i = 0
+    while i < n_read {
+        byte_arr = push(byte_arr, mem_read_u8(buf, i))
+        i = i + 1
+    }
+    mem_free(buf)
+    return str_from_bytes(byte_arr)
+}
+
+fn write_binary(path: String, data: [i64]) -> bool {
+    let path_ptr = _null_terminate(path)
+    let flags = 1 + 64 + 512
+    let fd = syscall3(2, path_ptr, flags, 493)
+    mem_free(path_ptr)
+    if fd < 0 {
+        return false
+    }
+    let n = len(data)
+    let buf = mem_alloc(n)
+    var i = 0
+    while i < n {
+        mem_write_u8(buf, i, int(data[i]))
+        i = i + 1
+    }
+    let written = syscall3(1, fd, buf, n)
+    mem_free(buf)
+    syscall1(3, fd)
+    return written == n
+}
+
+// ============================================================
+// PHASE 2: Minimal Lexer (inline)
+// ============================================================
+// Tokens: [type, value, line, col] — all strings
+
+fn _nl() -> String { return str_from_bytes([10]) }
+
+fn tok_new(typ: String, val: String, line: i64, col: i64) -> [String] {
+    return [typ, val, to_string(line), to_string(col)]
+}
+
+fn lex(source: String) -> [String] {
+    var tokens = []
+    var pos = 0
+    var line = 1
+    var col = 1
+    let src_len = len(source)
+
+    while pos < src_len {
+        let ch = str_char_at(source, pos)
+
+        // Skip whitespace
+        if ch == " " {
+            pos = pos + 1
+            col = col + 1
+        } else if ch == _nl() {
+            pos = pos + 1
+            line = line + 1
+            col = 1
+        } else if ch == str_from_bytes([9]) {
+            pos = pos + 1
+            col = col + 1
+        } else if ch == str_from_bytes([13]) {
+            pos = pos + 1
+        } else if ch == "/" {
+            // Check for line comment
+            if pos + 1 < src_len {
+                if str_char_at(source, pos + 1) == "/" {
+                    pos = pos + 2
+                    var in_comment = true
+                    while in_comment {
+                        if pos >= src_len {
+                            in_comment = false
+                        } else if str_char_at(source, pos) == _nl() {
+                            pos = pos + 1
+                            line = line + 1
+                            col = 1
+                            in_comment = false
+                        } else {
+                            pos = pos + 1
+                        }
+                    }
+                } else {
+                    tokens = push(tokens, tok_new("SLASH", "/", line, col))
+                    pos = pos + 1
+                    col = col + 1
+                }
+            } else {
+                tokens = push(tokens, tok_new("SLASH", "/", line, col))
+                pos = pos + 1
+                col = col + 1
+            }
+        } else if str_is_ascii_digit(ch) {
+            // Number
+            let start = pos
+            let start_col = col
+            var scanning_num = true
+            while scanning_num {
+                if pos < src_len {
+                    if str_is_ascii_digit(str_char_at(source, pos)) {
+                        pos = pos + 1
+                        col = col + 1
+                    } else {
+                        scanning_num = false
+                    }
+                } else {
+                    scanning_num = false
+                }
+            }
+            tokens = push(tokens, tok_new("INT", str_substr(source, start, pos - start), line, start_col))
+        } else if str_is_ascii_alpha(ch) {
+            let start = pos
+            let start_col = col
+            var scanning = true
+            while scanning {
+                if pos < src_len {
+                    let c = str_char_at(source, pos)
+                    if str_is_ascii_alpha(c) {
+                        pos = pos + 1
+                        col = col + 1
+                    } else if str_is_ascii_digit(c) {
+                        pos = pos + 1
+                        col = col + 1
+                    } else if c == "_" {
+                        pos = pos + 1
+                        col = col + 1
+                    } else {
+                        scanning = false
+                    }
+                } else {
+                    scanning = false
+                }
+            }
+            let word = str_substr(source, start, pos - start)
+            if word == "fn" {
+                tokens = push(tokens, tok_new("KW", "fn", line, start_col))
+            } else if word == "let" {
+                tokens = push(tokens, tok_new("KW", "let", line, start_col))
+            } else if word == "var" {
+                tokens = push(tokens, tok_new("KW", "var", line, start_col))
+            } else if word == "if" {
+                tokens = push(tokens, tok_new("KW", "if", line, start_col))
+            } else if word == "else" {
+                tokens = push(tokens, tok_new("KW", "else", line, start_col))
+            } else if word == "while" {
+                tokens = push(tokens, tok_new("KW", "while", line, start_col))
+            } else if word == "return" {
+                tokens = push(tokens, tok_new("KW", "return", line, start_col))
+            } else if word == "println" {
+                tokens = push(tokens, tok_new("KW", "println", line, start_col))
+            } else if word == "print_str" {
+                tokens = push(tokens, tok_new("KW", "print_str", line, start_col))
+            } else {
+                tokens = push(tokens, tok_new("IDENT", word, line, start_col))
+            }
+        } else if ch == "_" {
+            let start = pos
+            let start_col = col
+            pos = pos + 1
+            col = col + 1
+            var scanning = true
+            while scanning {
+                if pos < src_len {
+                    let c = str_char_at(source, pos)
+                    if str_is_ascii_alpha(c) {
+                        pos = pos + 1
+                        col = col + 1
+                    } else if str_is_ascii_digit(c) {
+                        pos = pos + 1
+                        col = col + 1
+                    } else if c == "_" {
+                        pos = pos + 1
+                        col = col + 1
+                    } else {
+                        scanning = false
+                    }
+                } else {
+                    scanning = false
+                }
+            }
+            let word = str_substr(source, start, pos - start)
+            tokens = push(tokens, tok_new("IDENT", word, line, start_col))
+        } else if ch == "(" {
+            tokens = push(tokens, tok_new("LPAREN", "(", line, col))
+            pos = pos + 1
+            col = col + 1
+        } else if ch == ")" {
+            tokens = push(tokens, tok_new("RPAREN", ")", line, col))
+            pos = pos + 1
+            col = col + 1
+        } else if ch == "{" {
+            tokens = push(tokens, tok_new("LBRACE", "{", line, col))
+            pos = pos + 1
+            col = col + 1
+        } else if ch == "}" {
+            tokens = push(tokens, tok_new("RBRACE", "}", line, col))
+            pos = pos + 1
+            col = col + 1
+        } else if ch == "," {
+            tokens = push(tokens, tok_new("COMMA", ",", line, col))
+            pos = pos + 1
+            col = col + 1
+        } else if ch == ":" {
+            tokens = push(tokens, tok_new("COLON", ":", line, col))
+            pos = pos + 1
+            col = col + 1
+        } else if ch == "+" {
+            tokens = push(tokens, tok_new("PLUS", "+", line, col))
+            pos = pos + 1
+            col = col + 1
+        } else if ch == "-" {
+            // Check for ->
+            if pos + 1 < src_len {
+                if str_char_at(source, pos + 1) == ">" {
+                    tokens = push(tokens, tok_new("ARROW", "->", line, col))
+                    pos = pos + 2
+                    col = col + 2
+                } else {
+                    tokens = push(tokens, tok_new("MINUS", "-", line, col))
+                    pos = pos + 1
+                    col = col + 1
+                }
+            } else {
+                tokens = push(tokens, tok_new("MINUS", "-", line, col))
+                pos = pos + 1
+                col = col + 1
+            }
+        } else if ch == "*" {
+            tokens = push(tokens, tok_new("STAR", "*", line, col))
+            pos = pos + 1
+            col = col + 1
+        } else if ch == "%" {
+            tokens = push(tokens, tok_new("PERCENT", "%", line, col))
+            pos = pos + 1
+            col = col + 1
+        } else if ch == "[" {
+            tokens = push(tokens, tok_new("LBRACKET", "[", line, col))
+            pos = pos + 1
+            col = col + 1
+        } else if ch == "]" {
+            tokens = push(tokens, tok_new("RBRACKET", "]", line, col))
+            pos = pos + 1
+            col = col + 1
+        } else if ch == str_from_bytes([34]) {
+            // String literal
+            let start_col = col
+            pos = pos + 1
+            col = col + 1
+            var str_val = ""
+            var scanning_str = true
+            while scanning_str {
+                if pos >= src_len {
+                    scanning_str = false
+                } else {
+                    let sc = str_char_at(source, pos)
+                    if sc == str_from_bytes([34]) {
+                        pos = pos + 1
+                        col = col + 1
+                        scanning_str = false
+                    } else if sc == str_from_bytes([92]) {
+                        // backslash escape
+                        pos = pos + 1
+                        col = col + 1
+                        if pos < src_len {
+                            let esc = str_char_at(source, pos)
+                            if esc == "n" {
+                                str_val = str_val + _nl()
+                            } else if esc == "t" {
+                                str_val = str_val + str_from_bytes([9])
+                            } else if esc == str_from_bytes([34]) {
+                                str_val = str_val + str_from_bytes([34])
+                            } else if esc == str_from_bytes([92]) {
+                                str_val = str_val + str_from_bytes([92])
+                            } else {
+                                str_val = str_val + esc
+                            }
+                            pos = pos + 1
+                            col = col + 1
+                        }
+                    } else {
+                        str_val = str_val + sc
+                        pos = pos + 1
+                        col = col + 1
+                    }
+                }
+            }
+            tokens = push(tokens, tok_new("STRING", str_val, line, start_col))
+        } else if ch == "=" {
+            if pos + 1 < src_len {
+                if str_char_at(source, pos + 1) == "=" {
+                    tokens = push(tokens, tok_new("EQEQ", "==", line, col))
+                    pos = pos + 2
+                    col = col + 2
+                } else {
+                    tokens = push(tokens, tok_new("EQ", "=", line, col))
+                    pos = pos + 1
+                    col = col + 1
+                }
+            } else {
+                tokens = push(tokens, tok_new("EQ", "=", line, col))
+                pos = pos + 1
+                col = col + 1
+            }
+        } else if ch == "!" {
+            if pos + 1 < src_len {
+                if str_char_at(source, pos + 1) == "=" {
+                    tokens = push(tokens, tok_new("NEQ", "!=", line, col))
+                    pos = pos + 2
+                    col = col + 2
+                } else {
+                    tokens = push(tokens, tok_new("NOT", "!", line, col))
+                    pos = pos + 1
+                    col = col + 1
+                }
+            } else {
+                tokens = push(tokens, tok_new("NOT", "!", line, col))
+                pos = pos + 1
+                col = col + 1
+            }
+        } else if ch == "<" {
+            if pos + 1 < src_len {
+                if str_char_at(source, pos + 1) == "=" {
+                    tokens = push(tokens, tok_new("LTEQ", "<=", line, col))
+                    pos = pos + 2
+                    col = col + 2
+                } else {
+                    tokens = push(tokens, tok_new("LT", "<", line, col))
+                    pos = pos + 1
+                    col = col + 1
+                }
+            } else {
+                tokens = push(tokens, tok_new("LT", "<", line, col))
+                pos = pos + 1
+                col = col + 1
+            }
+        } else if ch == ">" {
+            if pos + 1 < src_len {
+                if str_char_at(source, pos + 1) == "=" {
+                    tokens = push(tokens, tok_new("GTEQ", ">=", line, col))
+                    pos = pos + 2
+                    col = col + 2
+                } else {
+                    tokens = push(tokens, tok_new("GT", ">", line, col))
+                    pos = pos + 1
+                    col = col + 1
+                }
+            } else {
+                tokens = push(tokens, tok_new("GT", ">", line, col))
+                pos = pos + 1
+                col = col + 1
+            }
+        } else {
+            // Skip unknown character
+            pos = pos + 1
+            col = col + 1
+        }
+    }
+
+    tokens = push(tokens, tok_new("EOF", "", line, col))
+    return tokens
+}
+
+// ============================================================
+// PHASE 3: Minimal Parser (inline)
+// ============================================================
+// AST nodes are heterogeneous arrays:
+//   ["int", "42"]
+//   ["ident", "x"]
+//   ["+", left, right]  where left/right are nested arrays
+//   ["call", "fname", arg1, arg2, ...]
+//   ["println", expr]
+//   ["let", "name", expr]
+//   ["var", "name", expr]
+//   ["assign", "name", expr]
+//   ["return", expr]
+//   ["if", cond, then_stmts, else_stmts]
+//   ["while", cond, body_stmts]
+//   ["fn", "name", ["param1", "param2"], body_stmts]
+//   ["program", fn1, fn2, ...]
+//   ["string", "hello"]
+//   ["array", elem1, elem2, ...]
+//   ["index", arr_expr, idx_expr]
+//   ["len", expr]
+//   ["push", arr_expr, val_expr]
+//   ["print_str", expr]
+
+// Parser state: global mutable
+var _tokens = []
+var _tpos = 0
+
+fn p_peek_type() -> String {
+    if _tpos >= len(_tokens) {
+        return "EOF"
+    }
+    let tok = _tokens[_tpos]
+    return tok[0]
+}
+
+fn p_peek_val() -> String {
+    if _tpos >= len(_tokens) {
+        return ""
+    }
+    let tok = _tokens[_tpos]
+    return tok[1]
+}
+
+fn p_advance() -> [String] {
+    let tok = _tokens[_tpos]
+    _tpos = _tpos + 1
+    return tok
+}
+
+fn p_expect(typ: String) -> [String] {
+    if p_peek_type() != typ {
+        println("Parse error: expected " + typ + " got " + p_peek_type() + " '" + p_peek_val() + "'")
+    }
+    return p_advance()
+}
+
+fn p_expect_kw(kw: String) -> [String] {
+    if p_peek_type() != "KW" {
+        println("Parse error: expected keyword " + kw + " got " + p_peek_type())
+    }
+    if p_peek_val() != kw {
+        println("Parse error: expected keyword " + kw + " got " + p_peek_val())
+    }
+    return p_advance()
+}
+
+fn p_at(typ: String) -> bool {
+    return p_peek_type() == typ
+}
+
+fn p_at_kw(kw: String) -> bool {
+    return p_peek_type() == "KW" && p_peek_val() == kw
+}
+
+// --- Expression parsing with precedence ---
+
+fn parse_expr() -> [String] {
+    return parse_comparison()
+}
+
+fn parse_comparison() -> [String] {
+    var left = parse_addition()
+    var cont = true
+    while cont {
+        if p_at("EQEQ") {
+            p_advance()
+            let right = parse_addition()
+            left = ["==", left, right]
+        } else if p_at("NEQ") {
+            p_advance()
+            let right = parse_addition()
+            left = ["!=", left, right]
+        } else if p_at("LT") {
+            p_advance()
+            let right = parse_addition()
+            left = ["<", left, right]
+        } else if p_at("GT") {
+            p_advance()
+            let right = parse_addition()
+            left = [">", left, right]
+        } else if p_at("LTEQ") {
+            p_advance()
+            let right = parse_addition()
+            left = ["<=", left, right]
+        } else if p_at("GTEQ") {
+            p_advance()
+            let right = parse_addition()
+            left = [">=", left, right]
+        } else {
+            cont = false
+        }
+    }
+    return left
+}
+
+fn parse_addition() -> [String] {
+    var left = parse_multiplication()
+    var cont = true
+    while cont {
+        if p_at("PLUS") {
+            p_advance()
+            let right = parse_multiplication()
+            left = ["+", left, right]
+        } else if p_at("MINUS") {
+            p_advance()
+            let right = parse_multiplication()
+            left = ["-", left, right]
+        } else {
+            cont = false
+        }
+    }
+    return left
+}
+
+fn parse_multiplication() -> [String] {
+    var left = parse_unary()
+    var cont = true
+    while cont {
+        if p_at("STAR") {
+            p_advance()
+            let right = parse_unary()
+            left = ["*", left, right]
+        } else if p_at("SLASH") {
+            p_advance()
+            let right = parse_unary()
+            left = ["/", left, right]
+        } else if p_at("PERCENT") {
+            p_advance()
+            let right = parse_unary()
+            left = ["%", left, right]
+        } else {
+            cont = false
+        }
+    }
+    return left
+}
+
+fn parse_unary() -> [String] {
+    if p_at("MINUS") {
+        p_advance()
+        let expr = parse_unary()
+        return ["neg", expr]
+    }
+    return parse_primary()
+}
+
+fn parse_primary() -> [String] {
+    if p_at("INT") {
+        let tok = p_advance()
+        return ["int", tok[1]]
+    }
+
+    if p_at("STRING") {
+        let tok = p_advance()
+        return ["string", tok[1]]
+    }
+
+    if p_at("LPAREN") {
+        p_advance()
+        let expr = parse_expr()
+        p_expect("RPAREN")
+        return expr
+    }
+
+    // Array literal: [expr, expr, ...]
+    if p_at("LBRACKET") {
+        p_advance()
+        var elems = []
+        if p_at("RBRACKET") {
+            p_advance()
+            return ["array"]
+        }
+        elems = push(elems, parse_expr())
+        while p_at("COMMA") {
+            p_advance()
+            elems = push(elems, parse_expr())
+        }
+        p_expect("RBRACKET")
+        var node = ["array"]
+        var ai = 0
+        while ai < len(elems) {
+            node = push(node, elems[ai])
+            ai = ai + 1
+        }
+        return node
+    }
+
+    if p_at_kw("println") {
+        p_advance()
+        p_expect("LPAREN")
+        let expr = parse_expr()
+        p_expect("RPAREN")
+        return ["println", expr]
+    }
+
+    if p_at_kw("print_str") {
+        p_advance()
+        p_expect("LPAREN")
+        let expr = parse_expr()
+        p_expect("RPAREN")
+        return ["print_str", expr]
+    }
+
+    if p_at("IDENT") {
+        let tok = p_advance()
+        let name = tok[1]
+
+        // len(expr) builtin
+        if name == "len" {
+            if p_at("LPAREN") {
+                p_advance()
+                let arg = parse_expr()
+                p_expect("RPAREN")
+                return ["len", arg]
+            }
+        }
+
+        // push(arr, val) builtin
+        if name == "push" {
+            if p_at("LPAREN") {
+                p_advance()
+                let arr_arg = parse_expr()
+                p_expect("COMMA")
+                let val_arg = parse_expr()
+                p_expect("RPAREN")
+                return ["push", arr_arg, val_arg]
+            }
+        }
+
+        // Check for function call
+        if p_at("LPAREN") {
+            p_advance()
+            var args = []
+            if p_at("RPAREN") {
+                p_advance()
+                return ["call", name]
+            }
+            args = push(args, parse_expr())
+            while p_at("COMMA") {
+                p_advance()
+                args = push(args, parse_expr())
+            }
+            p_expect("RPAREN")
+            // Build call node: ["call", name, arg1, arg2, ...]
+            var node = ["call", name]
+            var i = 0
+            while i < len(args) {
+                node = push(node, args[i])
+                i = i + 1
+            }
+            return node
+        }
+
+        // Check for array indexing: ident[expr]
+        if p_at("LBRACKET") {
+            p_advance()
+            let idx_expr = parse_expr()
+            p_expect("RBRACKET")
+            return ["index", ["ident", name], idx_expr]
+        }
+
+        return ["ident", name]
+    }
+
+    println("Parse error: unexpected token " + p_peek_type() + " '" + p_peek_val() + "'")
+    p_advance()
+    return ["int", "0"]
+}
+
+// --- Statement parsing ---
+
+fn parse_stmt() -> [String] {
+    if p_at_kw("let") {
+        p_advance()
+        let name_tok = p_expect("IDENT")
+        // Skip optional type annotation
+        if p_at("COLON") {
+            p_advance()
+            // Skip type tokens until = sign
+            while p_peek_type() != "EQ" && p_peek_type() != "EOF" {
+                p_advance()
+            }
+        }
+        p_expect("EQ")
+        let expr = parse_expr()
+        return ["let", name_tok[1], expr]
+    }
+
+    if p_at_kw("var") {
+        p_advance()
+        let name_tok = p_expect("IDENT")
+        if p_at("COLON") {
+            p_advance()
+            while p_peek_type() != "EQ" && p_peek_type() != "EOF" {
+                p_advance()
+            }
+        }
+        p_expect("EQ")
+        let expr = parse_expr()
+        return ["var", name_tok[1], expr]
+    }
+
+    if p_at_kw("return") {
+        p_advance()
+        if p_at("RBRACE") {
+            return ["return", ["int", "0"]]
+        }
+        let expr = parse_expr()
+        return ["return", expr]
+    }
+
+    if p_at_kw("if") {
+        return parse_if_stmt()
+    }
+
+    if p_at_kw("while") {
+        return parse_while_stmt()
+    }
+
+    // Expression statement (could be assignment or println or call)
+    let expr = parse_expr()
+
+    // Check for array indexing after expression (e.g. arr[i] = val)
+    if p_at("LBRACKET") {
+        if expr[0] == "ident" {
+            p_advance()
+            let idx_e = parse_expr()
+            p_expect("RBRACKET")
+            if p_at("EQ") {
+                p_advance()
+                let val2 = parse_expr()
+                return ["index_assign", expr[1], idx_e, val2]
+            }
+            // It's just arr[i] as a statement
+            let idx_node = ["index", expr, idx_e]
+            return ["expr_stmt", idx_node]
+        }
+    }
+
+    // Check for assignment
+    if p_at("EQ") {
+        p_advance()
+        let val = parse_expr()
+        // expr should be ["ident", name]
+        if expr[0] == "ident" {
+            return ["assign", expr[1], val]
+        }
+        println("Parse error: invalid assignment target")
+        return ["assign", "?", val]
+    }
+
+    // println as expression-statement
+    if expr[0] == "println" {
+        return expr
+    }
+
+    // Function call as statement
+    if expr[0] == "call" {
+        return ["expr_stmt", expr]
+    }
+
+    return ["expr_stmt", expr]
+}
+
+fn parse_block() -> [String] {
+    p_expect("LBRACE")
+    var stmts = []
+    while p_peek_type() != "RBRACE" && p_peek_type() != "EOF" {
+        let s = parse_stmt()
+        stmts = push(stmts, s)
+    }
+    p_expect("RBRACE")
+    return stmts
+}
+
+fn parse_if_stmt() -> [String] {
+    p_expect_kw("if")
+    let cond = parse_expr()
+    let then_block = parse_block()
+    var else_block = []
+    if p_at_kw("else") {
+        p_advance()
+        if p_at_kw("if") {
+            // else if -> wrap in array
+            let elif_stmt = parse_if_stmt()
+            else_block = [elif_stmt]
+        } else {
+            else_block = parse_block()
+        }
+    }
+    return ["if", cond, then_block, else_block]
+}
+
+fn parse_while_stmt() -> [String] {
+    p_expect_kw("while")
+    let cond = parse_expr()
+    let body = parse_block()
+    return ["while", cond, body]
+}
+
+fn parse_fn_def() -> [String] {
+    p_expect_kw("fn")
+    let name_tok = p_expect("IDENT")
+    p_expect("LPAREN")
+    var params = []
+    if p_peek_type() != "RPAREN" {
+        let p1 = p_expect("IDENT")
+        params = push(params, p1[1])
+        // Skip type annotation
+        if p_at("COLON") {
+            p_advance()
+            while p_peek_type() != "COMMA" && p_peek_type() != "RPAREN" && p_peek_type() != "EOF" {
+                p_advance()
+            }
+        }
+        while p_at("COMMA") {
+            p_advance()
+            let pn = p_expect("IDENT")
+            params = push(params, pn[1])
+            if p_at("COLON") {
+                p_advance()
+                while p_peek_type() != "COMMA" && p_peek_type() != "RPAREN" && p_peek_type() != "EOF" {
+                    p_advance()
+                }
+            }
+        }
+    }
+    p_expect("RPAREN")
+    // Skip return type annotation
+    if p_at("ARROW") {
+        p_advance()
+        // Skip type tokens until {
+        while p_peek_type() != "LBRACE" && p_peek_type() != "EOF" {
+            p_advance()
+        }
+    }
+    let body = parse_block()
+    return ["fn", name_tok[1], params, body]
+}
+
+fn parse_program() -> [String] {
+    var fns = []
+    while p_peek_type() != "EOF" {
+        if p_at_kw("fn") {
+            fns = push(fns, parse_fn_def())
+        } else {
+            println("Parse error: expected fn at top level, got " + p_peek_type())
+            p_advance()
+        }
+    }
+    return fns
+}
+
+// ============================================================
+// PHASE 4: x86-64 Code Generator (inline)
+// ============================================================
+
+// Register constants
+fn REG_RAX() -> i64 { return 0 }
+fn REG_RCX() -> i64 { return 1 }
+fn REG_RDX() -> i64 { return 2 }
+fn REG_RBX() -> i64 { return 3 }
+fn REG_RSP() -> i64 { return 4 }
+fn REG_RBP() -> i64 { return 5 }
+fn REG_RSI() -> i64 { return 6 }
+fn REG_RDI() -> i64 { return 7 }
+
+fn arg_reg(index: i64) -> i64 {
+    if index == 0 { return 7 }
+    if index == 1 { return 6 }
+    if index == 2 { return 2 }
+    if index == 3 { return 1 }
+    return 0
+}
+
+// Byte emission
+fn emit_u8(code: [i64], b: i64) -> [i64] {
+    var val = b % 256
+    if val < 0 {
+        val = val + 256
+    }
+    return push(code, val)
+}
+
+fn emit_u32_le(code: [i64], val: i64) -> [i64] {
+    var v = val
+    if v < 0 {
+        v = v + 4294967296
+    }
+    code = push(code, v % 256)
+    v = v / 256
+    code = push(code, v % 256)
+    v = v / 256
+    code = push(code, v % 256)
+    v = v / 256
+    code = push(code, v % 256)
+    return code
+}
+
+fn emit_u64_le(code: [i64], val: i64) -> [i64] {
+    var v = val
+    if v < 0 {
+        v = v + 4294967296 * 4294967296
+    }
+    var i = 0
+    while i < 8 {
+        code = push(code, v % 256)
+        v = v / 256
+        i = i + 1
+    }
+    return code
+}
+
+fn emit_u16_le(code: [i64], val: i64) -> [i64] {
+    code = push(code, val % 256)
+    code = push(code, (val / 256) % 256)
+    return code
+}
+
+// REX prefix
+fn rex_for_regs(reg: i64, rm: i64) -> i64 {
+    var base = 72
+    if reg >= 8 {
+        base = base + 4
+    }
+    if rm >= 8 {
+        base = base + 1
+    }
+    return base
+}
+
+fn modrm_reg(reg: i64, rm: i64) -> i64 {
+    return 192 + (reg % 8) * 8 + (rm % 8)
+}
+
+fn modrm_disp8(reg: i64) -> i64 {
+    return 64 + (reg % 8) * 8 + 5
+}
+
+// mov reg, imm64
+fn emit_mov_reg_imm64(code: [i64], reg: i64, imm: i64) -> [i64] {
+    if reg >= 8 {
+        code = emit_u8(code, 73)
+    } else {
+        code = emit_u8(code, 72)
+    }
+    code = emit_u8(code, 184 + (reg % 8))
+    code = emit_u64_le(code, imm)
+    return code
+}
+
+// mov dst, src
+fn emit_mov_reg_reg(code: [i64], dst: i64, src: i64) -> [i64] {
+    code = emit_u8(code, rex_for_regs(src, dst))
+    code = emit_u8(code, 137)
+    code = emit_u8(code, modrm_reg(src, dst))
+    return code
+}
+
+// push reg
+fn emit_push_reg(code: [i64], reg: i64) -> [i64] {
+    if reg >= 8 {
+        code = emit_u8(code, 65)
+        code = emit_u8(code, 80 + (reg % 8))
+    } else {
+        code = emit_u8(code, 80 + reg)
+    }
+    return code
+}
+
+// pop reg
+fn emit_pop_reg(code: [i64], reg: i64) -> [i64] {
+    if reg >= 8 {
+        code = emit_u8(code, 65)
+        code = emit_u8(code, 88 + (reg % 8))
+    } else {
+        code = emit_u8(code, 88 + reg)
+    }
+    return code
+}
+
+// add dst, src
+fn emit_add_reg_reg(code: [i64], dst: i64, src: i64) -> [i64] {
+    code = emit_u8(code, rex_for_regs(src, dst))
+    code = emit_u8(code, 1)
+    code = emit_u8(code, modrm_reg(src, dst))
+    return code
+}
+
+// sub dst, src
+fn emit_sub_reg_reg(code: [i64], dst: i64, src: i64) -> [i64] {
+    code = emit_u8(code, rex_for_regs(src, dst))
+    code = emit_u8(code, 41)
+    code = emit_u8(code, modrm_reg(src, dst))
+    return code
+}
+
+// imul dst, src
+fn emit_imul_reg_reg(code: [i64], dst: i64, src: i64) -> [i64] {
+    code = emit_u8(code, rex_for_regs(dst, src))
+    code = emit_u8(code, 15)
+    code = emit_u8(code, 175)
+    code = emit_u8(code, modrm_reg(dst, src))
+    return code
+}
+
+// cmp a, b
+fn emit_cmp_reg_reg(code: [i64], a: i64, b: i64) -> [i64] {
+    code = emit_u8(code, rex_for_regs(b, a))
+    code = emit_u8(code, 57)
+    code = emit_u8(code, modrm_reg(b, a))
+    return code
+}
+
+// Store reg to [rbp - offset]
+fn emit_store_local(code: [i64], reg: i64, offset: i64) -> [i64] {
+    var neg_off = 0 - offset
+    code = emit_u8(code, rex_for_regs(reg, 5))
+    code = emit_u8(code, 137)
+    code = emit_u8(code, modrm_disp8(reg))
+    var byte_val = neg_off % 256
+    if byte_val < 0 {
+        byte_val = byte_val + 256
+    }
+    code = emit_u8(code, byte_val)
+    return code
+}
+
+// Load [rbp - offset] to reg
+fn emit_load_local(code: [i64], offset: i64, reg: i64) -> [i64] {
+    var neg_off = 0 - offset
+    code = emit_u8(code, rex_for_regs(reg, 5))
+    code = emit_u8(code, 139)
+    code = emit_u8(code, modrm_disp8(reg))
+    var byte_val = neg_off % 256
+    if byte_val < 0 {
+        byte_val = byte_val + 256
+    }
+    code = emit_u8(code, byte_val)
+    return code
+}
+
+// Function prologue: push rbp; mov rbp, rsp; sub rsp, N
+fn emit_prologue(code: [i64], stack_size: i64) -> [i64] {
+    code = emit_u8(code, 85)
+    code = emit_u8(code, 72)
+    code = emit_u8(code, 137)
+    code = emit_u8(code, 229)
+    if stack_size > 0 {
+        code = emit_u8(code, 72)
+        code = emit_u8(code, 131)
+        code = emit_u8(code, 236)
+        code = emit_u8(code, stack_size % 256)
+    }
+    return code
+}
+
+// Function epilogue: mov rsp, rbp; pop rbp; ret
+fn emit_epilogue(code: [i64]) -> [i64] {
+    code = emit_u8(code, 72)
+    code = emit_u8(code, 137)
+    code = emit_u8(code, 236)
+    code = emit_u8(code, 93)
+    code = emit_u8(code, 195)
+    return code
+}
+
+// syscall instruction
+fn emit_syscall_inst(code: [i64]) -> [i64] {
+    code = emit_u8(code, 15)
+    code = emit_u8(code, 5)
+    return code
+}
+
+// --- Locals management ---
+var _locals: [String] = []
+
+fn locals_find(name: String) -> i64 {
+    var i = 0
+    while i < len(_locals) {
+        if _locals[i] == name {
+            return i
+        }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+fn locals_offset(idx: i64) -> i64 {
+    return (idx + 1) * 8
+}
+
+fn locals_add(name: String) -> i64 {
+    _locals = push(_locals, name)
+    return len(_locals) - 1
+}
+
+// --- Label/fixup management ---
+var _label_counter = 0
+var _fixup_positions: [i64] = []
+var _fixup_labels: [String] = []
+var _label_names: [String] = []
+var _label_addrs: [i64] = []
+
+fn fresh_label(prefix: String) -> String {
+    let lbl = prefix + "_" + to_string(_label_counter)
+    _label_counter = _label_counter + 1
+    return lbl
+}
+
+fn add_fixup(pos: i64, label: String) -> i64 {
+    _fixup_positions = push(_fixup_positions, pos)
+    _fixup_labels = push(_fixup_labels, label)
+    return 0
+}
+
+fn add_label(name: String, addr: i64) -> i64 {
+    _label_names = push(_label_names, name)
+    _label_addrs = push(_label_addrs, addr)
+    return 0
+}
+
+// --- Function table ---
+var _func_names: [String] = []
+var _func_addrs: [i64] = []
+
+// --- String data section ---
+// Collected during codegen, emitted after code
+var _string_data: [String] = []
+var _string_offsets: [i64] = []
+var _string_lengths: [i64] = []
+
+fn add_string_literal(s: String) -> i64 {
+    // Check if already added
+    var i = 0
+    while i < len(_string_data) {
+        if _string_data[i] == s {
+            return i
+        }
+        i = i + 1
+    }
+    // Compute offset: sum of all previous string byte lengths
+    var offset = 0
+    var j = 0
+    while j < len(_string_data) {
+        offset = offset + _string_lengths[j]
+        j = j + 1
+    }
+    let slen = len(s)
+    _string_data = push(_string_data, s)
+    _string_offsets = push(_string_offsets, offset)
+    _string_lengths = push(_string_lengths, slen)
+    return len(_string_data) - 1
+}
+
+fn register_function(name: String, addr: i64) -> i64 {
+    _func_names = push(_func_names, name)
+    _func_addrs = push(_func_addrs, addr)
+    return 0
+}
+
+// --- Expression compiler: result in RAX ---
+fn compile_expr(code: [i64], expr: [String]) -> [i64] {
+    let kind = expr[0]
+
+    if kind == "int" {
+        let val = int(expr[1])
+        code = emit_mov_reg_imm64(code, REG_RAX(), val)
+        return code
+    }
+
+    if kind == "ident" {
+        let name = expr[1]
+        let idx = locals_find(name)
+        if idx >= 0 {
+            let off = locals_offset(idx)
+            code = emit_load_local(code, off, REG_RAX())
+        } else {
+            println("codegen error: undefined variable '" + name + "'")
+            code = emit_mov_reg_imm64(code, REG_RAX(), 0)
+        }
+        return code
+    }
+
+    if kind == "neg" {
+        code = compile_expr(code, expr[1])
+        // neg rax: 48 F7 D8
+        code = emit_u8(code, 72)
+        code = emit_u8(code, 247)
+        code = emit_u8(code, 216)
+        return code
+    }
+
+    if kind == "+" {
+        code = compile_expr(code, expr[2])
+        code = emit_push_reg(code, REG_RAX())
+        code = compile_expr(code, expr[1])
+        code = emit_pop_reg(code, REG_RCX())
+        code = emit_add_reg_reg(code, REG_RAX(), REG_RCX())
+        return code
+    }
+
+    if kind == "-" {
+        code = compile_expr(code, expr[2])
+        code = emit_push_reg(code, REG_RAX())
+        code = compile_expr(code, expr[1])
+        code = emit_pop_reg(code, REG_RCX())
+        code = emit_sub_reg_reg(code, REG_RAX(), REG_RCX())
+        return code
+    }
+
+    if kind == "*" {
+        code = compile_expr(code, expr[2])
+        code = emit_push_reg(code, REG_RAX())
+        code = compile_expr(code, expr[1])
+        code = emit_pop_reg(code, REG_RCX())
+        code = emit_imul_reg_reg(code, REG_RAX(), REG_RCX())
+        return code
+    }
+
+    if kind == "/" {
+        // dividend in RAX, divisor in RCX
+        // Need: compile divisor, push, compile dividend, pop rcx, cqo, idiv rcx
+        code = compile_expr(code, expr[2])
+        code = emit_push_reg(code, REG_RAX())
+        code = compile_expr(code, expr[1])
+        code = emit_pop_reg(code, REG_RCX())
+        // cqo: 48 99
+        code = emit_u8(code, 72)
+        code = emit_u8(code, 153)
+        // idiv rcx: 48 F7 F9
+        code = emit_u8(code, 72)
+        code = emit_u8(code, 247)
+        code = emit_u8(code, 249)
+        return code
+    }
+
+    if kind == "%" {
+        code = compile_expr(code, expr[2])
+        code = emit_push_reg(code, REG_RAX())
+        code = compile_expr(code, expr[1])
+        code = emit_pop_reg(code, REG_RCX())
+        // cqo
+        code = emit_u8(code, 72)
+        code = emit_u8(code, 153)
+        // idiv rcx
+        code = emit_u8(code, 72)
+        code = emit_u8(code, 247)
+        code = emit_u8(code, 249)
+        // remainder in RDX, move to RAX
+        code = emit_mov_reg_reg(code, REG_RAX(), REG_RDX())
+        return code
+    }
+
+    // Comparison operators: result 0 or 1 in RAX
+    if kind == "==" {
+        code = compile_expr(code, expr[2])
+        code = emit_push_reg(code, REG_RAX())
+        code = compile_expr(code, expr[1])
+        code = emit_pop_reg(code, REG_RCX())
+        code = emit_cmp_reg_reg(code, REG_RAX(), REG_RCX())
+        // sete al: 0F 94 C0
+        code = emit_u8(code, 15)
+        code = emit_u8(code, 148)
+        code = emit_u8(code, 192)
+        // movzx rax, al: 48 0F B6 C0
+        code = emit_u8(code, 72)
+        code = emit_u8(code, 15)
+        code = emit_u8(code, 182)
+        code = emit_u8(code, 192)
+        return code
+    }
+
+    if kind == "!=" {
+        code = compile_expr(code, expr[2])
+        code = emit_push_reg(code, REG_RAX())
+        code = compile_expr(code, expr[1])
+        code = emit_pop_reg(code, REG_RCX())
+        code = emit_cmp_reg_reg(code, REG_RAX(), REG_RCX())
+        // setne al: 0F 95 C0
+        code = emit_u8(code, 15)
+        code = emit_u8(code, 149)
+        code = emit_u8(code, 192)
+        code = emit_u8(code, 72)
+        code = emit_u8(code, 15)
+        code = emit_u8(code, 182)
+        code = emit_u8(code, 192)
+        return code
+    }
+
+    if kind == "<" {
+        code = compile_expr(code, expr[2])
+        code = emit_push_reg(code, REG_RAX())
+        code = compile_expr(code, expr[1])
+        code = emit_pop_reg(code, REG_RCX())
+        code = emit_cmp_reg_reg(code, REG_RAX(), REG_RCX())
+        // setl al: 0F 9C C0
+        code = emit_u8(code, 15)
+        code = emit_u8(code, 156)
+        code = emit_u8(code, 192)
+        code = emit_u8(code, 72)
+        code = emit_u8(code, 15)
+        code = emit_u8(code, 182)
+        code = emit_u8(code, 192)
+        return code
+    }
+
+    if kind == ">" {
+        // a > b: swap and use setl
+        code = compile_expr(code, expr[1])
+        code = emit_push_reg(code, REG_RAX())
+        code = compile_expr(code, expr[2])
+        code = emit_pop_reg(code, REG_RCX())
+        code = emit_cmp_reg_reg(code, REG_RAX(), REG_RCX())
+        code = emit_u8(code, 15)
+        code = emit_u8(code, 156)
+        code = emit_u8(code, 192)
+        code = emit_u8(code, 72)
+        code = emit_u8(code, 15)
+        code = emit_u8(code, 182)
+        code = emit_u8(code, 192)
+        return code
+    }
+
+    if kind == "<=" {
+        code = compile_expr(code, expr[1])
+        code = emit_push_reg(code, REG_RAX())
+        code = compile_expr(code, expr[2])
+        code = emit_pop_reg(code, REG_RCX())
+        code = emit_cmp_reg_reg(code, REG_RAX(), REG_RCX())
+        // setge al (swapped)
+        code = emit_u8(code, 15)
+        code = emit_u8(code, 157)
+        code = emit_u8(code, 192)
+        code = emit_u8(code, 72)
+        code = emit_u8(code, 15)
+        code = emit_u8(code, 182)
+        code = emit_u8(code, 192)
+        return code
+    }
+
+    if kind == ">=" {
+        code = compile_expr(code, expr[2])
+        code = emit_push_reg(code, REG_RAX())
+        code = compile_expr(code, expr[1])
+        code = emit_pop_reg(code, REG_RCX())
+        code = emit_cmp_reg_reg(code, REG_RAX(), REG_RCX())
+        // setge al
+        code = emit_u8(code, 15)
+        code = emit_u8(code, 157)
+        code = emit_u8(code, 192)
+        code = emit_u8(code, 72)
+        code = emit_u8(code, 15)
+        code = emit_u8(code, 182)
+        code = emit_u8(code, 192)
+        return code
+    }
+
+    if kind == "println" {
+        // Compile the expression, result in RAX
+        // Move to RDI, call _vx_print_int runtime stub
+        code = compile_expr(code, expr[1])
+        code = emit_mov_reg_reg(code, REG_RDI(), REG_RAX())
+        // call _vx_print_int (fixup)
+        code = emit_u8(code, 232)
+        add_fixup(len(code), "_vx_print_int")
+        code = emit_u32_le(code, 0)
+        return code
+    }
+
+    if kind == "string" {
+        // String literal: stored in data section as [u64 len][bytes...]
+        // RAX = pointer to the struct (RIP-relative lea)
+        let str_idx = add_string_literal(expr[1])
+        // lea rax, [rip + disp32]: 48 8D 05 <rel32>
+        code = emit_u8(code, 72)
+        code = emit_u8(code, 141)
+        code = emit_u8(code, 5)
+        add_fixup(len(code), "_str_" + to_string(str_idx))
+        code = emit_u32_le(code, 0)
+        return code
+    }
+
+    if kind == "print_str" {
+        // print_str(expr) — expr should be a string (ptr to [len, bytes...])
+        code = compile_expr(code, expr[1])
+        // RAX = ptr to string struct [u64 len, bytes...]
+        code = emit_mov_reg_reg(code, REG_RDI(), REG_RAX())
+        // call _vx_print_str
+        code = emit_u8(code, 232)
+        add_fixup(len(code), "_vx_print_str")
+        code = emit_u32_le(code, 0)
+        return code
+    }
+
+    if kind == "array" {
+        // Array literal: allocate (n+1)*8 bytes using mmap, store len then elements
+        let nelems = len(expr) - 1
+        // call _vx_alloc with size = (nelems+1)*8 in RDI
+        let alloc_size = (nelems + 1) * 8
+        code = emit_mov_reg_imm64(code, REG_RDI(), alloc_size)
+        code = emit_u8(code, 232)
+        add_fixup(len(code), "_vx_alloc")
+        code = emit_u32_le(code, 0)
+        // RAX = ptr to allocated memory
+        // Store length at [RAX]
+        code = emit_push_reg(code, REG_RAX())  // save base ptr
+        // mov [rax], nelems: mov rcx, nelems; mov [rax], rcx
+        code = emit_mov_reg_imm64(code, REG_RCX(), nelems)
+        // mov [rax], rcx: 48 89 08
+        code = emit_u8(code, 72)
+        code = emit_u8(code, 137)
+        code = emit_u8(code, 8)
+        // Store each element at [RAX + (i+1)*8]
+        var ei = 0
+        while ei < nelems {
+            // Save base ptr (it's on stack top)
+            code = compile_expr(code, expr[ei + 1])
+            // RAX = element value, base ptr is at [RSP]
+            code = emit_mov_reg_reg(code, REG_RCX(), REG_RAX())
+            // Load base ptr from stack (peek, don't pop)
+            // mov rax, [rsp]: 48 8B 04 24
+            code = emit_u8(code, 72)
+            code = emit_u8(code, 139)
+            code = emit_u8(code, 4)
+            code = emit_u8(code, 36)
+            // mov [rax + (ei+1)*8], rcx
+            // Using: mov [rax + disp32], rcx -> 48 89 88 <disp32>
+            let elem_off = (ei + 1) * 8
+            code = emit_u8(code, 72)
+            code = emit_u8(code, 137)
+            code = emit_u8(code, 136)
+            code = emit_u32_le(code, elem_off)
+            ei = ei + 1
+        }
+        // Pop base ptr back to RAX
+        code = emit_pop_reg(code, REG_RAX())
+        return code
+    }
+
+    if kind == "index" {
+        // Array indexing: arr[i]
+        // Result = arr_ptr[(i+1)*8]
+        code = compile_expr(code, expr[2])  // index -> RAX
+        code = emit_push_reg(code, REG_RAX())
+        code = compile_expr(code, expr[1])  // array ptr -> RAX
+        code = emit_pop_reg(code, REG_RCX())  // index -> RCX
+        // Compute offset: (RCX+1)*8
+        // add rcx, 1: 48 83 C1 01
+        code = emit_u8(code, 72)
+        code = emit_u8(code, 131)
+        code = emit_u8(code, 193)
+        code = emit_u8(code, 1)
+        // shl rcx, 3: 48 C1 E1 03
+        code = emit_u8(code, 72)
+        code = emit_u8(code, 193)
+        code = emit_u8(code, 225)
+        code = emit_u8(code, 3)
+        // add rax, rcx
+        code = emit_add_reg_reg(code, REG_RAX(), REG_RCX())
+        // mov rax, [rax]: 48 8B 00
+        code = emit_u8(code, 72)
+        code = emit_u8(code, 139)
+        code = emit_u8(code, 0)
+        return code
+    }
+
+    if kind == "len" {
+        // len(arr): load first 8 bytes = length
+        code = compile_expr(code, expr[1])
+        // mov rax, [rax]: 48 8B 00
+        code = emit_u8(code, 72)
+        code = emit_u8(code, 139)
+        code = emit_u8(code, 0)
+        return code
+    }
+
+    if kind == "push" {
+        // push(arr, val): call _vx_arr_push(arr_ptr, val) -> new arr ptr in RAX
+        code = compile_expr(code, expr[2])  // val -> RAX
+        code = emit_push_reg(code, REG_RAX())
+        code = compile_expr(code, expr[1])  // arr -> RAX
+        code = emit_mov_reg_reg(code, REG_RDI(), REG_RAX())
+        code = emit_pop_reg(code, REG_RSI())
+        code = emit_u8(code, 232)
+        add_fixup(len(code), "_vx_arr_push")
+        code = emit_u32_le(code, 0)
+        return code
+    }
+
+    if kind == "call" {
+        let fname = expr[1]
+        let argc = len(expr) - 2
+        // Evaluate args right-to-left, push to stack
+        var a = argc - 1
+        while a >= 0 {
+            code = compile_expr(code, expr[a + 2])
+            code = emit_push_reg(code, REG_RAX())
+            a = a - 1
+        }
+        // Pop into arg registers left-to-right
+        var b = 0
+        while b < argc {
+            code = emit_pop_reg(code, arg_reg(b))
+            b = b + 1
+        }
+        // Emit call with fixup
+        code = emit_u8(code, 232)
+        add_fixup(len(code), fname)
+        code = emit_u32_le(code, 0)
+        return code
+    }
+
+    println("codegen warning: unknown expression kind '" + kind + "'")
+    return code
+}
+
+// --- Statement compiler ---
+fn compile_stmt(code: [i64], stmt: [String]) -> [i64] {
+    let kind = stmt[0]
+
+    if kind == "let" {
+        let name = stmt[1]
+        let idx = locals_add(name)
+        code = compile_expr(code, stmt[2])
+        let off = locals_offset(idx)
+        code = emit_store_local(code, REG_RAX(), off)
+        return code
+    }
+
+    if kind == "var" {
+        let name = stmt[1]
+        let idx = locals_add(name)
+        code = compile_expr(code, stmt[2])
+        let off = locals_offset(idx)
+        code = emit_store_local(code, REG_RAX(), off)
+        return code
+    }
+
+    if kind == "assign" {
+        let name = stmt[1]
+        code = compile_expr(code, stmt[2])
+        let idx = locals_find(name)
+        if idx >= 0 {
+            let off = locals_offset(idx)
+            code = emit_store_local(code, REG_RAX(), off)
+        } else {
+            println("codegen error: undefined variable '" + name + "' in assignment")
+        }
+        return code
+    }
+
+    if kind == "return" {
+        code = compile_expr(code, stmt[1])
+        code = emit_epilogue(code)
+        return code
+    }
+
+    if kind == "println" {
+        code = compile_expr(code, stmt)
+        return code
+    }
+
+    if kind == "print_str" {
+        code = compile_expr(code, stmt)
+        return code
+    }
+
+    if kind == "index_assign" {
+        // arr[i] = val
+        let name = stmt[1]
+        let idx_expr = stmt[2]
+        let val_expr = stmt[3]
+        // Compile value
+        code = compile_expr(code, val_expr)
+        code = emit_push_reg(code, REG_RAX())  // save val
+        // Compile index
+        code = compile_expr(code, idx_expr)
+        code = emit_push_reg(code, REG_RAX())  // save index
+        // Load array ptr
+        let idx = locals_find(name)
+        if idx >= 0 {
+            let off = locals_offset(idx)
+            code = emit_load_local(code, off, REG_RAX())
+        } else {
+            println("codegen error: undefined variable '" + name + "' in index assign")
+            code = emit_mov_reg_imm64(code, REG_RAX(), 0)
+        }
+        // RAX = arr ptr, [RSP] = index, [RSP+8] = val
+        code = emit_pop_reg(code, REG_RCX())  // index -> RCX
+        // offset = (RCX+1)*8
+        code = emit_u8(code, 72)
+        code = emit_u8(code, 131)
+        code = emit_u8(code, 193)
+        code = emit_u8(code, 1)
+        code = emit_u8(code, 72)
+        code = emit_u8(code, 193)
+        code = emit_u8(code, 225)
+        code = emit_u8(code, 3)
+        code = emit_add_reg_reg(code, REG_RAX(), REG_RCX())
+        code = emit_pop_reg(code, REG_RCX())  // val -> RCX
+        // mov [rax], rcx: 48 89 08
+        code = emit_u8(code, 72)
+        code = emit_u8(code, 137)
+        code = emit_u8(code, 8)
+        return code
+    }
+
+    if kind == "expr_stmt" {
+        code = compile_expr(code, stmt[1])
+        return code
+    }
+
+    if kind == "if" {
+        let else_label = fresh_label("else")
+        let end_label = fresh_label("endif")
+        // Compile condition
+        code = compile_expr(code, stmt[1])
+        // cmp rax, 0: 48 83 F8 00
+        code = emit_u8(code, 72)
+        code = emit_u8(code, 131)
+        code = emit_u8(code, 248)
+        code = emit_u8(code, 0)
+        // je else_label: 0F 84 <rel32>
+        code = emit_u8(code, 15)
+        code = emit_u8(code, 132)
+        add_fixup(len(code), else_label)
+        code = emit_u32_le(code, 0)
+        // Compile then block
+        let then_stmts = stmt[2]
+        var ti = 0
+        while ti < len(then_stmts) {
+            code = compile_stmt(code, then_stmts[ti])
+            ti = ti + 1
+        }
+        // jmp end_label: E9 <rel32>
+        code = emit_u8(code, 233)
+        add_fixup(len(code), end_label)
+        code = emit_u32_le(code, 0)
+        // else_label:
+        add_label(else_label, len(code))
+        // Compile else block
+        let else_stmts = stmt[3]
+        var ei = 0
+        while ei < len(else_stmts) {
+            code = compile_stmt(code, else_stmts[ei])
+            ei = ei + 1
+        }
+        // end_label:
+        add_label(end_label, len(code))
+        return code
+    }
+
+    if kind == "while" {
+        let loop_label = fresh_label("while")
+        let end_label = fresh_label("endwhile")
+        // loop_label:
+        add_label(loop_label, len(code))
+        // Compile condition
+        code = compile_expr(code, stmt[1])
+        // cmp rax, 0
+        code = emit_u8(code, 72)
+        code = emit_u8(code, 131)
+        code = emit_u8(code, 248)
+        code = emit_u8(code, 0)
+        // je end_label
+        code = emit_u8(code, 15)
+        code = emit_u8(code, 132)
+        add_fixup(len(code), end_label)
+        code = emit_u32_le(code, 0)
+        // Compile body
+        let body_stmts = stmt[2]
+        var bi = 0
+        while bi < len(body_stmts) {
+            code = compile_stmt(code, body_stmts[bi])
+            bi = bi + 1
+        }
+        // jmp loop_label
+        code = emit_u8(code, 233)
+        add_fixup(len(code), loop_label)
+        code = emit_u32_le(code, 0)
+        // end_label:
+        add_label(end_label, len(code))
+        return code
+    }
+
+    println("codegen warning: unknown statement kind '" + kind + "'")
+    return code
+}
+
+// --- Function compiler ---
+fn compile_function(code: [i64], func: [String]) -> [i64] {
+    let name = func[1]
+    let params = func[2]
+    let body = func[3]
+
+    register_function(name, len(code))
+
+    // Reset locals
+    _locals = []
+
+    // Add params as locals
+    var p = 0
+    while p < len(params) {
+        locals_add(params[p])
+        p = p + 1
+    }
+
+    // Stack size: room for 16 locals (128 bytes), aligned to 16
+    let stack_size = 128
+
+    // Emit prologue
+    code = emit_prologue(code, stack_size)
+
+    // Store argument registers to local slots
+    var a = 0
+    while a < len(params) {
+        let off = locals_offset(a)
+        code = emit_store_local(code, arg_reg(a), off)
+        a = a + 1
+    }
+
+    // Compile body statements
+    var si = 0
+    while si < len(body) {
+        code = compile_stmt(code, body[si])
+        si = si + 1
+    }
+
+    // Default epilogue (return 0)
+    code = emit_mov_reg_imm64(code, REG_RAX(), 0)
+    code = emit_epilogue(code)
+
+    return code
+}
+
+// --- Runtime: _vx_print_int stub ---
+// Converts i64 in RDI to decimal string on stack, prints with newline
+fn emit_print_int_stub() -> [i64] {
+    var out: [i64] = []
+    // sub rsp, 32
+    out = push(out, 72)
+    out = push(out, 131)
+    out = push(out, 236)
+    out = push(out, 32)
+    // mov rax, rdi
+    out = push(out, 72)
+    out = push(out, 137)
+    out = push(out, 248)
+    // lea rsi, [rsp+31]
+    out = push(out, 72)
+    out = push(out, 141)
+    out = push(out, 116)
+    out = push(out, 36)
+    out = push(out, 31)
+    // mov byte [rsi], 0x0a (newline)
+    out = push(out, 198)
+    out = push(out, 6)
+    out = push(out, 10)
+    // xor rcx, rcx (digit counter)
+    out = push(out, 72)
+    out = push(out, 49)
+    out = push(out, 201)
+    // mov r8, 10
+    out = push(out, 73)
+    out = push(out, 199)
+    out = push(out, 192)
+    out = push(out, 10)
+    out = push(out, 0)
+    out = push(out, 0)
+    out = push(out, 0)
+    // test rax, rax
+    out = push(out, 72)
+    out = push(out, 133)
+    out = push(out, 192)
+    // jns +3 (skip neg)
+    out = push(out, 121)
+    out = push(out, 3)
+    // neg rax
+    out = push(out, 72)
+    out = push(out, 247)
+    out = push(out, 216)
+    // .digit_loop:
+    // xor rdx, rdx
+    out = push(out, 72)
+    out = push(out, 49)
+    out = push(out, 210)
+    // div r8
+    out = push(out, 73)
+    out = push(out, 247)
+    out = push(out, 240)
+    // add dl, 0x30
+    out = push(out, 128)
+    out = push(out, 194)
+    out = push(out, 48)
+    // dec rsi
+    out = push(out, 72)
+    out = push(out, 255)
+    out = push(out, 206)
+    // mov [rsi], dl
+    out = push(out, 136)
+    out = push(out, 22)
+    // inc rcx
+    out = push(out, 72)
+    out = push(out, 255)
+    out = push(out, 193)
+    // test rax, rax
+    out = push(out, 72)
+    out = push(out, 133)
+    out = push(out, 192)
+    // jnz .digit_loop (-22 = 0xea)
+    out = push(out, 117)
+    out = push(out, 234)
+    // Check if original was negative (rdi < 0)
+    // test rdi, rdi
+    out = push(out, 72)
+    out = push(out, 133)
+    out = push(out, 255)
+    // jns +9 (skip dec rsi + movb + inc rcx = 3+3+3 bytes)
+    out = push(out, 121)
+    out = push(out, 9)
+    // dec rsi
+    out = push(out, 72)
+    out = push(out, 255)
+    out = push(out, 206)
+    // mov byte [rsi], 0x2d (minus)
+    out = push(out, 198)
+    out = push(out, 6)
+    out = push(out, 45)
+    // inc rcx
+    out = push(out, 72)
+    out = push(out, 255)
+    out = push(out, 193)
+    // lea rdx, [rcx+1] (include newline)
+    out = push(out, 72)
+    out = push(out, 141)
+    out = push(out, 81)
+    out = push(out, 1)
+    // mov rax, 1 (SYS_WRITE)
+    out = push(out, 72)
+    out = push(out, 199)
+    out = push(out, 192)
+    out = push(out, 1)
+    out = push(out, 0)
+    out = push(out, 0)
+    out = push(out, 0)
+    // mov rdi, 1 (stdout)
+    out = push(out, 72)
+    out = push(out, 199)
+    out = push(out, 199)
+    out = push(out, 1)
+    out = push(out, 0)
+    out = push(out, 0)
+    out = push(out, 0)
+    // syscall
+    out = push(out, 15)
+    out = push(out, 5)
+    // add rsp, 32
+    out = push(out, 72)
+    out = push(out, 131)
+    out = push(out, 196)
+    out = push(out, 32)
+    // ret
+    out = push(out, 195)
+    return out
+}
+
+// --- Runtime: _vx_print_str stub ---
+// Prints string struct at [RDI]: first 8 bytes = length, then bytes
+// write(1, rdi+8, [rdi])
+fn emit_print_str_stub() -> [i64] {
+    var out: [i64] = []
+    // Save rdi
+    // mov rsi, rdi+8 (data pointer): lea rsi, [rdi+8]
+    out = push(out, 72)   // 48 8D 77 08 = lea rsi, [rdi+8]
+    out = push(out, 141)
+    out = push(out, 119)
+    out = push(out, 8)
+    // mov rdx, [rdi] (length)
+    out = push(out, 72)   // 48 8B 17 = mov rdx, [rdi]
+    out = push(out, 139)
+    out = push(out, 23)
+    // mov rax, 1 (SYS_WRITE)
+    out = push(out, 72)
+    out = push(out, 199)
+    out = push(out, 192)
+    out = push(out, 1)
+    out = push(out, 0)
+    out = push(out, 0)
+    out = push(out, 0)
+    // mov rdi, 1 (stdout)
+    out = push(out, 72)
+    out = push(out, 199)
+    out = push(out, 199)
+    out = push(out, 1)
+    out = push(out, 0)
+    out = push(out, 0)
+    out = push(out, 0)
+    // syscall
+    out = push(out, 15)
+    out = push(out, 5)
+    // ret
+    out = push(out, 195)
+    return out
+}
+
+// --- Runtime: _vx_alloc stub ---
+// Allocates `rdi` bytes using mmap(0, size, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0)
+// Returns pointer in RAX
+fn emit_alloc_stub() -> [i64] {
+    var out: [i64] = []
+    // Save size in r8
+    // mov r8, rdi: 49 89 F8
+    out = push(out, 73)
+    out = push(out, 137)
+    out = push(out, 248)
+    // mov rax, 9 (SYS_MMAP)
+    out = push(out, 72)
+    out = push(out, 199)
+    out = push(out, 192)
+    out = push(out, 9)
+    out = push(out, 0)
+    out = push(out, 0)
+    out = push(out, 0)
+    // mov rdi, 0 (addr = NULL)
+    out = push(out, 72)
+    out = push(out, 199)
+    out = push(out, 199)
+    out = push(out, 0)
+    out = push(out, 0)
+    out = push(out, 0)
+    out = push(out, 0)
+    // mov rsi, r8 (size)
+    out = push(out, 76)  // 4C 89 C6 = mov rsi, r8
+    out = push(out, 137)
+    out = push(out, 198)
+    // mov rdx, 3 (PROT_READ | PROT_WRITE)
+    out = push(out, 72)
+    out = push(out, 199)
+    out = push(out, 194)
+    out = push(out, 3)
+    out = push(out, 0)
+    out = push(out, 0)
+    out = push(out, 0)
+    // mov r10, 34 (MAP_PRIVATE | MAP_ANONYMOUS = 0x22)
+    out = push(out, 73)
+    out = push(out, 199)
+    out = push(out, 194)
+    out = push(out, 34)
+    out = push(out, 0)
+    out = push(out, 0)
+    out = push(out, 0)
+    // mov r8, -1 (fd)
+    out = push(out, 73)
+    out = push(out, 199)
+    out = push(out, 192)
+    out = push(out, 255)
+    out = push(out, 255)
+    out = push(out, 255)
+    out = push(out, 255)
+    // mov r9, 0 (offset)
+    out = push(out, 73)
+    out = push(out, 199)
+    out = push(out, 193)
+    out = push(out, 0)
+    out = push(out, 0)
+    out = push(out, 0)
+    out = push(out, 0)
+    // syscall
+    out = push(out, 15)
+    out = push(out, 5)
+    // ret (result in RAX)
+    out = push(out, 195)
+    return out
+}
+
+// --- Runtime: _vx_arr_push stub ---
+// RDI = old array ptr, RSI = value to push
+// Allocates new array with len+1, copies old, appends val
+// Returns new array ptr in RAX
+fn emit_arr_push_stub() -> [i64] {
+    var out: [i64] = []
+    // push rbp; mov rbp, rsp; sub rsp, 48
+    out = push(out, 85)
+    out = push(out, 72)
+    out = push(out, 137)
+    out = push(out, 229)
+    out = push(out, 72)
+    out = push(out, 131)
+    out = push(out, 236)
+    out = push(out, 48)
+    // Save args: [rbp-8] = old_arr(rdi), [rbp-16] = val(rsi)
+    // mov [rbp-8], rdi
+    out = push(out, 72)
+    out = push(out, 137)
+    out = push(out, 125)
+    out = push(out, 248)  // -8
+    // mov [rbp-16], rsi
+    out = push(out, 72)
+    out = push(out, 137)
+    out = push(out, 117)
+    out = push(out, 240)  // -16
+    // Load old length: mov rax, [rdi]
+    out = push(out, 72)
+    out = push(out, 139)
+    out = push(out, 7)
+    // Save old_len in [rbp-24]
+    out = push(out, 72)
+    out = push(out, 137)
+    out = push(out, 69)
+    out = push(out, 232)  // -24
+    // new_size = (old_len + 2) * 8  -> rdi for alloc
+    // add rax, 2
+    out = push(out, 72)
+    out = push(out, 131)
+    out = push(out, 192)
+    out = push(out, 2)
+    // shl rax, 3
+    out = push(out, 72)
+    out = push(out, 193)
+    out = push(out, 224)
+    out = push(out, 3)
+    // mov rdi, rax
+    out = push(out, 72)
+    out = push(out, 137)
+    out = push(out, 199)
+    // call _vx_alloc — but we can't call by name here, so inline the mmap
+    // Actually, we need a call. We'll use a near call with fixup.
+    // Problem: stubs don't have fixup mechanism. Let's inline mmap.
+
+    // mov rsi, rdi (size); mov rdi, 0; mov rax, 9; mov rdx, 3; mov r10, 34; mov r8, -1; mov r9, 0; syscall
+    // rdi currently has size, move to rsi
+    out = push(out, 72)    // mov rsi, rdi: 48 89 FE
+    out = push(out, 137)
+    out = push(out, 254)
+    // mov rdi, 0
+    out = push(out, 72)
+    out = push(out, 199)
+    out = push(out, 199)
+    out = push(out, 0)
+    out = push(out, 0)
+    out = push(out, 0)
+    out = push(out, 0)
+    // mov rax, 9
+    out = push(out, 72)
+    out = push(out, 199)
+    out = push(out, 192)
+    out = push(out, 9)
+    out = push(out, 0)
+    out = push(out, 0)
+    out = push(out, 0)
+    // mov rdx, 3
+    out = push(out, 72)
+    out = push(out, 199)
+    out = push(out, 194)
+    out = push(out, 3)
+    out = push(out, 0)
+    out = push(out, 0)
+    out = push(out, 0)
+    // mov r10, 34
+    out = push(out, 73)
+    out = push(out, 199)
+    out = push(out, 194)
+    out = push(out, 34)
+    out = push(out, 0)
+    out = push(out, 0)
+    out = push(out, 0)
+    // mov r8, -1
+    out = push(out, 73)
+    out = push(out, 199)
+    out = push(out, 192)
+    out = push(out, 255)
+    out = push(out, 255)
+    out = push(out, 255)
+    out = push(out, 255)
+    // mov r9, 0
+    out = push(out, 73)
+    out = push(out, 199)
+    out = push(out, 193)
+    out = push(out, 0)
+    out = push(out, 0)
+    out = push(out, 0)
+    out = push(out, 0)
+    // syscall
+    out = push(out, 15)
+    out = push(out, 5)
+
+    // RAX = new array ptr. Save in [rbp-32]
+    out = push(out, 72)
+    out = push(out, 137)
+    out = push(out, 69)
+    out = push(out, 224)  // -32
+
+    // Store new length = old_len + 1
+    // mov rcx, [rbp-24] (old_len)
+    out = push(out, 72)
+    out = push(out, 139)
+    out = push(out, 77)
+    out = push(out, 232)
+    // add rcx, 1
+    out = push(out, 72)
+    out = push(out, 131)
+    out = push(out, 193)
+    out = push(out, 1)
+    // mov [rax], rcx
+    out = push(out, 72)
+    out = push(out, 137)
+    out = push(out, 8)
+
+    // Copy old elements: for i = 0..old_len: new[i+1] = old[i+1]
+    // Actually copy (old_len+1)*8 bytes from old to new... wait, copy old_len elements
+    // Use a loop: rcx = old_len (already in rcx-1, need to reload)
+    // mov rcx, [rbp-24]
+    out = push(out, 72)
+    out = push(out, 139)
+    out = push(out, 77)
+    out = push(out, 232)
+    // test rcx, rcx
+    out = push(out, 72)
+    out = push(out, 133)
+    out = push(out, 201)
+    // jz skip_copy (+30 bytes approx) — we'll use a forward jump
+    out = push(out, 116)
+    let jz_skip = len(out)
+    out = push(out, 0)  // placeholder for offset
+
+    // r8 = 0 (loop counter)
+    out = push(out, 73)
+    out = push(out, 49)
+    out = push(out, 192)
+    // .copy_loop:
+    let copy_loop_pos = len(out)
+    // Load old_arr ptr
+    // mov rdi, [rbp-8]
+    out = push(out, 72)
+    out = push(out, 139)
+    out = push(out, 125)
+    out = push(out, 248)
+    // mov rdx, r8
+    out = push(out, 76)  // 4C 89 C2
+    out = push(out, 137)
+    out = push(out, 194)
+    // add rdx, 1
+    out = push(out, 72)
+    out = push(out, 131)
+    out = push(out, 194)
+    out = push(out, 1)
+    // shl rdx, 3
+    out = push(out, 72)
+    out = push(out, 193)
+    out = push(out, 226)
+    out = push(out, 3)
+    // mov rsi, [rdi + rdx]
+    out = push(out, 72)  // 48 8B 34 17 = mov rsi, [rdi+rdx]
+    out = push(out, 139)
+    out = push(out, 52)
+    out = push(out, 23)
+    // mov rdi, [rbp-32] (new arr)
+    out = push(out, 72)
+    out = push(out, 139)
+    out = push(out, 125)
+    out = push(out, 224)
+    // mov [rdi + rdx], rsi
+    out = push(out, 72)  // 48 89 34 17
+    out = push(out, 137)
+    out = push(out, 52)
+    out = push(out, 23)
+    // inc r8
+    out = push(out, 73)
+    out = push(out, 255)
+    out = push(out, 192)
+    // cmp r8, rcx
+    out = push(out, 73)  // 49 39 C8 = cmp r8, rcx
+    out = push(out, 57)
+    out = push(out, 200)
+    // jb .copy_loop
+    let loop_delta = copy_loop_pos - len(out) - 2
+    out = push(out, 114)
+    var jb_off = loop_delta % 256
+    if jb_off < 0 {
+        jb_off = jb_off + 256
+    }
+    out = push(out, jb_off)
+
+    // Patch jz_skip offset
+    let skip_target = len(out)
+    let skip_off = skip_target - jz_skip - 1
+    out[jz_skip] = skip_off
+
+    // Store new value at index old_len+1
+    // mov rax, [rbp-32] (new arr)
+    out = push(out, 72)
+    out = push(out, 139)
+    out = push(out, 69)
+    out = push(out, 224)
+    // mov rcx, [rbp-24] (old_len)
+    out = push(out, 72)
+    out = push(out, 139)
+    out = push(out, 77)
+    out = push(out, 232)
+    // add rcx, 1
+    out = push(out, 72)
+    out = push(out, 131)
+    out = push(out, 193)
+    out = push(out, 1)
+    // shl rcx, 3
+    out = push(out, 72)
+    out = push(out, 193)
+    out = push(out, 225)
+    out = push(out, 3)
+    // mov rdx, [rbp-16] (val)
+    out = push(out, 72)
+    out = push(out, 139)
+    out = push(out, 85)
+    out = push(out, 240)
+    // mov [rax + rcx], rdx
+    out = push(out, 72)  // 48 89 14 08
+    out = push(out, 137)
+    out = push(out, 20)
+    out = push(out, 8)
+
+    // Return new arr ptr in RAX (already in rax)
+    // epilogue
+    out = push(out, 72)
+    out = push(out, 137)
+    out = push(out, 236)
+    out = push(out, 93)
+    out = push(out, 195)
+    return out
+}
+
+// --- Program compiler ---
+fn compile_program(fns: [String]) -> [i64] {
+    var code: [i64] = []
+
+    // Reset all state
+    _label_counter = 0
+    _fixup_positions = []
+    _fixup_labels = []
+    _label_names = []
+    _label_addrs = []
+    _func_names = []
+    _func_addrs = []
+    _string_data = []
+    _string_offsets = []
+    _string_lengths = []
+
+    // First: emit _start that calls main then does exit(rax)
+    // We'll register it and emit it first, then compile user functions
+
+    // _start stub: call main, mov rdi rax, mov rax 60, syscall
+    register_function("_start", 0)
+    // call main (will be fixed up)
+    code = emit_u8(code, 232)
+    add_fixup(len(code), "main")
+    code = emit_u32_le(code, 0)
+    // mov rdi, rax (exit code = return value of main)
+    code = emit_mov_reg_reg(code, REG_RDI(), REG_RAX())
+    // mov rax, 60 (SYS_EXIT)
+    code = emit_mov_reg_imm64(code, REG_RAX(), 60)
+    // syscall
+    code = emit_syscall_inst(code)
+
+    // Now emit _vx_print_int runtime stub
+    let print_int_code = emit_print_int_stub()
+    register_function("_vx_print_int", len(code))
+    var pi = 0
+    while pi < len(print_int_code) {
+        code = push(code, print_int_code[pi])
+        pi = pi + 1
+    }
+
+    // Emit _vx_print_str runtime stub
+    let print_str_code = emit_print_str_stub()
+    register_function("_vx_print_str", len(code))
+    var psi = 0
+    while psi < len(print_str_code) {
+        code = push(code, print_str_code[psi])
+        psi = psi + 1
+    }
+
+    // Emit _vx_alloc runtime stub
+    let alloc_code = emit_alloc_stub()
+    register_function("_vx_alloc", len(code))
+    var ali = 0
+    while ali < len(alloc_code) {
+        code = push(code, alloc_code[ali])
+        ali = ali + 1
+    }
+
+    // Emit _vx_arr_push runtime stub
+    let arr_push_code = emit_arr_push_stub()
+    register_function("_vx_arr_push", len(code))
+    var api = 0
+    while api < len(arr_push_code) {
+        code = push(code, arr_push_code[api])
+        api = api + 1
+    }
+
+    // Compile user functions
+    var fi = 0
+    while fi < len(fns) {
+        code = compile_function(code, fns[fi])
+        fi = fi + 1
+    }
+
+    // Emit string data section after code
+    // Each string: [u64 length][bytes...]
+    var sdi = 0
+    while sdi < len(_string_data) {
+        let str_label = "_str_" + to_string(sdi)
+        add_label(str_label, len(code))
+        let slen = _string_lengths[sdi]
+        // Emit u64 length
+        code = emit_u64_le(code, slen)
+        // Emit string bytes
+        let s = _string_data[sdi]
+        let sbytes = str_bytes(s)
+        var sbi = 0
+        while sbi < len(sbytes) {
+            code = emit_u8(code, int(sbytes[sbi]))
+            sbi = sbi + 1
+        }
+        sdi = sdi + 1
+    }
+
+    // Resolve all fixups
+    // Add function addresses to labels
+    var f = 0
+    while f < len(_func_names) {
+        add_label(_func_names[f], _func_addrs[f])
+        f = f + 1
+    }
+
+    // Patch all fixups
+    var i = 0
+    while i < len(_fixup_positions) {
+        let pos = _fixup_positions[i]
+        let target_name = _fixup_labels[i]
+        // Find target address
+        var target_addr = 0 - 1
+        var j = 0
+        while j < len(_label_names) {
+            if _label_names[j] == target_name {
+                target_addr = _label_addrs[j]
+            }
+            j = j + 1
+        }
+        if target_addr < 0 {
+            println("linker error: unresolved symbol '" + target_name + "'")
+        } else {
+            // rel32 = target - (pos + 4)
+            var rel = target_addr - (pos + 4)
+            var v = rel
+            if v < 0 {
+                v = v + 4294967296
+            }
+            code[pos] = v % 256
+            v = v / 256
+            code[pos + 1] = v % 256
+            v = v / 256
+            code[pos + 2] = v % 256
+            v = v / 256
+            code[pos + 3] = v % 256
+        }
+        i = i + 1
+    }
+
+    return code
+}
+
+// ============================================================
+// PHASE 5: ELF Output (inline from elf.vx)
+// ============================================================
+
+fn make_elf(code: [i64]) -> [i64] {
+    let code_len = len(code)
+    let header_size = 120
+    let total_size = header_size + code_len
+    let base_addr = 4194304
+    let entry = base_addr + header_size
+
+    var buf: [i64] = []
+
+    // === ELF Header (64 bytes) ===
+    // e_ident magic
+    buf = emit_u8(buf, 127)
+    buf = emit_u8(buf, 69)
+    buf = emit_u8(buf, 76)
+    buf = emit_u8(buf, 70)
+    // EI_CLASS=2, EI_DATA=1, EI_VERSION=1, EI_OSABI=0
+    buf = emit_u8(buf, 2)
+    buf = emit_u8(buf, 1)
+    buf = emit_u8(buf, 1)
+    buf = emit_u8(buf, 0)
+    // 8 bytes padding
+    var pad = 0
+    while pad < 8 {
+        buf = emit_u8(buf, 0)
+        pad = pad + 1
+    }
+    // e_type = ET_EXEC (2)
+    buf = emit_u16_le(buf, 2)
+    // e_machine = x86-64 (62)
+    buf = emit_u16_le(buf, 62)
+    // e_version = 1
+    buf = emit_u32_le(buf, 1)
+    // e_entry
+    buf = emit_u64_le(buf, entry)
+    // e_phoff = 64
+    buf = emit_u64_le(buf, 64)
+    // e_shoff = 0
+    buf = emit_u64_le(buf, 0)
+    // e_flags = 0
+    buf = emit_u32_le(buf, 0)
+    // e_ehsize = 64
+    buf = emit_u16_le(buf, 64)
+    // e_phentsize = 56
+    buf = emit_u16_le(buf, 56)
+    // e_phnum = 1
+    buf = emit_u16_le(buf, 1)
+    // e_shentsize = 0
+    buf = emit_u16_le(buf, 0)
+    // e_shnum = 0
+    buf = emit_u16_le(buf, 0)
+    // e_shstrndx = 0
+    buf = emit_u16_le(buf, 0)
+
+    // === Program Header (56 bytes) ===
+    // p_type = PT_LOAD (1)
+    buf = emit_u32_le(buf, 1)
+    // p_flags = PF_R | PF_W | PF_X (7)
+    buf = emit_u32_le(buf, 7)
+    // p_offset = 0
+    buf = emit_u64_le(buf, 0)
+    // p_vaddr = base_addr
+    buf = emit_u64_le(buf, base_addr)
+    // p_paddr = base_addr
+    buf = emit_u64_le(buf, base_addr)
+    // p_filesz = total_size
+    buf = emit_u64_le(buf, total_size)
+    // p_memsz = total_size
+    buf = emit_u64_le(buf, total_size)
+    // p_align = 0x1000
+    buf = emit_u64_le(buf, 4096)
+
+    // === Append code ===
+    var ci = 0
+    while ci < code_len {
+        buf = push(buf, code[ci])
+        ci = ci + 1
+    }
+
+    return buf
+}
+
+// ============================================================
+// MAIN: Compile test program and produce binary
+// ============================================================
+
+fn main() {
+    println("=== Vortex Compiler (vxc) ===")
+
+    var source = ""
+    var output_path = "/tmp/vortex_out"
+    var source_path = "/tmp/test_strings.vx"
+
+    println("Reading " + source_path + "...")
+    source = read_source(source_path)
+    if len(source) == 0 {
+        // Fallback: hardcoded test program with string and array tests
+        println("No source file found, using built-in test program")
+        source = "fn main() {\n  println(42)\n}\n"
+    }
+
+    println("Source:")
+    println(source)
+
+    // Phase 2: Lex
+    println("Lexing...")
+    let tokens = lex(source)
+    println("Tokens: " + to_string(len(tokens)))
+
+    // Phase 3: Parse
+    println("Parsing...")
+    _tokens = tokens
+    _tpos = 0
+    let fns = parse_program()
+    println("Functions: " + to_string(len(fns)))
+
+    // Phase 4: Codegen
+    println("Generating x86-64...")
+    let code = compile_program(fns)
+    println("Code size: " + to_string(len(code)) + " bytes")
+
+    // Phase 5: ELF
+    println("Building ELF...")
+    let elf = make_elf(code)
+    println("ELF size: " + to_string(len(elf)) + " bytes")
+
+    // Write to disk
+    let ok = write_binary(output_path, elf)
+    if ok {
+        println("Written to " + output_path)
+        println("Run: " + output_path)
+    } else {
+        println("ERROR: failed to write binary")
+    }
+
+    println("=== vxc done ===")
+}

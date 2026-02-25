@@ -1,66 +1,45 @@
 // Vortex Self-Hosting Lexer
 // Tokenizes Vortex source code into a token stream.
 // Part of the self-hosting compiler pipeline: lexer -> parser -> codegen
+//
+// Tokens are [type, value, line, col] arrays.
+// Token types are string constants returned by helper functions.
 
-// --- Token type constants ---
-let TK_INT = "INT"
-let TK_FLOAT = "FLOAT"
-let TK_STRING = "STRING"
-let TK_IDENT = "IDENT"
-let TK_KEYWORD = "KEYWORD"
-let TK_PLUS = "PLUS"
-let TK_MINUS = "MINUS"
-let TK_STAR = "STAR"
-let TK_SLASH = "SLASH"
-let TK_PERCENT = "PERCENT"
-let TK_EQ = "EQ"
-let TK_EQEQ = "EQEQ"
-let TK_NEQ = "NEQ"
-let TK_LT = "LT"
-let TK_GT = "GT"
-let TK_LTEQ = "LTEQ"
-let TK_GTEQ = "GTEQ"
-let TK_AND = "AND"
-let TK_OR = "OR"
-let TK_NOT = "NOT"
-let TK_LPAREN = "LPAREN"
-let TK_RPAREN = "RPAREN"
-let TK_LBRACE = "LBRACE"
-let TK_RBRACE = "RBRACE"
-let TK_LBRACKET = "LBRACKET"
-let TK_RBRACKET = "RBRACKET"
-let TK_COMMA = "COMMA"
-let TK_DOT = "DOT"
-let TK_COLON = "COLON"
-let TK_ARROW = "ARROW"
-let TK_PIPE = "PIPE"
-let TK_QUESTION = "QUESTION"
-let TK_EOF = "EOF"
+// Special character helpers (Vortex strings do not process escape sequences)
+fn _nl() -> String { return str_from_bytes([10]) }
+fn _tab() -> String { return str_from_bytes([9]) }
+fn _quote() -> String { return str_from_bytes([34]) }
+fn _backslash() -> String { return str_from_bytes([92]) }
 
-// --- Keywords ---
-let KEYWORDS = [
-    "fn", "let", "var", "if", "else", "for", "while", "in",
-    "return", "true", "false", "struct", "enum", "impl", "trait",
-    "match", "import", "break", "continue", "pub", "mut", "self"
-]
+fn keywords() -> [String] {
+    return [
+        "fn", "let", "var", "if", "else", "for", "while", "in",
+        "return", "true", "false", "struct", "enum", "impl", "trait",
+        "match", "import", "break", "continue", "pub", "mut", "self"
+    ]
+}
 
-fn is_keyword(word) {
-    for i in range(0, len(KEYWORDS)) {
-        if KEYWORDS[i] == word {
+fn is_keyword(word: String) -> bool {
+    let kws = keywords()
+    for i in range(0, len(kws)) {
+        if kws[i] == word {
             return true
         }
     }
     return false
 }
 
-// --- Token constructor ---
-fn token(typ, value, line, col) {
-    return {"type": typ, "value": value, "line": line, "col": col}
+// Token constructor: returns [type, value, line, col]
+fn token(typ: String, value: String, line: i64, col: i64) -> [String] {
+    return [typ, value, str(line), str(col)]
 }
 
+fn tok_type(t: [String]) -> String { return t[0] }
+fn tok_value(t: [String]) -> String { return t[1] }
+
 // --- Main lexer ---
-fn lex(source) {
-    let tokens = []
+fn lex(source: String) -> [String] {
+    var tokens = []
     var pos = 0
     var line = 1
     var col = 1
@@ -71,7 +50,7 @@ fn lex(source) {
 
         // Skip whitespace
         if str_is_ascii_whitespace(ch) {
-            if ch == "\n" {
+            if ch == _nl() {
                 line = line + 1
                 col = 1
             } else {
@@ -90,7 +69,7 @@ fn lex(source) {
                     col = col + 2
                     while pos < src_len {
                         let cc = str_char_at(source, pos)
-                        if cc == "\n" {
+                        if cc == _nl() {
                             break
                         }
                         pos = pos + 1
@@ -133,14 +112,14 @@ fn lex(source) {
                                 }
                             }
                             let val = str_substr(source, start, pos - start)
-                            push(tokens, token(TK_FLOAT, val, line, start_col))
+                            tokens = push(tokens, token("FLOAT", val, line, start_col))
                             continue
                         }
                     }
                 }
             }
             let val = str_substr(source, start, pos - start)
-            push(tokens, token(TK_INT, val, line, start_col))
+            tokens = push(tokens, token("INT", val, line, start_col))
             continue
         }
 
@@ -165,15 +144,15 @@ fn lex(source) {
             }
             let word = str_substr(source, start, pos - start)
             if is_keyword(word) {
-                push(tokens, token(TK_KEYWORD, word, line, start_col))
+                tokens = push(tokens, token("KEYWORD", word, line, start_col))
             } else {
                 let interned = str_intern(word)
-                push(tokens, token(TK_IDENT, word, line, start_col))
+                tokens = push(tokens, token("IDENT", word, line, start_col))
             }
             continue
         }
 
-        // Also allow underscore-leading identifiers
+        // Underscore-leading identifiers
         if ch == "_" {
             let start = pos
             let start_col = col
@@ -196,43 +175,43 @@ fn lex(source) {
             }
             let word = str_substr(source, start, pos - start)
             let interned = str_intern(word)
-            push(tokens, token(TK_IDENT, word, line, start_col))
+            tokens = push(tokens, token("IDENT", word, line, start_col))
             continue
         }
 
         // String literals
-        if ch == "\"" {
+        if ch == _quote() {
             let start_col = col
             pos = pos + 1
             col = col + 1
             var buf = ""
             while pos < src_len {
                 let c = str_char_at(source, pos)
-                if c == "\\" {
+                if c == _backslash() {
                     pos = pos + 1
                     col = col + 1
                     if pos < src_len {
                         let esc = str_char_at(source, pos)
                         if esc == "n" {
-                            buf = buf + "\n"
+                            buf = buf + _nl()
                         } else if esc == "t" {
-                            buf = buf + "\t"
-                        } else if esc == "\\" {
-                            buf = buf + "\\"
-                        } else if esc == "\"" {
-                            buf = buf + "\""
+                            buf = buf + _tab()
+                        } else if esc == _backslash() {
+                            buf = buf + _backslash()
+                        } else if esc == _quote() {
+                            buf = buf + _quote()
                         } else {
                             buf = buf + esc
                         }
                         pos = pos + 1
                         col = col + 1
                     }
-                } else if c == "\"" {
+                } else if c == _quote() {
                     pos = pos + 1
                     col = col + 1
                     break
                 } else {
-                    if c == "\n" {
+                    if c == _nl() {
                         line = line + 1
                         col = 1
                     } else {
@@ -242,7 +221,7 @@ fn lex(source) {
                     pos = pos + 1
                 }
             }
-            push(tokens, token(TK_STRING, buf, line, start_col))
+            tokens = push(tokens, token("STRING", buf, line, start_col))
             continue
         }
 
@@ -250,43 +229,43 @@ fn lex(source) {
         if pos + 1 < src_len {
             let two = str_substr(source, pos, 2)
             if two == "==" {
-                push(tokens, token(TK_EQEQ, "==", line, col))
+                tokens = push(tokens, token("EQEQ", "==", line, col))
                 pos = pos + 2
                 col = col + 2
                 continue
             }
             if two == "!=" {
-                push(tokens, token(TK_NEQ, "!=", line, col))
+                tokens = push(tokens, token("NEQ", "!=", line, col))
                 pos = pos + 2
                 col = col + 2
                 continue
             }
             if two == "<=" {
-                push(tokens, token(TK_LTEQ, "<=", line, col))
+                tokens = push(tokens, token("LTEQ", "<=", line, col))
                 pos = pos + 2
                 col = col + 2
                 continue
             }
             if two == ">=" {
-                push(tokens, token(TK_GTEQ, ">=", line, col))
+                tokens = push(tokens, token("GTEQ", ">=", line, col))
                 pos = pos + 2
                 col = col + 2
                 continue
             }
             if two == "&&" {
-                push(tokens, token(TK_AND, "&&", line, col))
+                tokens = push(tokens, token("AND", "&&", line, col))
                 pos = pos + 2
                 col = col + 2
                 continue
             }
             if two == "||" {
-                push(tokens, token(TK_OR, "||", line, col))
+                tokens = push(tokens, token("OR", "||", line, col))
                 pos = pos + 2
                 col = col + 2
                 continue
             }
             if two == "->" {
-                push(tokens, token(TK_ARROW, "->", line, col))
+                tokens = push(tokens, token("ARROW", "->", line, col))
                 pos = pos + 2
                 col = col + 2
                 continue
@@ -296,64 +275,63 @@ fn lex(source) {
         // Single-character tokens
         let start_col = col
         if ch == "+" {
-            push(tokens, token(TK_PLUS, "+", line, start_col))
+            tokens = push(tokens, token("PLUS", "+", line, start_col))
         } else if ch == "-" {
-            push(tokens, token(TK_MINUS, "-", line, start_col))
+            tokens = push(tokens, token("MINUS", "-", line, start_col))
         } else if ch == "*" {
-            push(tokens, token(TK_STAR, "*", line, start_col))
+            tokens = push(tokens, token("STAR", "*", line, start_col))
         } else if ch == "/" {
-            push(tokens, token(TK_SLASH, "/", line, start_col))
+            tokens = push(tokens, token("SLASH", "/", line, start_col))
         } else if ch == "%" {
-            push(tokens, token(TK_PERCENT, "%", line, start_col))
+            tokens = push(tokens, token("PERCENT", "%", line, start_col))
         } else if ch == "=" {
-            push(tokens, token(TK_EQ, "=", line, start_col))
+            tokens = push(tokens, token("EQ", "=", line, start_col))
         } else if ch == "<" {
-            push(tokens, token(TK_LT, "<", line, start_col))
+            tokens = push(tokens, token("LT", "<", line, start_col))
         } else if ch == ">" {
-            push(tokens, token(TK_GT, ">", line, start_col))
+            tokens = push(tokens, token("GT", ">", line, start_col))
         } else if ch == "!" {
-            push(tokens, token(TK_NOT, "!", line, start_col))
+            tokens = push(tokens, token("NOT", "!", line, start_col))
         } else if ch == "(" {
-            push(tokens, token(TK_LPAREN, "(", line, start_col))
+            tokens = push(tokens, token("LPAREN", "(", line, start_col))
         } else if ch == ")" {
-            push(tokens, token(TK_RPAREN, ")", line, start_col))
+            tokens = push(tokens, token("RPAREN", ")", line, start_col))
         } else if ch == "{" {
-            push(tokens, token(TK_LBRACE, "{", line, start_col))
+            tokens = push(tokens, token("LBRACE", "{", line, start_col))
         } else if ch == "}" {
-            push(tokens, token(TK_RBRACE, "}", line, start_col))
+            tokens = push(tokens, token("RBRACE", "}", line, start_col))
         } else if ch == "[" {
-            push(tokens, token(TK_LBRACKET, "[", line, start_col))
+            tokens = push(tokens, token("LBRACKET", "[", line, start_col))
         } else if ch == "]" {
-            push(tokens, token(TK_RBRACKET, "]", line, start_col))
+            tokens = push(tokens, token("RBRACKET", "]", line, start_col))
         } else if ch == "," {
-            push(tokens, token(TK_COMMA, ",", line, start_col))
+            tokens = push(tokens, token("COMMA", ",", line, start_col))
         } else if ch == "." {
-            push(tokens, token(TK_DOT, ".", line, start_col))
+            tokens = push(tokens, token("DOT", ".", line, start_col))
         } else if ch == ":" {
-            push(tokens, token(TK_COLON, ":", line, start_col))
+            tokens = push(tokens, token("COLON", ":", line, start_col))
         } else if ch == "|" {
-            push(tokens, token(TK_PIPE, "|", line, start_col))
+            tokens = push(tokens, token("PIPE", "|", line, start_col))
         } else if ch == "?" {
-            push(tokens, token(TK_QUESTION, "?", line, start_col))
+            tokens = push(tokens, token("QUESTION", "?", line, start_col))
         } else {
-            // Unknown character - skip it
-            println("lexer: unexpected character '" + ch + "' at line " + line)
+            println("lexer: unexpected character '" + ch + "' at line " + str(line))
         }
 
         pos = pos + 1
         col = col + 1
     }
 
-    push(tokens, token(TK_EOF, "", line, col))
+    tokens = push(tokens, token("EOF", "", line, col))
     return tokens
 }
 
 // --- Test ---
 fn main() {
-    let source = "fn add(a, b) { return a + b }"
+    let source = "fn add(a: i64, b: i64) -> i64 { return a + b }"
     let tokens = lex(source)
     for i in range(0, len(tokens)) {
         let t = tokens[i]
-        println(t["type"] + ": " + t["value"])
+        println(tok_type(t) + ": " + tok_value(t))
     }
 }

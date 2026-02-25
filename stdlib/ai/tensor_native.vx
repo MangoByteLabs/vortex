@@ -1,0 +1,1646 @@
+// stdlib/ai/tensor_native.vx — THE native tensor type for Vortex
+// Tensors are first-class citizens. This is what Vortex was built for.
+//
+// Format: flat array [ndim, dim0, dim1, ..., data...]
+// ndim = number of dimensions
+// Followed by ndim dimension values
+// Then the actual data (f64 values)
+// Total length = 1 + ndim + product(dims)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Math Helpers (pure Vortex, no imports)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+fn _abs(x: f64) -> f64 {
+    if x < 0.0 {
+        return 0.0 - x
+    }
+    return x
+}
+
+fn _max(a: f64, b: f64) -> f64 {
+    if a > b {
+        return a
+    }
+    return b
+}
+
+fn _min(a: f64, b: f64) -> f64 {
+    if a < b {
+        return a
+    }
+    return b
+}
+
+fn _sqrt(x: f64) -> f64 {
+    if x <= 0.0 {
+        return 0.0
+    }
+    var guess = x / 2.0
+    if guess < 1.0 {
+        guess = 1.0
+    }
+    var i = 0
+    while i < 30 {
+        let next = (guess + x / guess) / 2.0
+        if _abs(next - guess) < 1.0e-15 {
+            return next
+        }
+        guess = next
+        i = i + 1
+    }
+    return guess
+}
+
+fn _exp(x: f64) -> f64 {
+    if x > 700.0 {
+        return 1.0e308
+    }
+    if x < -700.0 {
+        return 0.0
+    }
+    let ln2 = 0.6931471805599453
+    let k = int(x / ln2)
+    let r = x - float(k) * ln2
+    var term = 1.0
+    var sum = 1.0
+    var n = 1
+    while n < 40 {
+        term = term * r / float(n)
+        sum = sum + term
+        if _abs(term) < 1.0e-17 {
+            n = 100
+        }
+        n = n + 1
+    }
+    if k >= 0 {
+        var factor = 1.0
+        var i = 0
+        while i < k {
+            factor = factor * 2.0
+            i = i + 1
+        }
+        return sum * factor
+    } else {
+        var factor = 1.0
+        var i = 0
+        let nk = 0 - k
+        while i < nk {
+            factor = factor * 2.0
+            i = i + 1
+        }
+        return sum / factor
+    }
+}
+
+fn _log(x: f64) -> f64 {
+    if x <= 0.0 {
+        return -1.0e300
+    }
+    if x == 1.0 {
+        return 0.0
+    }
+    let ln2 = 0.6931471805599453
+    var v = x
+    var k = 0
+    while v >= 2.0 {
+        v = v / 2.0
+        k = k + 1
+    }
+    while v < 0.5 {
+        v = v * 2.0
+        k = k - 1
+    }
+    let t = (v - 1.0) / (v + 1.0)
+    let t2 = t * t
+    var term = t
+    var sum = t
+    var n = 1
+    while n < 60 {
+        term = term * t2
+        n = n + 2
+        let contrib = term / float(n)
+        sum = sum + contrib
+        if _abs(contrib) < 1.0e-16 {
+            n = 100
+        }
+    }
+    return 2.0 * sum + float(k) * ln2
+}
+
+fn _sin(x: f64) -> f64 {
+    let two_pi = 6.28318530717958647692
+    var v = x
+    while v > 3.14159265358979323846 {
+        v = v - two_pi
+    }
+    while v < -3.14159265358979323846 {
+        v = v + two_pi
+    }
+    let x2 = v * v
+    var term = v
+    var sum = v
+    var n = 1
+    while n < 20 {
+        term = term * x2 / float((2 * n) * (2 * n + 1))
+        if n - (n / 2) * 2 == 0 {
+            sum = sum + term
+        } else {
+            sum = sum - term
+        }
+        if _abs(term) < 1.0e-17 {
+            n = 100
+        }
+        n = n + 1
+    }
+    return sum
+}
+
+fn _cos(x: f64) -> f64 {
+    let two_pi = 6.28318530717958647692
+    var v = x
+    while v > 3.14159265358979323846 {
+        v = v - two_pi
+    }
+    while v < -3.14159265358979323846 {
+        v = v + two_pi
+    }
+    let x2 = v * v
+    var term = 1.0
+    var sum = 1.0
+    var n = 1
+    while n < 20 {
+        term = term * x2 / float((2 * n - 1) * (2 * n))
+        if n - (n / 2) * 2 == 0 {
+            sum = sum + term
+        } else {
+            sum = sum - term
+        }
+        if _abs(term) < 1.0e-17 {
+            n = 100
+        }
+        n = n + 1
+    }
+    return sum
+}
+
+fn _tanh(x: f64) -> f64 {
+    if x > 20.0 {
+        return 1.0
+    }
+    if x < -20.0 {
+        return -1.0
+    }
+    let e2x = _exp(2.0 * x)
+    return (e2x - 1.0) / (e2x + 1.0)
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Internal Helpers
+// ═══════════════════════════════════════════════════════════════════════════════
+
+fn _total_elems(shape: [i64]) -> i64 {
+    let ndim = len(shape)
+    var total = 1
+    var i = 0
+    while i < ndim {
+        total = total * shape[i]
+        i = i + 1
+    }
+    return total
+}
+
+fn _data_offset(t: [f64]) -> i64 {
+    return 1 + int(t[0])
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Core Tensor Operations
+// ═══════════════════════════════════════════════════════════════════════════════
+
+fn t_new(shape: [i64], data: [f64]) -> [f64] {
+    let ndim = len(shape)
+    var t: [f64] = []
+    t = push(t, float(ndim))
+    var i = 0
+    while i < ndim {
+        t = push(t, float(shape[i]))
+        i = i + 1
+    }
+    let n = len(data)
+    i = 0
+    while i < n {
+        t = push(t, data[i])
+        i = i + 1
+    }
+    return t
+}
+
+fn t_zeros(shape: [i64]) -> [f64] {
+    let total = _total_elems(shape)
+    var data: [f64] = []
+    var i = 0
+    while i < total {
+        data = push(data, 0.0)
+        i = i + 1
+    }
+    return t_new(shape, data)
+}
+
+fn t_ones(shape: [i64]) -> [f64] {
+    let total = _total_elems(shape)
+    var data: [f64] = []
+    var i = 0
+    while i < total {
+        data = push(data, 1.0)
+        i = i + 1
+    }
+    return t_new(shape, data)
+}
+
+fn t_fill(shape: [i64], val: f64) -> [f64] {
+    let total = _total_elems(shape)
+    var data: [f64] = []
+    var i = 0
+    while i < total {
+        data = push(data, val)
+        i = i + 1
+    }
+    return t_new(shape, data)
+}
+
+fn t_rand(shape: [i64], seed: i64) -> [f64] {
+    let total = _total_elems(shape)
+    var state = seed
+    if state == 0 {
+        state = 2463534242
+    }
+    var data: [f64] = []
+    var i = 0
+    while i < total {
+        // xorshift32
+        state = state * 1103515245 + 12345
+        if state < 0 {
+            state = 0 - state
+        }
+        let val = float(state) / 2147483647.0
+        data = push(data, val)
+        i = i + 1
+    }
+    return t_new(shape, data)
+}
+
+fn t_eye(n: i64) -> [f64] {
+    var data: [f64] = []
+    var i = 0
+    while i < n {
+        var j = 0
+        while j < n {
+            if i == j {
+                data = push(data, 1.0)
+            } else {
+                data = push(data, 0.0)
+            }
+            j = j + 1
+        }
+        i = i + 1
+    }
+    return t_new([n, n], data)
+}
+
+fn t_arange(start: f64, end_val: f64, step: f64) -> [f64] {
+    var data: [f64] = []
+    var v = start
+    while v < end_val {
+        data = push(data, v)
+        v = v + step
+    }
+    let n = len(data)
+    return t_new([n], data)
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Shape / Access
+// ═══════════════════════════════════════════════════════════════════════════════
+
+fn t_shape(t: [f64]) -> [i64] {
+    let ndim = int(t[0])
+    var shape: [i64] = []
+    var i = 0
+    while i < ndim {
+        shape = push(shape, int(t[1 + i]))
+        i = i + 1
+    }
+    return shape
+}
+
+fn t_ndim(t: [f64]) -> i64 {
+    return int(t[0])
+}
+
+fn t_numel(t: [f64]) -> i64 {
+    let shape = t_shape(t)
+    return _total_elems(shape)
+}
+
+fn t_get(t: [f64], indices: [i64]) -> f64 {
+    let ndim = int(t[0])
+    var flat = 0
+    var stride = 1
+    var i = ndim - 1
+    while i >= 0 {
+        flat = flat + indices[i] * stride
+        stride = stride * int(t[1 + i])
+        i = i - 1
+    }
+    return t[_data_offset(t) + flat]
+}
+
+fn t_set(t: [f64], indices: [i64], val: f64) -> [f64] {
+    let ndim = int(t[0])
+    var flat = 0
+    var stride = 1
+    var i = ndim - 1
+    while i >= 0 {
+        flat = flat + indices[i] * stride
+        stride = stride * int(t[1 + i])
+        i = i - 1
+    }
+    let idx = _data_offset(t) + flat
+    var result: [f64] = []
+    let n = len(t)
+    var j = 0
+    while j < n {
+        if j == idx {
+            result = push(result, val)
+        } else {
+            result = push(result, t[j])
+        }
+        j = j + 1
+    }
+    return result
+}
+
+fn t_data(t: [f64]) -> [f64] {
+    let offset = _data_offset(t)
+    let total = len(t) - offset
+    var data: [f64] = []
+    var i = 0
+    while i < total {
+        data = push(data, t[offset + i])
+        i = i + 1
+    }
+    return data
+}
+
+fn t_reshape(t: [f64], new_shape: [i64]) -> [f64] {
+    let data = t_data(t)
+    return t_new(new_shape, data)
+}
+
+fn t_flatten(t: [f64]) -> [f64] {
+    let data = t_data(t)
+    let n = len(data)
+    return t_new([n], data)
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Element-wise Arithmetic
+// ═══════════════════════════════════════════════════════════════════════════════
+
+fn t_add(a: [f64], b: [f64]) -> [f64] {
+    let shape = t_shape(a)
+    let da = t_data(a)
+    let db = t_data(b)
+    let n = len(da)
+    var result: [f64] = []
+    var i = 0
+    while i < n {
+        result = push(result, da[i] + db[i])
+        i = i + 1
+    }
+    return t_new(shape, result)
+}
+
+fn t_sub(a: [f64], b: [f64]) -> [f64] {
+    let shape = t_shape(a)
+    let da = t_data(a)
+    let db = t_data(b)
+    let n = len(da)
+    var result: [f64] = []
+    var i = 0
+    while i < n {
+        result = push(result, da[i] - db[i])
+        i = i + 1
+    }
+    return t_new(shape, result)
+}
+
+fn t_mul(a: [f64], b: [f64]) -> [f64] {
+    let shape = t_shape(a)
+    let da = t_data(a)
+    let db = t_data(b)
+    let n = len(da)
+    var result: [f64] = []
+    var i = 0
+    while i < n {
+        result = push(result, da[i] * db[i])
+        i = i + 1
+    }
+    return t_new(shape, result)
+}
+
+fn t_div(a: [f64], b: [f64]) -> [f64] {
+    let shape = t_shape(a)
+    let da = t_data(a)
+    let db = t_data(b)
+    let n = len(da)
+    var result: [f64] = []
+    var i = 0
+    while i < n {
+        result = push(result, da[i] / db[i])
+        i = i + 1
+    }
+    return t_new(shape, result)
+}
+
+fn t_scale(t: [f64], s: f64) -> [f64] {
+    let shape = t_shape(t)
+    let data = t_data(t)
+    let n = len(data)
+    var result: [f64] = []
+    var i = 0
+    while i < n {
+        result = push(result, data[i] * s)
+        i = i + 1
+    }
+    return t_new(shape, result)
+}
+
+fn t_neg(t: [f64]) -> [f64] {
+    return t_scale(t, -1.0)
+}
+
+fn t_pow(t: [f64], p: f64) -> [f64] {
+    let shape = t_shape(t)
+    let data = t_data(t)
+    let n = len(data)
+    var result: [f64] = []
+    var i = 0
+    while i < n {
+        result = push(result, _exp(p * _log(data[i])))
+        i = i + 1
+    }
+    return t_new(shape, result)
+}
+
+fn t_sqrt(t: [f64]) -> [f64] {
+    let shape = t_shape(t)
+    let data = t_data(t)
+    let n = len(data)
+    var result: [f64] = []
+    var i = 0
+    while i < n {
+        result = push(result, _sqrt(data[i]))
+        i = i + 1
+    }
+    return t_new(shape, result)
+}
+
+fn t_exp(t: [f64]) -> [f64] {
+    let shape = t_shape(t)
+    let data = t_data(t)
+    let n = len(data)
+    var result: [f64] = []
+    var i = 0
+    while i < n {
+        result = push(result, _exp(data[i]))
+        i = i + 1
+    }
+    return t_new(shape, result)
+}
+
+fn t_log(t: [f64]) -> [f64] {
+    let shape = t_shape(t)
+    let data = t_data(t)
+    let n = len(data)
+    var result: [f64] = []
+    var i = 0
+    while i < n {
+        result = push(result, _log(data[i]))
+        i = i + 1
+    }
+    return t_new(shape, result)
+}
+
+fn t_abs(t: [f64]) -> [f64] {
+    let shape = t_shape(t)
+    let data = t_data(t)
+    let n = len(data)
+    var result: [f64] = []
+    var i = 0
+    while i < n {
+        result = push(result, _abs(data[i]))
+        i = i + 1
+    }
+    return t_new(shape, result)
+}
+
+fn t_clamp(t: [f64], lo: f64, hi: f64) -> [f64] {
+    let shape = t_shape(t)
+    let data = t_data(t)
+    let n = len(data)
+    var result: [f64] = []
+    var i = 0
+    while i < n {
+        var v = data[i]
+        if v < lo {
+            v = lo
+        }
+        if v > hi {
+            v = hi
+        }
+        result = push(result, v)
+        i = i + 1
+    }
+    return t_new(shape, result)
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Reductions
+// ═══════════════════════════════════════════════════════════════════════════════
+
+fn t_sum(t: [f64]) -> f64 {
+    let data = t_data(t)
+    let n = len(data)
+    var sum = 0.0
+    var i = 0
+    while i < n {
+        sum = sum + data[i]
+        i = i + 1
+    }
+    return sum
+}
+
+fn t_mean(t: [f64]) -> f64 {
+    let data = t_data(t)
+    let n = len(data)
+    var sum = 0.0
+    var i = 0
+    while i < n {
+        sum = sum + data[i]
+        i = i + 1
+    }
+    return sum / float(n)
+}
+
+fn t_max(t: [f64]) -> f64 {
+    let data = t_data(t)
+    let n = len(data)
+    var m = data[0]
+    var i = 1
+    while i < n {
+        if data[i] > m {
+            m = data[i]
+        }
+        i = i + 1
+    }
+    return m
+}
+
+fn t_min(t: [f64]) -> f64 {
+    let data = t_data(t)
+    let n = len(data)
+    var m = data[0]
+    var i = 1
+    while i < n {
+        if data[i] < m {
+            m = data[i]
+        }
+        i = i + 1
+    }
+    return m
+}
+
+fn t_argmax(t: [f64]) -> i64 {
+    let data = t_data(t)
+    let n = len(data)
+    var best = 0
+    var best_val = data[0]
+    var i = 1
+    while i < n {
+        if data[i] > best_val {
+            best_val = data[i]
+            best = i
+        }
+        i = i + 1
+    }
+    return best
+}
+
+fn t_argmin(t: [f64]) -> i64 {
+    let data = t_data(t)
+    let n = len(data)
+    var best = 0
+    var best_val = data[0]
+    var i = 1
+    while i < n {
+        if data[i] < best_val {
+            best_val = data[i]
+            best = i
+        }
+        i = i + 1
+    }
+    return best
+}
+
+fn t_var(t: [f64]) -> f64 {
+    let data = t_data(t)
+    let n = len(data)
+    var sum = 0.0
+    var i = 0
+    while i < n {
+        sum = sum + data[i]
+        i = i + 1
+    }
+    let mu = sum / float(n)
+    var variance = 0.0
+    i = 0
+    while i < n {
+        let delta = data[i] - mu
+        variance = variance + delta * delta
+        i = i + 1
+    }
+    return variance / float(n)
+}
+
+fn t_std(t: [f64]) -> f64 {
+    return _sqrt(t_var(t))
+}
+
+fn t_dot(a: [f64], b: [f64]) -> f64 {
+    let da = t_data(a)
+    let db = t_data(b)
+    let n = len(da)
+    var sum = 0.0
+    var i = 0
+    while i < n {
+        sum = sum + da[i] * db[i]
+        i = i + 1
+    }
+    return sum
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Matrix Operations — THE heart of LLM compute
+// ═══════════════════════════════════════════════════════════════════════════════
+
+fn t_matmul(a: [f64], b: [f64]) -> [f64] {
+    let sa = t_shape(a)
+    let sb = t_shape(b)
+    let m = sa[0]
+    let k = sa[1]
+    let n = sb[1]
+    let da = t_data(a)
+    let db = t_data(b)
+    var result: [f64] = []
+    var i = 0
+    while i < m {
+        var j = 0
+        while j < n {
+            var sum = 0.0
+            var p = 0
+            while p < k {
+                sum = sum + da[i * k + p] * db[p * n + j]
+                p = p + 1
+            }
+            result = push(result, sum)
+            j = j + 1
+        }
+        i = i + 1
+    }
+    return t_new([m, n], result)
+}
+
+fn t_transpose(t: [f64]) -> [f64] {
+    let shape = t_shape(t)
+    let rows = shape[0]
+    let cols = shape[1]
+    let data = t_data(t)
+    var result: [f64] = []
+    var j = 0
+    while j < cols {
+        var i = 0
+        while i < rows {
+            result = push(result, data[i * cols + j])
+            i = i + 1
+        }
+        j = j + 1
+    }
+    return t_new([cols, rows], result)
+}
+
+fn t_batch_matmul(a: [f64], b: [f64]) -> [f64] {
+    // a: [batch, m, k], b: [batch, k, n] -> [batch, m, n]
+    let sa = t_shape(a)
+    let sb = t_shape(b)
+    let batch = sa[0]
+    let m = sa[1]
+    let k = sa[2]
+    let n = sb[2]
+    let da = t_data(a)
+    let db = t_data(b)
+    let a_stride = m * k
+    let b_stride = k * n
+    var result: [f64] = []
+    var bi = 0
+    while bi < batch {
+        let a_off = bi * a_stride
+        let b_off = bi * b_stride
+        var i = 0
+        while i < m {
+            var j = 0
+            while j < n {
+                var sum = 0.0
+                var p = 0
+                while p < k {
+                    sum = sum + da[a_off + i * k + p] * db[b_off + p * n + j]
+                    p = p + 1
+                }
+                result = push(result, sum)
+                j = j + 1
+            }
+            i = i + 1
+        }
+        bi = bi + 1
+    }
+    return t_new([batch, m, n], result)
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// LLM-Specific Operations
+// ═══════════════════════════════════════════════════════════════════════════════
+
+fn t_softmax(t: [f64]) -> [f64] {
+    // Softmax over last dimension, numerically stable (subtract max first)
+    let shape = t_shape(t)
+    let ndim = len(shape)
+    let data = t_data(t)
+    let total = len(data)
+
+    if ndim == 1 {
+        var mx = data[0]
+        var i = 1
+        while i < total {
+            if data[i] > mx {
+                mx = data[i]
+            }
+            i = i + 1
+        }
+        var sum = 0.0
+        var exps: [f64] = []
+        i = 0
+        while i < total {
+            let e = _exp(data[i] - mx)
+            exps = push(exps, e)
+            sum = sum + e
+            i = i + 1
+        }
+        var result: [f64] = []
+        i = 0
+        while i < total {
+            result = push(result, exps[i] / sum)
+            i = i + 1
+        }
+        return t_new(shape, result)
+    }
+
+    // 2D+: softmax each row (last dim)
+    let cols = shape[ndim - 1]
+    let rows = total / cols
+    var result: [f64] = []
+    var r = 0
+    while r < rows {
+        let base = r * cols
+        var mx = data[base]
+        var c = 1
+        while c < cols {
+            if data[base + c] > mx {
+                mx = data[base + c]
+            }
+            c = c + 1
+        }
+        var sum = 0.0
+        var exps: [f64] = []
+        c = 0
+        while c < cols {
+            let e = _exp(data[base + c] - mx)
+            exps = push(exps, e)
+            sum = sum + e
+            c = c + 1
+        }
+        c = 0
+        while c < cols {
+            result = push(result, exps[c] / sum)
+            c = c + 1
+        }
+        r = r + 1
+    }
+    return t_new(shape, result)
+}
+
+fn t_layer_norm(t: [f64], gamma: [f64], beta: [f64], eps: f64) -> [f64] {
+    // Layer normalization along last dimension
+    // t: [rows, cols], gamma: [1, cols], beta: [1, cols]
+    let shape = t_shape(t)
+    let rows = shape[0]
+    let cols = shape[1]
+    let data = t_data(t)
+    let g = t_data(gamma)
+    let b = t_data(beta)
+    var result: [f64] = []
+    var r = 0
+    while r < rows {
+        let base = r * cols
+        // Mean
+        var mu = 0.0
+        var c = 0
+        while c < cols {
+            mu = mu + data[base + c]
+            c = c + 1
+        }
+        mu = mu / float(cols)
+        // Variance
+        var variance = 0.0
+        c = 0
+        while c < cols {
+            let delta = data[base + c] - mu
+            variance = variance + delta * delta
+            c = c + 1
+        }
+        variance = variance / float(cols)
+        let inv_std = 1.0 / _sqrt(variance + eps)
+        // Normalize, scale, shift
+        c = 0
+        while c < cols {
+            let normed = (data[base + c] - mu) * inv_std
+            result = push(result, normed * g[c] + b[c])
+            c = c + 1
+        }
+        r = r + 1
+    }
+    return t_new(shape, result)
+}
+
+fn t_rms_norm(t: [f64], weight: [f64], eps: f64) -> [f64] {
+    // RMS Normalization (LLaMA style): x / sqrt(mean(x^2) + eps) * weight
+    let shape = t_shape(t)
+    let rows = shape[0]
+    let cols = shape[1]
+    let data = t_data(t)
+    let w = t_data(weight)
+    var result: [f64] = []
+    var r = 0
+    while r < rows {
+        let base = r * cols
+        var sq_sum = 0.0
+        var c = 0
+        while c < cols {
+            sq_sum = sq_sum + data[base + c] * data[base + c]
+            c = c + 1
+        }
+        let rms = _sqrt(sq_sum / float(cols) + eps)
+        let inv_rms = 1.0 / rms
+        c = 0
+        while c < cols {
+            result = push(result, data[base + c] * inv_rms * w[c])
+            c = c + 1
+        }
+        r = r + 1
+    }
+    return t_new(shape, result)
+}
+
+fn t_rope(q: [f64], k: [f64], pos: i64, head_dim: i64) -> [f64] {
+    // Rotary Position Embedding — applies rotation to Q and K
+    // q, k: [seq, head_dim]
+    // Returns concatenated [q_rotated_data..., k_rotated_data...] as [2*seq, head_dim]
+    let sq = t_shape(q)
+    let seq = sq[0]
+    let dim = sq[1]
+    let half = dim / 2
+    let qd = t_data(q)
+    let kd = t_data(k)
+    var q_rot: [f64] = []
+    var k_rot: [f64] = []
+    var s = 0
+    while s < seq {
+        let p = float(pos + s)
+        var d = 0
+        while d < half {
+            let theta = p / _exp(float(2 * d) / float(dim) * _log(10000.0))
+            let cos_t = _cos(theta)
+            let sin_t = _sin(theta)
+            let q0 = qd[s * dim + 2 * d]
+            let q1 = qd[s * dim + 2 * d + 1]
+            q_rot = push(q_rot, q0 * cos_t - q1 * sin_t)
+            q_rot = push(q_rot, q0 * sin_t + q1 * cos_t)
+            let k0 = kd[s * dim + 2 * d]
+            let k1 = kd[s * dim + 2 * d + 1]
+            k_rot = push(k_rot, k0 * cos_t - k1 * sin_t)
+            k_rot = push(k_rot, k0 * sin_t + k1 * cos_t)
+            d = d + 1
+        }
+        s = s + 1
+    }
+    // Concatenate q_rot and k_rot into one tensor [2*seq, head_dim]
+    var combined: [f64] = []
+    var i = 0
+    let qn = len(q_rot)
+    while i < qn {
+        combined = push(combined, q_rot[i])
+        i = i + 1
+    }
+    i = 0
+    let kn = len(k_rot)
+    while i < kn {
+        combined = push(combined, k_rot[i])
+        i = i + 1
+    }
+    return t_new([2 * seq, dim], combined)
+}
+
+fn t_attention(q: [f64], k: [f64], v: [f64], mask: [f64], head_dim: i64) -> [f64] {
+    // Scaled dot-product attention: softmax(QK^T / sqrt(d_k) + mask) @ V
+    // q: [seq_q, dk], k: [seq_k, dk], v: [seq_k, dv]
+    // mask: [seq_q, seq_k] — 0.0 to attend, -1e9 to mask
+    let scale = 1.0 / _sqrt(float(head_dim))
+    let kt = t_transpose(k)
+    let scores = t_matmul(q, kt)
+    // Scale and add mask
+    let s_shape = t_shape(scores)
+    let s_rows = s_shape[0]
+    let s_cols = s_shape[1]
+    let sd = t_data(scores)
+    let md = t_data(mask)
+    var scaled: [f64] = []
+    var i = 0
+    let sn = len(sd)
+    while i < sn {
+        scaled = push(scaled, sd[i] * scale + md[i])
+        i = i + 1
+    }
+    let scaled_t = t_new(s_shape, scaled)
+    let weights = t_softmax(scaled_t)
+    return t_matmul(weights, v)
+}
+
+fn t_multi_head_attention(x: [f64], wq: [f64], wk: [f64], wv: [f64], wo: [f64], n_heads: i64, head_dim: i64, pos: i64) -> [f64] {
+    // Full multi-head attention with RoPE
+    // x: [seq, d_model], wq/wk/wv: [d_model, d_model], wo: [d_model, d_model]
+    let sx = t_shape(x)
+    let seq = sx[0]
+    let d_model = sx[1]
+
+    let q_full = t_matmul(x, wq)
+    let k_full = t_matmul(x, wk)
+    let v_full = t_matmul(x, wv)
+
+    let qd = t_data(q_full)
+    let kd = t_data(k_full)
+    let vd = t_data(v_full)
+
+    // Build causal mask [seq, seq]
+    var mask_data: [f64] = []
+    var mi = 0
+    while mi < seq {
+        var mj = 0
+        while mj < seq {
+            if mj > mi {
+                mask_data = push(mask_data, -1000000000.0)
+            } else {
+                mask_data = push(mask_data, 0.0)
+            }
+            mj = mj + 1
+        }
+        mi = mi + 1
+    }
+    let causal_mask = t_new([seq, seq], mask_data)
+
+    // Initialize concat output
+    var concat: [f64] = []
+    var ci = 0
+    while ci < seq * d_model {
+        concat = push(concat, 0.0)
+        ci = ci + 1
+    }
+
+    var h = 0
+    while h < n_heads {
+        let col_start = h * head_dim
+        // Extract head slices
+        var qh: [f64] = []
+        var kh: [f64] = []
+        var vh: [f64] = []
+        var s = 0
+        while s < seq {
+            var d = 0
+            while d < head_dim {
+                qh = push(qh, qd[s * d_model + col_start + d])
+                kh = push(kh, kd[s * d_model + col_start + d])
+                vh = push(vh, vd[s * d_model + col_start + d])
+                d = d + 1
+            }
+            s = s + 1
+        }
+
+        // Apply RoPE
+        let q_head = t_new([seq, head_dim], qh)
+        let k_head = t_new([seq, head_dim], kh)
+        let rope_out = t_rope(q_head, k_head, pos, head_dim)
+        let rope_data = t_data(rope_out)
+        // First half is rotated Q, second half is rotated K
+        let rope_half = seq * head_dim
+        var qr: [f64] = []
+        var kr: [f64] = []
+        var ri = 0
+        while ri < rope_half {
+            qr = push(qr, rope_data[ri])
+            ri = ri + 1
+        }
+        ri = 0
+        while ri < rope_half {
+            kr = push(kr, rope_data[rope_half + ri])
+            ri = ri + 1
+        }
+        let q_rot = t_new([seq, head_dim], qr)
+        let k_rot = t_new([seq, head_dim], kr)
+        let v_head = t_new([seq, head_dim], vh)
+
+        let head_out = t_attention(q_rot, k_rot, v_head, causal_mask, head_dim)
+        let ho = t_data(head_out)
+
+        // Place into concat
+        s = 0
+        while s < seq {
+            var d = 0
+            while d < head_dim {
+                concat[s * d_model + col_start + d] = ho[s * head_dim + d]
+                d = d + 1
+            }
+            s = s + 1
+        }
+        h = h + 1
+    }
+
+    let combined = t_new([seq, d_model], concat)
+    return t_matmul(combined, wo)
+}
+
+fn t_ffn_swiglu(x: [f64], w1: [f64], w2: [f64], w3: [f64]) -> [f64] {
+    // SwiGLU FFN: w2 @ (silu(x @ w1) * (x @ w3))
+    // x: [seq, d], w1: [d, hidden], w2: [hidden, d], w3: [d, hidden]
+    let gate = t_matmul(x, w1)
+    let up = t_matmul(x, w3)
+    let gate_act = t_silu(gate)
+    let hidden = t_mul(gate_act, up)
+    return t_matmul(hidden, w2)
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Activation Functions
+// ═══════════════════════════════════════════════════════════════════════════════
+
+fn t_silu(t: [f64]) -> [f64] {
+    // SiLU/Swish: x * sigmoid(x)
+    let shape = t_shape(t)
+    let data = t_data(t)
+    let n = len(data)
+    var result: [f64] = []
+    var i = 0
+    while i < n {
+        let x = data[i]
+        let sig = 1.0 / (1.0 + _exp(0.0 - x))
+        result = push(result, x * sig)
+        i = i + 1
+    }
+    return t_new(shape, result)
+}
+
+fn t_gelu(t: [f64]) -> [f64] {
+    // GELU: 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
+    let shape = t_shape(t)
+    let data = t_data(t)
+    let n = len(data)
+    let c = 0.7978845608028654
+    var result: [f64] = []
+    var i = 0
+    while i < n {
+        let x = data[i]
+        let inner = c * (x + 0.044715 * x * x * x)
+        result = push(result, 0.5 * x * (1.0 + _tanh(inner)))
+        i = i + 1
+    }
+    return t_new(shape, result)
+}
+
+fn t_relu(t: [f64]) -> [f64] {
+    let shape = t_shape(t)
+    let data = t_data(t)
+    let n = len(data)
+    var result: [f64] = []
+    var i = 0
+    while i < n {
+        result = push(result, _max(0.0, data[i]))
+        i = i + 1
+    }
+    return t_new(shape, result)
+}
+
+fn t_sigmoid(t: [f64]) -> [f64] {
+    let shape = t_shape(t)
+    let data = t_data(t)
+    let n = len(data)
+    var result: [f64] = []
+    var i = 0
+    while i < n {
+        result = push(result, 1.0 / (1.0 + _exp(0.0 - data[i])))
+        i = i + 1
+    }
+    return t_new(shape, result)
+}
+
+fn t_tanh_act(t: [f64]) -> [f64] {
+    let shape = t_shape(t)
+    let data = t_data(t)
+    let n = len(data)
+    var result: [f64] = []
+    var i = 0
+    while i < n {
+        result = push(result, _tanh(data[i]))
+        i = i + 1
+    }
+    return t_new(shape, result)
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Embedding
+// ═══════════════════════════════════════════════════════════════════════════════
+
+fn t_embedding(indices: [i64], weight: [f64], vocab_size: i64, dim: i64) -> [f64] {
+    // Look up rows from weight matrix by index
+    // weight: [vocab_size, dim], indices: list of token ids
+    // returns: [len(indices), dim]
+    let wd = t_data(weight)
+    let n = len(indices)
+    var result: [f64] = []
+    var i = 0
+    while i < n {
+        let row = indices[i]
+        let base = row * dim
+        var j = 0
+        while j < dim {
+            result = push(result, wd[base + j])
+            j = j + 1
+        }
+        i = i + 1
+    }
+    return t_new([n, dim], result)
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Utility
+// ═══════════════════════════════════════════════════════════════════════════════
+
+fn t_print(t: [f64]) {
+    let shape = t_shape(t)
+    let ndim = len(shape)
+    var shape_str = "("
+    var si = 0
+    while si < ndim {
+        if si > 0 {
+            shape_str = shape_str + ", "
+        }
+        shape_str = shape_str + to_string(shape[si])
+        si = si + 1
+    }
+    shape_str = shape_str + ")"
+    print("Tensor shape=" + shape_str)
+    let data = t_data(t)
+    let n = len(data)
+    if ndim == 1 {
+        var s = "["
+        var i = 0
+        while i < n {
+            if i > 0 {
+                s = s + ", "
+            }
+            s = s + to_string(data[i])
+            i = i + 1
+        }
+        print(s + "]")
+    } else {
+        if ndim == 2 {
+            let rows = shape[0]
+            let cols = shape[1]
+            var r = 0
+            while r < rows {
+                var s = "  ["
+                var c = 0
+                while c < cols {
+                    if c > 0 {
+                        s = s + ", "
+                    }
+                    s = s + to_string(data[r * cols + c])
+                    c = c + 1
+                }
+                print(s + "]")
+                r = r + 1
+            }
+        } else {
+            var s = "["
+            var i = 0
+            while i < n {
+                if i > 0 {
+                    s = s + ", "
+                }
+                s = s + to_string(data[i])
+                i = i + 1
+            }
+            print(s + "]")
+        }
+    }
+}
+
+fn t_allclose(a: [f64], b: [f64], tol: f64) -> bool {
+    let sa = t_shape(a)
+    let sb = t_shape(b)
+    if len(sa) != len(sb) {
+        return false
+    }
+    var i = 0
+    while i < len(sa) {
+        if sa[i] != sb[i] {
+            return false
+        }
+        i = i + 1
+    }
+    let da = t_data(a)
+    let db = t_data(b)
+    let n = len(da)
+    i = 0
+    while i < n {
+        if _abs(da[i] - db[i]) > tol {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+fn t_cat(a: [f64], b: [f64]) -> [f64] {
+    // Concatenate along first dimension
+    let sa = t_shape(a)
+    let sb = t_shape(b)
+    let ndim = len(sa)
+    let da = t_data(a)
+    let db = t_data(b)
+    var new_shape: [i64] = []
+    new_shape = push(new_shape, sa[0] + sb[0])
+    var i = 1
+    while i < ndim {
+        new_shape = push(new_shape, sa[i])
+        i = i + 1
+    }
+    var result: [f64] = []
+    let na = len(da)
+    let nb = len(db)
+    i = 0
+    while i < na {
+        result = push(result, da[i])
+        i = i + 1
+    }
+    i = 0
+    while i < nb {
+        result = push(result, db[i])
+        i = i + 1
+    }
+    return t_new(new_shape, result)
+}
+
+fn t_slice(t: [f64], dim: i64, start: i64, end_idx: i64) -> [f64] {
+    // Slice along a dimension
+    let shape = t_shape(t)
+    let ndim = len(shape)
+    let data = t_data(t)
+
+    if ndim == 1 {
+        var result: [f64] = []
+        var i = start
+        while i < end_idx {
+            result = push(result, data[i])
+            i = i + 1
+        }
+        return t_new([end_idx - start], result)
+    }
+
+    if ndim == 2 {
+        let rows = shape[0]
+        let cols = shape[1]
+        if dim == 0 {
+            // Slice rows
+            var result: [f64] = []
+            var r = start
+            while r < end_idx {
+                var c = 0
+                while c < cols {
+                    result = push(result, data[r * cols + c])
+                    c = c + 1
+                }
+                r = r + 1
+            }
+            return t_new([end_idx - start, cols], result)
+        } else {
+            // Slice cols
+            var result: [f64] = []
+            var r = 0
+            while r < rows {
+                var c = start
+                while c < end_idx {
+                    result = push(result, data[r * cols + c])
+                    c = c + 1
+                }
+                r = r + 1
+            }
+            return t_new([rows, end_idx - start], result)
+        }
+    }
+
+    // 3D: slice along dim
+    let d0 = shape[0]
+    let d1 = shape[1]
+    let d2 = shape[2]
+    if dim == 0 {
+        var result: [f64] = []
+        var i = start
+        while i < end_idx {
+            var j = 0
+            while j < d1 * d2 {
+                result = push(result, data[i * d1 * d2 + j])
+                j = j + 1
+            }
+            i = i + 1
+        }
+        return t_new([end_idx - start, d1, d2], result)
+    }
+    if dim == 1 {
+        var result: [f64] = []
+        var i = 0
+        while i < d0 {
+            var j = start
+            while j < end_idx {
+                var k = 0
+                while k < d2 {
+                    result = push(result, data[i * d1 * d2 + j * d2 + k])
+                    k = k + 1
+                }
+                j = j + 1
+            }
+            i = i + 1
+        }
+        return t_new([d0, end_idx - start, d2], result)
+    }
+    // dim == 2
+    var result: [f64] = []
+    var i = 0
+    while i < d0 {
+        var j = 0
+        while j < d1 {
+            var k = start
+            while k < end_idx {
+                result = push(result, data[i * d1 * d2 + j * d2 + k])
+                k = k + 1
+            }
+            j = j + 1
+        }
+        i = i + 1
+    }
+    return t_new([d0, d1, end_idx - start], result)
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Tests
+// ═══════════════════════════════════════════════════════════════════════════════
+
+fn _assert(name: str, ok: bool) {
+    if ok {
+        print("  PASS: " + name)
+    } else {
+        print("  FAIL: " + name)
+    }
+}
+
+fn main() {
+    print("=== Vortex Native Tensor Test Suite ===")
+    print("")
+
+    // 1. Basic tensor create/get/set
+    print("--- Create / Get / Set ---")
+    let t1 = t_new([2, 3], [1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
+    let s1 = t_shape(t1)
+    _assert("shape [2,3]", s1[0] == 2 && s1[1] == 3)
+    _assert("ndim==2", t_ndim(t1) == 2)
+    _assert("numel==6", t_numel(t1) == 6)
+    _assert("get [0,0]==1", t_get(t1, [0, 0]) == 1.0)
+    _assert("get [1,2]==6", t_get(t1, [1, 2]) == 6.0)
+    let t1s = t_set(t1, [0, 1], 99.0)
+    _assert("set [0,1]=99", t_get(t1s, [0, 1]) == 99.0)
+    _assert("original unchanged", t_get(t1, [0, 1]) == 2.0)
+
+    let z = t_zeros([3, 3])
+    _assert("zeros sum==0", t_sum(z) == 0.0)
+    let o = t_ones([2, 2])
+    _assert("ones sum==4", t_sum(o) == 4.0)
+    let f = t_fill([2, 2], 3.14)
+    _assert("fill sum~12.56", _abs(t_sum(f) - 12.56) < 0.01)
+    let eye = t_eye(3)
+    _assert("eye sum==3", t_sum(eye) == 3.0)
+    _assert("eye [0,0]==1", t_get(eye, [0, 0]) == 1.0)
+    _assert("eye [0,1]==0", t_get(eye, [0, 1]) == 0.0)
+    let ar = t_arange(0.0, 5.0, 1.0)
+    _assert("arange len==5", t_numel(ar) == 5)
+    _assert("arange sum==10", t_sum(ar) == 10.0)
+    print("")
+
+    // 2. Matmul correctness with known values
+    print("--- Matmul ---")
+    let ma = t_new([2, 3], [1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
+    let mb = t_new([3, 2], [7.0, 8.0, 9.0, 10.0, 11.0, 12.0])
+    let mc = t_matmul(ma, mb)
+    let mc_s = t_shape(mc)
+    _assert("matmul shape [2,2]", mc_s[0] == 2 && mc_s[1] == 2)
+    _assert("matmul [0,0]==58", t_get(mc, [0, 0]) == 58.0)
+    _assert("matmul [0,1]==64", t_get(mc, [0, 1]) == 64.0)
+    _assert("matmul [1,0]==139", t_get(mc, [1, 0]) == 139.0)
+    _assert("matmul [1,1]==154", t_get(mc, [1, 1]) == 154.0)
+
+    // Identity matmul
+    let eye2 = t_eye(2)
+    let v22 = t_new([2, 2], [3.0, 7.0, 1.0, 4.0])
+    let id_mul = t_matmul(v22, eye2)
+    _assert("matmul identity", t_allclose(v22, id_mul, 1.0e-10))
+    print("")
+
+    // 3. Softmax sums to 1.0
+    print("--- Softmax ---")
+    let sm_in = t_new([1, 4], [1.0, 2.0, 3.0, 4.0])
+    let sm_out = t_softmax(sm_in)
+    let sm_data = t_data(sm_out)
+    var sm_sum = 0.0
+    var smi = 0
+    while smi < 4 {
+        sm_sum = sm_sum + sm_data[smi]
+        smi = smi + 1
+    }
+    _assert("softmax sums to 1", _abs(sm_sum - 1.0) < 1.0e-10)
+    _assert("softmax monotonic", sm_data[0] < sm_data[1] && sm_data[1] < sm_data[2] && sm_data[2] < sm_data[3])
+
+    // 2D softmax: each row sums to 1
+    let sm2 = t_new([2, 3], [1.0, 2.0, 3.0, 10.0, 20.0, 30.0])
+    let sm2_out = t_softmax(sm2)
+    let sm2_d = t_data(sm2_out)
+    let row0_sum = sm2_d[0] + sm2_d[1] + sm2_d[2]
+    let row1_sum = sm2_d[3] + sm2_d[4] + sm2_d[5]
+    _assert("softmax 2D row0 sums to 1", _abs(row0_sum - 1.0) < 1.0e-10)
+    _assert("softmax 2D row1 sums to 1", _abs(row1_sum - 1.0) < 1.0e-10)
+    print("")
+
+    // 4. Layer norm: mean~0, var~1
+    print("--- Layer Norm ---")
+    let ln_in = t_new([2, 4], [1.0, 2.0, 3.0, 4.0, 10.0, 20.0, 30.0, 40.0])
+    let ln_g = t_new([1, 4], [1.0, 1.0, 1.0, 1.0])
+    let ln_b = t_new([1, 4], [0.0, 0.0, 0.0, 0.0])
+    let ln_out = t_layer_norm(ln_in, ln_g, ln_b, 1.0e-5)
+    let ln_d = t_data(ln_out)
+    // Row 0 mean should be ~0
+    let r0_mean = (ln_d[0] + ln_d[1] + ln_d[2] + ln_d[3]) / 4.0
+    _assert("layernorm row0 mean~0", _abs(r0_mean) < 1.0e-10)
+    // Row 0 variance should be ~1
+    var r0_var = 0.0
+    var lni = 0
+    while lni < 4 {
+        r0_var = r0_var + (ln_d[lni] - r0_mean) * (ln_d[lni] - r0_mean)
+        lni = lni + 1
+    }
+    r0_var = r0_var / 4.0
+    _assert("layernorm row0 var~1", _abs(r0_var - 1.0) < 0.01)
+
+    // Row 1 mean should be ~0
+    let r1_mean = (ln_d[4] + ln_d[5] + ln_d[6] + ln_d[7]) / 4.0
+    _assert("layernorm row1 mean~0", _abs(r1_mean) < 1.0e-10)
+    print("")
+
+    // 5. Attention produces correct shape
+    print("--- Attention ---")
+    let aq = t_new([2, 4], [1.0, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 1.0])
+    let ak = t_new([2, 4], [1.0, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 1.0])
+    let av = t_new([2, 4], [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0])
+    // No masking (all zeros)
+    let amask = t_zeros([2, 2])
+    let attn_out = t_attention(aq, ak, av, amask, 4)
+    let attn_s = t_shape(attn_out)
+    _assert("attention shape [2,4]", attn_s[0] == 2 && attn_s[1] == 4)
+    // Each output row should be a weighted combination of V rows
+    // Verify output is reasonable (between min and max of V)
+    let attn_d = t_data(attn_out)
+    _assert("attention val in range", attn_d[0] >= 1.0 && attn_d[0] <= 5.0)
+    print("")
+
+    // 6. SiLU(0) = 0
+    print("--- Activations ---")
+    let silu_in = t_new([1, 3], [0.0, 1.0, -1.0])
+    let silu_out = t_silu(silu_in)
+    let silu_d = t_data(silu_out)
+    _assert("silu(0)==0", _abs(silu_d[0]) < 1.0e-15)
+    // silu(1) = 1 * sigmoid(1) = 1/(1+e^-1) ~ 0.7311
+    _assert("silu(1)~0.731", _abs(silu_d[1] - 0.7310585786) < 0.001)
+
+    let gelu_in = t_new([1, 1], [0.0])
+    let gelu_out = t_gelu(gelu_in)
+    _assert("gelu(0)==0", _abs(t_get(gelu_out, [0, 0])) < 1.0e-10)
+
+    let relu_in = t_new([1, 3], [-2.0, 0.0, 3.0])
+    let relu_out = t_relu(relu_in)
+    _assert("relu(-2)==0", t_get(relu_out, [0, 0]) == 0.0)
+    _assert("relu(3)==3", t_get(relu_out, [0, 2]) == 3.0)
+
+    let sig_out = t_sigmoid(t_new([1, 1], [0.0]))
+    _assert("sigmoid(0)==0.5", _abs(t_get(sig_out, [0, 0]) - 0.5) < 1.0e-10)
+
+    let tanh_out = t_tanh_act(t_new([1, 1], [0.0]))
+    _assert("tanh(0)==0", _abs(t_get(tanh_out, [0, 0])) < 1.0e-10)
+    print("")
+
+    // 7. Embedding lookup is correct
+    print("--- Embedding ---")
+    let emb_w = t_new([4, 3], [
+        0.1, 0.2, 0.3,
+        0.4, 0.5, 0.6,
+        0.7, 0.8, 0.9,
+        1.0, 1.1, 1.2
+    ])
+    let emb_out = t_embedding([2, 0, 3], emb_w, 4, 3)
+    let emb_s = t_shape(emb_out)
+    _assert("embedding shape [3,3]", emb_s[0] == 3 && emb_s[1] == 3)
+    _assert("embedding [0,0]==0.7", _abs(t_get(emb_out, [0, 0]) - 0.7) < 1.0e-10)
+    _assert("embedding [1,0]==0.1", _abs(t_get(emb_out, [1, 0]) - 0.1) < 1.0e-10)
+    _assert("embedding [2,2]==1.2", _abs(t_get(emb_out, [2, 2]) - 1.2) < 1.0e-10)
+    print("")
+
+    // Extra: RMS norm, transpose, reductions
+    print("--- Extra ---")
+    let rms_in = t_new([1, 4], [1.0, 2.0, 3.0, 4.0])
+    let rms_w = t_new([1, 4], [1.0, 1.0, 1.0, 1.0])
+    let rms_out = t_rms_norm(rms_in, rms_w, 1.0e-5)
+    let rms_d = t_data(rms_out)
+    // RMS = sqrt(mean(x^2)) = sqrt((1+4+9+16)/4) = sqrt(7.5) ~ 2.7386
+    // Output should be x / rms
+    let expected_rms = _sqrt(7.5)
+    _assert("rms_norm [0]", _abs(rms_d[0] - 1.0 / expected_rms) < 0.001)
+
+    let tr = t_transpose(t_new([2, 3], [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]))
+    let trs = t_shape(tr)
+    _assert("transpose [3,2]", trs[0] == 3 && trs[1] == 2)
+    _assert("transpose [0,1]==4", t_get(tr, [0, 1]) == 4.0)
+
+    let rv = t_new([1, 4], [3.0, 1.0, 4.0, 2.0])
+    _assert("argmax==2", t_argmax(rv) == 2)
+    _assert("argmin==1", t_argmin(rv) == 1)
+    _assert("max==4", t_max(rv) == 4.0)
+    _assert("min==1", t_min(rv) == 1.0)
+
+    let vt = t_new([1, 4], [2.0, 4.0, 4.0, 4.0])
+    _assert("var==0.75", _abs(t_var(vt) - 0.75) < 1.0e-10)
+    _assert("std~0.866", _abs(t_std(vt) - _sqrt(0.75)) < 0.001)
+
+    // Flatten
+    let fl = t_flatten(t_new([2, 3], [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]))
+    _assert("flatten ndim==1", t_ndim(fl) == 1)
+    _assert("flatten numel==6", t_numel(fl) == 6)
+
+    // Cat
+    let ca = t_new([1, 3], [1.0, 2.0, 3.0])
+    let cb = t_new([2, 3], [4.0, 5.0, 6.0, 7.0, 8.0, 9.0])
+    let cc = t_cat(ca, cb)
+    let ccs = t_shape(cc)
+    _assert("cat shape [3,3]", ccs[0] == 3 && ccs[1] == 3)
+
+    // Allclose
+    let ac1 = t_new([1, 2], [1.0, 2.0])
+    let ac2 = t_new([1, 2], [1.0000001, 2.0000001])
+    _assert("allclose true", t_allclose(ac1, ac2, 0.001))
+    _assert("allclose false", t_allclose(ac1, ac2, 1.0e-10) == false)
+    print("")
+
+    print("=== All tests complete ===")
+}

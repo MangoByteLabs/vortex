@@ -1,0 +1,698 @@
+// std/math.vx — Pure Vortex math library
+// No external dependencies beyond basic arithmetic operators
+
+// ─── Constants ────────────────────────────────────────────────────────────────
+
+fn pi() -> f64 {
+    return 3.14159265358979323846
+}
+
+fn e() -> f64 {
+    return 2.71828182845904523536
+}
+
+fn tau() -> f64 {
+    return 6.28318530717958647692
+}
+
+fn inf() -> f64 {
+    // 1e308 approximation via repeated multiplication
+    let big = 1.0e100
+    return big * big * big
+}
+
+// ─── Basic functions ──────────────────────────────────────────────────────────
+
+fn abs_int(x: i64) -> i64 {
+    if x < 0 {
+        return 0 - x
+    }
+    return x
+}
+
+fn abs_float(x: f64) -> f64 {
+    if x < 0.0 {
+        return 0.0 - x
+    }
+    return x
+}
+
+fn min_int(a: i64, b: i64) -> i64 {
+    if a < b {
+        return a
+    }
+    return b
+}
+
+fn max_int(a: i64, b: i64) -> i64 {
+    if a > b {
+        return a
+    }
+    return b
+}
+
+fn min_float(a: f64, b: f64) -> f64 {
+    if a < b {
+        return a
+    }
+    return b
+}
+
+fn max_float(a: f64, b: f64) -> f64 {
+    if a > b {
+        return a
+    }
+    return b
+}
+
+fn clamp_int(x: i64, lo: i64, hi: i64) -> i64 {
+    if x < lo {
+        return lo
+    }
+    if x > hi {
+        return hi
+    }
+    return x
+}
+
+fn clamp_float(x: f64, lo: f64, hi: f64) -> f64 {
+    if x < lo {
+        return lo
+    }
+    if x > hi {
+        return hi
+    }
+    return x
+}
+
+fn sign(x: f64) -> f64 {
+    if x > 0.0 {
+        return 1.0
+    }
+    if x < 0.0 {
+        return -1.0
+    }
+    return 0.0
+}
+
+// ─── Integer math ─────────────────────────────────────────────────────────────
+
+fn gcd(a: i64, b: i64) -> i64 {
+    var aa = abs_int(a)
+    var bb = abs_int(b)
+    while bb != 0 {
+        let tmp = bb
+        bb = aa - (aa / bb) * bb
+        aa = tmp
+    }
+    return aa
+}
+
+fn lcm(a: i64, b: i64) -> i64 {
+    let g = gcd(a, b)
+    if g == 0 {
+        return 0
+    }
+    return abs_int(a / g * b)
+}
+
+fn factorial(n: i64) -> i64 {
+    if n <= 1 {
+        return 1
+    }
+    var result = 1
+    for i in range(2, n + 1) {
+        result = result * i
+    }
+    return result
+}
+
+fn fib(n: i64) -> i64 {
+    if n <= 0 {
+        return 0
+    }
+    if n == 1 {
+        return 1
+    }
+    var a = 0
+    var b = 1
+    for i in range(2, n + 1) {
+        let tmp = a + b
+        a = b
+        b = tmp
+    }
+    return b
+}
+
+fn pow_int(base: i64, exp: i64) -> i64 {
+    if exp < 0 {
+        return 0
+    }
+    var result = 1
+    var b = base
+    var e = exp
+    while e > 0 {
+        if e - (e / 2) * 2 == 1 {
+            result = result * b
+        }
+        b = b * b
+        e = e / 2
+    }
+    return result
+}
+
+fn is_prime(n: i64) -> bool {
+    if n < 2 {
+        return false
+    }
+    if n == 2 {
+        return true
+    }
+    if n - (n / 2) * 2 == 0 {
+        return false
+    }
+    var i = 3
+    while i * i <= n {
+        if n - (n / i) * i == 0 {
+            return false
+        }
+        i = i + 2
+    }
+    return true
+}
+
+fn mod_pow(base: i64, exp: i64, m: i64) -> i64 {
+    if m == 1 {
+        return 0
+    }
+    var result = 1
+    var b = base - (base / m) * m
+    var e = exp
+    while e > 0 {
+        if e - (e / 2) * 2 == 1 {
+            result = (result * b) - ((result * b) / m) * m
+        }
+        b = (b * b) - ((b * b) / m) * m
+        e = e / 2
+    }
+    return result
+}
+
+// ─── Float math ───────────────────────────────────────────────────────────────
+
+fn pow_float(base: f64, exp: f64) -> f64 {
+    // For integer exponents: use repeated squaring
+    // For general: use exp(exp * ln(base))
+    let exp_int = int(exp)
+    let exp_f = float(exp_int)
+    if exp_f == exp && exp_int >= 0 {
+        var result = 1.0
+        var b = base
+        var e = exp_int
+        while e > 0 {
+            if e - (e / 2) * 2 == 1 {
+                result = result * b
+            }
+            b = b * b
+            e = e / 2
+        }
+        return result
+    }
+    // Negative integer exponent
+    if exp_f == exp && exp_int < 0 {
+        var result = 1.0
+        var b = base
+        var e = 0 - exp_int
+        while e > 0 {
+            if e - (e / 2) * 2 == 1 {
+                result = result * b
+            }
+            b = b * b
+            e = e / 2
+        }
+        return 1.0 / result
+    }
+    // General: exp(exp * ln(base))
+    if base <= 0.0 {
+        return 0.0
+    }
+    return exp_float(exp * ln(base))
+}
+
+fn sqrt_float(x: f64) -> f64 {
+    if x < 0.0 {
+        return 0.0
+    }
+    if x == 0.0 {
+        return 0.0
+    }
+    // Newton's method: x_{n+1} = (x_n + S/x_n) / 2
+    var guess = x / 2.0
+    if guess < 1.0 {
+        guess = 1.0
+    }
+    var i = 0
+    while i < 60 {
+        let next = (guess + x / guess) / 2.0
+        let delta = next - guess
+        if delta < 0.0 {
+            if (0.0 - delta) < 1.0e-15 {
+                return next
+            }
+        } else {
+            if delta < 1.0e-15 {
+                return next
+            }
+        }
+        guess = next
+        i = i + 1
+    }
+    return guess
+}
+
+fn cbrt(x: f64) -> f64 {
+    if x == 0.0 {
+        return 0.0
+    }
+    let neg = x < 0.0
+    var v = x
+    if neg {
+        v = 0.0 - x
+    }
+    // Newton's method for cube root: x_{n+1} = (2*x_n + v/x_n^2) / 3
+    var guess = v / 3.0
+    if guess < 1.0 {
+        guess = 1.0
+    }
+    var i = 0
+    while i < 80 {
+        let g2 = guess * guess
+        let next = (2.0 * guess + v / g2) / 3.0
+        let delta = next - guess
+        if delta < 0.0 {
+            if (0.0 - delta) < 1.0e-15 {
+                if neg {
+                    return 0.0 - next
+                }
+                return next
+            }
+        } else {
+            if delta < 1.0e-15 {
+                if neg {
+                    return 0.0 - next
+                }
+                return next
+            }
+        }
+        guess = next
+        i = i + 1
+    }
+    if neg {
+        return 0.0 - guess
+    }
+    return guess
+}
+
+fn ln(x: f64) -> f64 {
+    if x <= 0.0 {
+        return 0.0 - inf()
+    }
+    if x == 1.0 {
+        return 0.0
+    }
+    // Reduce: x = m * 2^k so that m is in [0.5, 1.0)
+    // ln(x) = k*ln(2) + ln(m)
+    // Then use series ln(m) = ln((1+t)/(1-t)) for t = (m-1)/(m+1)
+    // = 2*(t + t^3/3 + t^5/5 + ...)
+    let ln2 = 0.6931471805599453
+
+    var v = x
+    var k = 0
+    while v >= 2.0 {
+        v = v / 2.0
+        k = k + 1
+    }
+    while v < 0.5 {
+        v = v * 2.0
+        k = k - 1
+    }
+    // v in [0.5, 2.0), use t-series
+    let t = (v - 1.0) / (v + 1.0)
+    let t2 = t * t
+    var term = t
+    var sum = t
+    var n = 1
+    while n < 60 {
+        term = term * t2
+        n = n + 2
+        let contrib = term / float(n)
+        sum = sum + contrib
+        if contrib < 0.0 {
+            if (0.0 - contrib) < 1.0e-16 {
+                n = 100
+            }
+        } else {
+            if contrib < 1.0e-16 {
+                n = 100
+            }
+        }
+    }
+    return 2.0 * sum + float(k) * ln2
+}
+
+fn log2(x: f64) -> f64 {
+    return ln(x) / 0.6931471805599453
+}
+
+fn log10(x: f64) -> f64 {
+    return ln(x) / 2.302585092994046
+}
+
+fn exp_float(x: f64) -> f64 {
+    // Range reduce: e^x = e^k * e^r where k = floor(x/ln2), r = x - k*ln2
+    // Then Taylor series for e^r
+    let ln2 = 0.6931471805599453
+    let k = int(x / ln2)
+    let r = x - float(k) * ln2
+
+    // Taylor: e^r = sum r^n / n!
+    var term = 1.0
+    var sum = 1.0
+    var n = 1
+    while n < 40 {
+        term = term * r / float(n)
+        sum = sum + term
+        let at = abs_float(term)
+        if at < 1.0e-17 {
+            n = 100
+        }
+        n = n + 1
+    }
+    // Multiply by 2^k
+    if k >= 0 {
+        var factor = 1.0
+        var i = 0
+        while i < k {
+            factor = factor * 2.0
+            i = i + 1
+        }
+        return sum * factor
+    } else {
+        var factor = 1.0
+        var i = 0
+        let nk = 0 - k
+        while i < nk {
+            factor = factor * 2.0
+            i = i + 1
+        }
+        return sum / factor
+    }
+}
+
+fn sin_float(x: f64) -> f64 {
+    // Reduce to [-pi, pi]
+    let two_pi = 6.28318530717958647692
+    var v = x
+    while v > 3.14159265358979323846 {
+        v = v - two_pi
+    }
+    while v < -3.14159265358979323846 {
+        v = v + two_pi
+    }
+    // Taylor: sin(x) = x - x^3/3! + x^5/5! - ...
+    let x2 = v * v
+    var term = v
+    var sum = v
+    var n = 1
+    while n < 20 {
+        term = term * x2 / float((2 * n) * (2 * n + 1))
+        if n - (n / 2) * 2 == 0 {
+            sum = sum + term
+        } else {
+            sum = sum - term
+        }
+        let at = abs_float(term)
+        if at < 1.0e-17 {
+            n = 100
+        }
+        n = n + 1
+    }
+    return sum
+}
+
+fn cos_float(x: f64) -> f64 {
+    // Reduce to [-pi, pi]
+    let two_pi = 6.28318530717958647692
+    var v = x
+    while v > 3.14159265358979323846 {
+        v = v - two_pi
+    }
+    while v < -3.14159265358979323846 {
+        v = v + two_pi
+    }
+    // Taylor: cos(x) = 1 - x^2/2! + x^4/4! - ...
+    let x2 = v * v
+    var term = 1.0
+    var sum = 1.0
+    var n = 1
+    while n < 20 {
+        term = term * x2 / float((2 * n - 1) * (2 * n))
+        if n - (n / 2) * 2 == 0 {
+            sum = sum + term
+        } else {
+            sum = sum - term
+        }
+        let at = abs_float(term)
+        if at < 1.0e-17 {
+            n = 100
+        }
+        n = n + 1
+    }
+    return sum
+}
+
+fn tan_float(x: f64) -> f64 {
+    let c = cos_float(x)
+    if abs_float(c) < 1.0e-15 {
+        return inf()
+    }
+    return sin_float(x) / c
+}
+
+fn atan(x: f64) -> f64 {
+    // For |x| > 1 use atan(x) = pi/2 - atan(1/x)
+    // For |x| > tan(pi/12) ~ 0.268 use atan(x) = pi/6 + atan((x*sqrt3-1)/(x+sqrt3))
+    // Core series: atan(x) = x - x^3/3 + x^5/5 - ... for |x| <= 1
+    let pi_val = 3.14159265358979323846
+    let neg = x < 0.0
+    var v = x
+    if neg {
+        v = 0.0 - x
+    }
+    var result = 0.0
+    var shift = 0.0
+    if v > 1.0 {
+        v = 1.0 / v
+        shift = pi_val / 2.0
+    }
+    // Series for small v
+    let v2 = v * v
+    var term = v
+    var sum = v
+    var n = 1
+    while n < 80 {
+        term = term * v2
+        n = n + 2
+        let contrib = term / float(n)
+        if n - (n / 4) * 4 == 3 {
+            sum = sum + contrib
+        } else {
+            sum = sum - contrib
+        }
+        if contrib < 1.0e-16 {
+            n = 200
+        }
+    }
+    if shift > 0.0 {
+        result = shift - sum
+    } else {
+        result = sum
+    }
+    if neg {
+        return 0.0 - result
+    }
+    return result
+}
+
+fn atan2(y: f64, x: f64) -> f64 {
+    let pi_val = 3.14159265358979323846
+    if x > 0.0 {
+        return atan(y / x)
+    }
+    if x < 0.0 && y >= 0.0 {
+        return atan(y / x) + pi_val
+    }
+    if x < 0.0 && y < 0.0 {
+        return atan(y / x) - pi_val
+    }
+    if x == 0.0 && y > 0.0 {
+        return pi_val / 2.0
+    }
+    if x == 0.0 && y < 0.0 {
+        return 0.0 - pi_val / 2.0
+    }
+    return 0.0
+}
+
+fn lerp(a: f64, b: f64, t: f64) -> f64 {
+    return a + (b - a) * t
+}
+
+// ─── Statistics ───────────────────────────────────────────────────────────────
+
+fn mean(arr: [f64]) -> f64 {
+    let n = len(arr)
+    if n == 0 {
+        return 0.0
+    }
+    var sum = 0.0
+    for i in range(0, n) {
+        sum = sum + arr[i]
+    }
+    return sum / float(n)
+}
+
+fn variance(arr: [f64]) -> f64 {
+    let n = len(arr)
+    if n == 0 {
+        return 0.0
+    }
+    let m = mean(arr)
+    var sum = 0.0
+    for i in range(0, n) {
+        let delta = arr[i] - m
+        sum = sum + delta * delta
+    }
+    return sum / float(n)
+}
+
+fn stddev(arr: [f64]) -> f64 {
+    return sqrt_float(variance(arr))
+}
+
+fn sort_asc(arr: [f64]) -> [f64] {
+    // Bubble sort (simple, correct)
+    var a = arr
+    let n = len(a)
+    for i in range(0, n) {
+        for j in range(0, n - i - 1) {
+            if a[j] > a[j + 1] {
+                let tmp = a[j]
+                a[j] = a[j + 1]
+                a[j + 1] = tmp
+            }
+        }
+    }
+    return a
+}
+
+fn median(arr: [f64]) -> f64 {
+    let n = len(arr)
+    if n == 0 {
+        return 0.0
+    }
+    let sorted = sort_asc(arr)
+    let mid = n / 2
+    if n - (n / 2) * 2 == 1 {
+        return sorted[mid]
+    }
+    return (sorted[mid - 1] + sorted[mid]) / 2.0
+}
+
+// ─── Main: test all functions ─────────────────────────────────────────────────
+
+fn main() {
+    // Constants
+    print("=== Constants ===")
+    print("pi  = " + to_string(pi()))
+    print("e   = " + to_string(e()))
+    print("tau = " + to_string(tau()))
+
+    // Basic
+    print("")
+    print("=== Basic ===")
+    print("abs_int(-7)    = " + to_string(abs_int(-7)))
+    print("abs_float(-3.5)= " + to_string(abs_float(-3.5)))
+    print("min_int(3,7)   = " + to_string(min_int(3, 7)))
+    print("max_int(3,7)   = " + to_string(max_int(3, 7)))
+    print("min_float(1.5,2.5) = " + to_string(min_float(1.5, 2.5)))
+    print("max_float(1.5,2.5) = " + to_string(max_float(1.5, 2.5)))
+    print("clamp_int(10,0,5) = " + to_string(clamp_int(10, 0, 5)))
+    print("clamp_float(-1.0,0.0,1.0) = " + to_string(clamp_float(-1.0, 0.0, 1.0)))
+    print("sign(-3.0) = " + to_string(sign(-3.0)))
+    print("sign(0.0)  = " + to_string(sign(0.0)))
+    print("sign(5.0)  = " + to_string(sign(5.0)))
+
+    // Integer math
+    print("")
+    print("=== Integer Math ===")
+    print("gcd(48,18)     = " + to_string(gcd(48, 18)))
+    print("lcm(4,6)       = " + to_string(lcm(4, 6)))
+    print("factorial(10)  = " + to_string(factorial(10)))
+    print("fib(10)        = " + to_string(fib(10)))
+    print("fib(20)        = " + to_string(fib(20)))
+    print("pow_int(2,10)  = " + to_string(pow_int(2, 10)))
+    print("pow_int(3,5)   = " + to_string(pow_int(3, 5)))
+    print("is_prime(7)    = " + to_string(is_prime(7)))
+    print("is_prime(9)    = " + to_string(is_prime(9)))
+    print("is_prime(97)   = " + to_string(is_prime(97)))
+    print("mod_pow(2,10,1000) = " + to_string(mod_pow(2, 10, 1000)))
+
+    // Float math
+    print("")
+    print("=== Float Math ===")
+    print("sqrt_float(2.0)  = " + to_string(sqrt_float(2.0)))
+    print("sqrt_float(9.0)  = " + to_string(sqrt_float(9.0)))
+    print("cbrt(8.0)        = " + to_string(cbrt(8.0)))
+    print("cbrt(27.0)       = " + to_string(cbrt(27.0)))
+    print("cbrt(-8.0)       = " + to_string(cbrt(-8.0)))
+    print("ln(1.0)          = " + to_string(ln(1.0)))
+    print("ln(e())          = " + to_string(ln(e())))
+    print("ln(2.0)          = " + to_string(ln(2.0)))
+    print("log2(8.0)        = " + to_string(log2(8.0)))
+    print("log10(100.0)     = " + to_string(log10(100.0)))
+    print("exp_float(0.0)   = " + to_string(exp_float(0.0)))
+    print("exp_float(1.0)   = " + to_string(exp_float(1.0)))
+    print("exp_float(2.0)   = " + to_string(exp_float(2.0)))
+    print("pow_float(2.0,8.0) = " + to_string(pow_float(2.0, 8.0)))
+    print("pow_float(3.0,3.0) = " + to_string(pow_float(3.0, 3.0)))
+    print("sin_float(0.0)   = " + to_string(sin_float(0.0)))
+    print("sin_float(pi()/2.0) = " + to_string(sin_float(pi() / 2.0)))
+    print("cos_float(0.0)   = " + to_string(cos_float(0.0)))
+    print("cos_float(pi())  = " + to_string(cos_float(pi())))
+    print("tan_float(pi()/4.0) = " + to_string(tan_float(pi() / 4.0)))
+    print("atan(1.0)        = " + to_string(atan(1.0)))
+    print("atan2(1.0,1.0)   = " + to_string(atan2(1.0, 1.0)))
+    print("atan2(0.0,-1.0)  = " + to_string(atan2(0.0, -1.0)))
+    print("lerp(0.0,10.0,0.3) = " + to_string(lerp(0.0, 10.0, 0.3)))
+    print("lerp(0.0,10.0,0.5) = " + to_string(lerp(0.0, 10.0, 0.5)))
+
+    // Statistics
+    print("")
+    print("=== Statistics ===")
+    let data = [2.0, 4.0, 4.0, 4.0, 5.0, 5.0, 7.0, 9.0]
+    print("data = [2,4,4,4,5,5,7,9]")
+    print("mean     = " + to_string(mean(data)))
+    print("variance = " + to_string(variance(data)))
+    print("stddev   = " + to_string(stddev(data)))
+    print("median   = " + to_string(median(data)))
+
+    let odd_data = [3.0, 1.0, 4.0, 1.0, 5.0]
+    print("odd_data = [3,1,4,1,5]")
+    print("median(odd) = " + to_string(median(odd_data)))
+    print("mean(odd)   = " + to_string(mean(odd_data)))
+    print("stddev(odd) = " + to_string(stddev(odd_data)))
+
+    print("")
+    print("=== All tests complete ===")
+}

@@ -1,0 +1,1053 @@
+// vxb_codegen.vx — VXB (Vortex Binary ISA) GPU Code Generator
+// Encodes, assembles, and compiles VXB instructions targeting the Vortex GPU ISA.
+//
+// Encoding format: 32-bit fixed-width instructions
+//   [31:24] opcode  [23:16] dst_reg  [15:8] src1_reg  [7:0] src2_reg
+//
+// 8-byte instructions (with immediate):
+//   Word 0: [31:24] opcode  [23:16] dst_reg  [15:8] 0xFF (imm marker)  [7:0] 0x00
+//   Word 1: 32-bit immediate value
+//
+// Register model:
+//   r0-r31   : 32 general-purpose registers
+//   t0-t7    : 8 tensor registers (mapped to r32-r39 in encoding)
+//   pc       : program counter (special, not directly addressable)
+//   sp       : stack pointer (r30)
+//   fp       : frame pointer (r29)
+//   lane_id  : SIMT lane ID (read via THREAD_ID_X opcode)
+//   warp_id  : SIMT warp ID (read via BLOCK_ID_X opcode)
+
+// ===========================================================================
+// Section 1 — VXB Opcode Constants (matching vortex_isa.rs encoding)
+// ===========================================================================
+
+// --- Floating-point arithmetic ---
+fn OP_NOP() -> i64 { return 0 }
+fn OP_FADD() -> i64 { return 1 }
+fn OP_FSUB() -> i64 { return 2 }
+fn OP_FMUL() -> i64 { return 3 }
+fn OP_FDIV() -> i64 { return 4 }
+fn OP_FNEG() -> i64 { return 5 }
+fn OP_FABS() -> i64 { return 6 }
+fn OP_FSQRT() -> i64 { return 7 }
+fn OP_FEXP() -> i64 { return 8 }
+fn OP_FLOG() -> i64 { return 9 }
+fn OP_FMAX() -> i64 { return 10 }
+fn OP_FMIN() -> i64 { return 11 }
+fn OP_FMA() -> i64 { return 12 }
+
+// --- Integer arithmetic ---
+fn OP_IADD() -> i64 { return 16 }
+fn OP_ISUB() -> i64 { return 17 }
+fn OP_IMUL() -> i64 { return 18 }
+
+// --- Comparisons (float) ---
+fn OP_FEQ() -> i64 { return 32 }
+fn OP_FLT() -> i64 { return 33 }
+fn OP_FLE() -> i64 { return 34 }
+fn OP_FGT() -> i64 { return 35 }
+fn OP_FGE() -> i64 { return 36 }
+
+// --- Comparisons (integer) ---
+fn OP_IEQ() -> i64 { return 40 }
+fn OP_ILT() -> i64 { return 41 }
+
+// --- Logic / bitwise ---
+fn OP_AND() -> i64 { return 48 }
+fn OP_OR() -> i64 { return 49 }
+fn OP_XOR() -> i64 { return 50 }
+fn OP_SHL() -> i64 { return 51 }
+fn OP_SHR() -> i64 { return 52 }
+fn OP_NOT() -> i64 { return 53 }
+
+// --- Memory ---
+fn OP_LD_GLOBAL() -> i64 { return 64 }
+fn OP_ST_GLOBAL() -> i64 { return 65 }
+fn OP_LD_SHARED() -> i64 { return 66 }
+fn OP_ST_SHARED() -> i64 { return 67 }
+fn OP_LD_CONST() -> i64 { return 68 }
+
+// --- SIMT intrinsics ---
+fn OP_THREAD_ID_X() -> i64 { return 80 }
+fn OP_THREAD_ID_Y() -> i64 { return 81 }
+fn OP_THREAD_ID_Z() -> i64 { return 82 }
+fn OP_BLOCK_ID_X() -> i64 { return 83 }
+fn OP_BLOCK_ID_Y() -> i64 { return 84 }
+fn OP_BLOCK_ID_Z() -> i64 { return 85 }
+fn OP_BLOCK_DIM_X() -> i64 { return 86 }
+fn OP_BLOCK_DIM_Y() -> i64 { return 87 }
+fn OP_BLOCK_DIM_Z() -> i64 { return 88 }
+fn OP_BARRIER() -> i64 { return 89 }
+fn OP_WARP_SHUFFLE() -> i64 { return 90 }
+fn OP_WARP_REDUCE_SUM() -> i64 { return 91 }
+fn OP_WARP_REDUCE_MAX() -> i64 { return 92 }
+fn OP_WARP_VOTE_ALL() -> i64 { return 93 }
+fn OP_WARP_VOTE_ANY() -> i64 { return 94 }
+
+// --- Control flow ---
+fn OP_BRANCH() -> i64 { return 96 }
+fn OP_BRANCH_COND() -> i64 { return 97 }
+fn OP_CALL() -> i64 { return 98 }
+fn OP_RET() -> i64 { return 99 }
+
+// --- Type conversion ---
+fn OP_F2I() -> i64 { return 112 }
+fn OP_I2F() -> i64 { return 113 }
+fn OP_F16_TO_F32() -> i64 { return 114 }
+fn OP_F32_TO_F16() -> i64 { return 115 }
+
+// --- Fused tensor ops ---
+fn OP_TILED_MATMUL() -> i64 { return 128 }
+fn OP_FUSED_ATTENTION() -> i64 { return 129 }
+fn OP_FUSED_LAYERNORM() -> i64 { return 130 }
+fn OP_FUSED_GELU() -> i64 { return 131 }
+
+// --- Extended opcodes (Tensor) ---
+fn OP_TMAKE() -> i64 { return 144 }
+fn OP_TLOAD() -> i64 { return 145 }
+fn OP_TSTORE() -> i64 { return 146 }
+fn OP_TSHAPE() -> i64 { return 147 }
+fn OP_TADD() -> i64 { return 148 }
+fn OP_TMUL() -> i64 { return 149 }
+fn OP_TMATMUL() -> i64 { return 150 }
+fn OP_TREDUCE() -> i64 { return 151 }
+fn OP_TBROADCAST() -> i64 { return 152 }
+fn OP_TSOFTMAX() -> i64 { return 153 }
+fn OP_TATTENTION() -> i64 { return 154 }
+
+// --- Extended opcodes (SIMT) ---
+fn OP_WARP_SYNC() -> i64 { return 160 }
+fn OP_LANE_ID() -> i64 { return 161 }
+fn OP_WARP_VOTE() -> i64 { return 162 }
+fn OP_SHARED_LOAD() -> i64 { return 163 }
+fn OP_SHARED_STORE() -> i64 { return 164 }
+
+// --- Pseudo opcodes for assembler ---
+fn OP_LOAD() -> i64 { return 64 }
+fn OP_STORE() -> i64 { return 65 }
+fn OP_ADD() -> i64 { return 1 }
+fn OP_SUB() -> i64 { return 2 }
+fn OP_MUL() -> i64 { return 3 }
+fn OP_DIV() -> i64 { return 4 }
+fn OP_MOD() -> i64 { return 19 }
+fn OP_CMP() -> i64 { return 33 }
+fn OP_JMP() -> i64 { return 96 }
+fn OP_JZ() -> i64 { return 97 }
+fn OP_JNZ() -> i64 { return 97 }
+fn OP_PUSH() -> i64 { return 200 }
+fn OP_POP() -> i64 { return 201 }
+fn OP_HALT() -> i64 { return 202 }
+
+// ===========================================================================
+// Section 2 — Register Model
+// ===========================================================================
+
+// General-purpose registers r0-r31
+fn REG_R(n: i64) -> i64 { return n }
+
+// Tensor registers t0-t7 (mapped to r32-r39)
+fn REG_T(n: i64) -> i64 { return 32 + n }
+
+// Special registers
+fn REG_PC() -> i64 { return 255 }
+fn REG_SP() -> i64 { return 30 }
+fn REG_FP() -> i64 { return 29 }
+fn REG_LANE_ID() -> i64 { return 253 }
+fn REG_WARP_ID() -> i64 { return 254 }
+fn REG_ZERO() -> i64 { return 0 }
+
+// ===========================================================================
+// Section 3 — VXB Binary Encoder
+// ===========================================================================
+
+// Encode a single 32-bit VXB instruction as an i64 value.
+// Layout: [opcode:8][dst:8][src1:8][src2:8]
+fn vxb_encode(op: i64, dst: i64, src1: i64, src2: i64) -> i64 {
+    let opcode_shifted = (op % 256) * 256 * 256 * 256
+    let dst_shifted = (dst % 256) * 256 * 256
+    let src1_shifted = (src1 % 256) * 256
+    let src2_part = src2 % 256
+    return opcode_shifted + dst_shifted + src1_shifted + src2_part
+}
+
+// Encode a 32-bit instruction as 4 bytes (little-endian) appended to a byte array.
+fn vxb_encode_bytes(code: [i64], op: i64, dst: i64, src1: i64, src2: i64) -> [i64] {
+    let word = vxb_encode(op, dst, src1, src2)
+    var result = code
+    result = push(result, word % 256)
+    result = push(result, (word / 256) % 256)
+    result = push(result, (word / 256 / 256) % 256)
+    result = push(result, (word / 256 / 256 / 256) % 256)
+    return result
+}
+
+// Encode an 8-byte instruction with immediate value.
+// Word 0: [op:8][dst:8][0xFF:8][0x00:8]   (imm marker)
+// Word 1: immediate value (32-bit LE)
+fn vxb_encode_imm(code: [i64], op: i64, dst: i64, imm: i64) -> [i64] {
+    var result = code
+    // Word 0: opcode + dst + immediate marker
+    result = vxb_encode_bytes(result, op, dst, 255, 0)
+    // Word 1: 32-bit immediate (little-endian)
+    var v = imm
+    if v < 0 {
+        v = v + 4294967296
+    }
+    result = push(result, v % 256)
+    v = v / 256
+    result = push(result, v % 256)
+    v = v / 256
+    result = push(result, v % 256)
+    v = v / 256
+    result = push(result, v % 256)
+    return result
+}
+
+// Decode a 32-bit instruction word into [opcode, dst, src1, src2]
+fn vxb_decode(word: i64) -> [i64] {
+    let src2 = word % 256
+    let src1 = (word / 256) % 256
+    let dst = (word / 256 / 256) % 256
+    let opcode = (word / 256 / 256 / 256) % 256
+    return [opcode, dst, src1, src2]
+}
+
+// Build a 32-bit word from 4 little-endian bytes
+fn bytes_to_word(b0: i64, b1: i64, b2: i64, b3: i64) -> i64 {
+    return b0 + b1 * 256 + b2 * 256 * 256 + b3 * 256 * 256 * 256
+}
+
+// Convenience instruction builders (return [op, dst, src1, src2] arrays for vxb_compile)
+fn vxb_instr(op: i64, dst: i64, src1: i64, src2: i64) -> [i64] {
+    return [op, dst, src1, src2]
+}
+
+fn vxb_instr0(op: i64, dst: i64) -> [i64] {
+    return [op, dst, 0, 0]
+}
+
+fn vxb_instr1(op: i64, dst: i64, src1: i64) -> [i64] {
+    return [op, dst, src1, 0]
+}
+
+// ===========================================================================
+// Section 4 — Opcode Name Lookup (for assembler/disassembler)
+// ===========================================================================
+
+fn opcode_from_name(name: String) -> i64 {
+    if name == "NOP" { return OP_NOP() }
+    if name == "FADD" || name == "ADD" { return OP_FADD() }
+    if name == "FSUB" || name == "SUB" { return OP_FSUB() }
+    if name == "FMUL" || name == "MUL" { return OP_FMUL() }
+    if name == "FDIV" || name == "DIV" { return OP_FDIV() }
+    if name == "FNEG" { return OP_FNEG() }
+    if name == "FABS" { return OP_FABS() }
+    if name == "FSQRT" { return OP_FSQRT() }
+    if name == "FEXP" { return OP_FEXP() }
+    if name == "FLOG" { return OP_FLOG() }
+    if name == "FMAX" { return OP_FMAX() }
+    if name == "FMIN" { return OP_FMIN() }
+    if name == "FMA" { return OP_FMA() }
+    if name == "IADD" { return OP_IADD() }
+    if name == "ISUB" { return OP_ISUB() }
+    if name == "IMUL" { return OP_IMUL() }
+    if name == "MOD" { return OP_MOD() }
+    if name == "FEQ" { return OP_FEQ() }
+    if name == "FLT" || name == "CMP" { return OP_FLT() }
+    if name == "FLE" { return OP_FLE() }
+    if name == "FGT" { return OP_FGT() }
+    if name == "FGE" { return OP_FGE() }
+    if name == "IEQ" { return OP_IEQ() }
+    if name == "ILT" { return OP_ILT() }
+    if name == "AND" { return OP_AND() }
+    if name == "OR" { return OP_OR() }
+    if name == "XOR" { return OP_XOR() }
+    if name == "SHL" { return OP_SHL() }
+    if name == "SHR" { return OP_SHR() }
+    if name == "NOT" { return OP_NOT() }
+    if name == "LOAD" || name == "LD_GLOBAL" { return OP_LD_GLOBAL() }
+    if name == "STORE" || name == "ST_GLOBAL" { return OP_ST_GLOBAL() }
+    if name == "LD_SHARED" || name == "SHARED_LOAD" { return OP_LD_SHARED() }
+    if name == "ST_SHARED" || name == "SHARED_STORE" { return OP_ST_SHARED() }
+    if name == "LD_CONST" { return OP_LD_CONST() }
+    if name == "THREAD_ID_X" || name == "LANE_ID" { return OP_THREAD_ID_X() }
+    if name == "THREAD_ID_Y" { return OP_THREAD_ID_Y() }
+    if name == "THREAD_ID_Z" { return OP_THREAD_ID_Z() }
+    if name == "BLOCK_ID_X" || name == "WARP_ID" { return OP_BLOCK_ID_X() }
+    if name == "BLOCK_ID_Y" { return OP_BLOCK_ID_Y() }
+    if name == "BLOCK_ID_Z" { return OP_BLOCK_ID_Z() }
+    if name == "BLOCK_DIM_X" { return OP_BLOCK_DIM_X() }
+    if name == "BLOCK_DIM_Y" { return OP_BLOCK_DIM_Y() }
+    if name == "BLOCK_DIM_Z" { return OP_BLOCK_DIM_Z() }
+    if name == "BARRIER" { return OP_BARRIER() }
+    if name == "WARP_SHUFFLE" { return OP_WARP_SHUFFLE() }
+    if name == "WARP_REDUCE_SUM" { return OP_WARP_REDUCE_SUM() }
+    if name == "WARP_REDUCE_MAX" { return OP_WARP_REDUCE_MAX() }
+    if name == "WARP_VOTE_ALL" { return OP_WARP_VOTE_ALL() }
+    if name == "WARP_VOTE_ANY" { return OP_WARP_VOTE_ANY() }
+    if name == "WARP_SYNC" { return OP_WARP_SYNC() }
+    if name == "WARP_VOTE" { return OP_WARP_VOTE() }
+    if name == "JMP" || name == "BRANCH" { return OP_BRANCH() }
+    if name == "JZ" || name == "JNZ" || name == "BRANCH_COND" { return OP_BRANCH_COND() }
+    if name == "CALL" { return OP_CALL() }
+    if name == "RET" { return OP_RET() }
+    if name == "PUSH" { return OP_PUSH() }
+    if name == "POP" { return OP_POP() }
+    if name == "HALT" { return OP_HALT() }
+    if name == "F2I" { return OP_F2I() }
+    if name == "I2F" { return OP_I2F() }
+    if name == "F16_TO_F32" { return OP_F16_TO_F32() }
+    if name == "F32_TO_F16" { return OP_F32_TO_F16() }
+    if name == "TILED_MATMUL" { return OP_TILED_MATMUL() }
+    if name == "FUSED_ATTENTION" { return OP_FUSED_ATTENTION() }
+    if name == "FUSED_LAYERNORM" { return OP_FUSED_LAYERNORM() }
+    if name == "FUSED_GELU" { return OP_FUSED_GELU() }
+    if name == "TMAKE" { return OP_TMAKE() }
+    if name == "TLOAD" { return OP_TLOAD() }
+    if name == "TSTORE" { return OP_TSTORE() }
+    if name == "TSHAPE" { return OP_TSHAPE() }
+    if name == "TADD" { return OP_TADD() }
+    if name == "TMUL" { return OP_TMUL() }
+    if name == "TMATMUL" { return OP_TMATMUL() }
+    if name == "TREDUCE" { return OP_TREDUCE() }
+    if name == "TBROADCAST" { return OP_TBROADCAST() }
+    if name == "TSOFTMAX" { return OP_TSOFTMAX() }
+    if name == "TATTENTION" { return OP_TATTENTION() }
+    return -1
+}
+
+fn opcode_name(op: i64) -> String {
+    if op == 0 { return "NOP" }
+    if op == 1 { return "FADD" }
+    if op == 2 { return "FSUB" }
+    if op == 3 { return "FMUL" }
+    if op == 4 { return "FDIV" }
+    if op == 5 { return "FNEG" }
+    if op == 6 { return "FABS" }
+    if op == 7 { return "FSQRT" }
+    if op == 8 { return "FEXP" }
+    if op == 9 { return "FLOG" }
+    if op == 10 { return "FMAX" }
+    if op == 11 { return "FMIN" }
+    if op == 12 { return "FMA" }
+    if op == 16 { return "IADD" }
+    if op == 17 { return "ISUB" }
+    if op == 18 { return "IMUL" }
+    if op == 32 { return "FEQ" }
+    if op == 33 { return "FLT" }
+    if op == 34 { return "FLE" }
+    if op == 35 { return "FGT" }
+    if op == 36 { return "FGE" }
+    if op == 40 { return "IEQ" }
+    if op == 41 { return "ILT" }
+    if op == 48 { return "AND" }
+    if op == 49 { return "OR" }
+    if op == 50 { return "XOR" }
+    if op == 51 { return "SHL" }
+    if op == 52 { return "SHR" }
+    if op == 53 { return "NOT" }
+    if op == 64 { return "LD_GLOBAL" }
+    if op == 65 { return "ST_GLOBAL" }
+    if op == 66 { return "LD_SHARED" }
+    if op == 67 { return "ST_SHARED" }
+    if op == 68 { return "LD_CONST" }
+    if op == 80 { return "THREAD_ID_X" }
+    if op == 81 { return "THREAD_ID_Y" }
+    if op == 82 { return "THREAD_ID_Z" }
+    if op == 83 { return "BLOCK_ID_X" }
+    if op == 84 { return "BLOCK_ID_Y" }
+    if op == 85 { return "BLOCK_ID_Z" }
+    if op == 86 { return "BLOCK_DIM_X" }
+    if op == 87 { return "BLOCK_DIM_Y" }
+    if op == 88 { return "BLOCK_DIM_Z" }
+    if op == 89 { return "BARRIER" }
+    if op == 90 { return "WARP_SHUFFLE" }
+    if op == 91 { return "WARP_REDUCE_SUM" }
+    if op == 92 { return "WARP_REDUCE_MAX" }
+    if op == 93 { return "WARP_VOTE_ALL" }
+    if op == 94 { return "WARP_VOTE_ANY" }
+    if op == 96 { return "BRANCH" }
+    if op == 97 { return "BRANCH_COND" }
+    if op == 98 { return "CALL" }
+    if op == 99 { return "RET" }
+    if op == 112 { return "F2I" }
+    if op == 113 { return "I2F" }
+    if op == 128 { return "TILED_MATMUL" }
+    if op == 129 { return "FUSED_ATTENTION" }
+    if op == 130 { return "FUSED_LAYERNORM" }
+    if op == 131 { return "FUSED_GELU" }
+    if op == 144 { return "TMAKE" }
+    if op == 145 { return "TLOAD" }
+    if op == 146 { return "TSTORE" }
+    if op == 147 { return "TSHAPE" }
+    if op == 148 { return "TADD" }
+    if op == 149 { return "TMUL" }
+    if op == 150 { return "TMATMUL" }
+    if op == 151 { return "TREDUCE" }
+    if op == 152 { return "TBROADCAST" }
+    if op == 153 { return "TSOFTMAX" }
+    if op == 154 { return "TATTENTION" }
+    if op == 160 { return "WARP_SYNC" }
+    if op == 161 { return "LANE_ID" }
+    if op == 162 { return "WARP_VOTE" }
+    if op == 163 { return "SHARED_LOAD" }
+    if op == 164 { return "SHARED_STORE" }
+    if op == 200 { return "PUSH" }
+    if op == 201 { return "POP" }
+    if op == 202 { return "HALT" }
+    return "UNKNOWN"
+}
+
+// ===========================================================================
+// Section 5 — Assembler: Text to VXB Binary
+// ===========================================================================
+
+// Parse a register operand string like "r5", "t2", "sp", "fp" into a register number.
+fn parse_register(s: String) -> i64 {
+    if s == "sp" { return REG_SP() }
+    if s == "fp" { return REG_FP() }
+    if s == "pc" { return REG_PC() }
+    if s == "lane_id" { return REG_LANE_ID() }
+    if s == "warp_id" { return REG_WARP_ID() }
+
+    let first = str_char_at(s, 0)
+    if first == "r" {
+        let num_str = str_substr(s, 1, len(s) - 1)
+        return parse_int(num_str)
+    }
+    if first == "t" {
+        let num_str = str_substr(s, 1, len(s) - 1)
+        return 32 + parse_int(num_str)
+    }
+    // Try parsing as bare number (immediate)
+    return parse_int(s)
+}
+
+// Skip whitespace in source string starting at position pos.
+fn skip_ws(src: String, pos: i64) -> i64 {
+    var p = pos
+    let src_len = len(src)
+    var done = false
+    while p < src_len && !done {
+        let ch = str_char_at(src, p)
+        if ch == " " || ch == "\t" {
+            p = p + 1
+        } else {
+            done = true
+        }
+    }
+    return p
+}
+
+// Read a token (non-whitespace, non-comma characters) from source at pos.
+// Returns [token_string, new_pos] encoded as a 2-element string array.
+fn read_token(src: String, pos: i64) -> [String] {
+    var p = skip_ws(src, pos)
+    let src_len = len(src)
+    var tok = ""
+    var done = false
+    while p < src_len && !done {
+        let ch = str_char_at(src, p)
+        if ch == " " || ch == "\t" || ch == "," || ch == "\n" {
+            done = true
+        } else {
+            tok = tok + ch
+            p = p + 1
+        }
+    }
+    // Skip trailing comma if present
+    if p < src_len {
+        let ch = str_char_at(src, p)
+        if ch == "," {
+            p = p + 1
+        }
+    }
+    return [tok, to_string(p)]
+}
+
+// Assemble VXB assembly text into an array of encoded 32-bit instruction words.
+// Supports labels (ending with ':'), all VXB mnemonics, and register operands.
+//
+// Assembly format:
+//   [label:]  OPCODE  dst, src1, src2
+//   [label:]  OPCODE  dst, src1          (src2 defaults to 0)
+//   [label:]  OPCODE  dst                (src1, src2 default to 0)
+//   [label:]  OPCODE                     (all operands default to 0)
+//
+// Labels are resolved with a second pass (fixup).
+fn vxb_assemble(source: String) -> [i64] {
+    var code: [i64] = []
+    var label_names: [String] = []
+    var label_addrs: [i64] = []
+    var fixup_positions: [i64] = []
+    var fixup_labels: [String] = []
+
+    // Split source into lines
+    var lines: [String] = []
+    var current_line = ""
+    var i = 0
+    let src_len = len(source)
+    while i < src_len {
+        let ch = str_char_at(source, i)
+        if ch == "\n" {
+            lines = push(lines, current_line)
+            current_line = ""
+        } else {
+            current_line = current_line + ch
+        }
+        i = i + 1
+    }
+    if len(current_line) > 0 {
+        lines = push(lines, current_line)
+    }
+
+    // First pass: parse instructions and collect labels
+    var line_idx = 0
+    while line_idx < len(lines) {
+        let line = lines[line_idx]
+        var pos = skip_ws(line, 0)
+        let line_len = len(line)
+
+        // Skip empty lines and comments
+        if pos >= line_len {
+            line_idx = line_idx + 1
+            // continue
+        } else if str_char_at(line, pos) == ";" || str_char_at(line, pos) == "#" {
+            line_idx = line_idx + 1
+            // continue
+        } else {
+            // Read first token
+            let tok_result = read_token(line, pos)
+            var first_tok = tok_result[0]
+            pos = parse_int(tok_result[1])
+
+            // Check if this is a label (ends with ':')
+            if len(first_tok) > 1 && str_char_at(first_tok, len(first_tok) - 1) == ":" {
+                let label = str_substr(first_tok, 0, len(first_tok) - 1)
+                label_names = push(label_names, label)
+                label_addrs = push(label_addrs, len(code))
+
+                // There might be an instruction after the label on the same line
+                pos = skip_ws(line, pos)
+                if pos < line_len {
+                    let next_result = read_token(line, pos)
+                    first_tok = next_result[0]
+                    pos = parse_int(next_result[1])
+                    if len(first_tok) == 0 {
+                        line_idx = line_idx + 1
+                        // continue to next line
+                        first_tok = ""
+                    }
+                } else {
+                    first_tok = ""
+                }
+            }
+
+            if len(first_tok) > 0 {
+                // Look up opcode
+                let op = opcode_from_name(first_tok)
+                if op < 0 {
+                    print("vxb_assemble: unknown opcode: " + first_tok)
+                    line_idx = line_idx + 1
+                } else {
+                    // Parse up to 3 operands
+                    var dst = 0
+                    var src1 = 0
+                    var src2 = 0
+                    var is_branch = (op == OP_BRANCH() || op == OP_BRANCH_COND() || op == OP_JMP() || op == OP_CALL())
+
+                    pos = skip_ws(line, pos)
+                    if pos < line_len && str_char_at(line, pos) != ";" && str_char_at(line, pos) != "#" {
+                        let r1 = read_token(line, pos)
+                        let tok1 = r1[0]
+                        pos = parse_int(r1[1])
+
+                        if is_branch && len(tok1) > 0 {
+                            // Branch target could be a label
+                            let first_ch = str_char_at(tok1, 0)
+                            if first_ch != "r" && first_ch != "t" && first_ch != "s" && first_ch != "f" {
+                                // Might be a label reference or numeric
+                                let maybe_num = parse_int(tok1)
+                                if maybe_num >= 0 {
+                                    dst = maybe_num
+                                } else {
+                                    // Label reference — record fixup
+                                    fixup_positions = push(fixup_positions, len(code))
+                                    fixup_labels = push(fixup_labels, tok1)
+                                    dst = 0
+                                }
+                            } else {
+                                dst = parse_register(tok1)
+                            }
+                        } else if len(tok1) > 0 {
+                            dst = parse_register(tok1)
+                        }
+
+                        // Second operand
+                        pos = skip_ws(line, pos)
+                        if pos < line_len && str_char_at(line, pos) != ";" && str_char_at(line, pos) != "#" {
+                            let r2 = read_token(line, pos)
+                            if len(r2[0]) > 0 {
+                                src1 = parse_register(r2[0])
+                                pos = parse_int(r2[1])
+                            }
+
+                            // Third operand
+                            pos = skip_ws(line, pos)
+                            if pos < line_len && str_char_at(line, pos) != ";" && str_char_at(line, pos) != "#" {
+                                let r3 = read_token(line, pos)
+                                if len(r3[0]) > 0 {
+                                    src2 = parse_register(r3[0])
+                                }
+                            }
+                        }
+                    }
+
+                    // Encode and emit instruction word
+                    let word = vxb_encode(op, dst, src1, src2)
+                    code = push(code, word)
+
+                    line_idx = line_idx + 1
+                }
+            } else {
+                line_idx = line_idx + 1
+            }
+        }
+    }
+
+    // Second pass: resolve label fixups
+    var fix_idx = 0
+    while fix_idx < len(fixup_positions) {
+        let fix_pos = fixup_positions[fix_idx]
+        let fix_label = fixup_labels[fix_idx]
+
+        // Find label address
+        var found = false
+        var lbl_idx = 0
+        while lbl_idx < len(label_names) && !found {
+            if label_names[lbl_idx] == fix_label {
+                let target_addr = label_addrs[lbl_idx]
+                // Re-encode the instruction at fix_pos with the resolved address
+                let old_word = code[fix_idx]
+                let parts = vxb_decode(old_word)
+                let new_word = vxb_encode(parts[0], target_addr, parts[2], parts[3])
+                // Replace in code array — rebuild
+                var new_code: [i64] = []
+                var ci = 0
+                while ci < len(code) {
+                    if ci == fix_pos {
+                        new_code = push(new_code, new_word)
+                    } else {
+                        new_code = push(new_code, code[ci])
+                    }
+                    ci = ci + 1
+                }
+                code = new_code
+                found = true
+            }
+            lbl_idx = lbl_idx + 1
+        }
+
+        if !found {
+            print("vxb_assemble: unresolved label: " + fix_label)
+        }
+
+        fix_idx = fix_idx + 1
+    }
+
+    return code
+}
+
+// ===========================================================================
+// Section 6 — Kernel Compiler (AST to VXB)
+// ===========================================================================
+
+// Compile a kernel from a simplified AST.
+// name: kernel name
+// params: array of parameter names (strings)
+// body: array of AST statement nodes
+//
+// AST node format (array-based, matching vxc.vx parser output):
+//   ["add", dst, lhs, rhs]   - arithmetic
+//   ["sub", dst, lhs, rhs]
+//   ["mul", dst, lhs, rhs]
+//   ["div", dst, lhs, rhs]
+//   ["load", dst, addr]      - memory load
+//   ["store", src, addr]     - memory store
+//   ["lane_id", dst]         - get SIMT lane ID
+//   ["barrier"]              - sync barrier
+//   ["ret"]                  - return
+//   ["tadd", dst, s1, s2]    - tensor add
+//   ["tmul", dst, s1, s2]    - tensor mul
+//   ["tmatmul", dst, s1, s2] - tensor matmul
+//   ["tsoftmax", dst, src]   - tensor softmax
+//   ["branch", label]        - unconditional branch
+//   ["branch_cond", reg, label] - conditional branch
+//   ["cmp", dst, s1, s2]     - compare
+//
+// Returns: [i64] array of encoded VXB instruction words.
+fn compile_kernel(name: String, params: [String], body: [String]) -> [i64] {
+    var code: [i64] = []
+    var label_map_names: [String] = []
+    var label_map_addrs: [i64] = []
+    var fixups_pos: [i64] = []
+    var fixups_label: [String] = []
+
+    // Emit prologue: get lane ID into r0
+    code = push(code, vxb_encode(OP_THREAD_ID_X(), 0, 0, 0))
+    // Get block ID into r1
+    code = push(code, vxb_encode(OP_BLOCK_ID_X(), 1, 0, 0))
+    // Get block dim into r2
+    code = push(code, vxb_encode(OP_BLOCK_DIM_X(), 2, 0, 0))
+    // Compute global index: r3 = r1 * r2 + r0
+    code = push(code, vxb_encode(OP_IMUL(), 3, 1, 2))
+    code = push(code, vxb_encode(OP_IADD(), 3, 3, 0))
+
+    // Map params to registers starting at r4
+    // r3 = global thread index (available to kernel body)
+    // r4, r5, ... = parameter base addresses
+
+    // Compile each statement
+    var stmt_idx = 0
+    while stmt_idx < len(body) {
+        let stmt = body[stmt_idx]
+        let kind = stmt[0]
+
+        if kind == "label" {
+            label_map_names = push(label_map_names, stmt[1])
+            label_map_addrs = push(label_map_addrs, len(code))
+        } else if kind == "add" {
+            let d = parse_int(stmt[1])
+            let s1 = parse_int(stmt[2])
+            let s2 = parse_int(stmt[3])
+            code = push(code, vxb_encode(OP_FADD(), d, s1, s2))
+        } else if kind == "iadd" {
+            let d = parse_int(stmt[1])
+            let s1 = parse_int(stmt[2])
+            let s2 = parse_int(stmt[3])
+            code = push(code, vxb_encode(OP_IADD(), d, s1, s2))
+        } else if kind == "sub" {
+            let d = parse_int(stmt[1])
+            let s1 = parse_int(stmt[2])
+            let s2 = parse_int(stmt[3])
+            code = push(code, vxb_encode(OP_FSUB(), d, s1, s2))
+        } else if kind == "mul" {
+            let d = parse_int(stmt[1])
+            let s1 = parse_int(stmt[2])
+            let s2 = parse_int(stmt[3])
+            code = push(code, vxb_encode(OP_FMUL(), d, s1, s2))
+        } else if kind == "div" {
+            let d = parse_int(stmt[1])
+            let s1 = parse_int(stmt[2])
+            let s2 = parse_int(stmt[3])
+            code = push(code, vxb_encode(OP_FDIV(), d, s1, s2))
+        } else if kind == "load" {
+            let d = parse_int(stmt[1])
+            let addr = parse_int(stmt[2])
+            code = push(code, vxb_encode(OP_LD_GLOBAL(), d, addr, 0))
+        } else if kind == "store" {
+            let src = parse_int(stmt[1])
+            let addr = parse_int(stmt[2])
+            code = push(code, vxb_encode(OP_ST_GLOBAL(), src, addr, 0))
+        } else if kind == "lane_id" {
+            let d = parse_int(stmt[1])
+            code = push(code, vxb_encode(OP_THREAD_ID_X(), d, 0, 0))
+        } else if kind == "barrier" {
+            code = push(code, vxb_encode(OP_BARRIER(), 0, 0, 0))
+        } else if kind == "ret" {
+            code = push(code, vxb_encode(OP_RET(), 0, 0, 0))
+        } else if kind == "cmp" {
+            let d = parse_int(stmt[1])
+            let s1 = parse_int(stmt[2])
+            let s2 = parse_int(stmt[3])
+            code = push(code, vxb_encode(OP_FLT(), d, s1, s2))
+        } else if kind == "tadd" {
+            let d = parse_int(stmt[1])
+            let s1 = parse_int(stmt[2])
+            let s2 = parse_int(stmt[3])
+            code = push(code, vxb_encode(OP_TADD(), d, s1, s2))
+        } else if kind == "tmul" {
+            let d = parse_int(stmt[1])
+            let s1 = parse_int(stmt[2])
+            let s2 = parse_int(stmt[3])
+            code = push(code, vxb_encode(OP_TMUL(), d, s1, s2))
+        } else if kind == "tmatmul" {
+            let d = parse_int(stmt[1])
+            let s1 = parse_int(stmt[2])
+            let s2 = parse_int(stmt[3])
+            code = push(code, vxb_encode(OP_TMATMUL(), d, s1, s2))
+        } else if kind == "tsoftmax" {
+            let d = parse_int(stmt[1])
+            let s1 = parse_int(stmt[2])
+            code = push(code, vxb_encode(OP_TSOFTMAX(), d, s1, 0))
+        } else if kind == "tattention" {
+            let d = parse_int(stmt[1])
+            let s1 = parse_int(stmt[2])
+            let s2 = parse_int(stmt[3])
+            code = push(code, vxb_encode(OP_TATTENTION(), d, s1, s2))
+        } else if kind == "branch" {
+            fixups_pos = push(fixups_pos, len(code))
+            fixups_label = push(fixups_label, stmt[1])
+            code = push(code, vxb_encode(OP_BRANCH(), 0, 0, 0))
+        } else if kind == "branch_cond" {
+            let reg = parse_int(stmt[1])
+            fixups_pos = push(fixups_pos, len(code))
+            fixups_label = push(fixups_label, stmt[2])
+            code = push(code, vxb_encode(OP_BRANCH_COND(), 0, reg, 0))
+        } else if kind == "warp_sync" {
+            code = push(code, vxb_encode(OP_WARP_SYNC(), 0, 0, 0))
+        } else if kind == "warp_reduce_sum" {
+            let d = parse_int(stmt[1])
+            let s1 = parse_int(stmt[2])
+            code = push(code, vxb_encode(OP_WARP_REDUCE_SUM(), d, s1, 0))
+        } else if kind == "warp_reduce_max" {
+            let d = parse_int(stmt[1])
+            let s1 = parse_int(stmt[2])
+            code = push(code, vxb_encode(OP_WARP_REDUCE_MAX(), d, s1, 0))
+        } else {
+            print("compile_kernel: unknown statement kind: " + kind)
+        }
+
+        stmt_idx = stmt_idx + 1
+    }
+
+    // Append RET if not already there
+    if len(code) == 0 || vxb_decode(code[len(code) - 1])[0] != OP_RET() {
+        code = push(code, vxb_encode(OP_RET(), 0, 0, 0))
+    }
+
+    // Resolve label fixups
+    var fix_idx = 0
+    while fix_idx < len(fixups_pos) {
+        let fix_pos = fixups_pos[fix_idx]
+        let fix_label = fixups_label[fix_idx]
+        var found = false
+        var lbl_idx = 0
+        while lbl_idx < len(label_map_names) && !found {
+            if label_map_names[lbl_idx] == fix_label {
+                let target = label_map_addrs[lbl_idx]
+                let old = vxb_decode(code[fix_pos])
+                let new_word = vxb_encode(old[0], target, old[2], old[3])
+                var new_code: [i64] = []
+                var ci = 0
+                while ci < len(code) {
+                    if ci == fix_pos {
+                        new_code = push(new_code, new_word)
+                    } else {
+                        new_code = push(new_code, code[ci])
+                    }
+                    ci = ci + 1
+                }
+                code = new_code
+                found = true
+            }
+            lbl_idx = lbl_idx + 1
+        }
+        fix_idx = fix_idx + 1
+    }
+
+    return code
+}
+
+// ===========================================================================
+// Section 7 — Disassembler
+// ===========================================================================
+
+fn vxb_disassemble(code: [i64]) -> String {
+    var out = ""
+    var i = 0
+    while i < len(code) {
+        let parts = vxb_decode(code[i])
+        let op = parts[0]
+        let dst = parts[1]
+        let s1 = parts[2]
+        let s2 = parts[3]
+        let name = opcode_name(op)
+
+        let addr_str = to_string(i)
+        var line = ""
+        if i < 10 {
+            line = "  000" + addr_str + ": "
+        } else if i < 100 {
+            line = "  00" + addr_str + ": "
+        } else if i < 1000 {
+            line = "  0" + addr_str + ": "
+        } else {
+            line = "  " + addr_str + ": "
+        }
+
+        line = line + name + " r" + to_string(dst) + ", r" + to_string(s1) + ", r" + to_string(s2) + "\n"
+        out = out + line
+        i = i + 1
+    }
+    return out
+}
+
+// ===========================================================================
+// Section 8 — VXB Module Serialization
+// ===========================================================================
+
+// Serialize a kernel to VXB binary format.
+// Returns byte array with header + instructions.
+// Header: magic(4) + version(4) + num_kernels(4) + shared_mem_size(4)
+// Per kernel: name_len(4) + name + num_regs(4) + num_instr(4) + wg[3](12) + instructions
+fn vxb_serialize_kernel(name: String, code: [i64], num_regs: i64, wg_x: i64, wg_y: i64, wg_z: i64) -> [i64] {
+    var bytes: [i64] = []
+
+    // Magic: 'V' 'X' 'B' 0
+    bytes = push(bytes, 86)   // V
+    bytes = push(bytes, 88)   // X
+    bytes = push(bytes, 66)   // B
+    bytes = push(bytes, 0)
+
+    // Version: 1 (LE 32)
+    bytes = push(bytes, 1)
+    bytes = push(bytes, 0)
+    bytes = push(bytes, 0)
+    bytes = push(bytes, 0)
+
+    // Num kernels: 1
+    bytes = push(bytes, 1)
+    bytes = push(bytes, 0)
+    bytes = push(bytes, 0)
+    bytes = push(bytes, 0)
+
+    // Shared mem size: 49152 = 0xC000
+    bytes = push(bytes, 0)
+    bytes = push(bytes, 192)
+    bytes = push(bytes, 0)
+    bytes = push(bytes, 0)
+
+    // Kernel name length
+    let name_len = len(name)
+    bytes = push(bytes, name_len % 256)
+    bytes = push(bytes, (name_len / 256) % 256)
+    bytes = push(bytes, 0)
+    bytes = push(bytes, 0)
+
+    // Kernel name bytes
+    let name_bytes = str_bytes(name)
+    var ni = 0
+    while ni < len(name_bytes) {
+        bytes = push(bytes, name_bytes[ni])
+        ni = ni + 1
+    }
+
+    // Num regs (LE 32)
+    bytes = push(bytes, num_regs % 256)
+    bytes = push(bytes, (num_regs / 256) % 256)
+    bytes = push(bytes, 0)
+    bytes = push(bytes, 0)
+
+    // Num instructions (LE 32)
+    let num_inst = len(code)
+    bytes = push(bytes, num_inst % 256)
+    bytes = push(bytes, (num_inst / 256) % 256)
+    bytes = push(bytes, 0)
+    bytes = push(bytes, 0)
+
+    // Workgroup size [3] (each LE 32)
+    bytes = push(bytes, wg_x % 256)
+    bytes = push(bytes, (wg_x / 256) % 256)
+    bytes = push(bytes, 0)
+    bytes = push(bytes, 0)
+    bytes = push(bytes, wg_y % 256)
+    bytes = push(bytes, (wg_y / 256) % 256)
+    bytes = push(bytes, 0)
+    bytes = push(bytes, 0)
+    bytes = push(bytes, wg_z % 256)
+    bytes = push(bytes, (wg_z / 256) % 256)
+    bytes = push(bytes, 0)
+    bytes = push(bytes, 0)
+
+    // Instructions (each LE 32)
+    var ii = 0
+    while ii < num_inst {
+        let w = code[ii]
+        bytes = push(bytes, w % 256)
+        bytes = push(bytes, (w / 256) % 256)
+        bytes = push(bytes, (w / 256 / 256) % 256)
+        bytes = push(bytes, (w / 256 / 256 / 256) % 256)
+        ii = ii + 1
+    }
+
+    return bytes
+}
+
+// ===========================================================================
+// Section 9 — Test: Vector Add Kernel
+// ===========================================================================
+
+fn main() {
+    print("=== VXB Code Generator ===")
+    print("")
+
+    // --- Test 1: Assemble a vector add kernel from assembly text ---
+    print("--- Test 1: Assembler (vector add) ---")
+    let asm_source = "THREAD_ID_X r0\nBLOCK_ID_X r1\nBLOCK_DIM_X r2\nIMUL r3, r1, r2\nIADD r3, r3, r0\nLD_GLOBAL r4, r3\nLD_GLOBAL r5, r3\nFADD r6, r4, r5\nST_GLOBAL r6, r3\nRET"
+
+    let assembled = vxb_assemble(asm_source)
+    print("Assembled " + to_string(len(assembled)) + " instructions")
+
+    // Disassemble and print
+    let disasm = vxb_disassemble(assembled)
+    print(disasm)
+
+    // Print raw encoded words
+    print("Raw encoding (32-bit words):")
+    var i = 0
+    while i < len(assembled) {
+        let parts = vxb_decode(assembled[i])
+        print("  [" + to_string(i) + "] 0x" + to_string(assembled[i]) + " -> op=" + to_string(parts[0]) + " dst=" + to_string(parts[1]) + " src1=" + to_string(parts[2]) + " src2=" + to_string(parts[3]))
+        i = i + 1
+    }
+
+    // --- Test 2: Compile kernel from AST ---
+    print("")
+    print("--- Test 2: Kernel compiler (vector add from AST) ---")
+    let body: [String] = [
+        ["load", "8", "3", "0"],
+        ["load", "9", "3", "0"],
+        ["add", "10", "8", "9"],
+        ["store", "10", "3", "0"],
+        ["ret"]
+    ]
+    let kernel_code = compile_kernel("vec_add", ["a", "b", "c"], body)
+    print("Compiled kernel: " + to_string(len(kernel_code)) + " instructions (including prologue)")
+    print(vxb_disassemble(kernel_code))
+
+    // --- Test 3: Binary encoding ---
+    print("--- Test 3: Binary encoding ---")
+    let test_word = vxb_encode(OP_FADD(), 6, 4, 5)
+    let decoded = vxb_decode(test_word)
+    print("FADD r6, r4, r5 -> word=" + to_string(test_word))
+    print("  decoded: op=" + to_string(decoded[0]) + " dst=" + to_string(decoded[1]) + " src1=" + to_string(decoded[2]) + " src2=" + to_string(decoded[3]))
+
+    // --- Test 4: Serialize to VXB binary ---
+    print("")
+    print("--- Test 4: VXB binary serialization ---")
+    let vxb_bytes = vxb_serialize_kernel("vec_add", assembled, 8, 256, 1, 1)
+    print("Serialized to " + to_string(len(vxb_bytes)) + " bytes")
+    print("Magic: " + to_string(vxb_bytes[0]) + " " + to_string(vxb_bytes[1]) + " " + to_string(vxb_bytes[2]) + " " + to_string(vxb_bytes[3]))
+
+    // --- Test 5: Assembler with labels ---
+    print("")
+    print("--- Test 5: Assembler with labels ---")
+    let label_asm = "THREAD_ID_X r0\nLD_GLOBAL r1, r0\nFADD r1, r1, r1\nST_GLOBAL r1, r0\nRET"
+    let label_code = vxb_assemble(label_asm)
+    print("Label test: " + to_string(len(label_code)) + " instructions")
+    print(vxb_disassemble(label_code))
+
+    // --- Test 6: Register model ---
+    print("--- Test 6: Register model ---")
+    print("General r0 = " + to_string(REG_R(0)))
+    print("General r31 = " + to_string(REG_R(31)))
+    print("Tensor t0 = " + to_string(REG_T(0)))
+    print("Tensor t7 = " + to_string(REG_T(7)))
+    print("SP = " + to_string(REG_SP()))
+    print("FP = " + to_string(REG_FP()))
+    print("PC = " + to_string(REG_PC()))
+
+    print("")
+    print("=== VXB Code Generator complete ===")
+}

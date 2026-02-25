@@ -1,0 +1,563 @@
+// std/sort_native.vx — Pure Vortex sorting and searching algorithms
+// No Rust, no external dependencies.
+// Merge sort (stable), quick sort, binary search, linear search, array utilities.
+
+// ─── String comparison helper ───────────────────────────────────────────────
+
+fn str_compare(a: String, b: String) -> i64 {
+    let ab = str_bytes(a)
+    let bb = str_bytes(b)
+    let la = len(ab)
+    let lb = len(bb)
+    var min_len = la
+    if lb < la {
+        min_len = lb
+    }
+    var i = 0
+    while i < min_len {
+        let ca = int(ab[i])
+        let cb = int(bb[i])
+        if ca < cb {
+            return -1
+        }
+        if ca > cb {
+            return 1
+        }
+        i = i + 1
+    }
+    if la < lb {
+        return -1
+    }
+    if la > lb {
+        return 1
+    }
+    return 0
+}
+
+// ─── Array slicing ──────────────────────────────────────────────────────────
+
+fn array_slice_int(arr: [i64], start: i64, end_idx: i64) -> [i64] {
+    var result = []
+    var i = start
+    while i < end_idx {
+        if i >= 0 && i < len(arr) {
+            result = push(result, arr[i])
+        }
+        i = i + 1
+    }
+    return result
+}
+
+fn array_slice_str(arr: [String], start: i64, end_idx: i64) -> [String] {
+    var result = []
+    var i = start
+    while i < end_idx {
+        if i >= 0 && i < len(arr) {
+            result = push(result, arr[i])
+        }
+        i = i + 1
+    }
+    return result
+}
+
+// ─── Merge helpers ──────────────────────────────────────────────────────────
+
+fn _merge_int(left: [i64], right: [i64]) -> [i64] {
+    var result = []
+    var i = 0
+    var j = 0
+    let nl = len(left)
+    let nr = len(right)
+    while i < nl && j < nr {
+        if left[i] <= right[j] {
+            result = push(result, left[i])
+            i = i + 1
+        } else {
+            result = push(result, right[j])
+            j = j + 1
+        }
+    }
+    while i < nl {
+        result = push(result, left[i])
+        i = i + 1
+    }
+    while j < nr {
+        result = push(result, right[j])
+        j = j + 1
+    }
+    return result
+}
+
+fn _merge_float(left: [f64], right: [f64]) -> [f64] {
+    var result = []
+    var i = 0
+    var j = 0
+    let nl = len(left)
+    let nr = len(right)
+    while i < nl && j < nr {
+        if left[i] <= right[j] {
+            result = push(result, left[i])
+            i = i + 1
+        } else {
+            result = push(result, right[j])
+            j = j + 1
+        }
+    }
+    while i < nl {
+        result = push(result, left[i])
+        i = i + 1
+    }
+    while j < nr {
+        result = push(result, right[j])
+        j = j + 1
+    }
+    return result
+}
+
+fn _merge_str(left: [String], right: [String]) -> [String] {
+    var result = []
+    var i = 0
+    var j = 0
+    let nl = len(left)
+    let nr = len(right)
+    while i < nl && j < nr {
+        let cmp = str_compare(left[i], right[j])
+        if cmp <= 0 {
+            result = push(result, left[i])
+            i = i + 1
+        } else {
+            result = push(result, right[j])
+            j = j + 1
+        }
+    }
+    while i < nl {
+        result = push(result, left[i])
+        i = i + 1
+    }
+    while j < nr {
+        result = push(result, right[j])
+        j = j + 1
+    }
+    return result
+}
+
+// ─── Merge sort ─────────────────────────────────────────────────────────────
+
+fn merge_sort_int(arr: [i64]) -> [i64] {
+    let n = len(arr)
+    if n <= 1 {
+        return arr
+    }
+    let mid = n / 2
+    let left = merge_sort_int(array_slice_int(arr, 0, mid))
+    let right = merge_sort_int(array_slice_int(arr, mid, n))
+    return _merge_int(left, right)
+}
+
+fn merge_sort_float(arr: [f64]) -> [f64] {
+    let n = len(arr)
+    if n <= 1 {
+        return arr
+    }
+    let mid = n / 2
+    var left_half = []
+    var i = 0
+    while i < mid {
+        left_half = push(left_half, arr[i])
+        i = i + 1
+    }
+    var right_half = []
+    while i < n {
+        right_half = push(right_half, arr[i])
+        i = i + 1
+    }
+    let left = merge_sort_float(left_half)
+    let right = merge_sort_float(right_half)
+    return _merge_float(left, right)
+}
+
+fn merge_sort_str(arr: [String]) -> [String] {
+    let n = len(arr)
+    if n <= 1 {
+        return arr
+    }
+    let mid = n / 2
+    let left = merge_sort_str(array_slice_str(arr, 0, mid))
+    let right = merge_sort_str(array_slice_str(arr, mid, n))
+    return _merge_str(left, right)
+}
+
+// ─── Quick sort ─────────────────────────────────────────────────────────────
+
+fn quick_sort_int(arr: [i64]) -> [i64] {
+    let n = len(arr)
+    if n <= 1 {
+        return arr
+    }
+    let pivot = arr[0]
+    var left = []
+    var middle = []
+    var right = []
+    var i = 0
+    while i < n {
+        if arr[i] < pivot {
+            left = push(left, arr[i])
+        } else if arr[i] == pivot {
+            middle = push(middle, arr[i])
+        } else {
+            right = push(right, arr[i])
+        }
+        i = i + 1
+    }
+    let sorted_left = quick_sort_int(left)
+    let sorted_right = quick_sort_int(right)
+    // concatenate sorted_left + middle + sorted_right
+    var result = []
+    var j = 0
+    while j < len(sorted_left) {
+        result = push(result, sorted_left[j])
+        j = j + 1
+    }
+    j = 0
+    while j < len(middle) {
+        result = push(result, middle[j])
+        j = j + 1
+    }
+    j = 0
+    while j < len(sorted_right) {
+        result = push(result, sorted_right[j])
+        j = j + 1
+    }
+    return result
+}
+
+// ─── Binary search ──────────────────────────────────────────────────────────
+
+fn bin_search_int(arr: [i64], target: i64) -> i64 {
+    var lo = 0
+    var hi = len(arr) - 1
+    while lo <= hi {
+        let mid = lo + (hi - lo) / 2
+        if arr[mid] == target {
+            return mid
+        }
+        if arr[mid] < target {
+            lo = mid + 1
+        } else {
+            hi = mid - 1
+        }
+    }
+    return -1
+}
+
+fn bin_search_str(arr: [String], target: String) -> i64 {
+    var lo = 0
+    var hi = len(arr) - 1
+    while lo <= hi {
+        let mid = lo + (hi - lo) / 2
+        let cmp = str_compare(arr[mid], target)
+        if cmp == 0 {
+            return mid
+        }
+        if cmp < 0 {
+            lo = mid + 1
+        } else {
+            hi = mid - 1
+        }
+    }
+    return -1
+}
+
+// ─── Linear search ──────────────────────────────────────────────────────────
+
+fn linear_search_int(arr: [i64], target: i64) -> i64 {
+    var i = 0
+    while i < len(arr) {
+        if arr[i] == target {
+            return i
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+fn linear_search_str(arr: [String], target: String) -> i64 {
+    var i = 0
+    while i < len(arr) {
+        if arr[i] == target {
+            return i
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+// ─── Array utilities ────────────────────────────────────────────────────────
+
+fn array_reverse_int(arr: [i64]) -> [i64] {
+    var result = []
+    var i = len(arr) - 1
+    while i >= 0 {
+        result = push(result, arr[i])
+        i = i - 1
+    }
+    return result
+}
+
+fn array_reverse_str(arr: [String]) -> [String] {
+    var result = []
+    var i = len(arr) - 1
+    while i >= 0 {
+        result = push(result, arr[i])
+        i = i - 1
+    }
+    return result
+}
+
+fn array_contains_int(arr: [i64], val: i64) -> bool {
+    var i = 0
+    while i < len(arr) {
+        if arr[i] == val {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+fn array_contains_str(arr: [String], val: String) -> bool {
+    var i = 0
+    while i < len(arr) {
+        if arr[i] == val {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+fn array_unique_int(arr: [i64]) -> [i64] {
+    var result = []
+    var i = 0
+    while i < len(arr) {
+        if !array_contains_int(result, arr[i]) {
+            result = push(result, arr[i])
+        }
+        i = i + 1
+    }
+    return result
+}
+
+fn array_unique_str(arr: [String]) -> [String] {
+    var result = []
+    var i = 0
+    while i < len(arr) {
+        if !array_contains_str(result, arr[i]) {
+            result = push(result, arr[i])
+        }
+        i = i + 1
+    }
+    return result
+}
+
+fn array_flatten(arr: [String]) -> [String] {
+    // For a flat [String], this is identity since we cannot nest typed arrays
+    // This returns the array as-is
+    return arr
+}
+
+fn array_map_int(arr: [i64], offset: i64) -> [i64] {
+    var result = []
+    var i = 0
+    while i < len(arr) {
+        result = push(result, arr[i] + offset)
+        i = i + 1
+    }
+    return result
+}
+
+fn array_filter_positive(arr: [i64]) -> [i64] {
+    var result = []
+    var i = 0
+    while i < len(arr) {
+        if arr[i] > 0 {
+            result = push(result, arr[i])
+        }
+        i = i + 1
+    }
+    return result
+}
+
+fn array_sum_int(arr: [i64]) -> i64 {
+    var total = 0
+    var i = 0
+    while i < len(arr) {
+        total = total + arr[i]
+        i = i + 1
+    }
+    return total
+}
+
+fn array_sum_float(arr: [f64]) -> f64 {
+    var total = 0.0
+    var i = 0
+    while i < len(arr) {
+        total = total + arr[i]
+        i = i + 1
+    }
+    return total
+}
+
+fn array_max_int(arr: [i64]) -> i64 {
+    var mx = arr[0]
+    var i = 1
+    while i < len(arr) {
+        if arr[i] > mx {
+            mx = arr[i]
+        }
+        i = i + 1
+    }
+    return mx
+}
+
+fn array_min_int(arr: [i64]) -> i64 {
+    var mn = arr[0]
+    var i = 1
+    while i < len(arr) {
+        if arr[i] < mn {
+            mn = arr[i]
+        }
+        i = i + 1
+    }
+    return mn
+}
+
+// ─── Helper for tests ───────────────────────────────────────────────────────
+
+fn _arr_eq_int(a: [i64], b: [i64]) -> bool {
+    if len(a) != len(b) {
+        return false
+    }
+    var i = 0
+    while i < len(a) {
+        if a[i] != b[i] {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+fn _arr_eq_str(a: [String], b: [String]) -> bool {
+    if len(a) != len(b) {
+        return false
+    }
+    var i = 0
+    while i < len(a) {
+        if a[i] != b[i] {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+fn _check(name: String, passed: bool) {
+    if passed {
+        println("PASS: " + name)
+    } else {
+        println("FAIL: " + name)
+    }
+}
+
+// ─── Main tests ─────────────────────────────────────────────────────────────
+
+fn main() {
+    println("=== sort_native.vx tests ===")
+
+    // Merge sort int
+    let sorted1 = merge_sort_int([5, 3, 1, 4, 2])
+    _check("merge_sort_int [5,3,1,4,2]", _arr_eq_int(sorted1, [1, 2, 3, 4, 5]))
+
+    // Merge sort empty and single
+    _check("merge_sort_int empty", _arr_eq_int(merge_sort_int([]), []))
+    _check("merge_sort_int single", _arr_eq_int(merge_sort_int([7]), [7]))
+
+    // Merge sort float
+    let sorted_f = merge_sort_float([3.14, 1.41, 2.71])
+    _check("merge_sort_float", len(sorted_f) == 3 && sorted_f[0] == 1.41 && sorted_f[1] == 2.71 && sorted_f[2] == 3.14)
+
+    // Merge sort string
+    let sorted_s = merge_sort_str(["banana", "apple", "cherry"])
+    _check("merge_sort_str", _arr_eq_str(sorted_s, ["apple", "banana", "cherry"]))
+
+    // Quick sort int
+    let qsorted = quick_sort_int([5, 3, 1, 4, 2])
+    _check("quick_sort_int", _arr_eq_int(qsorted, [1, 2, 3, 4, 5]))
+
+    // Binary search int
+    let sarr = [1, 2, 3, 4, 5]
+    _check("bin_search_int found 3", bin_search_int(sarr, 3) == 2)
+    _check("bin_search_int found 1", bin_search_int(sarr, 1) == 0)
+    _check("bin_search_int found 5", bin_search_int(sarr, 5) == 4)
+    _check("bin_search_int missing 6", bin_search_int(sarr, 6) == -1)
+    _check("bin_search_int missing 0", bin_search_int(sarr, 0) == -1)
+
+    // Binary search string
+    let sstr = ["apple", "banana", "cherry"]
+    _check("bin_search_str found apple", bin_search_str(sstr, "apple") == 0)
+    _check("bin_search_str found cherry", bin_search_str(sstr, "cherry") == 2)
+    _check("bin_search_str missing date", bin_search_str(sstr, "date") == -1)
+
+    // Linear search
+    _check("linear_search_int found", linear_search_int([10, 20, 30], 20) == 1)
+    _check("linear_search_int missing", linear_search_int([10, 20, 30], 99) == -1)
+    _check("linear_search_str found", linear_search_str(["a", "b", "c"], "b") == 1)
+    _check("linear_search_str missing", linear_search_str(["a", "b", "c"], "z") == -1)
+
+    // Array reverse
+    _check("array_reverse_int", _arr_eq_int(array_reverse_int([1, 2, 3]), [3, 2, 1]))
+    _check("array_reverse_str", _arr_eq_str(array_reverse_str(["a", "b", "c"]), ["c", "b", "a"]))
+
+    // Array slice
+    _check("array_slice_int", _arr_eq_int(array_slice_int([10, 20, 30, 40, 50], 1, 4), [20, 30, 40]))
+    _check("array_slice_str", _arr_eq_str(array_slice_str(["a", "b", "c", "d"], 0, 2), ["a", "b"]))
+
+    // Array contains
+    _check("array_contains_int true", array_contains_int([1, 2, 3], 2))
+    _check("array_contains_int false", !array_contains_int([1, 2, 3], 9))
+    _check("array_contains_str true", array_contains_str(["x", "y"], "y"))
+    _check("array_contains_str false", !array_contains_str(["x", "y"], "z"))
+
+    // Array unique
+    _check("array_unique_int", _arr_eq_int(array_unique_int([3, 1, 2, 1, 3]), [3, 1, 2]))
+    _check("array_unique_str", _arr_eq_str(array_unique_str(["a", "b", "a", "c", "b"]), ["a", "b", "c"]))
+
+    // Array map and filter
+    _check("array_map_int", _arr_eq_int(array_map_int([1, 2, 3], 10), [11, 12, 13]))
+    _check("array_filter_positive", _arr_eq_int(array_filter_positive([-2, -1, 0, 1, 2, 3]), [1, 2, 3]))
+
+    // Array sum
+    _check("array_sum_int", array_sum_int([1, 2, 3, 4, 5]) == 15)
+    _check("array_sum_float", array_sum_float([1.0, 2.0, 3.0]) == 6.0)
+
+    // Array max/min
+    _check("array_max_int", array_max_int([3, 1, 4, 1, 5, 9]) == 9)
+    _check("array_min_int", array_min_int([3, 1, 4, 1, 5, 9]) == 1)
+
+    // str_compare
+    _check("str_compare equal", str_compare("abc", "abc") == 0)
+    _check("str_compare less", str_compare("abc", "abd") == -1)
+    _check("str_compare greater", str_compare("abd", "abc") == 1)
+    _check("str_compare prefix", str_compare("ab", "abc") == -1)
+
+    // Merge sort stability: equal elements maintain order
+    // Use merge_sort_int on [2, 1, 1, 3] — the two 1s should stay in order
+    let stable_test = merge_sort_int([2, 1, 1, 3])
+    _check("merge_sort_int stable", _arr_eq_int(stable_test, [1, 1, 2, 3]))
+
+    // Array flatten (identity for flat string arrays)
+    _check("array_flatten", _arr_eq_str(array_flatten(["a", "b", "c"]), ["a", "b", "c"]))
+
+    println("=== done ===")
+}

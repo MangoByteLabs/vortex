@@ -1,0 +1,1022 @@
+// stdlib/math/modmath.vx — Modular Arithmetic Library for Cryptography
+//
+// Fast i64-based field operations, elliptic curves, number theory,
+// polynomials, and hash-to-field utilities.
+//
+// Separate from bigint.vx — this module uses native i64 for speed.
+
+// ============================================================
+// 1. Core Modular Operations
+// ============================================================
+
+fn mod_add(a: i64, b: i64, m: i64) -> i64 {
+    let r = (a % m + b % m) % m
+    if r < 0 {
+        return r + m
+    }
+    return r
+}
+
+fn mod_sub(a: i64, b: i64, m: i64) -> i64 {
+    let r = (a % m - b % m) % m
+    if r < 0 {
+        return r + m
+    }
+    return r
+}
+
+fn mod_neg(a: i64, m: i64) -> i64 {
+    let r = m - (a % m)
+    return r % m
+}
+
+// Russian peasant multiplication to avoid overflow
+fn mod_mul(a: i64, b: i64, m: i64) -> i64 {
+    var aa = a % m
+    if aa < 0 {
+        aa = aa + m
+    }
+    var bb = b % m
+    if bb < 0 {
+        bb = bb + m
+    }
+    var result = 0
+    while bb > 0 {
+        if bb % 2 == 1 {
+            result = (result + aa) % m
+        }
+        aa = (aa + aa) % m
+        bb = bb / 2
+    }
+    return result
+}
+
+// Square-and-multiply
+fn mod_pow(base: i64, exp: i64, m: i64) -> i64 {
+    if m == 1 {
+        return 0
+    }
+    var result = 1
+    var b = base % m
+    if b < 0 {
+        b = b + m
+    }
+    var e = exp
+    while e > 0 {
+        if e % 2 == 1 {
+            result = mod_mul(result, b, m)
+        }
+        b = mod_mul(b, b, m)
+        e = e / 2
+    }
+    return result
+}
+
+// Extended Euclidean algorithm: returns [gcd, x, y] where ax + by = gcd
+fn extended_gcd(a: i64, b: i64) -> [i64] {
+    if a == 0 {
+        return [b, 0, 1]
+    }
+    let r = extended_gcd(b % a, a)
+    let g = r[0]
+    let x1 = r[1]
+    let y1 = r[2]
+    let x = y1 - (b / a) * x1
+    let y = x1
+    return [g, x, y]
+}
+
+// Modular inverse via extended GCD
+fn mod_inv(a: i64, m: i64) -> i64 {
+    let r = extended_gcd(a % m, m)
+    if r[0] != 1 {
+        return -1
+    }
+    let result = r[1] % m
+    if result < 0 {
+        return result + m
+    }
+    return result
+}
+
+fn mod_div(a: i64, b: i64, m: i64) -> i64 {
+    let inv = mod_inv(b, m)
+    return mod_mul(a, inv, m)
+}
+
+// ============================================================
+// 2. Galois Field GF(p)
+// ============================================================
+
+fn gf_new(prime: i64) -> [i64] {
+    return [prime]
+}
+
+fn gf_add(f: [i64], a: i64, b: i64) -> i64 {
+    return mod_add(a, b, f[0])
+}
+
+fn gf_sub(f: [i64], a: i64, b: i64) -> i64 {
+    return mod_sub(a, b, f[0])
+}
+
+fn gf_mul(f: [i64], a: i64, b: i64) -> i64 {
+    return mod_mul(a, b, f[0])
+}
+
+fn gf_div(f: [i64], a: i64, b: i64) -> i64 {
+    return mod_div(a, b, f[0])
+}
+
+fn gf_pow(f: [i64], a: i64, e: i64) -> i64 {
+    return mod_pow(a, e, f[0])
+}
+
+fn gf_inv(f: [i64], a: i64) -> i64 {
+    return mod_inv(a, f[0])
+}
+
+// Euler's criterion: a is a quadratic residue mod p iff a^((p-1)/2) == 1
+fn gf_is_quadratic_residue(f: [i64], a: i64) -> bool {
+    let p = f[0]
+    if a % p == 0 {
+        return true
+    }
+    let r = mod_pow(a, (p - 1) / 2, p)
+    return r == 1
+}
+
+// Tonelli-Shanks algorithm for modular square root
+fn gf_sqrt(f: [i64], n: i64) -> i64 {
+    let p = f[0]
+    let a = n % p
+    if a == 0 {
+        return 0
+    }
+    if p == 2 {
+        return a
+    }
+    if gf_is_quadratic_residue(f, a) == false {
+        return -1
+    }
+    // Simple case: p == 3 mod 4
+    if p % 4 == 3 {
+        return mod_pow(a, (p + 1) / 4, p)
+    }
+    // Factor out powers of 2 from p-1: p-1 = Q * 2^S
+    var q = p - 1
+    var s = 0
+    while q % 2 == 0 {
+        q = q / 2
+        s = s + 1
+    }
+    // Find a non-residue z
+    var z = 2
+    while gf_is_quadratic_residue(f, z) {
+        z = z + 1
+    }
+    var m_val = s
+    var c = mod_pow(z, q, p)
+    var t = mod_pow(a, q, p)
+    var r = mod_pow(a, (q + 1) / 2, p)
+    while true {
+        if t == 1 {
+            return r
+        }
+        // Find least i such that t^(2^i) == 1
+        var i = 0
+        var tmp = t
+        while tmp != 1 {
+            tmp = mod_mul(tmp, tmp, p)
+            i = i + 1
+        }
+        if i == m_val {
+            return -1
+        }
+        // Update
+        var j = 0
+        var b = c
+        while j < m_val - i - 1 {
+            b = mod_mul(b, b, p)
+            j = j + 1
+        }
+        m_val = i
+        c = mod_mul(b, b, p)
+        t = mod_mul(t, c, p)
+        r = mod_mul(r, b, p)
+    }
+    return -1
+}
+
+// ============================================================
+// 3. Elliptic Curve Operations (Weierstrass: y^2 = x^3 + ax + b mod p)
+// ============================================================
+
+// Curve params: [a, b, p]
+fn ec_new(a: i64, b: i64, p: i64) -> [i64] {
+    return [a, b, p]
+}
+
+// Point: [x, y, is_infinity] where is_infinity: 0=normal, 1=point at infinity
+fn ec_point(x: i64, y: i64) -> [i64] {
+    return [x, y, 0]
+}
+
+fn ec_infinity() -> [i64] {
+    return [0, 0, 1]
+}
+
+fn ec_is_infinity(P: [i64]) -> bool {
+    return P[2] == 1
+}
+
+fn ec_is_on_curve(curve: [i64], point: [i64]) -> bool {
+    if ec_is_infinity(point) {
+        return true
+    }
+    let a = curve[0]
+    let b = curve[1]
+    let p = curve[2]
+    let x = point[0] % p
+    let y = point[1] % p
+    // y^2 mod p == (x^3 + ax + b) mod p
+    let lhs = mod_mul(y, y, p)
+    let x3 = mod_mul(mod_mul(x, x, p), x, p)
+    let ax = mod_mul(a, x, p)
+    let rhs = mod_add(mod_add(x3, ax, p), b % p, p)
+    return lhs == rhs
+}
+
+fn ec_neg(curve: [i64], P: [i64]) -> [i64] {
+    if ec_is_infinity(P) {
+        return ec_infinity()
+    }
+    let p = curve[2]
+    return [P[0], mod_neg(P[1], p), 0]
+}
+
+fn ec_add(curve: [i64], P: [i64], Q: [i64]) -> [i64] {
+    if ec_is_infinity(P) {
+        return Q
+    }
+    if ec_is_infinity(Q) {
+        return P
+    }
+    let p = curve[2]
+    let px = P[0] % p
+    let py = P[1] % p
+    let qx = Q[0] % p
+    let qy = Q[1] % p
+    // Check if P == -Q
+    if px == qx {
+        if mod_add(py, qy, p) == 0 {
+            return ec_infinity()
+        }
+        // P == Q, use doubling
+        if py == qy {
+            return ec_double(curve, P)
+        }
+    }
+    // slope = (qy - py) / (qx - px) mod p
+    let dy = mod_sub(qy, py, p)
+    let dx = mod_sub(qx, px, p)
+    let s = mod_div(dy, dx, p)
+    // rx = s^2 - px - qx
+    let rx = mod_sub(mod_sub(mod_mul(s, s, p), px, p), qx, p)
+    // ry = s * (px - rx) - py
+    let ry = mod_sub(mod_mul(s, mod_sub(px, rx, p), p), py, p)
+    return [rx, ry, 0]
+}
+
+fn ec_double(curve: [i64], P: [i64]) -> [i64] {
+    if ec_is_infinity(P) {
+        return ec_infinity()
+    }
+    let a = curve[0]
+    let p = curve[2]
+    let px = P[0] % p
+    let py = P[1] % p
+    if py == 0 {
+        return ec_infinity()
+    }
+    // slope = (3*x^2 + a) / (2*y) mod p
+    let num = mod_add(mod_mul(3, mod_mul(px, px, p), p), a % p, p)
+    let den = mod_mul(2, py, p)
+    let s = mod_div(num, den, p)
+    // rx = s^2 - 2*px
+    let rx = mod_sub(mod_mul(s, s, p), mod_mul(2, px, p), p)
+    // ry = s*(px - rx) - py
+    let ry = mod_sub(mod_mul(s, mod_sub(px, rx, p), p), py, p)
+    return [rx, ry, 0]
+}
+
+// Scalar multiplication via double-and-add
+fn ec_mul(curve: [i64], P: [i64], scalar: i64) -> [i64] {
+    if scalar == 0 {
+        return ec_infinity()
+    }
+    var n = scalar
+    if n < 0 {
+        n = 0 - n
+        return ec_mul(curve, ec_neg(curve, P), n)
+    }
+    var result = ec_infinity()
+    var base = P
+    while n > 0 {
+        if n % 2 == 1 {
+            result = ec_add(curve, result, base)
+        }
+        base = ec_double(curve, base)
+        n = n / 2
+    }
+    return result
+}
+
+// ============================================================
+// 4. Number Theory
+// ============================================================
+
+fn gcd(a: i64, b: i64) -> i64 {
+    var x = a
+    var y = b
+    if x < 0 { x = 0 - x }
+    if y < 0 { y = 0 - y }
+    while y != 0 {
+        let t = y
+        y = x % y
+        x = t
+    }
+    return x
+}
+
+fn lcm(a: i64, b: i64) -> i64 {
+    if a == 0 {
+        return 0
+    }
+    let g = gcd(a, b)
+    let result = (a / g) * b
+    if result < 0 {
+        return 0 - result
+    }
+    return result
+}
+
+// Miller-Rabin primality test with deterministic small bases
+fn is_prime(n: i64) -> bool {
+    if n < 2 {
+        return false
+    }
+    if n < 4 {
+        return true
+    }
+    if n % 2 == 0 {
+        return false
+    }
+    if n % 3 == 0 {
+        return false
+    }
+    // Write n-1 as d * 2^r
+    var d = n - 1
+    var r = 0
+    while d % 2 == 0 {
+        d = d / 2
+        r = r + 1
+    }
+    // Deterministic witnesses sufficient for n < 3,215,031,751
+    let witnesses = [2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37]
+    var wi = 0
+    while wi < len(witnesses) {
+        let a = witnesses[wi]
+        if a >= n {
+            wi = wi + 1
+            continue
+        }
+        var x = mod_pow(a, d, n)
+        if x == 1 {
+            wi = wi + 1
+            continue
+        }
+        if x == n - 1 {
+            wi = wi + 1
+            continue
+        }
+        var found = false
+        var j = 0
+        while j < r - 1 {
+            x = mod_mul(x, x, n)
+            if x == n - 1 {
+                found = true
+                break
+            }
+            j = j + 1
+        }
+        if found == false {
+            return false
+        }
+        wi = wi + 1
+    }
+    return true
+}
+
+fn euler_totient(n: i64) -> i64 {
+    var result = n
+    var p = 2
+    var num = n
+    while p * p <= num {
+        if num % p == 0 {
+            while num % p == 0 {
+                num = num / p
+            }
+            result = result - result / p
+        }
+        p = p + 1
+    }
+    if num > 1 {
+        result = result - result / num
+    }
+    return result
+}
+
+// Chinese Remainder Theorem
+// Given remainders[i] and moduli[i], find x such that x == remainders[i] mod moduli[i]
+fn chinese_remainder(remainders: [i64], moduli: [i64]) -> i64 {
+    let n = len(remainders)
+    if n == 0 {
+        return 0
+    }
+    var result = remainders[0]
+    var cur_mod = moduli[0]
+    var i = 1
+    while i < n {
+        let m = moduli[i]
+        let r = remainders[i]
+        // Solve: result + cur_mod * t == r (mod m)
+        // cur_mod * t == (r - result) (mod m)
+        let delta = ((r - result) % m + m) % m
+        let inv = mod_inv(cur_mod % m, m)
+        let t = mod_mul(delta, inv, m)
+        result = result + cur_mod * t
+        cur_mod = cur_mod * m
+        result = result % cur_mod
+        if result < 0 {
+            result = result + cur_mod
+        }
+        i = i + 1
+    }
+    return result
+}
+
+// Jacobi symbol (a/n), n must be odd positive
+fn jacobi_symbol(a: i64, n: i64) -> i64 {
+    if n <= 0 {
+        return 0
+    }
+    if n % 2 == 0 {
+        return 0
+    }
+    var aa = a % n
+    if aa < 0 {
+        aa = aa + n
+    }
+    var nn = n
+    var result = 1
+    while aa != 0 {
+        while aa % 2 == 0 {
+            aa = aa / 2
+            let r = nn % 8
+            if r == 3 {
+                result = 0 - result
+            }
+            if r == 5 {
+                result = 0 - result
+            }
+        }
+        // Swap
+        let tmp = aa
+        aa = nn
+        nn = tmp
+        if aa % 4 == 3 {
+            if nn % 4 == 3 {
+                result = 0 - result
+            }
+        }
+        aa = aa % nn
+    }
+    if nn == 1 {
+        return result
+    }
+    return 0
+}
+
+// Find a primitive root (generator) of Z/pZ* for prime p
+fn primitive_root(p: i64) -> i64 {
+    if p == 2 {
+        return 1
+    }
+    let phi = p - 1
+    // Find prime factors of phi
+    var factors = []
+    var n = phi
+    var d = 2
+    while d * d <= n {
+        if n % d == 0 {
+            factors = push(factors, d)
+            while n % d == 0 {
+                n = n / d
+            }
+        }
+        d = d + 1
+    }
+    if n > 1 {
+        factors = push(factors, n)
+    }
+    // Try candidates
+    var g = 2
+    while g < p {
+        var ok = true
+        var fi = 0
+        while fi < len(factors) {
+            if mod_pow(g, phi / factors[fi], p) == 1 {
+                ok = false
+                break
+            }
+            fi = fi + 1
+        }
+        if ok {
+            return g
+        }
+        g = g + 1
+    }
+    return -1
+}
+
+// Baby-step giant-step discrete log: find x such that g^x == h mod p
+fn discrete_log(g: i64, h: i64, p: i64) -> i64 {
+    // m = ceil(sqrt(p-1))
+    var m = 1
+    while m * m < p - 1 {
+        m = m + 1
+    }
+    // Baby steps: g^j for j = 0..m-1
+    // Store as parallel arrays (keys and values) for lookup
+    var baby_keys = []
+    var baby_vals = []
+    var val = 1
+    var j = 0
+    while j < m {
+        baby_keys = push(baby_keys, val)
+        baby_vals = push(baby_vals, j)
+        val = mod_mul(val, g, p)
+        j = j + 1
+    }
+    // Giant step factor: g^(-m) mod p
+    let gm_inv = mod_pow(mod_inv(g, p), m, p)
+    // Giant steps
+    var gamma = h % p
+    var i = 0
+    while i < m {
+        // Search baby_keys for gamma
+        var k = 0
+        while k < len(baby_keys) {
+            if baby_keys[k] == gamma {
+                return i * m + baby_vals[k]
+            }
+            k = k + 1
+        }
+        gamma = mod_mul(gamma, gm_inv, p)
+        i = i + 1
+    }
+    return -1
+}
+
+// ============================================================
+// 5. Polynomial Operations (mod p)
+// ============================================================
+// Polynomials represented as [i64] coefficient arrays where index = degree
+// e.g., [3, 0, 2] = 3 + 0*x + 2*x^2
+
+fn poly_degree(a: [i64]) -> i64 {
+    var d = len(a) - 1
+    while d > 0 {
+        if a[d] != 0 {
+            return d
+        }
+        d = d - 1
+    }
+    return 0
+}
+
+fn poly_normalize(a: [i64], p: i64) -> [i64] {
+    var result = []
+    var i = 0
+    while i < len(a) {
+        var c = a[i] % p
+        if c < 0 {
+            c = c + p
+        }
+        result = push(result, c)
+        i = i + 1
+    }
+    // Strip trailing zeros (but keep at least one element)
+    var d = len(result) - 1
+    while d > 0 {
+        if result[d] == 0 {
+            d = d - 1
+        } else {
+            break
+        }
+    }
+    var out = []
+    i = 0
+    while i <= d {
+        out = push(out, result[i])
+        i = i + 1
+    }
+    return out
+}
+
+fn poly_add(a: [i64], b: [i64], p: i64) -> [i64] {
+    var maxlen = len(a)
+    if len(b) > maxlen {
+        maxlen = len(b)
+    }
+    var result = []
+    var i = 0
+    while i < maxlen {
+        var ca = 0
+        var cb = 0
+        if i < len(a) { ca = a[i] }
+        if i < len(b) { cb = b[i] }
+        result = push(result, mod_add(ca, cb, p))
+        i = i + 1
+    }
+    return poly_normalize(result, p)
+}
+
+fn poly_sub(a: [i64], b: [i64], p: i64) -> [i64] {
+    var maxlen = len(a)
+    if len(b) > maxlen {
+        maxlen = len(b)
+    }
+    var result = []
+    var i = 0
+    while i < maxlen {
+        var ca = 0
+        var cb = 0
+        if i < len(a) { ca = a[i] }
+        if i < len(b) { cb = b[i] }
+        result = push(result, mod_sub(ca, cb, p))
+        i = i + 1
+    }
+    return poly_normalize(result, p)
+}
+
+fn poly_mul(a: [i64], b: [i64], p: i64) -> [i64] {
+    let la = len(a)
+    let lb = len(b)
+    let rlen = la + lb - 1
+    var result = []
+    var k = 0
+    while k < rlen {
+        result = push(result, 0)
+        k = k + 1
+    }
+    var i = 0
+    while i < la {
+        var j = 0
+        while j < lb {
+            let prod = mod_mul(a[i], b[j], p)
+            result[i + j] = mod_add(result[i + j], prod, p)
+            j = j + 1
+        }
+        i = i + 1
+    }
+    return poly_normalize(result, p)
+}
+
+// Polynomial modulo (a mod b in GF(p)[x])
+fn poly_mod(a: [i64], b: [i64], p: i64) -> [i64] {
+    var rem = poly_normalize(a, p)
+    let db = poly_degree(b)
+    let lead_inv = mod_inv(b[db], p)
+    while poly_degree(rem) >= db {
+        if len(rem) == 1 {
+            if rem[0] == 0 {
+                break
+            }
+        }
+        let dr = poly_degree(rem)
+        if dr < db {
+            break
+        }
+        let coeff = mod_mul(rem[dr], lead_inv, p)
+        let shift = dr - db
+        // Subtract coeff * x^shift * b from rem
+        var i = 0
+        while i <= db {
+            let idx = i + shift
+            let sub_val = mod_mul(coeff, b[i], p)
+            rem[idx] = mod_sub(rem[idx], sub_val, p)
+            i = i + 1
+        }
+        rem = poly_normalize(rem, p)
+    }
+    return rem
+}
+
+// Horner's method: evaluate poly at x mod p
+fn poly_eval(poly: [i64], x: i64, p: i64) -> i64 {
+    var result = 0
+    var i = len(poly) - 1
+    while i >= 0 {
+        result = mod_add(mod_mul(result, x, p), poly[i], p)
+        i = i - 1
+    }
+    return result
+}
+
+// Polynomial GCD in GF(p)[x]
+fn poly_gcd(a: [i64], b: [i64], p: i64) -> [i64] {
+    var x = poly_normalize(a, p)
+    var y = poly_normalize(b, p)
+    while true {
+        if len(y) == 1 {
+            if y[0] == 0 {
+                break
+            }
+        }
+        let t = y
+        y = poly_mod(x, y, p)
+        x = t
+    }
+    // Make monic
+    let d = poly_degree(x)
+    let lead_inv = mod_inv(x[d], p)
+    var result = []
+    var i = 0
+    while i <= d {
+        result = push(result, mod_mul(x[i], lead_inv, p))
+        i = i + 1
+    }
+    return result
+}
+
+// ============================================================
+// 6. Hash-to-field (FNV-1a)
+// ============================================================
+
+fn hash_to_field(data: String, p: i64) -> i64 {
+    let FNV_OFFSET = 2166136261
+    let FNV_PRIME = 16777619
+    var hash = FNV_OFFSET
+    var i = 0
+    while i < len(data) {
+        let ch = str_char_at(data, i)
+        // Use a simple char-to-int: take ordinal-like value via string heuristic
+        var byte_val = 0
+        if ch == "a" { byte_val = 97 }
+        if ch == "b" { byte_val = 98 }
+        if ch == "c" { byte_val = 99 }
+        if ch == "d" { byte_val = 100 }
+        if ch == "e" { byte_val = 101 }
+        if ch == "f" { byte_val = 102 }
+        if ch == "g" { byte_val = 103 }
+        if ch == "h" { byte_val = 104 }
+        if ch == "i" { byte_val = 105 }
+        if ch == "j" { byte_val = 106 }
+        if ch == "k" { byte_val = 107 }
+        if ch == "l" { byte_val = 108 }
+        if ch == "m" { byte_val = 109 }
+        if ch == "n" { byte_val = 110 }
+        if ch == "o" { byte_val = 111 }
+        if ch == "p" { byte_val = 112 }
+        if ch == "q" { byte_val = 113 }
+        if ch == "r" { byte_val = 114 }
+        if ch == "s" { byte_val = 115 }
+        if ch == "t" { byte_val = 116 }
+        if ch == "u" { byte_val = 117 }
+        if ch == "v" { byte_val = 118 }
+        if ch == "w" { byte_val = 119 }
+        if ch == "x" { byte_val = 120 }
+        if ch == "y" { byte_val = 121 }
+        if ch == "z" { byte_val = 122 }
+        if ch == "A" { byte_val = 65 }
+        if ch == "B" { byte_val = 66 }
+        if ch == "C" { byte_val = 67 }
+        if ch == "D" { byte_val = 68 }
+        if ch == "E" { byte_val = 69 }
+        if ch == "F" { byte_val = 70 }
+        if ch == "G" { byte_val = 71 }
+        if ch == "H" { byte_val = 72 }
+        if ch == "I" { byte_val = 73 }
+        if ch == "J" { byte_val = 74 }
+        if ch == "K" { byte_val = 75 }
+        if ch == "L" { byte_val = 76 }
+        if ch == "M" { byte_val = 77 }
+        if ch == "N" { byte_val = 78 }
+        if ch == "O" { byte_val = 79 }
+        if ch == "P" { byte_val = 80 }
+        if ch == "Q" { byte_val = 81 }
+        if ch == "R" { byte_val = 82 }
+        if ch == "S" { byte_val = 83 }
+        if ch == "T" { byte_val = 84 }
+        if ch == "U" { byte_val = 85 }
+        if ch == "V" { byte_val = 86 }
+        if ch == "W" { byte_val = 87 }
+        if ch == "X" { byte_val = 88 }
+        if ch == "Y" { byte_val = 89 }
+        if ch == "Z" { byte_val = 90 }
+        if ch == "0" { byte_val = 48 }
+        if ch == "1" { byte_val = 49 }
+        if ch == "2" { byte_val = 50 }
+        if ch == "3" { byte_val = 51 }
+        if ch == "4" { byte_val = 52 }
+        if ch == "5" { byte_val = 53 }
+        if ch == "6" { byte_val = 54 }
+        if ch == "7" { byte_val = 55 }
+        if ch == "8" { byte_val = 56 }
+        if ch == "9" { byte_val = 57 }
+        if ch == " " { byte_val = 32 }
+        // XOR and multiply
+        hash = hash ^ byte_val
+        hash = hash * FNV_PRIME
+        // Keep in positive range
+        hash = hash % 1000000007
+        if hash < 0 {
+            hash = hash + 1000000007
+        }
+        i = i + 1
+    }
+    let result = hash % p
+    if result < 0 {
+        return result + p
+    }
+    return result
+}
+
+// ============================================================
+// 7. Tests
+// ============================================================
+
+fn assert_eq(name: String, got: i64, expected: i64) {
+    if got == expected {
+        println("  PASS: " + name + " = " + to_string(got))
+    } else {
+        println("  FAIL: " + name + " expected " + to_string(expected) + " got " + to_string(got))
+    }
+}
+
+fn assert_true(name: String, val: bool) {
+    if val {
+        println("  PASS: " + name)
+    } else {
+        println("  FAIL: " + name + " expected true")
+    }
+}
+
+fn assert_false(name: String, val: bool) {
+    if val == false {
+        println("  PASS: " + name)
+    } else {
+        println("  FAIL: " + name + " expected false")
+    }
+}
+
+fn main() {
+    println("=== Modular Arithmetic Library Tests ===")
+    println("")
+
+    // --- Core mod operations ---
+    println("1. Core modular operations")
+    assert_eq("mod_pow(2, 10, 1000)", mod_pow(2, 10, 1000), 24)
+    assert_eq("mod_add(7, 8, 10)", mod_add(7, 8, 10), 5)
+    assert_eq("mod_sub(3, 7, 10)", mod_sub(3, 7, 10), 6)
+    assert_eq("mod_mul(6, 7, 10)", mod_mul(6, 7, 10), 2)
+    assert_eq("mod_neg(3, 10)", mod_neg(3, 10), 7)
+
+    // mod_inv round-trip: inv(3, 11) = 4, 3*4 mod 11 = 1
+    let inv3 = mod_inv(3, 11)
+    assert_eq("mod_inv(3, 11)", inv3, 4)
+    assert_eq("3 * mod_inv(3,11) mod 11", mod_mul(3, inv3, 11), 1)
+
+    assert_eq("mod_div(6, 3, 11)", mod_div(6, 3, 11), 2)
+    println("")
+
+    // --- GF(p) ---
+    println("2. Galois Field GF(p)")
+    let f = gf_new(17)
+    assert_eq("gf_add(f, 10, 12)", gf_add(f, 10, 12), 5)
+    assert_eq("gf_mul(f, 3, 6)", gf_mul(f, 3, 6), 1)
+    assert_eq("gf_inv(f, 3)", gf_inv(f, 3), 6)
+    assert_true("gf_is_qr(f, 1)", gf_is_quadratic_residue(f, 1))
+    assert_true("gf_is_qr(f, 4)", gf_is_quadratic_residue(f, 4))
+    assert_false("gf_is_qr(f, 3)", gf_is_quadratic_residue(f, 3))
+    // sqrt(4) mod 17 should be 2 or 15
+    let sq = gf_sqrt(f, 4)
+    let sq_check = mod_mul(sq, sq, 17)
+    assert_eq("gf_sqrt(f, 4)^2 mod 17", sq_check, 4)
+    println("")
+
+    // --- Elliptic Curve ---
+    println("3. Elliptic Curve operations")
+    // Small curve: y^2 = x^3 + 2x + 3 mod 97
+    let curve = ec_new(2, 3, 97)
+    let P = ec_point(3, 6)
+    assert_true("P on curve", ec_is_on_curve(curve, P))
+    // Verify: 6^2 = 36, 3^3 + 2*3 + 3 = 27 + 6 + 3 = 36 mod 97 = 36. Yes!
+
+    let inf = ec_infinity()
+    assert_true("infinity on curve", ec_is_on_curve(curve, inf))
+
+    // P + infinity = P
+    let sum1 = ec_add(curve, P, inf)
+    assert_eq("P + O = P (x)", sum1[0], 3)
+    assert_eq("P + O = P (y)", sum1[1], 6)
+
+    // Double P
+    let P2 = ec_double(curve, P)
+    assert_true("2P on curve", ec_is_on_curve(curve, P2))
+
+    // P + P should equal 2P
+    let P_plus_P = ec_add(curve, P, P)
+    assert_eq("P+P == 2P (x)", P_plus_P[0], P2[0])
+    assert_eq("P+P == 2P (y)", P_plus_P[1], P2[1])
+
+    // Scalar mul: 1*P = P
+    let P1 = ec_mul(curve, P, 1)
+    assert_eq("1*P (x)", P1[0], 3)
+    assert_eq("1*P (y)", P1[1], 6)
+
+    // P + (-P) = O
+    let negP = ec_neg(curve, P)
+    let should_be_inf = ec_add(curve, P, negP)
+    assert_true("P + (-P) = O", ec_is_infinity(should_be_inf))
+    println("")
+
+    // --- Number theory ---
+    println("4. Number theory")
+    assert_eq("gcd(48, 18)", gcd(48, 18), 6)
+    assert_eq("lcm(12, 18)", lcm(12, 18), 36)
+
+    let eg = extended_gcd(35, 15)
+    assert_eq("extended_gcd(35,15) gcd", eg[0], 5)
+    // Verify: 35*x + 15*y = 5
+    let verify_egcd = 35 * eg[1] + 15 * eg[2]
+    assert_eq("35*x + 15*y = gcd", verify_egcd, 5)
+
+    assert_true("is_prime(97)", is_prime(97))
+    assert_true("is_prime(7919)", is_prime(7919))
+    assert_false("is_prime(100)", is_prime(100))
+    assert_false("is_prime(1)", is_prime(1))
+    assert_true("is_prime(2)", is_prime(2))
+    assert_true("is_prime(3)", is_prime(3))
+
+    assert_eq("euler_totient(12)", euler_totient(12), 4)
+    assert_eq("euler_totient(7)", euler_totient(7), 6)
+
+    // CRT: x == 2 mod 3, x == 3 mod 5, x == 2 mod 7 => x = 23
+    let crt_result = chinese_remainder([2, 3, 2], [3, 5, 7])
+    assert_eq("CRT([2,3,2],[3,5,7])", crt_result, 23)
+
+    assert_eq("jacobi(2, 7)", jacobi_symbol(2, 7), 1)
+    assert_eq("jacobi(5, 7)", jacobi_symbol(5, 7), -1)
+
+    let g = primitive_root(7)
+    assert_eq("primitive_root(7)", g, 3)
+
+    // discrete_log: 3^x == 6 mod 7 => x = ?
+    // 3^1=3, 3^2=2, 3^3=6. So x=3.
+    assert_eq("discrete_log(3,6,7)", discrete_log(3, 6, 7), 3)
+    println("")
+
+    // --- Polynomials ---
+    println("5. Polynomial operations")
+    // poly = 1 + 2x + 3x^2, eval at x=2 mod 7: 1 + 4 + 12 = 17 mod 7 = 3
+    assert_eq("poly_eval([1,2,3], 2, 7)", poly_eval([1, 2, 3], 2, 7), 3)
+
+    // poly_add: (1+x) + (2+3x) = 3+4x mod 5
+    let pa = poly_add([1, 1], [2, 3], 5)
+    assert_eq("poly_add coeff0", pa[0], 3)
+    assert_eq("poly_add coeff1", pa[1], 4)
+
+    // poly_mul: (1+x)*(1+x) = 1+2x+x^2 mod 7
+    let pm = poly_mul([1, 1], [1, 1], 7)
+    assert_eq("poly_mul (1+x)^2 c0", pm[0], 1)
+    assert_eq("poly_mul (1+x)^2 c1", pm[1], 2)
+    assert_eq("poly_mul (1+x)^2 c2", pm[2], 1)
+    println("")
+
+    // --- Hash-to-field ---
+    println("6. Hash-to-field")
+    let h1 = hash_to_field("hello", 97)
+    let h2 = hash_to_field("hello", 97)
+    assert_eq("hash deterministic", h1, h2)
+    assert_true("hash in range", h1 >= 0)
+    assert_true("hash < p", h1 < 97)
+    let h3 = hash_to_field("world", 97)
+    println("  hash('hello', 97) = " + to_string(h1))
+    println("  hash('world', 97) = " + to_string(h3))
+    println("")
+
+    println("=== All modmath tests complete ===")
+}

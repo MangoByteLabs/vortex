@@ -1,0 +1,163 @@
+// Vortex Self-Hosting Compiler — Bootstrap Driver
+// Pipeline: lex -> parse -> typeck -> codegen / interpret
+//
+// This file ties together the compiler pipeline modules.
+// Functions lex(), parse(), typeck(), codegen(), interpret() are
+// provided by the respective compiler sub-modules (lexer.vx, parser.vx,
+// typeck.vx, codegen.vx, interpreter.vx).
+
+// Special character helpers (Vortex strings do not process escape sequences)
+fn _quote() -> String { return str_from_bytes([34]) }
+
+// --- Pipeline entry points ---
+
+// compile_and_run: full pipeline, returns interpreter result string
+fn compile_and_run(source: String) -> String {
+    let tokens = lex(source)
+    let ast = parse(tokens)
+    let errors = typeck(ast)
+    for i in range(0, len(errors)) {
+        println("Type error: " + errors[i])
+    }
+    let result = interpret(ast)
+    return result
+}
+
+// compile_to_bytecode: lex -> parse -> typeck -> codegen, returns bytecode listing
+fn compile_to_bytecode(source: String) -> [String] {
+    let tokens = lex(source)
+    let ast = parse(tokens)
+    let errors = typeck(ast)
+    if len(errors) > 0 {
+        var err_list = []
+        for i in range(0, len(errors)) {
+            err_list = push(err_list, "ERROR: " + errors[i])
+        }
+        return err_list
+    }
+    let bytecode = codegen(ast)
+    return bytecode
+}
+
+// compile_check: lex -> parse -> typeck only, returns error list
+fn compile_check(source: String) -> [String] {
+    let tokens = lex(source)
+    let ast = parse(tokens)
+    let errors = typeck(ast)
+    return errors
+}
+
+// format_tokens: pretty-print a token list for debugging
+fn format_tokens(tokens: [String]) -> [String] {
+    // Each token is encoded as 4 consecutive entries: type, value, line, col
+    var out = []
+    let stride = 4
+    let count = len(tokens) / stride
+    for i in range(0, count) {
+        let base = i * stride
+        let tok_type = tokens[base]
+        let tok_val  = tokens[base + 1]
+        let tok_line = tokens[base + 2]
+        let tok_col  = tokens[base + 3]
+        let repr = "[" + tok_type + " " + tok_val + " @" + tok_line + ":" + tok_col + "]"
+        out = push(out, repr)
+    }
+    return out
+}
+
+// print_banner: print compiler header
+fn print_banner() {
+    println("========================================")
+    println("  Vortex Self-Hosting Compiler v0.1")
+    println("  Pipeline: lex -> parse -> typeck -> codegen")
+    println("========================================")
+}
+
+// run_pipeline_verbose: run full pipeline with step-by-step output
+fn run_pipeline_verbose(source: String) -> i64 {
+    print_banner()
+    println("")
+    println("Source code:")
+    println("  " + source)
+    println("")
+
+    // --- Step 1: Lexing ---
+    println("--- Step 1: Lexing ---")
+    let tokens = lex(source)
+    let tok_stride = 4
+    let tok_count = len(tokens) / tok_stride
+    println("Token count: " + str(tok_count))
+    let pretty_toks = format_tokens(tokens)
+    for i in range(0, len(pretty_toks)) {
+        println("  " + pretty_toks[i])
+    }
+    println("")
+
+    // --- Step 2: Parsing ---
+    println("--- Step 2: Parsing ---")
+    let ast = parse(tokens)
+    println("AST nodes: " + str(len(ast)))
+    if len(ast) > 0 {
+        println("  Root: " + ast[0])
+    }
+    println("")
+
+    // --- Step 3: Type Checking ---
+    println("--- Step 3: Type Checking ---")
+    let errors = typeck(ast)
+    if len(errors) == 0 {
+        println("  No type errors — OK")
+    } else {
+        for i in range(0, len(errors)) {
+            println("  Error: " + errors[i])
+        }
+    }
+    println("")
+
+    // --- Step 4: Code Generation ---
+    println("--- Step 4: Code Generation ---")
+    let bytecode = codegen(ast)
+    println("Bytecode instructions: " + str(len(bytecode)))
+    for i in range(0, len(bytecode)) {
+        println("  " + str(i) + ": " + bytecode[i])
+    }
+    println("")
+
+    // --- Step 5: Interpretation ---
+    println("--- Step 5: Interpretation ---")
+    let result = interpret(ast)
+    println("Result: " + result)
+    println("")
+    println("=== Compilation complete ===")
+
+    if len(errors) > 0 {
+        return 1
+    }
+    return 0
+}
+
+fn main() {
+    // Demo: compile a small Vortex program through the full pipeline
+    let source = "fn add(a: i64, b: i64) -> i64 { return a + b } fn main() { let x = add(3, 4) println(str(x)) }"
+    let exit_code = run_pipeline_verbose(source)
+
+    println("")
+    println("--- Batch check demo ---")
+    var samples = []
+    samples = push(samples, "fn greet(name: String) -> String { return " + _quote() + "Hello, " + _quote() + " + name }")
+    samples = push(samples, "fn bad(x) { return x }")
+    samples = push(samples, "struct Point { x: i64, y: i64 }")
+
+    for i in range(0, len(samples)) {
+        let src = samples[i]
+        println("Checking: " + src)
+        let errs = compile_check(src)
+        if len(errs) == 0 {
+            println("  -> OK")
+        } else {
+            for j in range(0, len(errs)) {
+                println("  -> Error: " + errs[j])
+            }
+        }
+    }
+}

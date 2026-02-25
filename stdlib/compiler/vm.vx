@@ -1,0 +1,1045 @@
+// Vortex Bytecode Virtual Machine
+// Executes instruction arrays produced by codegen.vx
+//
+// Value tags on the stack:
+//   "i:N"     integer       "f:N"     float
+//   "s:text"  string        "b:true"  / "b:false"  bool
+//   "void"    unit          "fn:name" function reference
+//   "a:item0|item1|..."  array encoded as pipe-delimited items
+//
+// State threading:
+//   stack      — [String] value stack
+//   vars       — [String] flat [name, val, name, val, ...] with "##SCOPE##" markers
+//   labels     — [String] flat [label, idx_str, ...]  jump targets
+//   fns        — [String] flat [fn_name, idx_str, ...]  function entry points
+//   call_stack — [String] flat [ret_ip_str, ...]  return addresses
+
+// ── Character helpers ────────────────────────────────────────────────────────
+
+fn _nl() -> String { return str_from_bytes([10]) }
+fn _pipe() -> String { return str_from_bytes([124]) }
+
+// ── String utilities ─────────────────────────────────────────────────────────
+
+fn sw(s: String, prefix: String) -> bool {
+    if len(s) < len(prefix) { return false }
+    return str_substr(s, 0, len(prefix)) == prefix
+}
+
+fn after(s: String, n: i64) -> String {
+    return str_substr(s, n, len(s))
+}
+
+fn find_idx(haystack: String, needle: String) -> i64 {
+    return unwrap_or(str_find(haystack, needle), -1)
+}
+
+// Split string on first space → returns rest after first space
+fn rest_after_space(s: String) -> String {
+    var idx = find_idx(s, " ")
+    if idx < 0 { return "" }
+    return str_substr(s, idx + 1, len(s))
+}
+
+// Extract opcode (first word)
+fn instr_op(instr: String) -> String {
+    var idx = find_idx(instr, " ")
+    if idx < 0 { return instr }
+    return str_substr(instr, 0, idx)
+}
+
+// Extract first argument (second word)
+fn instr_arg1(instr: String) -> String {
+    var rest = rest_after_space(instr)
+    var idx = find_idx(rest, " ")
+    if idx < 0 { return rest }
+    return str_substr(rest, 0, idx)
+}
+
+// Extract second argument (third word)
+fn instr_arg2(instr: String) -> String {
+    var rest = rest_after_space(instr)
+    return rest_after_space(rest)
+}
+
+// ── Value helpers ─────────────────────────────────────────────────────────────
+
+fn make_int(n: i64) -> String   { return "i:" + to_string(n) }
+fn make_float(f: f64) -> String { return "f:" + to_string(f) }
+fn make_str(s: String) -> String { return "s:" + s }
+fn make_bool(b: bool) -> String {
+    if b { return "b:true" }
+    return "b:false"
+}
+
+// Arrays encoded as "a:item0|item1|item2" (pipe-separated)
+// Empty array = "a:"
+fn make_arr_empty() -> String { return "a:" }
+
+fn arr_encode(items: [String]) -> String {
+    var result = "a:"
+    var i = 0
+    while i < len(items) {
+        if i > 0 { result = result + _pipe() }
+        result = result + items[i]
+        i = i + 1
+    }
+    return result
+}
+
+fn arr_decode(v: String) -> [String] {
+    var content = after(v, 2)
+    var items: [String] = []
+    if len(content) == 0 { return items }
+    // Split on pipe
+    var cur = ""
+    var i = 0
+    var pipe = _pipe()
+    while i < len(content) {
+        var ch = str_substr(content, i, i + 1)
+        if ch == pipe {
+            items = push(items, cur)
+            cur = ""
+        } else {
+            cur = cur + ch
+        }
+        i = i + 1
+    }
+    items = push(items, cur)
+    return items
+}
+
+fn arr_len(v: String) -> i64 {
+    var items = arr_decode(v)
+    return len(items)
+}
+
+fn arr_get(v: String, idx: i64) -> String {
+    var items = arr_decode(v)
+    if idx < 0 { return "void" }
+    if idx >= len(items) { return "void" }
+    return items[idx]
+}
+
+fn arr_push_val(v: String, item: String) -> String {
+    var items = arr_decode(v)
+    items = push(items, item)
+    return arr_encode(items)
+}
+
+fn val_display(v: String) -> String {
+    if sw(v, "i:")    { return after(v, 2) }
+    if sw(v, "f:")    { return after(v, 2) }
+    if sw(v, "s:")    { return after(v, 2) }
+    if v == "b:true"  { return "true" }
+    if v == "b:false" { return "false" }
+    if v == "void"    { return "()" }
+    if sw(v, "fn:")   { return "<fn:" + after(v, 3) + ">" }
+    if sw(v, "a:")    {
+        var items = arr_decode(v)
+        return "[" + to_string(len(items)) + " items]"
+    }
+    return v
+}
+
+fn val_is_truthy(v: String) -> bool {
+    if v == "b:true"  { return true }
+    if v == "b:false" { return false }
+    if v == "void"    { return false }
+    if sw(v, "i:") { return after(v, 2) != "0" }
+    if sw(v, "f:") {
+        var fstr = after(v, 2)
+        if fstr == "0"   { return false }
+        if fstr == "0.0" { return false }
+        return true
+    }
+    if sw(v, "s:") { return len(after(v, 2)) > 0 }
+    return true
+}
+
+fn val_as_int(v: String) -> i64 {
+    if sw(v, "i:") { return int(after(v, 2)) }
+    if sw(v, "f:") { return int(float(after(v, 2))) }
+    return 0
+}
+
+fn val_as_float(v: String) -> f64 {
+    if sw(v, "f:") { return float(after(v, 2)) }
+    if sw(v, "i:") { return float(int(after(v, 2))) }
+    return 0.0
+}
+
+fn is_int_val(v: String) -> bool {
+    return sw(v, "i:")
+}
+
+fn is_float_val(v: String) -> bool {
+    return sw(v, "f:")
+}
+
+// ── Arithmetic ────────────────────────────────────────────────────────────────
+
+fn val_add(a: String, b: String) -> String {
+    if sw(a, "s:") {
+        return make_str(val_display(a) + val_display(b))
+    }
+    if sw(b, "s:") {
+        return make_str(val_display(a) + val_display(b))
+    }
+    if is_float_val(a) {
+        return make_float(val_as_float(a) + val_as_float(b))
+    }
+    if is_float_val(b) {
+        return make_float(val_as_float(a) + val_as_float(b))
+    }
+    return make_int(val_as_int(a) + val_as_int(b))
+}
+
+fn val_sub(a: String, b: String) -> String {
+    if is_float_val(a) {
+        return make_float(val_as_float(a) - val_as_float(b))
+    }
+    if is_float_val(b) {
+        return make_float(val_as_float(a) - val_as_float(b))
+    }
+    return make_int(val_as_int(a) - val_as_int(b))
+}
+
+fn val_mul(a: String, b: String) -> String {
+    if is_float_val(a) {
+        return make_float(val_as_float(a) * val_as_float(b))
+    }
+    if is_float_val(b) {
+        return make_float(val_as_float(a) * val_as_float(b))
+    }
+    return make_int(val_as_int(a) * val_as_int(b))
+}
+
+fn val_div(a: String, b: String) -> String {
+    if is_float_val(a) {
+        return make_float(val_as_float(a) / val_as_float(b))
+    }
+    if is_float_val(b) {
+        return make_float(val_as_float(a) / val_as_float(b))
+    }
+    var denom = val_as_int(b)
+    if denom == 0 { return "i:0" }
+    return make_int(val_as_int(a) / denom)
+}
+
+fn val_mod(a: String, b: String) -> String {
+    var denom = val_as_int(b)
+    if denom == 0 { return "i:0" }
+    return make_int(val_as_int(a) % denom)
+}
+
+fn val_neg(a: String) -> String {
+    if is_float_val(a) { return make_float(0.0 - val_as_float(a)) }
+    return make_int(0 - val_as_int(a))
+}
+
+fn val_cmp(a: String, b: String, op: String) -> String {
+    if is_int_val(a) {
+        if is_int_val(b) {
+            var ai = val_as_int(a)
+            var bi = val_as_int(b)
+            if op == "EQ"   { return make_bool(ai == bi) }
+            if op == "NEQ"  { return make_bool(ai != bi) }
+            if op == "LT"   { return make_bool(ai < bi) }
+            if op == "GT"   { return make_bool(ai > bi) }
+            if op == "LTEQ" { return make_bool(ai <= bi) }
+            if op == "GTEQ" { return make_bool(ai >= bi) }
+            return "b:false"
+        }
+    }
+    if is_float_val(a) {
+        var af = val_as_float(a)
+        var bf = val_as_float(b)
+        if op == "EQ"   { return make_bool(af == bf) }
+        if op == "NEQ"  { return make_bool(af != bf) }
+        if op == "LT"   { return make_bool(af < bf) }
+        if op == "GT"   { return make_bool(af > bf) }
+        if op == "LTEQ" { return make_bool(af <= bf) }
+        if op == "GTEQ" { return make_bool(af >= bf) }
+        return "b:false"
+    }
+    if is_float_val(b) {
+        var af = val_as_float(a)
+        var bf = val_as_float(b)
+        if op == "EQ"   { return make_bool(af == bf) }
+        if op == "NEQ"  { return make_bool(af != bf) }
+        if op == "LT"   { return make_bool(af < bf) }
+        if op == "GT"   { return make_bool(af > bf) }
+        if op == "LTEQ" { return make_bool(af <= bf) }
+        if op == "GTEQ" { return make_bool(af >= bf) }
+        return "b:false"
+    }
+    // String / other comparison
+    var as_ = val_display(a)
+    var bs  = val_display(b)
+    if op == "EQ"  { return make_bool(as_ == bs) }
+    if op == "NEQ" { return make_bool(as_ != bs) }
+    return "b:false"
+}
+
+fn val_and(a: String, b: String) -> String {
+    if val_is_truthy(a) {
+        if val_is_truthy(b) { return "b:true" }
+    }
+    return "b:false"
+}
+
+fn val_or(a: String, b: String) -> String {
+    if val_is_truthy(a) { return "b:true" }
+    if val_is_truthy(b) { return "b:true" }
+    return "b:false"
+}
+
+fn val_not(a: String) -> String {
+    if val_is_truthy(a) { return "b:false" }
+    return "b:true"
+}
+
+// ── Stack helpers ─────────────────────────────────────────────────────────────
+
+fn stack_pop(stack: [String]) -> [String] {
+    var new_stack: [String] = []
+    var i = 0
+    while i < len(stack) - 1 {
+        new_stack = push(new_stack, stack[i])
+        i = i + 1
+    }
+    return new_stack
+}
+
+fn stack_pop2(stack: [String]) -> [String] {
+    var new_stack: [String] = []
+    var i = 0
+    while i < len(stack) - 2 {
+        new_stack = push(new_stack, stack[i])
+        i = i + 1
+    }
+    return new_stack
+}
+
+fn stack_top(stack: [String]) -> String {
+    if len(stack) == 0 { return "void" }
+    return stack[len(stack) - 1]
+}
+
+fn stack_second(stack: [String]) -> String {
+    if len(stack) < 2 { return "void" }
+    return stack[len(stack) - 2]
+}
+
+// ── Variable storage ──────────────────────────────────────────────────────────
+
+fn vars_get(vars: [String], name: String) -> String {
+    var i = len(vars) - 2
+    while i >= 0 {
+        if vars[i] == name { return vars[i + 1] }
+        i = i - 2
+    }
+    return "void"
+}
+
+fn vars_set(vars: [String], name: String, val: String) -> [String] {
+    var i = len(vars) - 2
+    while i >= 0 {
+        if vars[i] == name {
+            vars[i + 1] = val
+            return vars
+        }
+        if vars[i] == "##SCOPE##" {
+            // Stop at scope boundary — add new binding
+            vars = push(vars, name)
+            vars = push(vars, val)
+            return vars
+        }
+        i = i - 2
+    }
+    vars = push(vars, name)
+    vars = push(vars, val)
+    return vars
+}
+
+fn vars_push_scope(vars: [String]) -> [String] {
+    vars = push(vars, "##SCOPE##")
+    vars = push(vars, "##SCOPE##")
+    return vars
+}
+
+fn vars_pop_scope(vars: [String]) -> [String] {
+    while len(vars) >= 2 {
+        var top_name = vars[len(vars) - 2]
+        var new_vars: [String] = []
+        var j = 0
+        while j < len(vars) - 2 {
+            new_vars = push(new_vars, vars[j])
+            j = j + 1
+        }
+        vars = new_vars
+        if top_name == "##SCOPE##" { return vars }
+    }
+    return vars
+}
+
+// ── Label/function table ──────────────────────────────────────────────────────
+
+fn table_get(table: [String], key: String) -> i64 {
+    var i = 0
+    while i < len(table) - 1 {
+        if table[i] == key { return int(table[i + 1]) }
+        i = i + 2
+    }
+    return -1
+}
+
+fn table_set(table: [String], key: String, val: i64) -> [String] {
+    table = push(table, key)
+    table = push(table, to_string(val))
+    return table
+}
+
+// ── Preprocessing ─────────────────────────────────────────────────────────────
+
+fn preprocess_labels(instrs: [String]) -> [String] {
+    var labels: [String] = []
+    var i = 0
+    while i < len(instrs) {
+        var op = instr_op(instrs[i])
+        if op == "LABEL" {
+            var name = instr_arg1(instrs[i])
+            labels = table_set(labels, name, i)
+        }
+        i = i + 1
+    }
+    return labels
+}
+
+fn preprocess_fns(instrs: [String]) -> [String] {
+    var fns: [String] = []
+    var i = 0
+    while i < len(instrs) {
+        var op = instr_op(instrs[i])
+        if op == "FN_START" {
+            var name = instr_arg1(instrs[i])
+            fns = table_set(fns, name, i)
+        }
+        i = i + 1
+    }
+    return fns
+}
+
+// ── Built-in function dispatch ────────────────────────────────────────────────
+
+fn call_builtin(name: String, argc: i64, stack: [String]) -> [String] {
+    var top = stack_top(stack)
+
+    if name == "println" {
+        var new_stack = stack_pop(stack)
+        var i = 1
+        while i < argc {
+            new_stack = stack_pop(new_stack)
+            i = i + 1
+        }
+        print(val_display(top) + _nl())
+        new_stack = push(new_stack, "void")
+        return new_stack
+    }
+
+    if name == "print" {
+        var new_stack = stack_pop(stack)
+        var i = 1
+        while i < argc {
+            new_stack = stack_pop(new_stack)
+            i = i + 1
+        }
+        print(val_display(top))
+        new_stack = push(new_stack, "void")
+        return new_stack
+    }
+
+    if name == "to_string" {
+        var new_stack = stack_pop(stack)
+        new_stack = push(new_stack, make_str(val_display(top)))
+        return new_stack
+    }
+
+    if name == "str" {
+        var new_stack = stack_pop(stack)
+        new_stack = push(new_stack, make_str(val_display(top)))
+        return new_stack
+    }
+
+    if name == "int" {
+        var new_stack = stack_pop(stack)
+        new_stack = push(new_stack, make_int(val_as_int(top)))
+        return new_stack
+    }
+
+    if name == "float" {
+        var new_stack = stack_pop(stack)
+        new_stack = push(new_stack, make_float(val_as_float(top)))
+        return new_stack
+    }
+
+    if name == "len" {
+        var new_stack = stack_pop(stack)
+        if sw(top, "s:") {
+            new_stack = push(new_stack, make_int(len(after(top, 2))))
+        } else {
+            if sw(top, "a:") {
+                new_stack = push(new_stack, make_int(arr_len(top)))
+            } else {
+                new_stack = push(new_stack, make_int(0))
+            }
+        }
+        return new_stack
+    }
+
+    if name == "push" {
+        // push(arr, val) — argc = 2
+        var val = top
+        var arr = stack_second(stack)
+        var new_stack = stack_pop2(stack)
+        var new_arr = arr_push_val(arr, val)
+        new_stack = push(new_stack, new_arr)
+        return new_stack
+    }
+
+    if name == "range" {
+        // range(n) — create [0,1,...,n-1]
+        var n = val_as_int(top)
+        var new_stack = stack_pop(stack)
+        var arr = make_arr_empty()
+        var i = 0
+        while i < n {
+            arr = arr_push_val(arr, make_int(i))
+            i = i + 1
+        }
+        new_stack = push(new_stack, arr)
+        return new_stack
+    }
+
+    // Unknown builtin — pop args, push void
+    var new_stack: [String] = []
+    var start = len(stack) - argc
+    var i = 0
+    while i < start {
+        new_stack = push(new_stack, stack[i])
+        i = i + 1
+    }
+    new_stack = push(new_stack, "void")
+    return new_stack
+}
+
+// ── Main execution engine ─────────────────────────────────────────────────────
+
+fn vm_execute(instrs: [String], labels: [String], fns: [String]) -> String {
+    var stack: [String] = []
+    var vars: [String] = []
+    var call_stack: [String] = []
+
+    var ip = 0
+    var status = "running"
+    var result = "void"
+
+    // Find main entry point
+    var main_ip = table_get(fns, "main")
+    if main_ip >= 0 {
+        ip = main_ip + 1
+        vars = vars_push_scope(vars)
+    }
+
+    while status == "running" {
+        if ip >= len(instrs) { status = "halted" }
+        if status == "running" {
+            var instr = instrs[ip]
+            var op = instr_op(instr)
+
+            if op == "HALT" {
+                status = "halted"
+                result = stack_top(stack)
+            }
+
+            if op == "PUSH_INT" {
+                var arg = instr_arg1(instr)
+                stack = push(stack, make_int(int(arg)))
+                ip = ip + 1
+            }
+
+            if op == "PUSH_FLOAT" {
+                var arg = instr_arg1(instr)
+                stack = push(stack, make_float(float(arg)))
+                ip = ip + 1
+            }
+
+            if op == "PUSH_STRING" {
+                var arg = instr_arg1(instr)
+                stack = push(stack, make_str(arg))
+                ip = ip + 1
+            }
+
+            if op == "PUSH_BOOL" {
+                var arg = instr_arg1(instr)
+                if arg == "true" {
+                    stack = push(stack, "b:true")
+                } else {
+                    stack = push(stack, "b:false")
+                }
+                ip = ip + 1
+            }
+
+            if op == "LOAD" {
+                var name = instr_arg1(instr)
+                stack = push(stack, vars_get(vars, name))
+                ip = ip + 1
+            }
+
+            if op == "STORE" {
+                var name = instr_arg1(instr)
+                var val = stack_top(stack)
+                stack = stack_pop(stack)
+                vars = vars_set(vars, name, val)
+                ip = ip + 1
+            }
+
+            if op == "POP" {
+                if len(stack) > 0 { stack = stack_pop(stack) }
+                ip = ip + 1
+            }
+
+            if op == "DUP" {
+                if len(stack) > 0 { stack = push(stack, stack_top(stack)) }
+                ip = ip + 1
+            }
+
+            if op == "ADD" {
+                var b = stack_top(stack)
+                var a = stack_second(stack)
+                stack = stack_pop2(stack)
+                stack = push(stack, val_add(a, b))
+                ip = ip + 1
+            }
+
+            if op == "SUB" {
+                var b = stack_top(stack)
+                var a = stack_second(stack)
+                stack = stack_pop2(stack)
+                stack = push(stack, val_sub(a, b))
+                ip = ip + 1
+            }
+
+            if op == "MUL" {
+                var b = stack_top(stack)
+                var a = stack_second(stack)
+                stack = stack_pop2(stack)
+                stack = push(stack, val_mul(a, b))
+                ip = ip + 1
+            }
+
+            if op == "DIV" {
+                var b = stack_top(stack)
+                var a = stack_second(stack)
+                stack = stack_pop2(stack)
+                stack = push(stack, val_div(a, b))
+                ip = ip + 1
+            }
+
+            if op == "MOD" {
+                var b = stack_top(stack)
+                var a = stack_second(stack)
+                stack = stack_pop2(stack)
+                stack = push(stack, val_mod(a, b))
+                ip = ip + 1
+            }
+
+            if op == "NEG" {
+                var a = stack_top(stack)
+                stack = stack_pop(stack)
+                stack = push(stack, val_neg(a))
+                ip = ip + 1
+            }
+
+            var is_cmp = false
+            if op == "EQ"   { is_cmp = true }
+            if op == "NEQ"  { is_cmp = true }
+            if op == "LT"   { is_cmp = true }
+            if op == "GT"   { is_cmp = true }
+            if op == "LTEQ" { is_cmp = true }
+            if op == "GTEQ" { is_cmp = true }
+            if is_cmp {
+                var b = stack_top(stack)
+                var a = stack_second(stack)
+                stack = stack_pop2(stack)
+                stack = push(stack, val_cmp(a, b, op))
+                ip = ip + 1
+            }
+
+            if op == "AND" {
+                var b = stack_top(stack)
+                var a = stack_second(stack)
+                stack = stack_pop2(stack)
+                stack = push(stack, val_and(a, b))
+                ip = ip + 1
+            }
+
+            if op == "OR" {
+                var b = stack_top(stack)
+                var a = stack_second(stack)
+                stack = stack_pop2(stack)
+                stack = push(stack, val_or(a, b))
+                ip = ip + 1
+            }
+
+            if op == "NOT" {
+                var a = stack_top(stack)
+                stack = stack_pop(stack)
+                stack = push(stack, val_not(a))
+                ip = ip + 1
+            }
+
+            if op == "JMP" {
+                var lbl = instr_arg1(instr)
+                var target = table_get(labels, lbl)
+                if target >= 0 {
+                    ip = target + 1
+                } else {
+                    status = "error"
+                    print("VM error: unknown label " + lbl + _nl())
+                }
+            }
+
+            if op == "JZ" {
+                var lbl = instr_arg1(instr)
+                var top = stack_top(stack)
+                stack = stack_pop(stack)
+                if val_is_truthy(top) {
+                    ip = ip + 1
+                } else {
+                    var target = table_get(labels, lbl)
+                    if target >= 0 {
+                        ip = target + 1
+                    } else {
+                        status = "error"
+                        print("VM error: unknown label " + lbl + _nl())
+                    }
+                }
+            }
+
+            if op == "LABEL" {
+                ip = ip + 1
+            }
+
+            if op == "FN_START" {
+                // Skip to matching FN_END (encountered during fall-through, not via CALL)
+                var depth = 1
+                ip = ip + 1
+                while depth > 0 {
+                    if ip >= len(instrs) { depth = 0 }
+                    if depth > 0 {
+                        var skip_op = instr_op(instrs[ip])
+                        if skip_op == "FN_START" { depth = depth + 1 }
+                        if skip_op == "FN_END"   { depth = depth - 1 }
+                        ip = ip + 1
+                    }
+                }
+            }
+
+            if op == "FN_END" {
+                if len(call_stack) >= 1 {
+                    var ret_ip = int(call_stack[len(call_stack) - 1])
+                    call_stack = stack_pop(call_stack)
+                    vars = vars_pop_scope(vars)
+                    ip = ret_ip
+                } else {
+                    status = "halted"
+                    result = stack_top(stack)
+                }
+            }
+
+            if op == "RET" {
+                var ret_val = "void"
+                if len(stack) > 0 {
+                    ret_val = stack_top(stack)
+                    stack = stack_pop(stack)
+                }
+                if len(call_stack) >= 1 {
+                    var ret_ip = int(call_stack[len(call_stack) - 1])
+                    call_stack = stack_pop(call_stack)
+                    vars = vars_pop_scope(vars)
+                    stack = push(stack, ret_val)
+                    ip = ret_ip
+                } else {
+                    result = ret_val
+                    status = "halted"
+                }
+            }
+
+            if op == "CALL" {
+                var fn_name = instr_arg1(instr)
+                var argc = int(instr_arg2(instr))
+
+                var is_builtin = false
+                if fn_name == "println"   { is_builtin = true }
+                if fn_name == "print"     { is_builtin = true }
+                if fn_name == "str"       { is_builtin = true }
+                if fn_name == "to_string" { is_builtin = true }
+                if fn_name == "int"       { is_builtin = true }
+                if fn_name == "float"     { is_builtin = true }
+                if fn_name == "len"       { is_builtin = true }
+                if fn_name == "push"      { is_builtin = true }
+                if fn_name == "range"     { is_builtin = true }
+
+                if is_builtin {
+                    stack = call_builtin(fn_name, argc, stack)
+                    ip = ip + 1
+                } else {
+                    var fn_ip = table_get(fns, fn_name)
+                    if fn_ip < 0 {
+                        status = "error"
+                        print("VM error: undefined function " + fn_name + _nl())
+                    } else {
+                        call_stack = push(call_stack, to_string(ip + 1))
+                        vars = vars_push_scope(vars)
+                        ip = fn_ip + 1
+                    }
+                }
+            }
+
+            if op == "ARRAY" {
+                var count = int(instr_arg1(instr))
+                var items: [String] = []
+                var start = len(stack) - count
+                var si = start
+                while si < len(stack) {
+                    items = push(items, stack[si])
+                    si = si + 1
+                }
+                var new_stack: [String] = []
+                si = 0
+                while si < start {
+                    new_stack = push(new_stack, stack[si])
+                    si = si + 1
+                }
+                stack = new_stack
+                stack = push(stack, arr_encode(items))
+                ip = ip + 1
+            }
+
+            if op == "INDEX" {
+                var idx_val = stack_top(stack)
+                var arr_val = stack_second(stack)
+                stack = stack_pop2(stack)
+                var item_idx = val_as_int(idx_val)
+                if sw(arr_val, "a:") {
+                    stack = push(stack, arr_get(arr_val, item_idx))
+                } else {
+                    stack = push(stack, "void")
+                }
+                ip = ip + 1
+            }
+
+            if op == "FIELD" {
+                // Pop object, push void (struct fields not fully implemented)
+                stack = stack_pop(stack)
+                stack = push(stack, "void")
+                ip = ip + 1
+            }
+
+            if op == "CLOSURE" {
+                stack = push(stack, "fn:closure@" + to_string(ip))
+                ip = ip + 1
+            }
+
+        } // end if status == "running"
+    } // end while
+
+    if result == "void" {
+        result = stack_top(stack)
+    }
+
+    return result
+}
+
+// ── Public API ────────────────────────────────────────────────────────────────
+
+fn vm_run(instrs: [String]) -> String {
+    var labels = preprocess_labels(instrs)
+    var fns    = preprocess_fns(instrs)
+    return vm_execute(instrs, labels, fns)
+}
+
+// ── Demo programs ─────────────────────────────────────────────────────────────
+
+fn demo_arithmetic() -> [String] {
+    // (5 + 3) * 10 = 80
+    var prog: [String] = []
+    prog = push(prog, "FN_START main")
+    prog = push(prog, "PUSH_INT 5")
+    prog = push(prog, "PUSH_INT 3")
+    prog = push(prog, "ADD")
+    prog = push(prog, "STORE x")
+    prog = push(prog, "LOAD x")
+    prog = push(prog, "PUSH_INT 10")
+    prog = push(prog, "MUL")
+    prog = push(prog, "CALL println 1")
+    prog = push(prog, "HALT")
+    prog = push(prog, "FN_END")
+    return prog
+}
+
+fn demo_conditional() -> [String] {
+    // if 7 > 4 then print "yes" else print "no"
+    var prog: [String] = []
+    prog = push(prog, "FN_START main")
+    prog = push(prog, "PUSH_INT 7")
+    prog = push(prog, "PUSH_INT 4")
+    prog = push(prog, "GT")
+    prog = push(prog, "JZ else_branch")
+    prog = push(prog, "PUSH_STRING yes")
+    prog = push(prog, "CALL println 1")
+    prog = push(prog, "JMP end_if")
+    prog = push(prog, "LABEL else_branch")
+    prog = push(prog, "PUSH_STRING no")
+    prog = push(prog, "CALL println 1")
+    prog = push(prog, "LABEL end_if")
+    prog = push(prog, "HALT")
+    prog = push(prog, "FN_END")
+    return prog
+}
+
+fn demo_loop() -> [String] {
+    // sum = 0; i = 1; while i <= 5 { sum += i; i++ }; print sum  => 15
+    var prog: [String] = []
+    prog = push(prog, "FN_START main")
+    prog = push(prog, "PUSH_INT 0")
+    prog = push(prog, "STORE sum")
+    prog = push(prog, "PUSH_INT 1")
+    prog = push(prog, "STORE i")
+    prog = push(prog, "LABEL loop_start")
+    prog = push(prog, "LOAD i")
+    prog = push(prog, "PUSH_INT 5")
+    prog = push(prog, "LTEQ")
+    prog = push(prog, "JZ loop_end")
+    prog = push(prog, "LOAD sum")
+    prog = push(prog, "LOAD i")
+    prog = push(prog, "ADD")
+    prog = push(prog, "STORE sum")
+    prog = push(prog, "LOAD i")
+    prog = push(prog, "PUSH_INT 1")
+    prog = push(prog, "ADD")
+    prog = push(prog, "STORE i")
+    prog = push(prog, "JMP loop_start")
+    prog = push(prog, "LABEL loop_end")
+    prog = push(prog, "LOAD sum")
+    prog = push(prog, "CALL println 1")
+    prog = push(prog, "HALT")
+    prog = push(prog, "FN_END")
+    return prog
+}
+
+fn demo_function_call() -> [String] {
+    // fn square(n) { n * n }; print square(9)  => 81
+    var prog: [String] = []
+    prog = push(prog, "FN_START main")
+    prog = push(prog, "PUSH_INT 9")
+    prog = push(prog, "CALL square 1")
+    prog = push(prog, "CALL println 1")
+    prog = push(prog, "HALT")
+    prog = push(prog, "FN_END")
+    prog = push(prog, "FN_START square")
+    prog = push(prog, "STORE n")
+    prog = push(prog, "LOAD n")
+    prog = push(prog, "LOAD n")
+    prog = push(prog, "MUL")
+    prog = push(prog, "RET")
+    prog = push(prog, "FN_END")
+    return prog
+}
+
+fn demo_string_ops() -> [String] {
+    // string concat + boolean NOT
+    var prog: [String] = []
+    prog = push(prog, "FN_START main")
+    prog = push(prog, "PUSH_STRING Hello")
+    prog = push(prog, "PUSH_STRING World")
+    prog = push(prog, "ADD")
+    prog = push(prog, "CALL println 1")
+    prog = push(prog, "PUSH_BOOL true")
+    prog = push(prog, "NOT")
+    prog = push(prog, "CALL println 1")
+    prog = push(prog, "HALT")
+    prog = push(prog, "FN_END")
+    return prog
+}
+
+fn demo_float_arith() -> [String] {
+    // (1.5 + 2.5) * 4.0 = 16.0
+    var prog: [String] = []
+    prog = push(prog, "FN_START main")
+    prog = push(prog, "PUSH_FLOAT 1.5")
+    prog = push(prog, "PUSH_FLOAT 2.5")
+    prog = push(prog, "ADD")
+    prog = push(prog, "PUSH_FLOAT 4.0")
+    prog = push(prog, "MUL")
+    prog = push(prog, "CALL println 1")
+    prog = push(prog, "HALT")
+    prog = push(prog, "FN_END")
+    return prog
+}
+
+fn demo_neg_mod() -> [String] {
+    // 17 mod 5 = 2
+    var prog: [String] = []
+    prog = push(prog, "FN_START main")
+    prog = push(prog, "PUSH_INT 17")
+    prog = push(prog, "PUSH_INT 5")
+    prog = push(prog, "MOD")
+    prog = push(prog, "CALL println 1")
+    prog = push(prog, "PUSH_INT 42")
+    prog = push(prog, "NEG")
+    prog = push(prog, "CALL println 1")
+    prog = push(prog, "HALT")
+    prog = push(prog, "FN_END")
+    return prog
+}
+
+fn run_demo(name: String, prog: [String]) -> String {
+    print("--- " + name + " ---" + _nl())
+    var result = vm_run(prog)
+    print("Result: " + val_display(result) + _nl())
+    return result
+}
+
+// ── Entry point ───────────────────────────────────────────────────────────────
+
+fn main() {
+    print("Vortex Bytecode VM" + _nl())
+    print("==================" + _nl())
+    print(_nl())
+
+    run_demo("Arithmetic: (5+3)*10 = 80", demo_arithmetic())
+    print(_nl())
+
+    run_demo("Conditional: 7>4 => yes", demo_conditional())
+    print(_nl())
+
+    run_demo("Loop: sum 1..5 = 15", demo_loop())
+    print(_nl())
+
+    run_demo("Function call: square(9) = 81", demo_function_call())
+    print(_nl())
+
+    run_demo("String concat + NOT", demo_string_ops())
+    print(_nl())
+
+    run_demo("Float arithmetic: (1.5+2.5)*4.0 = 16", demo_float_arith())
+    print(_nl())
+
+    run_demo("MOD and NEG", demo_neg_mod())
+    print(_nl())
+
+    print("VM execution complete" + _nl())
+}

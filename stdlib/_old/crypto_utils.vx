@@ -29,10 +29,10 @@ fn merkle_root(leaves) {
     if len(leaves) == 1 { return leaves[0] }
     let next_level = []
     for i in 0..len(leaves) / 2 {
-        push(next_level, merkle_hash(leaves[i * 2], leaves[i * 2 + 1]))
+        next_level = push(next_level, merkle_hash(leaves[i * 2], leaves[i * 2 + 1]))
     }
     if len(leaves) % 2 == 1 {
-        push(next_level, leaves[len(leaves) - 1])
+        next_level = push(next_level, leaves[len(leaves) - 1])
     }
     merkle_root(next_level)
 }

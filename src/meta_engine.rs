@@ -1011,6 +1011,7 @@ fn ast_to_value(program: &Program) -> Value {
                 ItemKind::Const(c) => format!("const:{}", c.name.name),
                 ItemKind::TypeAlias(t) => format!("type:{}", t.name.name),
                 ItemKind::FieldDef(fd) => format!("field:{}", fd.name.name),
+                ItemKind::Static(s) => format!("static:{}", s.name.name),
             };
             Value::String(kind_str)
         })

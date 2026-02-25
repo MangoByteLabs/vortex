@@ -582,7 +582,7 @@ impl SymbolTable {
                     };
                     defs.entry(c.name.name.clone()).or_default().push(sym);
                 }
-                ItemKind::TypeAlias(_) | ItemKind::Import(_) | ItemKind::FieldDef(_) => {}
+                ItemKind::TypeAlias(_) | ItemKind::Import(_) | ItemKind::FieldDef(_) | ItemKind::Static(_) => {}
             }
         }
 

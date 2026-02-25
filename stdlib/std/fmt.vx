@@ -1,0 +1,458 @@
+// std/fmt.vx — String formatting utilities
+
+// ─── Padding & Alignment ──────────────────────────────────────────────────────
+
+fn repeat_str(s: String, n: i64) -> String {
+    var result = ""
+    var i = 0
+    while i < n {
+        result = result + s
+        i = i + 1
+    }
+    return result
+}
+
+fn pad_left(s: String, width: i64, ch: String) -> String {
+    let slen = len(s)
+    if slen >= width {
+        return s
+    }
+    let padding = repeat_str(ch, width - slen)
+    return padding + s
+}
+
+fn pad_right(s: String, width: i64, ch: String) -> String {
+    let slen = len(s)
+    if slen >= width {
+        return s
+    }
+    let padding = repeat_str(ch, width - slen)
+    return s + padding
+}
+
+fn center(s: String, width: i64, ch: String) -> String {
+    let slen = len(s)
+    if slen >= width {
+        return s
+    }
+    let total_pad = width - slen
+    let left_pad = total_pad / 2
+    let right_pad = total_pad - left_pad
+    return repeat_str(ch, left_pad) + s + repeat_str(ch, right_pad)
+}
+
+// ─── Integer Base Conversion ──────────────────────────────────────────────────
+
+fn int_to_hex(n: i64) -> String {
+    if n == 0 {
+        return "0"
+    }
+    var num = n
+    var negative = false
+    if num < 0 {
+        negative = true
+        num = 0 - num
+    }
+    let digits = "0123456789abcdef"
+    var chars = []
+    while num > 0 {
+        let rem = num % 16
+        chars = push(chars, str_substr(digits, rem, 1))
+        num = num / 16
+    }
+    // reverse
+    var result = ""
+    var i = len(chars) - 1
+    while i >= 0 {
+        result = result + chars[i]
+        i = i - 1
+    }
+    if negative {
+        return "-" + result
+    }
+    return result
+}
+
+fn int_to_bin(n: i64) -> String {
+    if n == 0 {
+        return "0"
+    }
+    var num = n
+    var negative = false
+    if num < 0 {
+        negative = true
+        num = 0 - num
+    }
+    var chars = []
+    while num > 0 {
+        let rem = num % 2
+        if rem == 1 {
+            chars = push(chars, "1")
+        } else {
+            chars = push(chars, "0")
+        }
+        num = num / 2
+    }
+    var result = ""
+    var i = len(chars) - 1
+    while i >= 0 {
+        result = result + chars[i]
+        i = i - 1
+    }
+    if negative {
+        return "-" + result
+    }
+    return result
+}
+
+fn int_to_oct(n: i64) -> String {
+    if n == 0 {
+        return "0"
+    }
+    var num = n
+    var negative = false
+    if num < 0 {
+        negative = true
+        num = 0 - num
+    }
+    var chars = []
+    while num > 0 {
+        let rem = num % 8
+        chars = push(chars, to_string(rem))
+        num = num / 8
+    }
+    var result = ""
+    var i = len(chars) - 1
+    while i >= 0 {
+        result = result + chars[i]
+        i = i - 1
+    }
+    if negative {
+        return "-" + result
+    }
+    return result
+}
+
+// ─── Float Formatting ─────────────────────────────────────────────────────────
+
+fn _pow10(n: i64) -> f64 {
+    var result = 1.0
+    var i = 0
+    while i < n {
+        result = result * 10.0
+        i = i + 1
+    }
+    return result
+}
+
+fn float_fmt(x: f64, decimals: i64) -> String {
+    var negative = false
+    var val = x
+    if val < 0.0 {
+        negative = true
+        val = 0.0 - val
+    }
+    let scale = _pow10(decimals)
+    // Round by adding 0.5 at the last decimal place
+    let rounded = val * scale + 0.5
+    let int_part = int(rounded)
+    // integer part of original
+    let orig_int = int(val)
+    // fractional digits
+    let frac_val = int_part % int(scale)
+    var frac_str = to_string(frac_val)
+    // zero-pad fractional part on the left
+    while len(frac_str) < decimals {
+        frac_str = "0" + frac_str
+    }
+    var result = to_string(orig_int)
+    if decimals > 0 {
+        result = result + "." + frac_str
+    }
+    if negative {
+        return "-" + result
+    }
+    return result
+}
+
+// ─── Array & String Operations ────────────────────────────────────────────────
+
+fn join_arr(arr: [String], sep: String) -> String {
+    let n = len(arr)
+    if n == 0 {
+        return ""
+    }
+    var result = arr[0]
+    var i = 1
+    while i < n {
+        result = result + sep + arr[i]
+        i = i + 1
+    }
+    return result
+}
+
+fn split_str(s: String, sep: String) -> [String] {
+    let slen = len(s)
+    let seplen = len(sep)
+    var parts = []
+    var start = 0
+    if seplen == 0 {
+        // split into individual characters
+        for i in range(0, slen) {
+            parts = push(parts, str_substr(s, i, 1))
+        }
+        return parts
+    }
+    var i = 0
+    while i <= slen - seplen {
+        if str_substr(s, i, seplen) == sep {
+            parts = push(parts, str_substr(s, start, i - start))
+            start = i + seplen
+            i = i + seplen
+        } else {
+            i = i + 1
+        }
+    }
+    parts = push(parts, str_substr(s, start, slen - start))
+    return parts
+}
+
+fn replace_str(s: String, old: String, new_str: String) -> String {
+    let slen = len(s)
+    let oldlen = len(old)
+    if oldlen == 0 {
+        return s
+    }
+    var result = ""
+    var i = 0
+    while i <= slen - oldlen {
+        if str_substr(s, i, oldlen) == old {
+            result = result + new_str
+            i = i + oldlen
+        } else {
+            result = result + str_substr(s, i, 1)
+            i = i + 1
+        }
+    }
+    // append remaining tail
+    if i < slen {
+        result = result + str_substr(s, i, slen - i)
+    }
+    return result
+}
+
+// ─── Whitespace Trimming ──────────────────────────────────────────────────────
+
+fn trim_left(s: String) -> String {
+    let slen = len(s)
+    var i = 0
+    while i < slen {
+        let ch = str_substr(s, i, 1)
+        if str_is_ascii_whitespace(ch) {
+            i = i + 1
+        } else {
+            break
+        }
+    }
+    return str_substr(s, i, slen - i)
+}
+
+fn trim_right(s: String) -> String {
+    let slen = len(s)
+    var i = slen
+    while i > 0 {
+        let ch = str_substr(s, i - 1, 1)
+        if str_is_ascii_whitespace(ch) {
+            i = i - 1
+        } else {
+            break
+        }
+    }
+    return str_substr(s, 0, i)
+}
+
+fn trim(s: String) -> String {
+    return trim_left(trim_right(s))
+}
+
+// ─── Case Conversion ──────────────────────────────────────────────────────────
+
+fn to_upper(s: String) -> String {
+    let bytes = str_bytes(s)
+    var result = []
+    for i in range(0, len(bytes)) {
+        let b = bytes[i]
+        if b >= 97 && b <= 122 {
+            result = push(result, b - 32)
+        } else {
+            result = push(result, b)
+        }
+    }
+    return str_from_bytes(result)
+}
+
+fn to_lower(s: String) -> String {
+    let bytes = str_bytes(s)
+    var result = []
+    for i in range(0, len(bytes)) {
+        let b = bytes[i]
+        if b >= 65 && b <= 90 {
+            result = push(result, b + 32)
+        } else {
+            result = push(result, b)
+        }
+    }
+    return str_from_bytes(result)
+}
+
+// ─── Search & Match ───────────────────────────────────────────────────────────
+
+fn contains(s: String, sub: String) -> bool {
+    let slen = len(s)
+    let sublen = len(sub)
+    if sublen == 0 {
+        return true
+    }
+    if sublen > slen {
+        return false
+    }
+    var i = 0
+    while i <= slen - sublen {
+        if str_substr(s, i, sublen) == sub {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+fn starts_with(s: String, prefix: String) -> bool {
+    let plen = len(prefix)
+    if plen > len(s) {
+        return false
+    }
+    return str_substr(s, 0, plen) == prefix
+}
+
+fn ends_with(s: String, suffix: String) -> bool {
+    let sfxlen = len(suffix)
+    let slen = len(s)
+    if sfxlen > slen {
+        return false
+    }
+    return str_substr(s, slen - sfxlen, sfxlen) == suffix
+}
+
+// ─── Character Codes ──────────────────────────────────────────────────────────
+
+fn char_code(ch: String) -> i64 {
+    let bytes = str_bytes(ch)
+    if len(bytes) == 0 {
+        return 0
+    }
+    return bytes[0]
+}
+
+fn from_char_code(code: i64) -> String {
+    var bytes = []
+    bytes = push(bytes, code)
+    return str_from_bytes(bytes)
+}
+
+// ─── Tests ────────────────────────────────────────────────────────────────────
+
+fn main() {
+    // pad_left / pad_right / center
+    let pl = pad_left("hi", 6, " ")
+    print("pad_left:  [" + pl + "]")
+
+    let pr = pad_right("hi", 6, "-")
+    print("pad_right: [" + pr + "]")
+
+    let ce = center("hi", 8, "*")
+    print("center:    [" + ce + "]")
+
+    // repeat_str
+    let rep = repeat_str("ab", 3)
+    print("repeat:    " + rep)
+
+    // base conversions
+    let hex = int_to_hex(255)
+    print("hex(255):  " + hex)
+
+    let hex2 = int_to_hex(4096)
+    print("hex(4096): " + hex2)
+
+    let bin = int_to_bin(13)
+    print("bin(13):   " + bin)
+
+    let oct = int_to_oct(8)
+    print("oct(8):    " + oct)
+
+    let oct2 = int_to_oct(255)
+    print("oct(255):  " + oct2)
+
+    // float_fmt
+    let ff1 = float_fmt(3.14159, 2)
+    print("float_fmt(3.14159, 2): " + ff1)
+
+    let ff2 = float_fmt(2.71828, 4)
+    print("float_fmt(2.71828, 4): " + ff2)
+
+    let ff3 = float_fmt(0.0 - 1.5, 1)
+    print("float_fmt(-1.5, 1):    " + ff3)
+
+    // join_arr
+    var words = []
+    words = push(words, "hello")
+    words = push(words, "world")
+    words = push(words, "vortex")
+    let joined = join_arr(words, ", ")
+    print("join:      " + joined)
+
+    // split_str
+    let parts = split_str("a:b:c:d", ":")
+    print("split len: " + to_string(len(parts)))
+    print("split[0]:  " + parts[0])
+    print("split[3]:  " + parts[3])
+
+    // replace_str
+    let replaced = replace_str("hello world hello", "hello", "hi")
+    print("replace:   " + replaced)
+
+    // trim
+    let trimmed = trim("   hello   ")
+    print("trim:      [" + trimmed + "]")
+
+    let tl = trim_left("   hello   ")
+    print("trim_left: [" + tl + "]")
+
+    let tr = trim_right("   hello   ")
+    print("trim_right:[" + tr + "]")
+
+    // case
+    let up = to_upper("Hello World")
+    print("to_upper:  " + up)
+
+    let lo = to_lower("Hello World")
+    print("to_lower:  " + lo)
+
+    // contains / starts_with / ends_with
+    let c1 = contains("foobar", "oba")
+    print("contains:  " + to_string(c1))
+
+    let sw = starts_with("foobar", "foo")
+    print("starts_with: " + to_string(sw))
+
+    let ew = ends_with("foobar", "bar")
+    print("ends_with: " + to_string(ew))
+
+    // char_code / from_char_code
+    let code = char_code("A")
+    print("char_code(A): " + to_string(code))
+
+    let ch = from_char_code(65)
+    print("from_char_code(65): " + ch)
+
+    print("fmt tests done")
+}

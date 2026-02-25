@@ -1,0 +1,1087 @@
+// MatrixOfThought (MoT) — 5D shared cognitive reasoning space
+// Dimensions: hypothesis × abstraction × modality × confidence × temporal
+//
+// Thought node layout (NODE_SIZE = 8 fields per node, flat [String] array):
+//   [0] id          — numeric id as string
+//   [1] hypothesis  — hypothesis axis index as string
+//   [2] abstraction — abstraction level as string (0=concrete, N=abstract)
+//   [3] modality    — expert type string
+//   [4] confidence  — float confidence as string
+//   [5] temporal    — time step as string
+//   [6] content     — thought content string
+//   [7] energy      — float energy cost as string
+
+// ─────────────────────────────────────────────
+// Section 1: Low-level helpers
+// ─────────────────────────────────────────────
+
+fn node_size() -> i64 {
+    8
+}
+
+fn mot_count(matrix: [String]) -> i64 {
+    len(matrix) / 8
+}
+
+fn mot_get_field(matrix: [String], id: i64, field: i64) -> String {
+    matrix[id * 8 + field]
+}
+
+fn mot_set_field(matrix: [String], id: i64, field: i64, val: String) -> [String] {
+    var result = []
+    var i = 0
+    var total = len(matrix)
+    while i < total {
+        var target = id * 8 + field
+        if i == target {
+            result = push(result, val)
+        } else {
+            result = push(result, matrix[i])
+        }
+        i = i + 1
+    }
+    result
+}
+
+// Append a fully-formed 8-field node to the matrix
+fn mot_append_node(matrix: [String], id_s: String, hyp_s: String, abs_s: String,
+                   mod_s: String, conf_s: String, temp_s: String, cont_s: String,
+                   eng_s: String) -> [String] {
+    var m = push(matrix, id_s)
+    m = push(m, hyp_s)
+    m = push(m, abs_s)
+    m = push(m, mod_s)
+    m = push(m, conf_s)
+    m = push(m, temp_s)
+    m = push(m, cont_s)
+    m = push(m, eng_s)
+    m
+}
+
+// Copy the node at src_id into a new array of 8 strings
+fn mot_copy_node(matrix: [String], src_id: i64) -> [String] {
+    var node = []
+    var f = 0
+    while f < 8 {
+        node = push(node, mot_get_field(matrix, src_id, f))
+        f = f + 1
+    }
+    node
+}
+
+// ─────────────────────────────────────────────
+// Section 2: Core MoT Operations
+// ─────────────────────────────────────────────
+
+fn mot_new() -> [String] {
+    []
+}
+
+fn mot_add_thought(matrix: [String], hypothesis: i64, abstraction: i64,
+                   modality: String, confidence: f64, content: String) -> [String] {
+    var id = mot_count(matrix)
+    var eng = mot_energy_score(content)
+    mot_append_node(matrix,
+        to_string(id),
+        to_string(hypothesis),
+        to_string(abstraction),
+        modality,
+        to_string(confidence),
+        "0",
+        content,
+        to_string(eng))
+}
+
+// Return a flat array of 8-field nodes (re-indexed from 0) matching id
+fn mot_get_thought(matrix: [String], id: i64) -> [String] {
+    var count = mot_count(matrix)
+    if id < 0 {
+        []
+    } else {
+        if id >= count {
+            []
+        } else {
+            mot_copy_node(matrix, id)
+        }
+    }
+}
+
+// Return all thoughts at given hypothesis + abstraction (as flat field array)
+fn mot_thoughts_at(matrix: [String], hypothesis: i64, abstraction: i64) -> [String] {
+    var count = mot_count(matrix)
+    var result = []
+    var i = 0
+    while i < count {
+        var h = int(mot_get_field(matrix, i, 1))
+        var a = int(mot_get_field(matrix, i, 2))
+        if h == hypothesis {
+            if a == abstraction {
+                var node = mot_copy_node(matrix, i)
+                var f = 0
+                while f < 8 {
+                    result = push(result, node[f])
+                    f = f + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    result
+}
+
+fn mot_filter_modality(matrix: [String], modality: String) -> [String] {
+    var count = mot_count(matrix)
+    var result = []
+    var i = 0
+    while i < count {
+        var m = mot_get_field(matrix, i, 3)
+        if m == modality {
+            var node = mot_copy_node(matrix, i)
+            var f = 0
+            while f < 8 {
+                result = push(result, node[f])
+                f = f + 1
+            }
+        }
+        i = i + 1
+    }
+    result
+}
+
+fn mot_filter_confidence(matrix: [String], min_conf: f64) -> [String] {
+    var count = mot_count(matrix)
+    var result = []
+    var i = 0
+    while i < count {
+        var c = float(mot_get_field(matrix, i, 4))
+        if c >= min_conf {
+            var node = mot_copy_node(matrix, i)
+            var f = 0
+            while f < 8 {
+                result = push(result, node[f])
+                f = f + 1
+            }
+        }
+        i = i + 1
+    }
+    result
+}
+
+// ─────────────────────────────────────────────
+// Section 3: Expert Dispatch
+// ─────────────────────────────────────────────
+
+// Symbolic evaluator: handles simple "A op B" arithmetic strings
+fn mot_symbolic_eval(content: String) -> String {
+    // Try to detect "N * M + K" or "N + M" or "N * M" patterns via length heuristic
+    // We parse by scanning for operator characters
+    var n = len(content)
+    var i = 0
+    var found_mul = -1
+    var found_add = -1
+    var found_sub = -1
+    while i < n {
+        var c = content[i]
+        if c == "*" {
+            found_mul = i
+        }
+        if c == "+" {
+            found_add = i
+        }
+        if c == "-" {
+            if i > 0 {
+                found_sub = i
+            }
+        }
+        i = i + 1
+    }
+    // Try "A * B + C"
+    if found_mul >= 0 {
+        if found_add > found_mul {
+            var a_s = str_trim(str_slice(content, 0, found_mul))
+            var b_s = str_trim(str_slice(content, found_mul + 1, found_add))
+            var c_s = str_trim(str_slice(content, found_add + 1, n))
+            var a_v = int(a_s)
+            var b_v = int(b_s)
+            var c_v = int(c_s)
+            return to_string(a_v * b_v + c_v)
+        }
+        // Just "A * B"
+        var a_s = str_trim(str_slice(content, 0, found_mul))
+        var b_s = str_trim(str_slice(content, found_mul + 1, n))
+        var a_v = int(a_s)
+        var b_v = int(b_s)
+        return to_string(a_v * b_v)
+    }
+    if found_add >= 0 {
+        var a_s = str_trim(str_slice(content, 0, found_add))
+        var b_s = str_trim(str_slice(content, found_add + 1, n))
+        var a_v = int(a_s)
+        var b_v = int(b_s)
+        return to_string(a_v + b_v)
+    }
+    content
+}
+
+// Neural score: bag-of-chars similarity in [0,1]
+fn mot_neural_score(content: String, reference: String) -> f64 {
+    var n = len(content)
+    var m = len(reference)
+    if n == 0 {
+        return 0.0
+    }
+    if m == 0 {
+        return 0.0
+    }
+    var matches = 0
+    var i = 0
+    while i < n {
+        var ci = content[i]
+        var j = 0
+        var found = false
+        while j < m {
+            if reference[j] == ci {
+                found = true
+            }
+            j = j + 1
+        }
+        if found {
+            matches = matches + 1
+        }
+        i = i + 1
+    }
+    var score = float(matches) / float(n)
+    score
+}
+
+// KV memory: memory is flat [key, value, key, value, ...]
+fn mot_retrieval_lookup(memory: [String], query: String) -> String {
+    var n = len(memory)
+    var i = 0
+    var best = "not_found"
+    while i + 1 < n {
+        var key = memory[i]
+        if key == query {
+            best = memory[i + 1]
+        }
+        i = i + 2
+    }
+    best
+}
+
+// Energy score: length * unique-char-diversity approximation
+fn mot_energy_score(content: String) -> f64 {
+    var n = len(content)
+    if n == 0 {
+        return 0.0
+    }
+    var seen = []
+    var unique = 0
+    var i = 0
+    while i < n {
+        var c = content[i]
+        var j = 0
+        var already = false
+        while j < len(seen) {
+            if seen[j] == c {
+                already = true
+            }
+            j = j + 1
+        }
+        if already == false {
+            seen = push(seen, c)
+            unique = unique + 1
+        }
+        i = i + 1
+    }
+    float(n) * float(unique) * 0.01
+}
+
+// Creative mutation: rotate each char code by seed
+fn mot_creative_mutate(content: String, seed: i64) -> String {
+    var n = len(content)
+    var result_bytes = []
+    var i = 0
+    while i < n {
+        var c = content[i]
+        // XOR-like rotation using seed: alternate add/sub
+        var b = char_code(c)
+        var delta = seed mod 7 + 1
+        if i mod 2 == 0 {
+            b = b + delta
+        } else {
+            b = b - delta
+        }
+        // Clamp to printable ASCII range 32-126
+        if b < 32 { b = 32 }
+        if b > 126 { b = 126 }
+        result_bytes = push(result_bytes, b)
+        i = i + 1
+    }
+    str_from_codes(result_bytes)
+}
+
+// Verifier: check if claim appears as substring of content
+fn mot_verify(content: String, claim: String) -> bool {
+    var cn = len(content)
+    var cm = len(claim)
+    if cm == 0 {
+        return true
+    }
+    if cn < cm {
+        return false
+    }
+    var i = 0
+    var found = false
+    while i <= cn - cm {
+        var match = true
+        var j = 0
+        while j < cm {
+            if content[i + j] != claim[j] {
+                match = false
+            }
+            j = j + 1
+        }
+        if match {
+            found = true
+        }
+        i = i + 1
+    }
+    found
+}
+
+// Route a thought node (8-field array) to its expert, return result string
+fn mot_dispatch(thought: [String]) -> String {
+    var modality = thought[3]
+    var content = thought[6]
+    if modality == "symbolic" {
+        return mot_symbolic_eval(content)
+    }
+    if modality == "neural" {
+        var score = mot_neural_score(content, "answer result solution")
+        return to_string(score)
+    }
+    if modality == "energy" {
+        var e = mot_energy_score(content)
+        return to_string(e)
+    }
+    if modality == "creative" {
+        return mot_creative_mutate(content, 42)
+    }
+    if modality == "verifier" {
+        var ok = mot_verify(content, content)
+        if ok {
+            return "verified"
+        } else {
+            return "contradiction"
+        }
+    }
+    // retrieval / default
+    content
+}
+
+// ─────────────────────────────────────────────
+// Section 4: Reasoning Operations
+// ─────────────────────────────────────────────
+
+// Expand: generate two child hypotheses branching from a thought
+fn mot_expand(matrix: [String], thought_id: i64) -> [String] {
+    var count = mot_count(matrix)
+    if thought_id >= count {
+        return matrix
+    }
+    var hyp = int(mot_get_field(matrix, thought_id, 1))
+    var abs_lvl = int(mot_get_field(matrix, thought_id, 2))
+    var modality = mot_get_field(matrix, thought_id, 3)
+    var content = mot_get_field(matrix, thought_id, 6)
+    var conf = float(mot_get_field(matrix, thought_id, 4))
+    var child_conf = conf * 0.8
+
+    // Branch A: same modality, next hypothesis slot
+    var branch_a = "expand_A: " + content
+    var m = mot_add_thought(matrix, hyp + 1, abs_lvl, modality, child_conf, branch_a)
+
+    // Branch B: switch to neural for second branch
+    var branch_b = "expand_B: " + content
+    m = mot_add_thought(m, hyp + 2, abs_lvl, "neural", child_conf * 0.9, branch_b)
+    m
+}
+
+// Abstract: elevate a thought to a higher abstraction level
+fn mot_abstract(matrix: [String], thought_id: i64) -> [String] {
+    var count = mot_count(matrix)
+    if thought_id >= count {
+        return matrix
+    }
+    var hyp = int(mot_get_field(matrix, thought_id, 1))
+    var abs_lvl = int(mot_get_field(matrix, thought_id, 2))
+    var modality = mot_get_field(matrix, thought_id, 3)
+    var content = mot_get_field(matrix, thought_id, 6)
+    var conf = float(mot_get_field(matrix, thought_id, 4))
+    var abstract_content = "abstract(" + content + ")"
+    mot_add_thought(matrix, hyp, abs_lvl + 1, modality, conf * 0.95, abstract_content)
+}
+
+// Converge: return the single highest-confidence node for a hypothesis (as 8-field array)
+fn mot_converge(matrix: [String], hypothesis: i64) -> [String] {
+    var count = mot_count(matrix)
+    var best_conf = -1.0
+    var best_id = -1
+    var i = 0
+    while i < count {
+        var h = int(mot_get_field(matrix, i, 1))
+        if h == hypothesis {
+            var c = float(mot_get_field(matrix, i, 4))
+            if c > best_conf {
+                best_conf = c
+                best_id = i
+            }
+        }
+        i = i + 1
+    }
+    if best_id < 0 {
+        []
+    } else {
+        mot_copy_node(matrix, best_id)
+    }
+}
+
+// Prune: remove thoughts below min_confidence
+fn mot_prune(matrix: [String], min_confidence: f64) -> [String] {
+    var count = mot_count(matrix)
+    var result = []
+    var new_id = 0
+    var i = 0
+    while i < count {
+        var c = float(mot_get_field(matrix, i, 4))
+        if c >= min_confidence {
+            var node = mot_copy_node(matrix, i)
+            // Update id field to new sequential id
+            result = push(result, to_string(new_id))
+            var f = 1
+            while f < 8 {
+                result = push(result, node[f])
+                f = f + 1
+            }
+            new_id = new_id + 1
+        }
+        i = i + 1
+    }
+    result
+}
+
+// Temporal step: advance all thought time counters, decay confidence by 5%
+fn mot_temporal_step(matrix: [String]) -> [String] {
+    var count = mot_count(matrix)
+    var result = []
+    var i = 0
+    while i < count {
+        var node = mot_copy_node(matrix, i)
+        var temp = int(node[5]) + 1
+        var conf = float(node[4]) * 0.95
+        // Rebuild node with updated fields
+        var new_node = []
+        new_node = push(new_node, matrix[i * 8 + 0])  // id
+        new_node = push(new_node, matrix[i * 8 + 1])  // hyp
+        new_node = push(new_node, matrix[i * 8 + 2])  // abs
+        new_node = push(new_node, matrix[i * 8 + 3])  // modality
+        new_node = push(new_node, to_string(conf))     // updated conf
+        new_node = push(new_node, to_string(temp))     // updated temporal
+        new_node = push(new_node, matrix[i * 8 + 6])  // content
+        new_node = push(new_node, matrix[i * 8 + 7])  // energy
+        var f = 0
+        while f < 8 {
+            result = push(result, new_node[f])
+            f = f + 1
+        }
+        i = i + 1
+    }
+    result
+}
+
+// Fuse: merge two thoughts into one with combined confidence
+fn mot_fuse(matrix: [String], id_a: i64, id_b: i64) -> [String] {
+    var count = mot_count(matrix)
+    if id_a >= count {
+        return matrix
+    }
+    if id_b >= count {
+        return matrix
+    }
+    var conf_a = float(mot_get_field(matrix, id_a, 4))
+    var conf_b = float(mot_get_field(matrix, id_b, 4))
+    var hyp_a = mot_get_field(matrix, id_a, 1)
+    var abs_a = mot_get_field(matrix, id_a, 2)
+    var mod_a = mot_get_field(matrix, id_a, 3)
+    var cont_a = mot_get_field(matrix, id_a, 6)
+    var cont_b = mot_get_field(matrix, id_b, 6)
+    var fused_conf = (conf_a + conf_b) / 2.0
+    if fused_conf > 1.0 { fused_conf = 1.0 }
+    var fused_content = "fused[" + cont_a + "|" + cont_b + "]"
+    mot_add_thought(matrix, int(hyp_a), int(abs_a), mod_a, fused_conf, fused_content)
+}
+
+// Conflict detect: find thoughts in same hypothesis with differing content lengths (heuristic)
+fn mot_conflict_detect(matrix: [String]) -> [String] {
+    var count = mot_count(matrix)
+    var conflicts = []
+    var i = 0
+    while i < count {
+        var h_i = mot_get_field(matrix, i, 1)
+        var cont_i = mot_get_field(matrix, i, 6)
+        var j = i + 1
+        while j < count {
+            var h_j = mot_get_field(matrix, j, 1)
+            if h_i == h_j {
+                var cont_j = mot_get_field(matrix, j, 6)
+                // Conflict heuristic: same hypothesis but very different content lengths
+                var diff = len(cont_i) - len(cont_j)
+                if diff < 0 { diff = 0 - diff }
+                if diff > 10 {
+                    conflicts = push(conflicts, to_string(i))
+                    conflicts = push(conflicts, to_string(j))
+                }
+            }
+            j = j + 1
+        }
+        i = i + 1
+    }
+    conflicts
+}
+
+// Resolve: keep highest-confidence thought from each conflict pair
+fn mot_resolve(matrix: [String], conflicts: [String]) -> [String] {
+    var n = len(conflicts)
+    var to_remove = []
+    var i = 0
+    while i + 1 < n {
+        var id_a = int(conflicts[i])
+        var id_b = int(conflicts[i + 1])
+        var conf_a = float(mot_get_field(matrix, id_a, 4))
+        var conf_b = float(mot_get_field(matrix, id_b, 4))
+        if conf_a >= conf_b {
+            to_remove = push(to_remove, to_string(id_b))
+        } else {
+            to_remove = push(to_remove, to_string(id_a))
+        }
+        i = i + 2
+    }
+    // Rebuild matrix excluding removed ids
+    var count = mot_count(matrix)
+    var result = []
+    var new_id = 0
+    var k = 0
+    while k < count {
+        var k_s = to_string(k)
+        var skip = false
+        var r = 0
+        while r < len(to_remove) {
+            if to_remove[r] == k_s {
+                skip = true
+            }
+            r = r + 1
+        }
+        if skip == false {
+            result = push(result, to_string(new_id))
+            var f = 1
+            while f < 8 {
+                result = push(result, matrix[k * 8 + f])
+                f = f + 1
+            }
+            new_id = new_id + 1
+        }
+        k = k + 1
+    }
+    result
+}
+
+// ─────────────────────────────────────────────
+// Section 5: Multi-Model Communication
+// ─────────────────────────────────────────────
+
+// Serialize matrix to a single string using | field sep and newline node sep
+fn mot_serialize(matrix: [String]) -> String {
+    var count = mot_count(matrix)
+    var nl = str_from_bytes([10])
+    var pipe = "|"
+    var out = ""
+    var i = 0
+    while i < count {
+        var row = ""
+        var f = 0
+        while f < 8 {
+            var v = matrix[i * 8 + f]
+            if f == 0 {
+                row = v
+            } else {
+                row = row + pipe + v
+            }
+            f = f + 1
+        }
+        if i == 0 {
+            out = row
+        } else {
+            out = out + nl + row
+        }
+        i = i + 1
+    }
+    out
+}
+
+// Deserialize: split by newline then by |
+fn mot_deserialize(data: String) -> [String] {
+    var nl_code = 10
+    var pipe_code = 124
+    var n = len(data)
+    var matrix = []
+    var line = ""
+    var i = 0
+    while i < n {
+        var c = data[i]
+        var code = char_code(c)
+        if code == nl_code {
+            // Process line
+            if len(line) > 0 {
+                matrix = mot_parse_node_line(matrix, line)
+                line = ""
+            }
+        } else {
+            line = line + c
+        }
+        i = i + 1
+    }
+    // Process last line
+    if len(line) > 0 {
+        matrix = mot_parse_node_line(matrix, line)
+    }
+    matrix
+}
+
+fn mot_parse_node_line(matrix: [String], line: String) -> [String] {
+    var n = len(line)
+    var fields = []
+    var cur = ""
+    var i = 0
+    while i < n {
+        var c = line[i]
+        if c == "|" {
+            fields = push(fields, cur)
+            cur = ""
+        } else {
+            cur = cur + c
+        }
+        i = i + 1
+    }
+    fields = push(fields, cur)
+    // Pad to 8 fields if needed
+    while len(fields) < 8 {
+        fields = push(fields, "")
+    }
+    var f = 0
+    while f < 8 {
+        matrix = push(matrix, fields[f])
+        f = f + 1
+    }
+    matrix
+}
+
+// Merge two matrices, re-sequencing ids
+fn mot_merge_matrices(a: [String], b: [String]) -> [String] {
+    var count_a = mot_count(a)
+    var count_b = mot_count(b)
+    var result = []
+    var new_id = 0
+    var i = 0
+    while i < count_a {
+        result = push(result, to_string(new_id))
+        var f = 1
+        while f < 8 {
+            result = push(result, a[i * 8 + f])
+            f = f + 1
+        }
+        new_id = new_id + 1
+        i = i + 1
+    }
+    var j = 0
+    while j < count_b {
+        result = push(result, to_string(new_id))
+        var f = 1
+        while f < 8 {
+            result = push(result, b[j * 8 + f])
+            f = f + 1
+        }
+        new_id = new_id + 1
+        j = j + 1
+    }
+    result
+}
+
+// Consensus: find thoughts whose content appears in at least 2 matrices
+// matrices: flat [String] = serialized matrix strings separated by "|SPLIT|"
+fn mot_consensus(matrices: [String]) -> [String] {
+    var n = len(matrices)
+    if n == 0 {
+        return []
+    }
+    // matrices here is a [String] of serialized matrix strings
+    // Deserialize each, collect all contents, find duplicates
+    var all_contents = []
+    var i = 0
+    while i < n {
+        var mat = mot_deserialize(matrices[i])
+        var count = mot_count(mat)
+        var j = 0
+        while j < count {
+            all_contents = push(all_contents, mat[j * 8 + 6])
+            j = j + 1
+        }
+        i = i + 1
+    }
+    // Find contents that appear >= 2 times
+    var consensus_thoughts = []
+    var seen = []
+    var added = []
+    var k = 0
+    while k < len(all_contents) {
+        var c = all_contents[k]
+        var count_c = 0
+        var m = 0
+        while m < len(all_contents) {
+            if all_contents[m] == c {
+                count_c = count_c + 1
+            }
+            m = m + 1
+        }
+        if count_c >= 2 {
+            var already_added = false
+            var p = 0
+            while p < len(added) {
+                if added[p] == c {
+                    already_added = true
+                }
+                p = p + 1
+            }
+            if already_added == false {
+                consensus_thoughts = push(consensus_thoughts, c)
+                added = push(added, c)
+            }
+        }
+        k = k + 1
+    }
+    consensus_thoughts
+}
+
+// ─────────────────────────────────────────────
+// Section 6: Energy-Aware Reasoning
+// ─────────────────────────────────────────────
+
+fn mot_total_energy(matrix: [String]) -> f64 {
+    var count = mot_count(matrix)
+    var total = 0.0
+    var i = 0
+    while i < count {
+        total = total + float(matrix[i * 8 + 7])
+        i = i + 1
+    }
+    total
+}
+
+// Prune thoughts greedily by energy until total <= max_energy
+fn mot_energy_budget(matrix: [String], max_energy: f64) -> [String] {
+    var total = mot_total_energy(matrix)
+    var result = matrix
+    while total > max_energy {
+        var count = mot_count(result)
+        if count == 0 {
+            return result
+        }
+        // Find lowest-confidence thought and remove it
+        var worst_id = 0
+        var worst_conf = float(mot_get_field(result, 0, 4))
+        var i = 1
+        while i < count {
+            var c = float(mot_get_field(result, i, 4))
+            if c < worst_conf {
+                worst_conf = c
+                worst_id = i
+            }
+            i = i + 1
+        }
+        // Rebuild without worst_id
+        var pruned = []
+        var new_id = 0
+        var j = 0
+        while j < count {
+            if j != worst_id {
+                pruned = push(pruned, to_string(new_id))
+                var f = 1
+                while f < 8 {
+                    pruned = push(pruned, result[j * 8 + f])
+                    f = f + 1
+                }
+                new_id = new_id + 1
+            }
+            j = j + 1
+        }
+        result = pruned
+        total = mot_total_energy(result)
+    }
+    result
+}
+
+// Adaptive depth: how many more steps are needed for a thought
+fn mot_adaptive_depth(matrix: [String], thought_id: i64) -> i64 {
+    var count = mot_count(matrix)
+    if thought_id >= count {
+        return 0
+    }
+    var conf = float(mot_get_field(matrix, thought_id, 4))
+    var abs_lvl = int(mot_get_field(matrix, thought_id, 2))
+    // More steps if low confidence or low abstraction
+    if conf > 0.9 {
+        return 0
+    }
+    if conf > 0.7 {
+        return 1
+    }
+    if conf > 0.5 {
+        return 2 + (3 - abs_lvl)
+    }
+    5 + (3 - abs_lvl)
+}
+
+// ─────────────────────────────────────────────
+// Section 7: Full Reasoning Loop
+// ─────────────────────────────────────────────
+
+fn mot_reason(problem: String, max_steps: i64) -> [String] {
+    // Step 1: Initialize matrix with seed thoughts across modalities
+    var matrix = mot_new()
+    matrix = mot_add_thought(matrix, 0, 0, "symbolic", 0.7, problem)
+    matrix = mot_add_thought(matrix, 1, 0, "neural",   0.5, problem)
+    matrix = mot_add_thought(matrix, 2, 0, "energy",   0.4, problem)
+    matrix = mot_add_thought(matrix, 3, 0, "verifier", 0.6, problem)
+
+    var step = 0
+    var converged = false
+    while step < max_steps {
+        if converged == false {
+            // Dispatch experts: update energy field for each thought
+            var count = mot_count(matrix)
+            var i = 0
+            while i < count {
+                var node = mot_copy_node(matrix, i)
+                var result = mot_dispatch(node)
+                // Boost confidence if symbolic result looks like a number
+                var mod = node[3]
+                if mod == "symbolic" {
+                    var new_conf = float(node[4]) + 0.15
+                    if new_conf > 1.0 { new_conf = 1.0 }
+                    matrix = mot_set_field(matrix, i, 4, to_string(new_conf))
+                    matrix = mot_set_field(matrix, i, 6, result)
+                }
+                i = i + 1
+            }
+
+            // Expand hypothesis 0 if step < max_steps / 2
+            if step < max_steps / 2 {
+                matrix = mot_expand(matrix, 0)
+            }
+
+            // Abstract top thought
+            if step == 2 {
+                matrix = mot_abstract(matrix, 0)
+            }
+
+            // Prune low-confidence thoughts every 2 steps
+            if step mod 2 == 1 {
+                matrix = mot_prune(matrix, 0.3)
+            }
+
+            // Detect and resolve conflicts
+            var conflicts = mot_conflict_detect(matrix)
+            if len(conflicts) > 0 {
+                matrix = mot_resolve(matrix, conflicts)
+            }
+
+            // Temporal decay
+            matrix = mot_temporal_step(matrix)
+
+            // Check convergence: any thought with confidence >= 0.9
+            var best = mot_converge(matrix, 0)
+            if len(best) >= 5 {
+                var best_conf = float(best[4])
+                if best_conf >= 0.9 {
+                    converged = true
+                }
+            }
+        }
+        step = step + 1
+    }
+
+    matrix
+}
+
+// ─────────────────────────────────────────────
+// Section 8: Pretty Printing
+// ─────────────────────────────────────────────
+
+fn mot_print_thought(node: [String]) {
+    if len(node) < 8 {
+        println("  [empty node]")
+        return ()
+    }
+    println("  id=" + node[0] + " hyp=" + node[1] + " abs=" + node[2] +
+            " mod=" + node[3] + " conf=" + node[4] + " t=" + node[5])
+    println("    content: " + node[6])
+    println("    energy:  " + node[7])
+}
+
+fn mot_print_matrix(matrix: [String], label: String) {
+    var count = mot_count(matrix)
+    println("=== " + label + " (" + to_string(count) + " thoughts) ===")
+    var i = 0
+    while i < count {
+        var node = mot_copy_node(matrix, i)
+        mot_print_thought(node)
+        i = i + 1
+    }
+}
+
+// ─────────────────────────────────────────────
+// Section 9: Main demonstration
+// ─────────────────────────────────────────────
+
+fn main() {
+    println("=== MatrixOfThought (MoT) — 5D Cognitive Reasoning Space ===")
+    var nl = str_from_bytes([10])
+
+    // 1. Create a MoT matrix for an arithmetic problem
+    println(nl + "--- 1. Initialize matrix for: 7 * 8 + 3 ---")
+    var matrix = mot_new()
+    matrix = mot_add_thought(matrix, 0, 0, "symbolic",  0.7, "7 * 8 + 3")
+    matrix = mot_add_thought(matrix, 0, 0, "neural",    0.5, "seven times eight plus three")
+    matrix = mot_add_thought(matrix, 1, 0, "energy",    0.4, "7 * 8 + 3")
+    matrix = mot_add_thought(matrix, 1, 0, "verifier",  0.6, "result should be 59")
+    matrix = mot_add_thought(matrix, 2, 0, "creative",  0.3, "multiply then add")
+    mot_print_matrix(matrix, "Initial matrix")
+
+    // 2. Add hypotheses via different experts
+    println(nl + "--- 2. Expert dispatch ---")
+    var thought0 = mot_get_thought(matrix, 0)
+    var sym_result = mot_dispatch(thought0)
+    println("Symbolic expert on '7 * 8 + 3': " + sym_result)
+
+    var thought1 = mot_get_thought(matrix, 1)
+    var neural_score = mot_neural_score("seven times eight plus three", "answer solution")
+    println("Neural similarity score: " + to_string(neural_score))
+
+    var eng_score = mot_energy_score("7 * 8 + 3")
+    println("Energy score of problem: " + to_string(eng_score))
+
+    var verified = mot_verify("result should be 59", "59")
+    if verified {
+        println("Verifier: claim '59' is consistent with content")
+    } else {
+        println("Verifier: inconsistency detected")
+    }
+
+    // 3. Expand and abstract
+    println(nl + "--- 3. Expand + Abstract ---")
+    matrix = mot_expand(matrix, 0)
+    matrix = mot_abstract(matrix, 0)
+    mot_print_matrix(matrix, "After expand + abstract")
+
+    // 4. Run full reasoning loop
+    println(nl + "--- 4. Full reasoning loop (max 6 steps) ---")
+    var reasoned = mot_reason("7 * 8 + 3", 6)
+    mot_print_matrix(reasoned, "Post-reasoning matrix")
+
+    // Convergence check
+    var best = mot_converge(reasoned, 0)
+    if len(best) >= 5 {
+        println(nl + "Converged answer for hypothesis 0:")
+        mot_print_thought(best)
+    } else {
+        println(nl + "No convergence for hypothesis 0 — need more steps")
+    }
+
+    // 5. Multi-matrix merge (simulating two model instances)
+    println(nl + "--- 5. Multi-model matrix merge ---")
+    var model_a = mot_new()
+    model_a = mot_add_thought(model_a, 0, 0, "symbolic", 0.85, "56 + 3 = 59")
+    model_a = mot_add_thought(model_a, 1, 1, "neural",   0.60, "seven times eight")
+
+    var model_b = mot_new()
+    model_b = mot_add_thought(model_b, 0, 0, "verifier", 0.90, "59 is correct")
+    model_b = mot_add_thought(model_b, 2, 0, "energy",   0.45, "low-cost path: 7*8=56")
+
+    var merged = mot_merge_matrices(model_a, model_b)
+    mot_print_matrix(merged, "Merged model A + B")
+
+    // Fuse two thoughts
+    var fused = mot_fuse(merged, 0, 2)
+    println("After fusing thought 0 + thought 2:")
+    var fused_node = mot_get_thought(fused, mot_count(fused) - 1)
+    mot_print_thought(fused_node)
+
+    // 6. Energy budgeting
+    println(nl + "--- 6. Energy budgeting ---")
+    var total_e = mot_total_energy(merged)
+    println("Total energy before budget: " + to_string(total_e))
+    var budgeted = mot_energy_budget(merged, 1.5)
+    var after_e = mot_total_energy(budgeted)
+    println("Total energy after budget(1.5): " + to_string(after_e))
+    mot_print_matrix(budgeted, "Energy-budgeted matrix")
+
+    // 7. Consensus across model matrices
+    println(nl + "--- 7. Multi-model consensus ---")
+    var serial_a = mot_serialize(model_a)
+    var serial_b = mot_serialize(model_b)
+    // Add a shared thought to both
+    model_a = mot_add_thought(model_a, 3, 0, "symbolic", 0.95, "answer=59")
+    model_b = mot_add_thought(model_b, 3, 0, "symbolic", 0.92, "answer=59")
+    var serial_a2 = mot_serialize(model_a)
+    var serial_b2 = mot_serialize(model_b)
+    var matrix_list = [serial_a2, serial_b2]
+    var consensus = mot_consensus(matrix_list)
+    println("Consensus thoughts across models:")
+    var ci = 0
+    while ci < len(consensus) {
+        println("  [consensus] " + consensus[ci])
+        ci = ci + 1
+    }
+
+    // Adaptive depth
+    println(nl + "--- 8. Adaptive depth ---")
+    var depth0 = mot_adaptive_depth(reasoned, 0)
+    println("Adaptive depth for thought 0: " + to_string(depth0) + " more steps")
+
+    // Serialize / deserialize round-trip
+    println(nl + "--- 9. Serialize / deserialize round-trip ---")
+    var serialized = mot_serialize(model_a)
+    println("Serialized model_a (first 80 chars): " + str_slice(serialized, 0, 80))
+    var deserialized = mot_deserialize(serialized)
+    println("Deserialized thought count: " + to_string(mot_count(deserialized)))
+    var deser_node = mot_get_thought(deserialized, 0)
+    println("First deserialized thought:")
+    mot_print_thought(deser_node)
+
+    // Final summary
+    println(nl + "=== Final Answer ===")
+    var final_matrix = mot_reason("7 * 8 + 3", 8)
+    var answer_node = mot_converge(final_matrix, 0)
+    if len(answer_node) >= 7 {
+        println("Problem:    7 * 8 + 3")
+        println("Answer:     " + answer_node[6])
+        println("Confidence: " + answer_node[4])
+        println("Modality:   " + answer_node[3])
+        println("Time steps: " + answer_node[5])
+    } else {
+        // Fall back to direct symbolic evaluation
+        var direct = mot_symbolic_eval("7 * 8 + 3")
+        println("Problem:    7 * 8 + 3")
+        println("Answer:     " + direct)
+        println("Confidence: 1.0 (direct symbolic)")
+    }
+}

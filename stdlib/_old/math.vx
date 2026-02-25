@@ -47,7 +47,7 @@ fn norm(v) { sqrt(dot_product(v, v)) }
 fn normalize(v) {
     let n = norm(v)
     let result = []
-    for i in 0..len(v) { push(result, v[i] / n) }
+    for i in 0..len(v) { result = push(result, v[i] / n) }
     result
 }
 

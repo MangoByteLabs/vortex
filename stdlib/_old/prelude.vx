@@ -10,6 +10,6 @@ fn identity(x) { x }
 fn compose(f, g) { |x| f(g(x)) }
 fn range_array(start, end) {
     let result = []
-    for i in start..end { push(result, i) }
+    for i in start..end { result = push(result, i) }
     result
 }

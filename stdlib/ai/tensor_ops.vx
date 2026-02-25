@@ -1,0 +1,1027 @@
+// stdlib/ai/tensor_ops.vx — Pure Vortex tensor operations for AI/LLM workloads
+// Tensor format: [ndim, dim0, dim1, ..., data...]
+// All operations return new tensors (immutable style)
+
+// ─── Math Helpers ────────────────────────────────────────────────────────────
+
+fn _abs(x: f64) -> f64 {
+    if x < 0.0 {
+        return 0.0 - x
+    }
+    return x
+}
+
+fn _max(a: f64, b: f64) -> f64 {
+    if a > b {
+        return a
+    }
+    return b
+}
+
+fn _min(a: f64, b: f64) -> f64 {
+    if a < b {
+        return a
+    }
+    return b
+}
+
+fn _sqrt(x: f64) -> f64 {
+    if x <= 0.0 {
+        return 0.0
+    }
+    var guess = x / 2.0
+    if guess < 1.0 {
+        guess = 1.0
+    }
+    var i = 0
+    while i < 60 {
+        let next = (guess + x / guess) / 2.0
+        if _abs(next - guess) < 1.0e-15 {
+            return next
+        }
+        guess = next
+        i = i + 1
+    }
+    return guess
+}
+
+fn _exp(x: f64) -> f64 {
+    let ln2 = 0.6931471805599453
+    let k = int(x / ln2)
+    let r = x - float(k) * ln2
+    var term = 1.0
+    var sum = 1.0
+    var n = 1
+    while n < 40 {
+        term = term * r / float(n)
+        sum = sum + term
+        if _abs(term) < 1.0e-17 {
+            n = 100
+        }
+        n = n + 1
+    }
+    if k >= 0 {
+        var factor = 1.0
+        var i = 0
+        while i < k {
+            factor = factor * 2.0
+            i = i + 1
+        }
+        return sum * factor
+    } else {
+        var factor = 1.0
+        var i = 0
+        let nk = 0 - k
+        while i < nk {
+            factor = factor * 2.0
+            i = i + 1
+        }
+        return sum / factor
+    }
+}
+
+fn _ln(x: f64) -> f64 {
+    if x <= 0.0 {
+        return -1.0e300
+    }
+    if x == 1.0 {
+        return 0.0
+    }
+    let ln2 = 0.6931471805599453
+    var v = x
+    var k = 0
+    while v >= 2.0 {
+        v = v / 2.0
+        k = k + 1
+    }
+    while v < 0.5 {
+        v = v * 2.0
+        k = k - 1
+    }
+    let t = (v - 1.0) / (v + 1.0)
+    let t2 = t * t
+    var term = t
+    var sum = t
+    var n = 1
+    while n < 60 {
+        term = term * t2
+        n = n + 2
+        let contrib = term / float(n)
+        sum = sum + contrib
+        if _abs(contrib) < 1.0e-16 {
+            n = 100
+        }
+    }
+    return 2.0 * sum + float(k) * ln2
+}
+
+fn _tanh(x: f64) -> f64 {
+    if x > 20.0 {
+        return 1.0
+    }
+    if x < -20.0 {
+        return -1.0
+    }
+    let e2x = _exp(2.0 * x)
+    return (e2x - 1.0) / (e2x + 1.0)
+}
+
+fn _sin(x: f64) -> f64 {
+    let two_pi = 6.28318530717958647692
+    var v = x
+    while v > 3.14159265358979323846 {
+        v = v - two_pi
+    }
+    while v < -3.14159265358979323846 {
+        v = v + two_pi
+    }
+    let x2 = v * v
+    var term = v
+    var sum = v
+    var n = 1
+    while n < 20 {
+        term = term * x2 / float((2 * n) * (2 * n + 1))
+        if n - (n / 2) * 2 == 0 {
+            sum = sum + term
+        } else {
+            sum = sum - term
+        }
+        if _abs(term) < 1.0e-17 {
+            n = 100
+        }
+        n = n + 1
+    }
+    return sum
+}
+
+fn _cos(x: f64) -> f64 {
+    let two_pi = 6.28318530717958647692
+    var v = x
+    while v > 3.14159265358979323846 {
+        v = v - two_pi
+    }
+    while v < -3.14159265358979323846 {
+        v = v + two_pi
+    }
+    let x2 = v * v
+    var term = 1.0
+    var sum = 1.0
+    var n = 1
+    while n < 20 {
+        term = term * x2 / float((2 * n - 1) * (2 * n))
+        if n - (n / 2) * 2 == 0 {
+            sum = sum + term
+        } else {
+            sum = sum - term
+        }
+        if _abs(term) < 1.0e-17 {
+            n = 100
+        }
+        n = n + 1
+    }
+    return sum
+}
+
+// ─── Tensor Representation ───────────────────────────────────────────────────
+
+fn _header_size(ndim: i64) -> i64 {
+    return 1 + ndim
+}
+
+fn _total_elems(shape: [i64]) -> i64 {
+    let ndim = len(shape)
+    var total = 1
+    for i in range(0, ndim) {
+        total = total * shape[i]
+    }
+    return total
+}
+
+fn tensor_new(shape: [i64], data: [f64]) -> [f64] {
+    let ndim = len(shape)
+    var t: [f64] = []
+    t = push(t, float(ndim))
+    for i in range(0, ndim) {
+        t = push(t, float(shape[i]))
+    }
+    let n = len(data)
+    for i in range(0, n) {
+        t = push(t, data[i])
+    }
+    return t
+}
+
+fn tensor_zeros(shape: [i64]) -> [f64] {
+    let ndim = len(shape)
+    let total = _total_elems(shape)
+    var t: [f64] = []
+    t = push(t, float(ndim))
+    for i in range(0, ndim) {
+        t = push(t, float(shape[i]))
+    }
+    for i in range(0, total) {
+        t = push(t, 0.0)
+    }
+    return t
+}
+
+fn tensor_ones(shape: [i64]) -> [f64] {
+    let ndim = len(shape)
+    let total = _total_elems(shape)
+    var t: [f64] = []
+    t = push(t, float(ndim))
+    for i in range(0, ndim) {
+        t = push(t, float(shape[i]))
+    }
+    for i in range(0, total) {
+        t = push(t, 1.0)
+    }
+    return t
+}
+
+fn tensor_shape(t: [f64]) -> [i64] {
+    let ndim = int(t[0])
+    var shape: [i64] = []
+    for i in range(0, ndim) {
+        shape = push(shape, int(t[1 + i]))
+    }
+    return shape
+}
+
+fn tensor_ndim(t: [f64]) -> i64 {
+    return int(t[0])
+}
+
+fn tensor_data(t: [f64]) -> [f64] {
+    let ndim = int(t[0])
+    let offset = 1 + ndim
+    let total = len(t) - offset
+    var data: [f64] = []
+    for i in range(0, total) {
+        data = push(data, t[offset + i])
+    }
+    return data
+}
+
+fn _data_offset(t: [f64]) -> i64 {
+    return 1 + int(t[0])
+}
+
+fn tensor_get(t: [f64], indices: [i64]) -> f64 {
+    let ndim = int(t[0])
+    var flat = 0
+    var stride = 1
+    var i = ndim - 1
+    while i >= 0 {
+        flat = flat + indices[i] * stride
+        stride = stride * int(t[1 + i])
+        i = i - 1
+    }
+    return t[_data_offset(t) + flat]
+}
+
+fn tensor_set(t: [f64], indices: [i64], val: f64) -> [f64] {
+    let ndim = int(t[0])
+    var flat = 0
+    var stride = 1
+    var i = ndim - 1
+    while i >= 0 {
+        flat = flat + indices[i] * stride
+        stride = stride * int(t[1 + i])
+        i = i - 1
+    }
+    let idx = _data_offset(t) + flat
+    var result: [f64] = []
+    let n = len(t)
+    for j in range(0, n) {
+        if j == idx {
+            result = push(result, val)
+        } else {
+            result = push(result, t[j])
+        }
+    }
+    return result
+}
+
+fn tensor_numel(t: [f64]) -> i64 {
+    let shape = tensor_shape(t)
+    return _total_elems(shape)
+}
+
+// ─── Core Math ───────────────────────────────────────────────────────────────
+
+fn _elementwise_binop(a: [f64], b: [f64], op: i64) -> [f64] {
+    // op: 0=add, 1=sub, 2=mul
+    let shape = tensor_shape(a)
+    let da = tensor_data(a)
+    let db = tensor_data(b)
+    let n = len(da)
+    var result: [f64] = []
+    for i in range(0, n) {
+        if op == 0 {
+            result = push(result, da[i] + db[i])
+        } else {
+            if op == 1 {
+                result = push(result, da[i] - db[i])
+            } else {
+                result = push(result, da[i] * db[i])
+            }
+        }
+    }
+    return tensor_new(shape, result)
+}
+
+fn tensor_add(a: [f64], b: [f64]) -> [f64] {
+    return _elementwise_binop(a, b, 0)
+}
+
+fn tensor_sub(a: [f64], b: [f64]) -> [f64] {
+    return _elementwise_binop(a, b, 1)
+}
+
+fn tensor_mul(a: [f64], b: [f64]) -> [f64] {
+    return _elementwise_binop(a, b, 2)
+}
+
+fn tensor_scale(t: [f64], scalar: f64) -> [f64] {
+    let shape = tensor_shape(t)
+    let data = tensor_data(t)
+    let n = len(data)
+    var result: [f64] = []
+    for i in range(0, n) {
+        result = push(result, data[i] * scalar)
+    }
+    return tensor_new(shape, result)
+}
+
+fn tensor_neg(t: [f64]) -> [f64] {
+    return tensor_scale(t, -1.0)
+}
+
+fn tensor_matmul(a: [f64], b: [f64]) -> [f64] {
+    let sa = tensor_shape(a)
+    let sb = tensor_shape(b)
+    let m = sa[0]
+    let k = sa[1]
+    let n = sb[1]
+    let da = tensor_data(a)
+    let db = tensor_data(b)
+    var result: [f64] = []
+    for i in range(0, m) {
+        for j in range(0, n) {
+            var sum = 0.0
+            for p in range(0, k) {
+                sum = sum + da[i * k + p] * db[p * n + j]
+            }
+            result = push(result, sum)
+        }
+    }
+    return tensor_new([m, n], result)
+}
+
+fn tensor_transpose(t: [f64]) -> [f64] {
+    let shape = tensor_shape(t)
+    let rows = shape[0]
+    let cols = shape[1]
+    let data = tensor_data(t)
+    var result: [f64] = []
+    for j in range(0, cols) {
+        for i in range(0, rows) {
+            result = push(result, data[i * cols + j])
+        }
+    }
+    return tensor_new([cols, rows], result)
+}
+
+fn tensor_sum(t: [f64]) -> f64 {
+    let data = tensor_data(t)
+    let n = len(data)
+    var sum = 0.0
+    for i in range(0, n) {
+        sum = sum + data[i]
+    }
+    return sum
+}
+
+fn tensor_mean(t: [f64]) -> f64 {
+    let data = tensor_data(t)
+    let n = len(data)
+    var sum = 0.0
+    for i in range(0, n) {
+        sum = sum + data[i]
+    }
+    return sum / float(n)
+}
+
+fn tensor_max(t: [f64]) -> f64 {
+    let data = tensor_data(t)
+    let n = len(data)
+    var m = data[0]
+    for i in range(1, n) {
+        if data[i] > m {
+            m = data[i]
+        }
+    }
+    return m
+}
+
+fn tensor_dot(a: [f64], b: [f64]) -> f64 {
+    let da = tensor_data(a)
+    let db = tensor_data(b)
+    let n = len(da)
+    var sum = 0.0
+    for i in range(0, n) {
+        sum = sum + da[i] * db[i]
+    }
+    return sum
+}
+
+// ─── Activation Functions ────────────────────────────────────────────────────
+
+fn tensor_relu(t: [f64]) -> [f64] {
+    let shape = tensor_shape(t)
+    let data = tensor_data(t)
+    let n = len(data)
+    var result: [f64] = []
+    for i in range(0, n) {
+        result = push(result, _max(0.0, data[i]))
+    }
+    return tensor_new(shape, result)
+}
+
+fn tensor_sigmoid(t: [f64]) -> [f64] {
+    let shape = tensor_shape(t)
+    let data = tensor_data(t)
+    let n = len(data)
+    var result: [f64] = []
+    for i in range(0, n) {
+        result = push(result, 1.0 / (1.0 + _exp(0.0 - data[i])))
+    }
+    return tensor_new(shape, result)
+}
+
+fn tensor_tanh(t: [f64]) -> [f64] {
+    let shape = tensor_shape(t)
+    let data = tensor_data(t)
+    let n = len(data)
+    var result: [f64] = []
+    for i in range(0, n) {
+        result = push(result, _tanh(data[i]))
+    }
+    return tensor_new(shape, result)
+}
+
+fn tensor_gelu(t: [f64]) -> [f64] {
+    // GELU approximation: 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
+    let shape = tensor_shape(t)
+    let data = tensor_data(t)
+    let n = len(data)
+    let c = 0.7978845608028654  // sqrt(2/pi)
+    var result: [f64] = []
+    for i in range(0, n) {
+        let x = data[i]
+        let inner = c * (x + 0.044715 * x * x * x)
+        result = push(result, 0.5 * x * (1.0 + _tanh(inner)))
+    }
+    return tensor_new(shape, result)
+}
+
+fn tensor_softmax(t: [f64]) -> [f64] {
+    // Softmax along last dimension
+    // For 2D: each row is softmaxed independently
+    let shape = tensor_shape(t)
+    let ndim = len(shape)
+    let data = tensor_data(t)
+    let total = len(data)
+
+    if ndim == 1 {
+        // Single vector softmax
+        var mx = data[0]
+        for i in range(1, total) {
+            if data[i] > mx {
+                mx = data[i]
+            }
+        }
+        var sum = 0.0
+        var exps: [f64] = []
+        for i in range(0, total) {
+            let e = _exp(data[i] - mx)
+            exps = push(exps, e)
+            sum = sum + e
+        }
+        var result: [f64] = []
+        for i in range(0, total) {
+            result = push(result, exps[i] / sum)
+        }
+        return tensor_new(shape, result)
+    }
+
+    // 2D: softmax each row
+    let rows = shape[0]
+    let cols = shape[ndim - 1]
+    let row_stride = total / rows
+    var result: [f64] = []
+    for r in range(0, rows) {
+        let base = r * row_stride
+        var mx = data[base]
+        for c in range(1, cols) {
+            if data[base + c] > mx {
+                mx = data[base + c]
+            }
+        }
+        var sum = 0.0
+        var exps: [f64] = []
+        for c in range(0, cols) {
+            let e = _exp(data[base + c] - mx)
+            exps = push(exps, e)
+            sum = sum + e
+        }
+        for c in range(0, cols) {
+            result = push(result, exps[c] / sum)
+        }
+    }
+    return tensor_new(shape, result)
+}
+
+fn tensor_layer_norm(t: [f64], gamma: [f64], beta: [f64], eps: f64) -> [f64] {
+    // Layer norm along last dimension for 2D tensor
+    let shape = tensor_shape(t)
+    let rows = shape[0]
+    let cols = shape[1]
+    let data = tensor_data(t)
+    let g = tensor_data(gamma)
+    let b = tensor_data(beta)
+    var result: [f64] = []
+    for r in range(0, rows) {
+        let base = r * cols
+        // Compute mean
+        var mu = 0.0
+        for c in range(0, cols) {
+            mu = mu + data[base + c]
+        }
+        mu = mu / float(cols)
+        // Compute variance
+        var variance = 0.0
+        for c in range(0, cols) {
+            let delta = data[base + c] - mu
+            variance = variance + delta * delta
+        }
+        variance = variance / float(cols)
+        let inv_std = 1.0 / _sqrt(variance + eps)
+        // Normalize
+        for c in range(0, cols) {
+            let normed = (data[base + c] - mu) * inv_std
+            result = push(result, normed * g[c] + b[c])
+        }
+    }
+    return tensor_new(shape, result)
+}
+
+// ─── LLM-Specific Operations ────────────────────────────────────────────────
+
+fn tensor_attention(q: [f64], k: [f64], v: [f64]) -> [f64] {
+    // Scaled dot-product attention: softmax(Q @ K^T / sqrt(dk)) @ V
+    // Q: [seq_q, dk], K: [seq_k, dk], V: [seq_k, dv]
+    let sk = tensor_shape(k)
+    let dk = sk[1]
+    let scale = 1.0 / _sqrt(float(dk))
+    let kt = tensor_transpose(k)
+    let scores = tensor_matmul(q, kt)
+    let scaled = tensor_scale(scores, scale)
+    let weights = tensor_softmax(scaled)
+    return tensor_matmul(weights, v)
+}
+
+fn tensor_multi_head_attention(x: [f64], wq: [f64], wk: [f64], wv: [f64], wo: [f64], num_heads: i64) -> [f64] {
+    // x: [seq, d_model], wq/wk/wv: [d_model, d_model], wo: [d_model, d_model]
+    let sx = tensor_shape(x)
+    let seq = sx[0]
+    let d_model = sx[1]
+    let head_dim = d_model / num_heads
+
+    let q_full = tensor_matmul(x, wq)
+    let k_full = tensor_matmul(x, wk)
+    let v_full = tensor_matmul(x, wv)
+
+    let qd = tensor_data(q_full)
+    let kd = tensor_data(k_full)
+    let vd = tensor_data(v_full)
+
+    // Concatenated head outputs
+    var concat: [f64] = []
+    // Initialize to zeros
+    for i in range(0, seq * d_model) {
+        concat = push(concat, 0.0)
+    }
+
+    for h in range(0, num_heads) {
+        let col_start = h * head_dim
+        // Extract head slices
+        var qh: [f64] = []
+        var kh: [f64] = []
+        var vh: [f64] = []
+        for s in range(0, seq) {
+            for d in range(0, head_dim) {
+                qh = push(qh, qd[s * d_model + col_start + d])
+                kh = push(kh, kd[s * d_model + col_start + d])
+                vh = push(vh, vd[s * d_model + col_start + d])
+            }
+        }
+        let q_head = tensor_new([seq, head_dim], qh)
+        let k_head = tensor_new([seq, head_dim], kh)
+        let v_head = tensor_new([seq, head_dim], vh)
+
+        let head_out = tensor_attention(q_head, k_head, v_head)
+        let ho = tensor_data(head_out)
+
+        // Place head output into concat
+        for s in range(0, seq) {
+            for d in range(0, head_dim) {
+                concat[s * d_model + col_start + d] = ho[s * head_dim + d]
+            }
+        }
+    }
+
+    let combined = tensor_new([seq, d_model], concat)
+    return tensor_matmul(combined, wo)
+}
+
+fn tensor_feed_forward(x: [f64], w1: [f64], b1: [f64], w2: [f64], b2: [f64]) -> [f64] {
+    // FFN: GELU(x @ W1 + b1) @ W2 + b2
+    let h = tensor_matmul(x, w1)
+    let h_bias = _add_bias(h, b1)
+    let h_act = tensor_gelu(h_bias)
+    let out = tensor_matmul(h_act, w2)
+    return _add_bias(out, b2)
+}
+
+fn _add_bias(t: [f64], bias: [f64]) -> [f64] {
+    // Add 1D bias to each row of 2D tensor
+    let shape = tensor_shape(t)
+    let rows = shape[0]
+    let cols = shape[1]
+    let data = tensor_data(t)
+    let b = tensor_data(bias)
+    var result: [f64] = []
+    for r in range(0, rows) {
+        for c in range(0, cols) {
+            result = push(result, data[r * cols + c] + b[c])
+        }
+    }
+    return tensor_new(shape, result)
+}
+
+fn tensor_embedding_lookup(table: [f64], indices: [i64]) -> [f64] {
+    // table: [vocab_size, embed_dim], indices: list of token ids
+    // returns: [len(indices), embed_dim]
+    let st = tensor_shape(table)
+    let embed_dim = st[1]
+    let td = tensor_data(table)
+    let n = len(indices)
+    var result: [f64] = []
+    for i in range(0, n) {
+        let row = indices[i]
+        let base = row * embed_dim
+        for j in range(0, embed_dim) {
+            result = push(result, td[base + j])
+        }
+    }
+    return tensor_new([n, embed_dim], result)
+}
+
+fn tensor_rope(x: [f64], seq_pos: i64) -> [f64] {
+    // Rotary Position Embeddings (RoPE)
+    // x: [seq, dim] — apply rotation to pairs of dimensions
+    let shape = tensor_shape(x)
+    let seq = shape[0]
+    let dim = shape[1]
+    let data = tensor_data(x)
+    let half = dim / 2
+    var result: [f64] = []
+    for s in range(0, seq) {
+        let pos = float(seq_pos + s)
+        for d in range(0, half) {
+            let theta = pos / _exp(float(2 * d) / float(dim) * _ln(10000.0))
+            let cos_t = _cos(theta)
+            let sin_t = _sin(theta)
+            let x0 = data[s * dim + 2 * d]
+            let x1 = data[s * dim + 2 * d + 1]
+            result = push(result, x0 * cos_t - x1 * sin_t)
+            result = push(result, x0 * sin_t + x1 * cos_t)
+        }
+    }
+    return tensor_new(shape, result)
+}
+
+// ─── Utility ─────────────────────────────────────────────────────────────────
+
+fn tensor_print(t: [f64]) -> i64 {
+    let shape = tensor_shape(t)
+    let ndim = len(shape)
+    var shape_str = "("
+    for i in range(0, ndim) {
+        if i > 0 {
+            shape_str = shape_str + ", "
+        }
+        shape_str = shape_str + to_string(shape[i])
+    }
+    shape_str = shape_str + ")"
+    print("Tensor shape=" + shape_str)
+
+    let data = tensor_data(t)
+    let n = len(data)
+
+    if ndim == 1 {
+        var s = "["
+        for i in range(0, n) {
+            if i > 0 {
+                s = s + ", "
+            }
+            s = s + to_string(data[i])
+        }
+        print(s + "]")
+    } else {
+        if ndim == 2 {
+            let rows = shape[0]
+            let cols = shape[1]
+            for r in range(0, rows) {
+                var s = "  ["
+                for c in range(0, cols) {
+                    if c > 0 {
+                        s = s + ", "
+                    }
+                    s = s + to_string(data[r * cols + c])
+                }
+                print(s + "]")
+            }
+        } else {
+            // Flat print for higher dims
+            var s = "["
+            for i in range(0, n) {
+                if i > 0 {
+                    s = s + ", "
+                }
+                s = s + to_string(data[i])
+            }
+            print(s + "]")
+        }
+    }
+    return 0
+}
+
+fn tensor_equal(a: [f64], b: [f64], eps: f64) -> bool {
+    let sa = tensor_shape(a)
+    let sb = tensor_shape(b)
+    if len(sa) != len(sb) {
+        return false
+    }
+    for i in range(0, len(sa)) {
+        if sa[i] != sb[i] {
+            return false
+        }
+    }
+    let da = tensor_data(a)
+    let db = tensor_data(b)
+    let n = len(da)
+    for i in range(0, n) {
+        if _abs(da[i] - db[i]) > eps {
+            return false
+        }
+    }
+    return true
+}
+
+fn tensor_randn(shape: [i64], seed: i64) -> [f64] {
+    // Pseudo-random normal via Box-Muller with LCG
+    let total = _total_elems(shape)
+    var state = seed
+    if state == 0 {
+        state = 12345
+    }
+    var data: [f64] = []
+    var i = 0
+    while i < total {
+        // LCG: state = (a * state + c) mod m
+        state = (1103515245 * state + 12345)
+        if state < 0 {
+            state = 0 - state
+        }
+        let u1_raw = state
+        state = (1103515245 * state + 12345)
+        if state < 0 {
+            state = 0 - state
+        }
+        let u2_raw = state
+        // Map to (0, 1)
+        let u1 = (float(u1_raw) / 2147483647.0) * 0.9998 + 0.0001
+        let u2 = (float(u2_raw) / 2147483647.0) * 0.9998 + 0.0001
+        // Box-Muller
+        let r = _sqrt(-2.0 * _ln(u1))
+        let theta = 6.28318530717958647692 * u2
+        let z0 = r * _cos(theta)
+        let z1 = r * _sin(theta)
+        data = push(data, z0)
+        i = i + 1
+        if i < total {
+            data = push(data, z1)
+            i = i + 1
+        }
+    }
+    return tensor_new(shape, data)
+}
+
+fn tensor_reshape(t: [f64], new_shape: [i64]) -> [f64] {
+    let data = tensor_data(t)
+    return tensor_new(new_shape, data)
+}
+
+// ─── Tests ───────────────────────────────────────────────────────────────────
+
+fn _assert(name: str, ok: bool) -> i64 {
+    if ok {
+        print("  PASS: " + name)
+    } else {
+        print("  FAIL: " + name)
+    }
+    return 0
+}
+
+fn main() {
+    print("=== Tensor Ops Test Suite ===")
+    print("")
+
+    // --- Construction ---
+    print("--- Construction ---")
+    let z = tensor_zeros([2, 3])
+    let o = tensor_ones([2, 3])
+    let shape_z = tensor_shape(z)
+    _assert("zeros shape[0]==2", shape_z[0] == 2)
+    _assert("zeros shape[1]==3", shape_z[1] == 3)
+    _assert("zeros sum==0", tensor_sum(z) == 0.0)
+    _assert("ones sum==6", tensor_sum(o) == 6.0)
+
+    let t1 = tensor_new([2, 2], [1.0, 2.0, 3.0, 4.0])
+    _assert("get [0,0]==1", tensor_get(t1, [0, 0]) == 1.0)
+    _assert("get [1,1]==4", tensor_get(t1, [1, 1]) == 4.0)
+
+    let t1s = tensor_set(t1, [0, 1], 9.0)
+    _assert("set [0,1]=9", tensor_get(t1s, [0, 1]) == 9.0)
+    print("")
+
+    // --- Element-wise ops ---
+    print("--- Element-wise Ops ---")
+    let a = tensor_new([1, 3], [1.0, 2.0, 3.0])
+    let b = tensor_new([1, 3], [4.0, 5.0, 6.0])
+    let ab_add = tensor_add(a, b)
+    _assert("add [5,7,9]", tensor_sum(ab_add) == 21.0)
+    let ab_sub = tensor_sub(b, a)
+    _assert("sub [3,3,3]", tensor_sum(ab_sub) == 9.0)
+    let ab_mul = tensor_mul(a, b)
+    _assert("mul [4,10,18]", tensor_sum(ab_mul) == 32.0)
+    let sc = tensor_scale(a, 3.0)
+    _assert("scale [3,6,9]", tensor_sum(sc) == 18.0)
+    let neg = tensor_neg(a)
+    _assert("neg [-1,-2,-3]", tensor_sum(neg) == -6.0)
+    print("")
+
+    // --- Matmul ---
+    print("--- Matmul ---")
+    let ma = tensor_new([2, 3], [1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
+    let mb = tensor_new([3, 2], [7.0, 8.0, 9.0, 10.0, 11.0, 12.0])
+    let mc = tensor_matmul(ma, mb)
+    let mc_shape = tensor_shape(mc)
+    _assert("matmul shape [2,2]", mc_shape[0] == 2 && mc_shape[1] == 2)
+    // [1,2,3]@[7,9,11; 8,10,12] = [58,64; 139,154]
+    _assert("matmul [0,0]==58", tensor_get(mc, [0, 0]) == 58.0)
+    _assert("matmul [0,1]==64", tensor_get(mc, [0, 1]) == 64.0)
+    _assert("matmul [1,0]==139", tensor_get(mc, [1, 0]) == 139.0)
+    _assert("matmul [1,1]==154", tensor_get(mc, [1, 1]) == 154.0)
+    print("")
+
+    // --- Transpose ---
+    print("--- Transpose ---")
+    let tr = tensor_transpose(ma)
+    let tr_shape = tensor_shape(tr)
+    _assert("transpose shape [3,2]", tr_shape[0] == 3 && tr_shape[1] == 2)
+    _assert("transpose [0,0]==1", tensor_get(tr, [0, 0]) == 1.0)
+    _assert("transpose [0,1]==4", tensor_get(tr, [0, 1]) == 4.0)
+    _assert("transpose [2,1]==6", tensor_get(tr, [2, 1]) == 6.0)
+    print("")
+
+    // --- Reductions ---
+    print("--- Reductions ---")
+    let rv = tensor_new([1, 4], [2.0, 4.0, 6.0, 8.0])
+    _assert("sum==20", tensor_sum(rv) == 20.0)
+    _assert("mean==5", tensor_mean(rv) == 5.0)
+    _assert("max==8", tensor_max(rv) == 8.0)
+    let d1 = tensor_new([1, 3], [1.0, 2.0, 3.0])
+    let d2 = tensor_new([1, 3], [4.0, 5.0, 6.0])
+    _assert("dot==32", tensor_dot(d1, d2) == 32.0)
+    print("")
+
+    // --- Activations ---
+    print("--- Activations ---")
+    let act_in = tensor_new([1, 4], [-2.0, -1.0, 0.0, 1.0])
+    let relu_out = tensor_relu(act_in)
+    _assert("relu[-2]==0", tensor_get(relu_out, [0, 0]) == 0.0)
+    _assert("relu[1]==1", tensor_get(relu_out, [0, 3]) == 1.0)
+
+    let sig_out = tensor_sigmoid(tensor_new([1, 1], [0.0]))
+    _assert("sigmoid(0)==0.5", _abs(tensor_get(sig_out, [0, 0]) - 0.5) < 1.0e-10)
+
+    let tanh_out = tensor_tanh(tensor_new([1, 1], [0.0]))
+    _assert("tanh(0)==0", _abs(tensor_get(tanh_out, [0, 0])) < 1.0e-10)
+
+    let gelu_out = tensor_gelu(tensor_new([1, 1], [0.0]))
+    _assert("gelu(0)==0", _abs(tensor_get(gelu_out, [0, 0])) < 1.0e-10)
+    print("")
+
+    // --- Softmax ---
+    print("--- Softmax ---")
+    let sm_in = tensor_new([1, 3], [1.0, 2.0, 3.0])
+    let sm_out = tensor_softmax(sm_in)
+    let sm_data = tensor_data(sm_out)
+    let sm_sum = sm_data[0] + sm_data[1] + sm_data[2]
+    _assert("softmax sums to 1", _abs(sm_sum - 1.0) < 1.0e-10)
+    _assert("softmax monotonic", sm_data[0] < sm_data[1] && sm_data[1] < sm_data[2])
+    print("")
+
+    // --- Layer Norm ---
+    print("--- Layer Norm ---")
+    let ln_in = tensor_new([2, 3], [1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
+    let ln_g = tensor_new([1, 3], [1.0, 1.0, 1.0])
+    let ln_b = tensor_new([1, 3], [0.0, 0.0, 0.0])
+    let ln_out = tensor_layer_norm(ln_in, ln_g, ln_b, 1.0e-5)
+    // Each row should have mean~0
+    let ln_d = tensor_data(ln_out)
+    let row0_mean = (ln_d[0] + ln_d[1] + ln_d[2]) / 3.0
+    _assert("layernorm row0 mean~0", _abs(row0_mean) < 1.0e-10)
+    print("")
+
+    // --- Attention ---
+    print("--- Attention ---")
+    let q = tensor_new([2, 4], [1.0, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 1.0])
+    let k = tensor_new([2, 4], [1.0, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 1.0])
+    let v = tensor_new([2, 4], [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0])
+    let attn_out = tensor_attention(q, k, v)
+    let attn_shape = tensor_shape(attn_out)
+    _assert("attention shape [2,4]", attn_shape[0] == 2 && attn_shape[1] == 4)
+    print("  Attention output:")
+    tensor_print(attn_out)
+    print("")
+
+    // --- Reshape ---
+    print("--- Reshape ---")
+    let r_in = tensor_new([2, 3], [1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
+    let r_out = tensor_reshape(r_in, [3, 2])
+    let r_shape = tensor_shape(r_out)
+    _assert("reshape [3,2]", r_shape[0] == 3 && r_shape[1] == 2)
+    _assert("reshape data preserved", tensor_get(r_out, [0, 0]) == 1.0 && tensor_get(r_out, [2, 1]) == 6.0)
+    print("")
+
+    // --- Random ---
+    print("--- Random ---")
+    let rnd = tensor_randn([1, 100], 42)
+    let rnd_mean = tensor_mean(rnd)
+    _assert("randn mean near 0", _abs(rnd_mean) < 1.0)
+    print("  randn mean = " + to_string(rnd_mean))
+    print("")
+
+    // --- Embedding ---
+    print("--- Embedding ---")
+    let emb_table = tensor_new([4, 3], [
+        0.1, 0.2, 0.3,
+        0.4, 0.5, 0.6,
+        0.7, 0.8, 0.9,
+        1.0, 1.1, 1.2
+    ])
+    let emb_out = tensor_embedding_lookup(emb_table, [2, 0, 3])
+    let emb_shape = tensor_shape(emb_out)
+    _assert("embedding shape [3,3]", emb_shape[0] == 3 && emb_shape[1] == 3)
+    _assert("embedding [0,0]==0.7", _abs(tensor_get(emb_out, [0, 0]) - 0.7) < 1.0e-10)
+    _assert("embedding [2,2]==1.2", _abs(tensor_get(emb_out, [2, 2]) - 1.2) < 1.0e-10)
+    print("")
+
+    // --- RoPE ---
+    print("--- RoPE ---")
+    let rope_in = tensor_new([1, 4], [1.0, 0.0, 1.0, 0.0])
+    let rope_out = tensor_rope(rope_in, 0)
+    let rope_shape = tensor_shape(rope_out)
+    _assert("rope shape preserved", rope_shape[0] == 1 && rope_shape[1] == 4)
+    // At position 0, theta=0 for first pair, so cos(0)=1, sin(0)=0
+    // x0*1 - x1*0 = 1.0, x0*0 + x1*1 = 0.0
+    _assert("rope pos0 identity", _abs(tensor_get(rope_out, [0, 0]) - 1.0) < 1.0e-6)
+    _assert("rope pos0 identity2", _abs(tensor_get(rope_out, [0, 1])) < 1.0e-6)
+    print("")
+
+    // --- Equal ---
+    print("--- Equal ---")
+    let eq_a = tensor_new([1, 3], [1.0, 2.0, 3.0])
+    let eq_b = tensor_new([1, 3], [1.0, 2.0, 3.0])
+    let eq_c = tensor_new([1, 3], [1.0, 2.0, 4.0])
+    _assert("equal same", tensor_equal(eq_a, eq_b, 1.0e-10))
+    _assert("not equal diff", tensor_equal(eq_a, eq_c, 1.0e-10) == false)
+    print("")
+
+    print("=== All tests complete ===")
+}

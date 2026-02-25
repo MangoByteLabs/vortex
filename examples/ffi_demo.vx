@@ -18,11 +18,12 @@ fn main() {
     let pid2 = syscall0(SYS_GETPID)
     println("PID via syscall: " + str(pid2))
 
-    // C struct example: pack a timespec and call clock_gettime
-    let ts_ptr = cstruct_pack("timespec", {"tv_sec": 0, "tv_nsec": 0})
+    // C struct example: use raw memory for timespec and call clock_gettime
+    let ts_ptr = mem_alloc(16)
+    mem_zero(ts_ptr, 16)
     syscall2(SYS_CLOCK_GETTIME, 0, ptr_to_int(ts_ptr))
-    let ts = cstruct_unpack("timespec", ts_ptr)
-    println("Current time: " + str(ts["tv_sec"]) + "s")
+    let secs = mem_read_i64(ts_ptr)
+    println("Current time: " + str(secs) + "s")
 
     mem_free(ts_ptr)
     ffi_close(lib)

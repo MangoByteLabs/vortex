@@ -1,0 +1,823 @@
+// std/json.vx — JSON parser and serializer in pure Vortex
+//
+// Vortex string literals do NOT process escape sequences.
+// Use str_from_bytes([byte]) for special characters.
+//
+// JSON values are represented as tagged arrays:
+//   ["null"]
+//   ["bool", "true"] or ["bool", "false"]
+//   ["num", "123.45"]
+//   ["str", "hello"]
+//   ["arr", elem0_json_str, elem1_json_str, ...]   -- elements stored as stringified JSON
+//   ["obj", key0, val0_json_str, key1, val1_json_str, ...]  -- values stored as stringified JSON
+//
+// Parse functions return: ["ok", new_pos_str, tag, fields...]
+// or ["err", message] on failure.
+
+// ─── Special character helpers ────────────────────────────────────────────────
+
+fn _quote() -> String { return str_from_bytes([34]) }
+fn _backslash() -> String { return str_from_bytes([92]) }
+fn _newline() -> String { return str_from_bytes([10]) }
+fn _tab() -> String { return str_from_bytes([9]) }
+fn _cr() -> String { return str_from_bytes([13]) }
+
+// ─── Constructors ─────────────────────────────────────────────────────────────
+
+fn json_null() -> [String] {
+    var v: [String] = []
+    v = push(v, "null")
+    return v
+}
+
+fn json_bool(b: bool) -> [String] {
+    var v: [String] = []
+    v = push(v, "bool")
+    if b {
+        v = push(v, "true")
+    } else {
+        v = push(v, "false")
+    }
+    return v
+}
+
+fn json_num(n: f64) -> [String] {
+    var v: [String] = []
+    v = push(v, "num")
+    v = push(v, to_string(n))
+    return v
+}
+
+fn json_str(s: String) -> [String] {
+    var v: [String] = []
+    v = push(v, "str")
+    v = push(v, s)
+    return v
+}
+
+fn json_arr_new() -> [String] {
+    var v: [String] = []
+    v = push(v, "arr")
+    return v
+}
+
+fn json_obj_new() -> [String] {
+    var v: [String] = []
+    v = push(v, "obj")
+    return v
+}
+
+// ─── Value extractors ─────────────────────────────────────────────────────────
+
+fn json_str_val(v: [String]) -> String {
+    if len(v) >= 2 && v[0] == "str" {
+        return v[1]
+    }
+    return ""
+}
+
+fn json_num_val(v: [String]) -> String {
+    if len(v) >= 2 && v[0] == "num" {
+        return v[1]
+    }
+    return "0"
+}
+
+fn json_bool_val(v: [String]) -> bool {
+    if len(v) >= 2 && v[0] == "bool" {
+        return v[1] == "true"
+    }
+    return false
+}
+
+// ─── Stringify ────────────────────────────────────────────────────────────────
+
+// Escape a raw string for embedding in a JSON string literal.
+// Uses byte comparisons: 34=quote, 92=backslash, 10=newline, 13=CR, 9=tab
+fn _json_escape_str(s: String) -> String {
+    let slen = len(s)
+    var result = ""
+    var i = 0
+    let bs = _backslash()
+    while i < slen {
+        let bytes = str_bytes(str_substr(s, i, 1))
+        let b = bytes[0]
+        if b == 34 {
+            // quote -> backslash + quote
+            result = result + bs + _quote()
+        } else if b == 92 {
+            // backslash -> double backslash
+            result = result + bs + bs
+        } else if b == 10 {
+            // newline -> backslash + n
+            result = result + bs + "n"
+        } else if b == 13 {
+            // carriage return -> backslash + r
+            result = result + bs + "r"
+        } else if b == 9 {
+            // tab -> backslash + t
+            result = result + bs + "t"
+        } else {
+            result = result + str_substr(s, i, 1)
+        }
+        i = i + 1
+    }
+    return result
+}
+
+fn json_stringify(val: [String]) -> String {
+    if len(val) == 0 {
+        return "null"
+    }
+    let tag = val[0]
+    if tag == "null" {
+        return "null"
+    }
+    if tag == "bool" {
+        return val[1]
+    }
+    if tag == "num" {
+        return val[1]
+    }
+    if tag == "str" {
+        let q = _quote()
+        return q + _json_escape_str(val[1]) + q
+    }
+    if tag == "arr" {
+        var result = "["
+        var i = 1
+        while i < len(val) {
+            if i > 1 {
+                result = result + ","
+            }
+            // elements already stored as stringified JSON
+            result = result + val[i]
+            i = i + 1
+        }
+        result = result + "]"
+        return result
+    }
+    if tag == "obj" {
+        let q = _quote()
+        var result = "{"
+        var i = 1
+        while i < len(val) - 1 {
+            if i > 1 {
+                result = result + ","
+            }
+            result = result + q + _json_escape_str(val[i]) + q + ":"
+            result = result + val[i + 1]
+            i = i + 2
+        }
+        result = result + "}"
+        return result
+    }
+    return "null"
+}
+
+// ─── Accessors ────────────────────────────────────────────────────────────────
+
+fn json_type(val: [String]) -> String {
+    if len(val) == 0 {
+        return "unknown"
+    }
+    return val[0]
+}
+
+fn json_arr_len(arr: [String]) -> i64 {
+    // arr = ["arr", elem0_str, elem1_str, ...]
+    return len(arr) - 1
+}
+
+fn json_arr_get(arr: [String], idx: i64) -> [String] {
+    // elements stored as stringified JSON at indices 1, 2, ...
+    return json_parse(arr[idx + 1])
+}
+
+fn json_get(obj: [String], key: String) -> [String] {
+    // obj = ["obj", key0, val0_json, key1, val1_json, ...]
+    var i = 1
+    while i < len(obj) - 1 {
+        if obj[i] == key {
+            return json_parse(obj[i + 1])
+        }
+        i = i + 2
+    }
+    return json_null()
+}
+
+// ─── Mutators ─────────────────────────────────────────────────────────────────
+
+fn json_arr_push(arr: [String], val: [String]) -> [String] {
+    let s = json_stringify(val)
+    arr = push(arr, s)
+    return arr
+}
+
+fn json_obj_set(obj: [String], key: String, val: [String]) -> [String] {
+    var i = 1
+    var found = false
+    var new_obj: [String] = []
+    new_obj = push(new_obj, "obj")
+    while i < len(obj) - 1 {
+        if obj[i] == key {
+            new_obj = push(new_obj, key)
+            new_obj = push(new_obj, json_stringify(val))
+            found = true
+        } else {
+            new_obj = push(new_obj, obj[i])
+            new_obj = push(new_obj, obj[i + 1])
+        }
+        i = i + 2
+    }
+    if !found {
+        new_obj = push(new_obj, key)
+        new_obj = push(new_obj, json_stringify(val))
+    }
+    return new_obj
+}
+
+// ─── Parser helpers ───────────────────────────────────────────────────────────
+
+// Returns position after skipping whitespace
+fn _skip_ws(s: String, pos: i64) -> i64 {
+    let slen = len(s)
+    var p = pos
+    while p < slen {
+        let ch = str_substr(s, p, 1)
+        if str_is_ascii_whitespace(ch) {
+            p = p + 1
+        } else {
+            break
+        }
+    }
+    return p
+}
+
+// Parse a JSON string literal starting at pos (pos points to opening quote byte 34).
+// Returns ["ok", new_pos_str, "str", value] or ["err", msg]
+fn _parse_string(s: String, pos: i64) -> [String] {
+    let slen = len(s)
+    var p = pos + 1
+    var result = ""
+    var ok = true
+    while p < slen {
+        let bytes = str_bytes(str_substr(s, p, 1))
+        let b = bytes[0]
+        if b == 34 {
+            // closing quote
+            p = p + 1
+            break
+        } else if b == 92 {
+            // backslash escape
+            p = p + 1
+            if p >= slen {
+                ok = false
+                break
+            }
+            let esc_bytes = str_bytes(str_substr(s, p, 1))
+            let eb = esc_bytes[0]
+            if eb == 34 {
+                // \" -> quote character
+                result = result + _quote()
+            } else if eb == 92 {
+                // \\ -> backslash character
+                result = result + _backslash()
+            } else if eb == 47 {
+                // \/ -> forward slash
+                result = result + "/"
+            } else if eb == 110 {
+                // \n -> newline character
+                result = result + _newline()
+            } else if eb == 114 {
+                // \r -> carriage return character
+                result = result + _cr()
+            } else if eb == 116 {
+                // \t -> tab character
+                result = result + _tab()
+            } else {
+                // unknown escape: keep as-is
+                result = result + str_substr(s, p, 1)
+            }
+            p = p + 1
+        } else {
+            result = result + str_substr(s, p, 1)
+            p = p + 1
+        }
+    }
+    if !ok {
+        var err: [String] = []
+        err = push(err, "err")
+        err = push(err, "unterminated string")
+        return err
+    }
+    var ret: [String] = []
+    ret = push(ret, "ok")
+    ret = push(ret, to_string(p))
+    ret = push(ret, "str")
+    ret = push(ret, result)
+    return ret
+}
+
+// Parse a JSON number starting at pos.
+// Returns ["ok", new_pos_str, "num", numstr]
+fn _parse_number(s: String, pos: i64) -> [String] {
+    let slen = len(s)
+    var p = pos
+    var numstr = ""
+    // optional minus
+    if p < slen {
+        let b = str_bytes(str_substr(s, p, 1))
+        if b[0] == 45 {
+            numstr = numstr + "-"
+            p = p + 1
+        }
+    }
+    // integer digits
+    while p < slen {
+        let ch = str_substr(s, p, 1)
+        if str_is_ascii_digit(ch) {
+            numstr = numstr + ch
+            p = p + 1
+        } else {
+            break
+        }
+    }
+    // optional fractional part
+    if p < slen {
+        let fb = str_bytes(str_substr(s, p, 1))
+        if fb[0] == 46 {
+            numstr = numstr + "."
+            p = p + 1
+            while p < slen {
+                let ch = str_substr(s, p, 1)
+                if str_is_ascii_digit(ch) {
+                    numstr = numstr + ch
+                    p = p + 1
+                } else {
+                    break
+                }
+            }
+        }
+    }
+    // optional exponent
+    if p < slen {
+        let eb = str_bytes(str_substr(s, p, 1))
+        if eb[0] == 101 || eb[0] == 69 {
+            numstr = numstr + str_substr(s, p, 1)
+            p = p + 1
+            if p < slen {
+                let sb = str_bytes(str_substr(s, p, 1))
+                if sb[0] == 43 || sb[0] == 45 {
+                    numstr = numstr + str_substr(s, p, 1)
+                    p = p + 1
+                }
+            }
+            while p < slen {
+                let ch = str_substr(s, p, 1)
+                if str_is_ascii_digit(ch) {
+                    numstr = numstr + ch
+                    p = p + 1
+                } else {
+                    break
+                }
+            }
+        }
+    }
+    var ret: [String] = []
+    ret = push(ret, "ok")
+    ret = push(ret, to_string(p))
+    ret = push(ret, "num")
+    ret = push(ret, numstr)
+    return ret
+}
+
+fn _parse_array(s: String, pos: i64) -> [String] {
+    let slen = len(s)
+    var p = pos + 1
+    var arr: [String] = []
+    arr = push(arr, "arr")
+    p = _skip_ws(s, p)
+    // empty array
+    if p < slen {
+        let cb = str_bytes(str_substr(s, p, 1))
+        if cb[0] == 93 {
+            var ret: [String] = []
+            ret = push(ret, "ok")
+            ret = push(ret, to_string(p + 1))
+            var i = 0
+            while i < len(arr) {
+                ret = push(ret, arr[i])
+                i = i + 1
+            }
+            return ret
+        }
+    }
+    var done = false
+    while !done {
+        p = _skip_ws(s, p)
+        let elem_res = _parse_value(s, p)
+        if elem_res[0] == "err" {
+            return elem_res
+        }
+        p = int(elem_res[1])
+        // Extract the value portion from elem_res and stringify it for storage
+        var elem_val: [String] = []
+        var ei = 2
+        while ei < len(elem_res) {
+            elem_val = push(elem_val, elem_res[ei])
+            ei = ei + 1
+        }
+        arr = push(arr, json_stringify(elem_val))
+        p = _skip_ws(s, p)
+        if p >= slen {
+            done = true
+        } else {
+            let nb = str_bytes(str_substr(s, p, 1))
+            if nb[0] == 93 {
+                // ']'
+                p = p + 1
+                done = true
+            } else if nb[0] == 44 {
+                // ','
+                p = p + 1
+            } else {
+                var err: [String] = []
+                err = push(err, "err")
+                err = push(err, "expected , or ] in array")
+                return err
+            }
+        }
+    }
+    var ret: [String] = []
+    ret = push(ret, "ok")
+    ret = push(ret, to_string(p))
+    var i = 0
+    while i < len(arr) {
+        ret = push(ret, arr[i])
+        i = i + 1
+    }
+    return ret
+}
+
+fn _parse_object(s: String, pos: i64) -> [String] {
+    let slen = len(s)
+    var p = pos + 1
+    var obj: [String] = []
+    obj = push(obj, "obj")
+    p = _skip_ws(s, p)
+    // empty object
+    if p < slen {
+        let cb = str_bytes(str_substr(s, p, 1))
+        if cb[0] == 125 {
+            var ret: [String] = []
+            ret = push(ret, "ok")
+            ret = push(ret, to_string(p + 1))
+            var i = 0
+            while i < len(obj) {
+                ret = push(ret, obj[i])
+                i = i + 1
+            }
+            return ret
+        }
+    }
+    var done = false
+    while !done {
+        p = _skip_ws(s, p)
+        // key must be a string (byte 34 = quote)
+        if p >= slen {
+            var err: [String] = []
+            err = push(err, "err")
+            err = push(err, "unexpected end in object")
+            return err
+        }
+        let qb = str_bytes(str_substr(s, p, 1))
+        if qb[0] != 34 {
+            var err: [String] = []
+            err = push(err, "err")
+            err = push(err, "expected string key in object")
+            return err
+        }
+        let key_res = _parse_string(s, p)
+        if key_res[0] == "err" {
+            return key_res
+        }
+        p = int(key_res[1])
+        let key = key_res[3]
+        p = _skip_ws(s, p)
+        if p >= slen {
+            var err: [String] = []
+            err = push(err, "err")
+            err = push(err, "unexpected end after object key")
+            return err
+        }
+        let colb = str_bytes(str_substr(s, p, 1))
+        if colb[0] != 58 {
+            var err: [String] = []
+            err = push(err, "err")
+            err = push(err, "expected : after object key")
+            return err
+        }
+        p = p + 1
+        p = _skip_ws(s, p)
+        let val_res = _parse_value(s, p)
+        if val_res[0] == "err" {
+            return val_res
+        }
+        p = int(val_res[1])
+        var val_arr: [String] = []
+        var vi = 2
+        while vi < len(val_res) {
+            val_arr = push(val_arr, val_res[vi])
+            vi = vi + 1
+        }
+        obj = push(obj, key)
+        obj = push(obj, json_stringify(val_arr))
+        p = _skip_ws(s, p)
+        if p >= slen {
+            done = true
+        } else {
+            let nb = str_bytes(str_substr(s, p, 1))
+            if nb[0] == 125 {
+                // '}'
+                p = p + 1
+                done = true
+            } else if nb[0] == 44 {
+                // ','
+                p = p + 1
+            } else {
+                var err: [String] = []
+                err = push(err, "err")
+                err = push(err, "expected , or } in object")
+                return err
+            }
+        }
+    }
+    var ret: [String] = []
+    ret = push(ret, "ok")
+    ret = push(ret, to_string(p))
+    var i = 0
+    while i < len(obj) {
+        ret = push(ret, obj[i])
+        i = i + 1
+    }
+    return ret
+}
+
+// _parse_value: dispatch to appropriate parser based on first non-whitespace byte.
+fn _parse_value(s: String, pos: i64) -> [String] {
+    let slen = len(s)
+    let p = _skip_ws(s, pos)
+    if p >= slen {
+        var err: [String] = []
+        err = push(err, "err")
+        err = push(err, "unexpected end of input")
+        return err
+    }
+    let bytes = str_bytes(str_substr(s, p, 1))
+    let b = bytes[0]
+
+    // 'n' = 110 -> null
+    if b == 110 {
+        if p + 4 <= slen && str_substr(s, p, 4) == "null" {
+            var ret: [String] = []
+            ret = push(ret, "ok")
+            ret = push(ret, to_string(p + 4))
+            ret = push(ret, "null")
+            return ret
+        }
+        var err: [String] = []
+        err = push(err, "err")
+        err = push(err, "expected null")
+        return err
+    }
+
+    // 't' = 116 -> true
+    if b == 116 {
+        if p + 4 <= slen && str_substr(s, p, 4) == "true" {
+            var ret: [String] = []
+            ret = push(ret, "ok")
+            ret = push(ret, to_string(p + 4))
+            ret = push(ret, "bool")
+            ret = push(ret, "true")
+            return ret
+        }
+        var err: [String] = []
+        err = push(err, "err")
+        err = push(err, "expected true")
+        return err
+    }
+
+    // 'f' = 102 -> false
+    if b == 102 {
+        if p + 5 <= slen && str_substr(s, p, 5) == "false" {
+            var ret: [String] = []
+            ret = push(ret, "ok")
+            ret = push(ret, to_string(p + 5))
+            ret = push(ret, "bool")
+            ret = push(ret, "false")
+            return ret
+        }
+        var err: [String] = []
+        err = push(err, "err")
+        err = push(err, "expected false")
+        return err
+    }
+
+    // 34 = quote -> string
+    if b == 34 {
+        return _parse_string(s, p)
+    }
+
+    // 91 = '[' -> array
+    if b == 91 {
+        return _parse_array(s, p)
+    }
+
+    // 123 = '{' -> object
+    if b == 123 {
+        return _parse_object(s, p)
+    }
+
+    // digit (48-57) or '-' (45) -> number
+    if (b >= 48 && b <= 57) || b == 45 {
+        return _parse_number(s, p)
+    }
+
+    var err: [String] = []
+    err = push(err, "err")
+    err = push(err, "unexpected character at pos " + to_string(p))
+    return err
+}
+
+// ─── Public parse entry point ─────────────────────────────────────────────────
+
+fn json_parse(s: String) -> [String] {
+    let res = _parse_value(s, 0)
+    if res[0] == "err" {
+        return res
+    }
+    // Return just the value portion (tag + fields), dropping "ok" and pos
+    var val: [String] = []
+    var i = 2
+    while i < len(res) {
+        val = push(val, res[i])
+        i = i + 1
+    }
+    return val
+}
+
+// ─── Tests ────────────────────────────────────────────────────────────────────
+
+fn main() {
+    let q = _quote()
+
+    // --- Constructors and stringify ---
+    let jn = json_null()
+    println("null:       " + json_stringify(jn))
+
+    let jb_true = json_bool(true)
+    println("bool true:  " + json_stringify(jb_true))
+
+    let jb_false = json_bool(false)
+    println("bool false: " + json_stringify(jb_false))
+
+    let jnum = json_num(42.0)
+    println("num:        " + json_stringify(jnum))
+
+    // String containing a quote character, built without escape sequences
+    let hello_world = "hello " + q + "world" + q
+    let jstr = json_str(hello_world)
+    println("str:        " + json_stringify(jstr))
+
+    // --- Array construction ---
+    var jarr = json_arr_new()
+    jarr = json_arr_push(jarr, json_num(1.0))
+    jarr = json_arr_push(jarr, json_num(2.0))
+    jarr = json_arr_push(jarr, json_str("three"))
+    println("arr:        " + json_stringify(jarr))
+    println("arr_len:    " + to_string(json_arr_len(jarr)))
+
+    // --- Array element access ---
+    let elem0 = json_arr_get(jarr, 0)
+    println("arr[0]:     " + json_num_val(elem0))
+    let elem2 = json_arr_get(jarr, 2)
+    println("arr[2]:     " + json_str_val(elem2))
+
+    // --- Object construction ---
+    var jobj = json_obj_new()
+    jobj = json_obj_set(jobj, "name", json_str("Vortex"))
+    jobj = json_obj_set(jobj, "version", json_num(1.0))
+    jobj = json_obj_set(jobj, "active", json_bool(true))
+    jobj = json_obj_set(jobj, "scores", jarr)
+    println("obj:        " + json_stringify(jobj))
+
+    // --- Parse simple types ---
+    let p_null = json_parse("null")
+    println("p_null:     " + json_stringify(p_null))
+
+    let p_true = json_parse("true")
+    println("p_true:     " + json_stringify(p_true))
+
+    let p_false = json_parse("false")
+    println("p_false:    " + json_stringify(p_false))
+
+    let p_int = json_parse("42")
+    println("p_int:      " + json_stringify(p_int))
+
+    let p_neg = json_parse("-3.14")
+    println("p_neg:      " + json_stringify(p_neg))
+
+    let p_exp = json_parse("1.5e10")
+    println("p_exp:      " + json_stringify(p_exp))
+
+    // Parse a JSON string: "hello"
+    let raw_str = q + "hello" + q
+    let p_str = json_parse(raw_str)
+    println("p_str:      " + json_stringify(p_str))
+    println("p_str_val:  " + json_str_val(p_str))
+
+    // --- Parse a string with escape sequences in it ---
+    // Build the JSON text: "line1\nline2" using byte helpers
+    let bs = _backslash()
+    let raw_esc = q + "line1" + bs + "nline2" + q
+    let p_esc = json_parse(raw_esc)
+    println("p_esc type: " + json_type(p_esc))
+    // The parsed value should contain an actual newline
+    let esc_val = json_str_val(p_esc)
+    let esc_bytes = str_bytes(esc_val)
+    println("p_esc len:  " + to_string(len(esc_val)))
+
+    // --- Parse array ---
+    let raw_arr = "[1,2,3]"
+    let p_arr = json_parse(raw_arr)
+    println("p_arr:      " + json_stringify(p_arr))
+    println("p_arr_len:  " + to_string(json_arr_len(p_arr)))
+
+    // --- Round-trip test ---
+    // Build: {"lang":"vortex","year":2026,"gpu":true,"scores":[10,20,30]}
+    let raw = "{" + q + "lang" + q + ":" + q + "vortex" + q + "," +
+              q + "year" + q + ":2026," +
+              q + "gpu" + q + ":true," +
+              q + "scores" + q + ":[10,20,30]}"
+    println("input:      " + raw)
+    let parsed = json_parse(raw)
+    println("type:       " + json_type(parsed))
+    println("re-ser:     " + json_stringify(parsed))
+
+    let lang_v = json_get(parsed, "lang")
+    println("lang:       " + json_str_val(lang_v))
+
+    let year_v = json_get(parsed, "year")
+    println("year:       " + json_num_val(year_v))
+
+    let gpu_v = json_get(parsed, "gpu")
+    println("gpu:        " + to_string(json_bool_val(gpu_v)))
+
+    let scores_v = json_get(parsed, "scores")
+    println("scores:     " + json_stringify(scores_v))
+    println("scores len: " + to_string(json_arr_len(scores_v)))
+
+    let s0 = json_arr_get(scores_v, 0)
+    println("scores[0]:  " + json_num_val(s0))
+
+    // --- Update existing key ---
+    var jobj2 = json_obj_new()
+    jobj2 = json_obj_set(jobj2, "x", json_num(1.0))
+    jobj2 = json_obj_set(jobj2, "x", json_num(99.0))
+    println("updated x:  " + json_stringify(jobj2))
+
+    // --- Nested objects ---
+    // Build: {"a":{"b":{"c":99}}}
+    let raw_nested = "{" + q + "a" + q + ":{" + q + "b" + q + ":{" + q + "c" + q + ":99}}}"
+    let nested = json_parse(raw_nested)
+    println("nested:     " + json_stringify(nested))
+    let a_v = json_get(nested, "a")
+    println("nested a:   " + json_type(a_v))
+    let b_v = json_get(a_v, "b")
+    println("nested b:   " + json_type(b_v))
+    let c_v = json_get(b_v, "c")
+    println("nested c:   " + json_num_val(c_v))
+
+    // --- Empty containers ---
+    let p_empty_arr = json_parse("[]")
+    println("empty arr:  " + json_stringify(p_empty_arr))
+    println("empty len:  " + to_string(json_arr_len(p_empty_arr)))
+
+    let p_empty_obj = json_parse("{}")
+    println("empty obj:  " + json_stringify(p_empty_obj))
+
+    // --- Whitespace tolerance ---
+    let raw_ws = "  {  " + q + "k" + q + "  :  42  }  "
+    let p_ws = json_parse(raw_ws)
+    println("whitespace: " + json_stringify(p_ws))
+
+    // --- Stringify round-trip for obj built in Vortex ---
+    let built_str = json_stringify(jobj)
+    let reparsed = json_parse(built_str)
+    println("reparse:    " + json_type(reparsed))
+    let name_v = json_get(reparsed, "name")
+    println("name:       " + json_str_val(name_v))
+
+    println("json tests done")
+}

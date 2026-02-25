@@ -1,0 +1,649 @@
+// Vortex Self-Hosting Bytecode Code Generator
+// Operates on AST nodes produced by parser.vx (array-based: ["kind", field1, ...])
+//
+// ctx layout: [label_counter_str, instr0, instr1, ...]
+//   ctx[0]    = string representation of the current label counter (integer)
+//   ctx[1..]  = accumulated instruction strings emitted so far
+//
+// Instruction set (stack-based):
+//   PUSH_INT <n>      push integer literal
+//   PUSH_FLOAT <f>    push float literal
+//   PUSH_STRING <s>   push string literal
+//   PUSH_BOOL <b>     push bool literal
+//   LOAD <name>       load named variable onto stack
+//   STORE <name>      pop top-of-stack, store into named variable
+//   ADD / SUB / MUL / DIV / MOD   arithmetic (pop 2, push 1)
+//   EQ / NEQ / LT / GT / LTEQ / GTEQ  comparison
+//   AND / OR / NOT    logical ops
+//   NEG               unary negate
+//   CALL <name> <argc>  call named function; argc args already on stack
+//   RET               return top of stack
+//   JMP <label>       unconditional jump
+//   JZ  <label>       jump if top-of-stack is falsy (pops value)
+//   LABEL <name>      label marker (no-op at runtime, target for jumps)
+//   ARRAY <count>     pop count items (LIFO), push array
+//   INDEX             pop index, pop array/string, push element
+//   FIELD <name>      pop struct, push named field
+//   POP               discard top of stack
+//   DUP               duplicate top of stack
+//   HALT              stop execution
+//   FN_START <name>   mark beginning of a function body
+//   FN_END            mark end of a function body
+//   CLOSURE <pcount>  create closure from top-of-stack body + pcount params
+
+// Special character helpers (Vortex strings do not process escape sequences)
+fn _quote() -> String { return str_from_bytes([34]) }
+
+// ─── Context helpers ────────────────────────────────────────────────────────
+
+// ctx_new: create a fresh context with counter = 0
+fn ctx_new() -> [String] {
+    let c: [String] = []
+    c = push(c, "0")
+    return c
+}
+
+// ctx_counter: read current label counter as integer
+fn ctx_counter(ctx: [String]) -> i64 {
+    return int(ctx[0])
+}
+
+// ctx_emit: append a single instruction string, return updated ctx
+fn ctx_emit(ctx: [String], instr: String) -> [String] {
+    let out: [String] = []
+    let n = len(ctx)
+    let i = 0
+    for i in range(0, n) {
+        out = push(out, ctx[i])
+    }
+    out = push(out, instr)
+    return out
+}
+
+// ctx_merge: append all instructions from another ctx (skipping its counter at [0])
+fn ctx_merge(dst: [String], src: [String]) -> [String] {
+    let out: [String] = []
+    let nd = len(dst)
+    let ns = len(src)
+    let i = 0
+    for i in range(0, nd) {
+        out = push(out, dst[i])
+    }
+    // src[0] is the counter — skip it; copy src[1..]
+    for i in range(1, ns) {
+        out = push(out, src[i])
+    }
+    return out
+}
+
+// ctx_instructions: return instruction-only slice (drop counter at index 0)
+fn ctx_instructions(ctx: [String]) -> [String] {
+    let out: [String] = []
+    let n = len(ctx)
+    let i = 0
+    for i in range(1, n) {
+        out = push(out, ctx[i])
+    }
+    return out
+}
+
+// fresh_label: generate a unique label string; return [label_string, updated_ctx]
+fn fresh_label(ctx: [String], prefix: String) -> [String] {
+    let n = ctx_counter(ctx)
+    let label = prefix + "_" + str(n)
+    // Build updated ctx with incremented counter
+    let out: [String] = []
+    out = push(out, str(n + 1))
+    let total = len(ctx)
+    let i = 0
+    for i in range(1, total) {
+        out = push(out, ctx[i])
+    }
+    // Return [label, ctx_counter, ...ctx_instrs] packed as single array
+    // Caller unpacks: result[0] = label, result[1..] is the new ctx
+    let result: [String] = []
+    result = push(result, label)
+    let j = 0
+    for j in range(0, len(out)) {
+        result = push(result, out[j])
+    }
+    return result
+}
+
+// unpack_label: extract label and ctx from fresh_label result
+fn label_get(fl: [String]) -> String {
+    return fl[0]
+}
+
+fn label_ctx(fl: [String]) -> [String] {
+    let out: [String] = []
+    let n = len(fl)
+    let i = 0
+    for i in range(1, n) {
+        out = push(out, fl[i])
+    }
+    return out
+}
+
+// ─── Expression emitter ──────────────────────────────────────────────────────
+
+// emit_expr: emit bytecode for expression node; returns updated ctx
+// After execution the expression result is on top of stack.
+fn emit_expr(ctx: [String], node: [String]) -> [String] {
+    let kind = node[0]
+
+    if kind == "int" {
+        return ctx_emit(ctx, "PUSH_INT " + node[1])
+    }
+
+    if kind == "float" {
+        return ctx_emit(ctx, "PUSH_FLOAT " + node[1])
+    }
+
+    if kind == "string" {
+        return ctx_emit(ctx, "PUSH_STRING " + node[1])
+    }
+
+    if kind == "bool" {
+        return ctx_emit(ctx, "PUSH_BOOL " + node[1])
+    }
+
+    if kind == "ident" {
+        return ctx_emit(ctx, "LOAD " + node[1])
+    }
+
+    if kind == "unary" {
+        let op = node[1]
+        // node[2] is the operand — but we store it as a sub-array string; decode below
+        // Because AST nodes are [String] arrays, nested nodes are serialised inline.
+        // The convention used here: sub-node fields are encoded as their index in node[].
+        // emit_expr is called recursively; for nested nodes we pass them via emit_subnode.
+        let ctx2 = emit_subnode(ctx, node, 2)
+        if op == "-" {
+            return ctx_emit(ctx2, "NEG")
+        }
+        if op == "!" {
+            return ctx_emit(ctx2, "NOT")
+        }
+        return ctx2
+    }
+
+    if kind == "binary" {
+        let op  = node[1]
+        let ctx2 = emit_subnode(ctx,  node, 2)
+        let ctx3 = emit_subnode(ctx2, node, 3)
+        if op == "+"  { return ctx_emit(ctx3, "ADD") }
+        if op == "-"  { return ctx_emit(ctx3, "SUB") }
+        if op == "*"  { return ctx_emit(ctx3, "MUL") }
+        if op == "/"  { return ctx_emit(ctx3, "DIV") }
+        if op == "%"  { return ctx_emit(ctx3, "MOD") }
+        if op == "==" { return ctx_emit(ctx3, "EQ") }
+        if op == "!=" { return ctx_emit(ctx3, "NEQ") }
+        if op == "<"  { return ctx_emit(ctx3, "LT") }
+        if op == ">"  { return ctx_emit(ctx3, "GT") }
+        if op == "<=" { return ctx_emit(ctx3, "LTEQ") }
+        if op == ">=" { return ctx_emit(ctx3, "GTEQ") }
+        if op == "&&" { return ctx_emit(ctx3, "AND") }
+        if op == "||" { return ctx_emit(ctx3, "OR") }
+        return ctx3
+    }
+
+    if kind == "index" {
+        let ctx2 = emit_subnode(ctx,  node, 1)
+        let ctx3 = emit_subnode(ctx2, node, 2)
+        return ctx_emit(ctx3, "INDEX")
+    }
+
+    if kind == "field" {
+        let ctx2 = emit_subnode(ctx, node, 1)
+        return ctx_emit(ctx2, "FIELD " + node[2])
+    }
+
+    if kind == "call" {
+        // node = ["call", callee_name_str, arg0_encoded, arg1_encoded, ...]
+        // callee is an ident string stored at node[1]
+        let callee = node[1]
+        let argc = len(node) - 2
+        let ctx2 = ctx
+        let i = 0
+        for i in range(0, argc) {
+            ctx2 = emit_subnode(ctx2, node, i + 2)
+        }
+        return ctx_emit(ctx2, "CALL " + callee + " " + str(argc))
+    }
+
+    if kind == "array" {
+        let count = len(node) - 1
+        let ctx2 = ctx
+        let i = 0
+        for i in range(0, count) {
+            ctx2 = emit_subnode(ctx2, node, i + 1)
+        }
+        return ctx_emit(ctx2, "ARRAY " + str(count))
+    }
+
+    if kind == "closure" {
+        // node = ["closure", param_count_str, body_encoded...]
+        let pcount = node[1]
+        let ctx2 = emit_subnode(ctx, node, 2)
+        return ctx_emit(ctx2, "CLOSURE " + pcount)
+    }
+
+    // Fallback: unknown expression kind — push a placeholder
+    return ctx_emit(ctx, "PUSH_INT 0 ; unknown_expr:" + kind)
+}
+
+// ─── Statement emitter ───────────────────────────────────────────────────────
+
+// emit_stmt: emit bytecode for a statement node; returns updated ctx
+fn emit_stmt(ctx: [String], node: [String]) -> [String] {
+    let kind = node[0]
+
+    if kind == "let" || kind == "var" {
+        // node = ["let", name, type_or_empty, expr_encoded]
+        let name = node[1]
+        let ctx2 = emit_subnode(ctx, node, 3)
+        return ctx_emit(ctx2, "STORE " + name)
+    }
+
+    if kind == "assign" {
+        // node = ["assign", target_name, value_encoded]
+        let target = node[1]
+        let ctx2 = emit_subnode(ctx, node, 2)
+        return ctx_emit(ctx2, "STORE " + target)
+    }
+
+    if kind == "return" {
+        // node = ["return", expr_encoded]
+        let ctx2 = emit_subnode(ctx, node, 1)
+        return ctx_emit(ctx2, "RET")
+    }
+
+    if kind == "if" {
+        // node = ["if", cond_encoded, then_encoded, else_encoded_or_empty]
+        let fl1 = fresh_label(ctx, "else")
+        let else_label = label_get(fl1)
+        let ctx2     = label_ctx(fl1)
+
+        let fl2 = fresh_label(ctx2, "endif")
+        let end_label = label_get(fl2)
+        let ctx3    = label_ctx(fl2)
+
+        // Emit condition
+        let ctx4 = emit_subnode(ctx3, node, 1)
+        // Jump to else if false
+        let ctx5 = ctx_emit(ctx4, "JZ " + else_label)
+        // Emit then block
+        let ctx6 = emit_subnode(ctx5, node, 2)
+        // Jump past else
+        let ctx7 = ctx_emit(ctx6, "JMP " + end_label)
+        // Else label
+        let ctx8 = ctx_emit(ctx7, "LABEL " + else_label)
+        // Emit else if present (node[3] non-empty)
+        let ctx9 = ctx8
+        if len(node) > 3 {
+            if node[3] != "" {
+                ctx9 = emit_subnode(ctx8, node, 3)
+            }
+        }
+        return ctx_emit(ctx9, "LABEL " + end_label)
+    }
+
+    if kind == "while" {
+        // node = ["while", cond_encoded, body_encoded]
+        let fl1 = fresh_label(ctx, "while_start")
+        let start_label = label_get(fl1)
+        let ctx2       = label_ctx(fl1)
+
+        let fl2 = fresh_label(ctx2, "while_end")
+        let end_label = label_get(fl2)
+        let ctx3     = label_ctx(fl2)
+
+        let ctx4 = ctx_emit(ctx3, "LABEL " + start_label)
+        let ctx5 = emit_subnode(ctx4, node, 1)
+        let ctx6 = ctx_emit(ctx5, "JZ " + end_label)
+        let ctx7 = emit_subnode(ctx6, node, 2)
+        let ctx8 = ctx_emit(ctx7, "JMP " + start_label)
+        return ctx_emit(ctx8, "LABEL " + end_label)
+    }
+
+    if kind == "for" {
+        // node = ["for", var_name, iter_expr_encoded, body_encoded]
+        // Compile to: evaluate iter, store in __iter_<var>; loop with index
+        let var_name  = node[1]
+        let iter_var  = "__iter_" + var_name
+        let idx_var   = "__idx_" + var_name
+        let len_var   = "__len_" + var_name
+
+        let fl1 = fresh_label(ctx, "for_start")
+        let start_label = label_get(fl1)
+        let ctx2       = label_ctx(fl1)
+
+        let fl2 = fresh_label(ctx2, "for_end")
+        let end_label = label_get(fl2)
+        let ctx3     = label_ctx(fl2)
+
+        // Evaluate iterable, store in iter_var
+        let ctx4 = emit_subnode(ctx3, node, 2)
+        let ctx5 = ctx_emit(ctx4, "STORE " + iter_var)
+
+        // idx = 0
+        let ctx6 = ctx_emit(ctx5, "PUSH_INT 0")
+        let ctx7 = ctx_emit(ctx6, "STORE " + idx_var)
+
+        // len = len(iter_var)
+        let ctx8  = ctx_emit(ctx7, "LOAD " + iter_var)
+        let ctx9  = ctx_emit(ctx8, "CALL len 1")
+        let ctx10 = ctx_emit(ctx9, "STORE " + len_var)
+
+        // Loop start
+        let ctx11 = ctx_emit(ctx10, "LABEL " + start_label)
+
+        // Check idx < len
+        let ctx12 = ctx_emit(ctx11, "LOAD " + idx_var)
+        let ctx13 = ctx_emit(ctx12, "LOAD " + len_var)
+        let ctx14 = ctx_emit(ctx13, "LT")
+        let ctx15 = ctx_emit(ctx14, "JZ " + end_label)
+
+        // var_name = iter_var[idx]
+        let ctx16 = ctx_emit(ctx15, "LOAD " + iter_var)
+        let ctx17 = ctx_emit(ctx16, "LOAD " + idx_var)
+        let ctx18 = ctx_emit(ctx17, "INDEX")
+        let ctx19 = ctx_emit(ctx18, "STORE " + var_name)
+
+        // Emit body
+        let ctx20 = emit_subnode(ctx19, node, 3)
+
+        // idx = idx + 1
+        let ctx21 = ctx_emit(ctx20, "LOAD " + idx_var)
+        let ctx22 = ctx_emit(ctx21, "PUSH_INT 1")
+        let ctx23 = ctx_emit(ctx22, "ADD")
+        let ctx24 = ctx_emit(ctx23, "STORE " + idx_var)
+
+        let ctx25 = ctx_emit(ctx24, "JMP " + start_label)
+        return ctx_emit(ctx25, "LABEL " + end_label)
+    }
+
+    if kind == "block" {
+        return emit_block(ctx, node)
+    }
+
+    // Expression statement (call, assign used as stmt, etc.)
+    let ctx2 = emit_expr(ctx, node)
+    // Discard result left on stack by expression statement
+    return ctx_emit(ctx2, "POP")
+}
+
+// ─── Block emitter ───────────────────────────────────────────────────────────
+
+// emit_block: emit all statements in a block node
+// node = ["block", stmt0_encoded, stmt1_encoded, ...]
+fn emit_block(ctx: [String], node: [String]) -> [String] {
+    let n = len(node)
+    let ctx2 = ctx
+    let i = 0
+    for i in range(1, n) {
+        ctx2 = emit_stmt_encoded(ctx2, node[i])
+    }
+    return ctx2
+}
+
+// ─── Function emitter ────────────────────────────────────────────────────────
+
+// emit_fn: emit code for a function definition node
+// node = ["fn", name, params_encoded, ret_type, body_encoded]
+fn emit_fn(ctx: [String], node: [String]) -> [String] {
+    let name = node[1]
+    let ctx2 = ctx_emit(ctx, "FN_START " + name)
+    // Emit body (node[4])
+    let ctx3 = emit_stmt_encoded(ctx2, node[4])
+    // Ensure function ends with RET (add implicit return of 0 if needed)
+    let ctx4 = ctx_emit(ctx3, "PUSH_INT 0")
+    let ctx5 = ctx_emit(ctx4, "RET")
+    return ctx_emit(ctx5, "FN_END")
+}
+
+// ─── Stub for nested node dispatch ───────────────────────────────────────────
+// In Vortex stdlib, AST sub-nodes are stored as strings (serialised).
+// The convention: node[i] for i >= 1 is either a plain string scalar
+// or a serialised sub-node marker "NODE:<kind>:..." that we re-parse.
+// For this codegen stub we treat node[i] as a literal flat token
+// and call emit_expr / emit_stmt accordingly.
+//
+// emit_subnode dispatches based on the first character of the encoded string.
+
+fn emit_subnode(ctx: [String], node: [String], idx: i64) -> [String] {
+    let encoded = node[idx]
+    return emit_expr_encoded(ctx, encoded)
+}
+
+// emit_expr_encoded: decode a single encoded token and emit expr bytecode
+fn emit_expr_encoded(ctx: [String], encoded: String) -> [String] {
+    // Simple heuristic decode:
+    // - starts with digit or '-'  → integer literal
+    // - starts with '"'           → string literal (strip quotes)
+    // - "true" / "false"          → bool
+    // - contains '.' and is numeric → float
+    // - otherwise                 → load variable
+    if encoded == "true" || encoded == "false" {
+        return ctx_emit(ctx, "PUSH_BOOL " + encoded)
+    }
+    let first = str_char_at(encoded, 0)
+    if first == _quote() {
+        // Strip surrounding quotes for PUSH_STRING
+        let inner = str_substr(encoded, 1, len(encoded) - 1)
+        return ctx_emit(ctx, "PUSH_STRING " + inner)
+    }
+    // Check if it looks numeric (digit or leading minus)
+    if str_is_ascii_digit(first) || first == "-" {
+        // If it contains a dot treat as float, else int
+        if str_contains(encoded, ".") {
+            return ctx_emit(ctx, "PUSH_FLOAT " + encoded)
+        }
+        return ctx_emit(ctx, "PUSH_INT " + encoded)
+    }
+    // Default: load variable
+    return ctx_emit(ctx, "LOAD " + encoded)
+}
+
+// emit_stmt_encoded: decode and emit a statement (used for body fields)
+fn emit_stmt_encoded(ctx: [String], encoded: String) -> [String] {
+    // For a body that is just an identifier, treat as expression stmt
+    return emit_expr_encoded(ctx, encoded)
+}
+
+// ─── Main entry point ────────────────────────────────────────────────────────
+
+// codegen: compile a program AST node to a flat instruction array
+// ast = ["program", item0, item1, ...]  where each item is a top-level node
+// Returns the instruction array (without the ctx counter at index 0).
+fn codegen(ast: [String]) -> [String] {
+    let ctx = ctx_new()
+    let n = len(ast)
+    let i = 0
+    for i in range(1, n) {
+        let item = ast[i]
+        // Each top-level item is encoded as a string; for now we expect
+        // that the caller passes the program node whose children are
+        // pre-encoded instruction blocks (advanced use) or literal fn names.
+        // In the self-hosting pipeline the parser hands us nested arrays;
+        // here we treat each item as a function-level encoded string.
+        ctx = emit_expr_encoded(ctx, item)
+        ctx = ctx_emit(ctx, "POP")
+    }
+    ctx = ctx_emit(ctx, "HALT")
+    return ctx_instructions(ctx)
+}
+
+// codegen_fn_node: compile a single ["fn",...] node, append to existing ctx
+fn codegen_fn_node(ctx: [String], node: [String]) -> [String] {
+    return emit_fn(ctx, node)
+}
+
+// ─── Printer helper ──────────────────────────────────────────────────────────
+
+fn print_bytecode(instrs: [String]) {
+    let n = len(instrs)
+    let i = 0
+    for i in range(0, n) {
+        println(instrs[i])
+    }
+}
+
+// ─── Demo / self-test ────────────────────────────────────────────────────────
+
+fn main() {
+    println("=== Vortex Bytecode Codegen Demo ===")
+    println("")
+
+    // ── Demo 1: integer arithmetic expression ─────────────────────────────
+    // AST for:  (3 + 4) * 2
+    // binary(*, binary(+, int(3), int(4)), int(2))
+    // In flat [String] form we build and emit manually via emit_expr.
+
+    let ctx = ctx_new()
+
+    // Emit:  3 + 4  (push 3, push 4, ADD)
+    ctx = ctx_emit(ctx, "PUSH_INT 3")
+    ctx = ctx_emit(ctx, "PUSH_INT 4")
+    ctx = ctx_emit(ctx, "ADD")
+    // Emit:  * 2
+    ctx = ctx_emit(ctx, "PUSH_INT 2")
+    ctx = ctx_emit(ctx, "MUL")
+
+    println("--- Expr: (3 + 4) * 2 ---")
+    let instrs = ctx_instructions(ctx)
+    print_bytecode(instrs)
+    println("")
+
+    // ── Demo 2: if/else ───────────────────────────────────────────────────
+    // Simulating:
+    //   if x > 0 { y = 1 } else { y = 0 }
+    let ctx2 = ctx_new()
+
+    // fresh_label usage
+    let fl1 = fresh_label(ctx2, "else")
+    let else_lbl = label_get(fl1)
+    ctx2 = label_ctx(fl1)
+
+    let fl2 = fresh_label(ctx2, "endif")
+    let end_lbl = label_get(fl2)
+    ctx2 = label_ctx(fl2)
+
+    ctx2 = ctx_emit(ctx2, "LOAD x")
+    ctx2 = ctx_emit(ctx2, "PUSH_INT 0")
+    ctx2 = ctx_emit(ctx2, "GT")
+    ctx2 = ctx_emit(ctx2, "JZ " + else_lbl)
+    ctx2 = ctx_emit(ctx2, "PUSH_INT 1")
+    ctx2 = ctx_emit(ctx2, "STORE y")
+    ctx2 = ctx_emit(ctx2, "JMP " + end_lbl)
+    ctx2 = ctx_emit(ctx2, "LABEL " + else_lbl)
+    ctx2 = ctx_emit(ctx2, "PUSH_INT 0")
+    ctx2 = ctx_emit(ctx2, "STORE y")
+    ctx2 = ctx_emit(ctx2, "LABEL " + end_lbl)
+
+    println("--- Stmt: if x > 0 { y = 1 } else { y = 0 } ---")
+    let instrs2 = ctx_instructions(ctx2)
+    print_bytecode(instrs2)
+    println("")
+
+    // ── Demo 3: while loop ────────────────────────────────────────────────
+    // Simulating:
+    //   i = 0
+    //   while i < 5 { i = i + 1 }
+    let ctx3 = ctx_new()
+
+    let fl3 = fresh_label(ctx3, "while_start")
+    let ws_lbl = label_get(fl3)
+    ctx3 = label_ctx(fl3)
+
+    let fl4 = fresh_label(ctx3, "while_end")
+    let we_lbl = label_get(fl4)
+    ctx3 = label_ctx(fl4)
+
+    ctx3 = ctx_emit(ctx3, "PUSH_INT 0")
+    ctx3 = ctx_emit(ctx3, "STORE i")
+    ctx3 = ctx_emit(ctx3, "LABEL " + ws_lbl)
+    ctx3 = ctx_emit(ctx3, "LOAD i")
+    ctx3 = ctx_emit(ctx3, "PUSH_INT 5")
+    ctx3 = ctx_emit(ctx3, "LT")
+    ctx3 = ctx_emit(ctx3, "JZ " + we_lbl)
+    ctx3 = ctx_emit(ctx3, "LOAD i")
+    ctx3 = ctx_emit(ctx3, "PUSH_INT 1")
+    ctx3 = ctx_emit(ctx3, "ADD")
+    ctx3 = ctx_emit(ctx3, "STORE i")
+    ctx3 = ctx_emit(ctx3, "JMP " + ws_lbl)
+    ctx3 = ctx_emit(ctx3, "LABEL " + we_lbl)
+
+    println("--- Stmt: i=0; while i < 5 { i = i + 1 } ---")
+    let instrs3 = ctx_instructions(ctx3)
+    print_bytecode(instrs3)
+    println("")
+
+    // ── Demo 4: function definition ───────────────────────────────────────
+    // Simulating:
+    //   fn add(a, b) -> i64 { return a + b }
+    let ctx4 = ctx_new()
+    ctx4 = ctx_emit(ctx4, "FN_START add")
+    ctx4 = ctx_emit(ctx4, "LOAD a")
+    ctx4 = ctx_emit(ctx4, "LOAD b")
+    ctx4 = ctx_emit(ctx4, "ADD")
+    ctx4 = ctx_emit(ctx4, "RET")
+    ctx4 = ctx_emit(ctx4, "FN_END")
+
+    println("--- Fn: fn add(a, b) -> i64 { return a + b } ---")
+    let instrs4 = ctx_instructions(ctx4)
+    print_bytecode(instrs4)
+    println("")
+
+    // ── Demo 5: function call + array literal ─────────────────────────────
+    // Simulating:
+    //   let arr = [1, 2, 3]
+    //   let result = sum(arr)
+    let ctx5 = ctx_new()
+    ctx5 = ctx_emit(ctx5, "PUSH_INT 1")
+    ctx5 = ctx_emit(ctx5, "PUSH_INT 2")
+    ctx5 = ctx_emit(ctx5, "PUSH_INT 3")
+    ctx5 = ctx_emit(ctx5, "ARRAY 3")
+    ctx5 = ctx_emit(ctx5, "STORE arr")
+    ctx5 = ctx_emit(ctx5, "LOAD arr")
+    ctx5 = ctx_emit(ctx5, "CALL sum 1")
+    ctx5 = ctx_emit(ctx5, "STORE result")
+
+    println("--- let arr=[1,2,3]; let result=sum(arr) ---")
+    let instrs5 = ctx_instructions(ctx5)
+    print_bytecode(instrs5)
+    println("")
+
+    // ── Demo 6: label counter increments correctly ────────────────────────
+    let ctx6 = ctx_new()
+    let fl5 = fresh_label(ctx6, "L")
+    let l1 = label_get(fl5)
+    ctx6 = label_ctx(fl5)
+
+    let fl6 = fresh_label(ctx6, "L")
+    let l2 = label_get(fl6)
+    ctx6 = label_ctx(fl6)
+
+    let fl7 = fresh_label(ctx6, "L")
+    let l3 = label_get(fl7)
+    ctx6 = label_ctx(fl7)
+
+    println("--- Label generation: " + l1 + ", " + l2 + ", " + l3 + " ---")
+    println("")
+
+    // ── Demo 7: nested field access + index ───────────────────────────────
+    // Simulating:  obj.items[0]
+    let ctx7 = ctx_new()
+    ctx7 = ctx_emit(ctx7, "LOAD obj")
+    ctx7 = ctx_emit(ctx7, "FIELD items")
+    ctx7 = ctx_emit(ctx7, "PUSH_INT 0")
+    ctx7 = ctx_emit(ctx7, "INDEX")
+
+    println("--- Expr: obj.items[0] ---")
+    let instrs7 = ctx_instructions(ctx7)
+    print_bytecode(instrs7)
+    println("")
+
+    println("=== Codegen demo complete ===")
+}

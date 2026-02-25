@@ -1,0 +1,239 @@
+// stdlib/std/test.vx — Vortex test framework
+//
+// Suite format: [name, pass_count, fail_count, log_entry_0, log_entry_1, ...]
+// Counts are stored as strings and parsed/updated via int() / to_string().
+
+// Special character helpers (Vortex strings do not process escape sequences)
+fn _quote() -> String { return str_from_bytes([34]) }
+
+fn test_suite(name: String) -> [String] {
+    var suite: [String] = []
+    suite = push(suite, name)
+    suite = push(suite, "0")
+    suite = push(suite, "0")
+    return suite
+}
+
+fn suite_passes(suite: [String]) -> i64 {
+    return int(suite[1])
+}
+
+fn suite_fails(suite: [String]) -> i64 {
+    return int(suite[2])
+}
+
+fn suite_name(suite: [String]) -> String {
+    return suite[0]
+}
+
+fn test_pass(suite: [String], desc: String) -> [String] {
+    var p: i64 = int(suite[1])
+    p = p + 1
+    var out: [String] = []
+    out = push(out, suite[0])
+    out = push(out, to_string(p))
+    out = push(out, suite[2])
+    var i: i64 = 3
+    for i in range(3, len(suite)) {
+        out = push(out, suite[i])
+    }
+    out = push(out, "  [PASS] " + desc)
+    return out
+}
+
+fn test_fail(suite: [String], desc: String, msg: String) -> [String] {
+    var f: i64 = int(suite[2])
+    f = f + 1
+    var out: [String] = []
+    out = push(out, suite[0])
+    out = push(out, suite[1])
+    out = push(out, to_string(f))
+    var i: i64 = 3
+    for i in range(3, len(suite)) {
+        out = push(out, suite[i])
+    }
+    out = push(out, "  [FAIL] " + desc + " — " + msg)
+    return out
+}
+
+fn assert_true(suite: [String], desc: String, val: bool) -> [String] {
+    if val {
+        return test_pass(suite, desc)
+    }
+    return test_fail(suite, desc, "expected true, got false")
+}
+
+fn assert_false(suite: [String], desc: String, val: bool) -> [String] {
+    if val == false {
+        return test_pass(suite, desc)
+    }
+    return test_fail(suite, desc, "expected false, got true")
+}
+
+fn assert_eq_int(suite: [String], desc: String, got: i64, expected: i64) -> [String] {
+    if got == expected {
+        return test_pass(suite, desc)
+    }
+    var msg: String = "got " + to_string(got) + ", expected " + to_string(expected)
+    return test_fail(suite, desc, msg)
+}
+
+fn assert_neq_int(suite: [String], desc: String, a: i64, b: i64) -> [String] {
+    if a != b {
+        return test_pass(suite, desc)
+    }
+    var msg: String = "expected " + to_string(a) + " != " + to_string(b) + ", but they are equal"
+    return test_fail(suite, desc, msg)
+}
+
+fn assert_eq_str(suite: [String], desc: String, got: String, expected: String) -> [String] {
+    if got == expected {
+        return test_pass(suite, desc)
+    }
+    var msg: String = "got " + _quote() + got + _quote() + ", expected " + _quote() + expected + _quote()
+    return test_fail(suite, desc, msg)
+}
+
+fn float_abs(x: f64) -> f64 {
+    if x < 0.0 {
+        return 0.0 - x
+    }
+    return x
+}
+
+fn assert_eq_float(suite: [String], desc: String, got: f64, expected: f64, epsilon: f64) -> [String] {
+    var delta: f64 = float_abs(got - expected)
+    if delta < epsilon {
+        return test_pass(suite, desc)
+    }
+    var msg: String = "got " + to_string(got) + ", expected " + to_string(expected) + " (epsilon=" + to_string(epsilon) + ")"
+    return test_fail(suite, desc, msg)
+}
+
+fn test_summary(suite: [String]) {
+    var name: String = suite[0]
+    var passes: i64 = int(suite[1])
+    var fails: i64 = int(suite[2])
+    var total: i64 = passes + fails
+    println("=== " + name + " ===")
+    var i: i64 = 3
+    for i in range(3, len(suite)) {
+        println(suite[i])
+    }
+    println("--- Results: " + to_string(passes) + "/" + to_string(total) + " passed, " + to_string(fails) + " failed ---")
+    if fails == 0 {
+        println("All tests passed!")
+    }
+    println("")
+}
+
+// run_all takes a flat [String] that is a pre-built combined log.
+// Build it with combine_suites() before calling.
+fn run_all(combined: [String]) {
+    var total_pass: i64 = int(combined[0])
+    var total_fail: i64 = int(combined[1])
+    var n_suites: i64 = int(combined[2])
+    var total: i64 = total_pass + total_fail
+    println("========================================")
+    println("Combined results across " + to_string(n_suites) + " suite(s):")
+    println("  Passed: " + to_string(total_pass) + " / " + to_string(total))
+    println("  Failed: " + to_string(total_fail))
+    if total_fail == 0 {
+        println("  Status: ALL PASSING")
+    } else {
+        println("  Status: SOME FAILURES")
+    }
+    println("========================================")
+}
+
+// Start a combined tracker: [pass_count, fail_count, suite_count]
+fn combine_start() -> [String] {
+    var c: [String] = []
+    c = push(c, "0")
+    c = push(c, "0")
+    c = push(c, "0")
+    return c
+}
+
+// Add one suite's results to the combined tracker.
+fn combine_add(combined: [String], suite: [String]) -> [String] {
+    var p: i64 = int(combined[0]) + int(suite[1])
+    var f: i64 = int(combined[1]) + int(suite[2])
+    var n: i64 = int(combined[2]) + 1
+    var out: [String] = []
+    out = push(out, to_string(p))
+    out = push(out, to_string(f))
+    out = push(out, to_string(n))
+    return out
+}
+
+// ── Demo ──────────────────────────────────────────────────────────────────────
+
+fn demo_math_suite() -> [String] {
+    var s: [String] = test_suite("Integer Math")
+    s = assert_eq_int(s, "addition: 2 + 3 = 5", 2 + 3, 5)
+    s = assert_eq_int(s, "subtraction: 10 - 4 = 6", 10 - 4, 6)
+    s = assert_eq_int(s, "multiplication: 7 * 6 = 42", 7 * 6, 42)
+    s = assert_eq_int(s, "integer division: 15 / 3 = 5", 15 / 3, 5)
+    s = assert_eq_int(s, "modulo: 17 % 5 = 2", 17 % 5, 2)
+    s = assert_neq_int(s, "1 and 2 are different", 1, 2)
+    // Deliberately failing test: 3 * 3 != 10
+    s = assert_eq_int(s, "wrong: 3 * 3 = 10 (should fail)", 3 * 3, 10)
+    return s
+}
+
+fn demo_string_suite() -> [String] {
+    var s: [String] = test_suite("String Operations")
+    s = assert_eq_str(s, "concatenation: hello + world", "hello" + " " + "world", "hello world")
+    s = assert_eq_str(s, "int to string: 42", to_string(42), "42")
+    s = assert_eq_int(s, "string length: " + _quote() + "vortex" + _quote() + " = 6", len("vortex"), 6)
+    s = assert_eq_str(s, "substr: first 3 of " + _quote() + "abcdef" + _quote(), str_substr("abcdef", 0, 3), "abc")
+    // Deliberately failing test: wrong expected value
+    s = assert_eq_str(s, "wrong: to_string(7) = " + _quote() + "eight" + _quote() + " (should fail)", to_string(7), "eight")
+    return s
+}
+
+fn demo_bool_suite() -> [String] {
+    var s: [String] = test_suite("Boolean Logic")
+    s = assert_true(s, "true is true", true)
+    s = assert_false(s, "false is false", false)
+    s = assert_true(s, "true && true", true && true)
+    s = assert_false(s, "true && false", true && false)
+    s = assert_true(s, "false || true", false || true)
+    s = assert_true(s, "1 < 2", 1 < 2)
+    s = assert_true(s, "5 >= 5", 5 >= 5)
+    return s
+}
+
+fn demo_float_suite() -> [String] {
+    var s: [String] = test_suite("Float Arithmetic")
+    s = assert_eq_float(s, "0.1 + 0.2 approx 0.3", 0.1 + 0.2, 0.3, 0.000000001)
+    s = assert_eq_float(s, "sqrt(4.0) approx 2.0", sqrt(4.0), 2.0, 0.000000001)
+    // Deliberately failing: epsilon too tight for 1/3 representation
+    s = assert_eq_float(s, "wrong: 1.0/3.0 == 0.333 exact (should fail)", 1.0 / 3.0, 0.333, 0.0000000001)
+    return s
+}
+
+fn main() {
+    println("Vortex Test Framework — Demo Run")
+    println("")
+
+    var math_s: [String] = demo_math_suite()
+    test_summary(math_s)
+
+    var str_s: [String] = demo_string_suite()
+    test_summary(str_s)
+
+    var bool_s: [String] = demo_bool_suite()
+    test_summary(bool_s)
+
+    var float_s: [String] = demo_float_suite()
+    test_summary(float_s)
+
+    var combined: [String] = combine_start()
+    combined = combine_add(combined, math_s)
+    combined = combine_add(combined, str_s)
+    combined = combine_add(combined, bool_s)
+    combined = combine_add(combined, float_s)
+    run_all(combined)
+}

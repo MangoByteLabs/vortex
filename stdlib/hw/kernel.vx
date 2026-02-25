@@ -1,0 +1,983 @@
+// kernel.vx — Vortex Kernel Library: higher-level GPU kernel patterns
+// Built entirely on VXB ISA (no PTX, no CUDA).
+// All OP_* constants and vxb_instr functions copied from gpu.vx
+//
+// Register convention:
+//   r0-r3   : thread/block indices
+//   r4-r7   : address computation temporaries
+//   r8-r15  : data registers
+//   r16-r31 : accumulator / scratch
+//   r32-r47 : shared memory addresses
+//   r48-r63 : special (loop counters, bounds)
+
+// ---------------------------------------------------------------------------
+// Section 0 — VXB Opcode Constants (copied from gpu.vx)
+// ---------------------------------------------------------------------------
+
+fn OP_NOP() -> i64 { return 0 }
+
+// Floating-point arithmetic
+fn OP_FADD() -> i64 { return 1 }
+fn OP_FSUB() -> i64 { return 2 }
+fn OP_FMUL() -> i64 { return 3 }
+fn OP_FDIV() -> i64 { return 4 }
+fn OP_FNEG() -> i64 { return 5 }
+fn OP_FABS() -> i64 { return 6 }
+fn OP_FSQRT() -> i64 { return 7 }
+fn OP_FEXP() -> i64 { return 8 }
+fn OP_FLOG() -> i64 { return 9 }
+fn OP_FMAX() -> i64 { return 10 }
+fn OP_FMIN() -> i64 { return 11 }
+fn OP_FMA() -> i64 { return 12 }
+
+// Integer arithmetic
+fn OP_IADD() -> i64 { return 16 }
+fn OP_ISUB() -> i64 { return 17 }
+fn OP_IMUL() -> i64 { return 18 }
+
+// Compare
+fn OP_FEQ() -> i64 { return 32 }
+fn OP_FLT() -> i64 { return 33 }
+fn OP_FLE() -> i64 { return 34 }
+fn OP_FGT() -> i64 { return 35 }
+fn OP_FGE() -> i64 { return 36 }
+
+// Logic / bitwise
+fn OP_AND() -> i64 { return 48 }
+fn OP_OR() -> i64 { return 49 }
+fn OP_XOR() -> i64 { return 50 }
+fn OP_SHL() -> i64 { return 51 }
+fn OP_SHR() -> i64 { return 52 }
+fn OP_NOT() -> i64 { return 53 }
+
+// Memory
+fn OP_LD_GLOBAL() -> i64 { return 64 }
+fn OP_ST_GLOBAL() -> i64 { return 65 }
+fn OP_LD_SHARED() -> i64 { return 66 }
+fn OP_ST_SHARED() -> i64 { return 67 }
+fn OP_LD_CONST() -> i64 { return 68 }
+
+// SIMT / warp intrinsics
+fn OP_THREAD_ID_X() -> i64 { return 80 }
+fn OP_BLOCK_ID_X() -> i64 { return 83 }
+fn OP_BLOCK_DIM_X() -> i64 { return 86 }
+fn OP_BARRIER() -> i64 { return 89 }
+fn OP_WARP_SHUFFLE() -> i64 { return 90 }
+fn OP_WARP_REDUCE_SUM() -> i64 { return 91 }
+fn OP_WARP_REDUCE_MAX() -> i64 { return 92 }
+
+// Control flow
+fn OP_BRANCH() -> i64 { return 96 }
+fn OP_BRANCH_COND() -> i64 { return 97 }
+fn OP_CALL() -> i64 { return 98 }
+fn OP_RET() -> i64 { return 99 }
+
+// Type conversion
+fn OP_F2I() -> i64 { return 112 }
+fn OP_I2F() -> i64 { return 113 }
+fn OP_F16_TO_F32() -> i64 { return 114 }
+fn OP_F32_TO_F16() -> i64 { return 115 }
+
+// Fused / tiled ops
+fn OP_TILED_MATMUL() -> i64 { return 128 }
+fn OP_FUSED_ATTENTION() -> i64 { return 129 }
+fn OP_FUSED_LAYERNORM() -> i64 { return 130 }
+fn OP_FUSED_GELU() -> i64 { return 131 }
+
+// ---------------------------------------------------------------------------
+// Section 0b — VXB Instruction Encoder (copied from gpu.vx)
+// ---------------------------------------------------------------------------
+
+// Return a 4-element array [op, dst, src1, src2] — the format expected by
+// vxb_compile, which requires opcodes as [[op,dst,src1,src2], ...].
+fn vxb_instr(op: i64, dst: i64, src1: i64, src2: i64) -> [i64] {
+    return [op, dst, src1, src2]
+}
+
+// Convenience: instruction with no sources (e.g. THREAD_ID_X, BARRIER, RET)
+fn vxb_instr0(op: i64, dst: i64) -> [i64] {
+    return [op, dst, 0, 0]
+}
+
+// Convenience: instruction with one source (e.g. FNEG, FABS, LD_GLOBAL)
+fn vxb_instr1(op: i64, dst: i64, src1: i64) -> [i64] {
+    return [op, dst, src1, 0]
+}
+
+// ---------------------------------------------------------------------------
+// Section 1 — Register Constants
+// ---------------------------------------------------------------------------
+
+fn REG_TID_X()    -> i64 { return 0  }
+fn REG_TID_Y()    -> i64 { return 1  }
+fn REG_BLOCK_X()  -> i64 { return 2  }
+fn REG_BLOCK_Y()  -> i64 { return 3  }
+fn REG_ADDR0()    -> i64 { return 4  }
+fn REG_ADDR1()    -> i64 { return 5  }
+fn REG_ADDR2()    -> i64 { return 6  }
+fn REG_ADDR3()    -> i64 { return 7  }
+fn REG_DATA0()    -> i64 { return 8  }
+fn REG_DATA1()    -> i64 { return 9  }
+fn REG_DATA2()    -> i64 { return 10 }
+fn REG_DATA3()    -> i64 { return 11 }
+fn REG_DATA4()    -> i64 { return 12 }
+fn REG_DATA5()    -> i64 { return 13 }
+fn REG_DATA6()    -> i64 { return 14 }
+fn REG_DATA7()    -> i64 { return 15 }
+fn REG_ACC0()     -> i64 { return 16 }
+fn REG_ACC1()     -> i64 { return 17 }
+fn REG_ACC2()     -> i64 { return 18 }
+fn REG_ACC3()     -> i64 { return 19 }
+fn REG_ACC4()     -> i64 { return 20 }
+fn REG_ACC5()     -> i64 { return 21 }
+fn REG_ACC6()     -> i64 { return 22 }
+fn REG_ACC7()     -> i64 { return 23 }
+fn REG_SCRATCH0() -> i64 { return 24 }
+fn REG_SCRATCH1() -> i64 { return 25 }
+fn REG_SCRATCH2() -> i64 { return 26 }
+fn REG_SCRATCH3() -> i64 { return 27 }
+fn REG_SHM0()     -> i64 { return 32 }
+fn REG_SHM1()     -> i64 { return 33 }
+fn REG_SHM2()     -> i64 { return 34 }
+fn REG_SHM3()     -> i64 { return 35 }
+fn REG_LOOP0()    -> i64 { return 48 }
+fn REG_LOOP1()    -> i64 { return 49 }
+fn REG_BOUND0()   -> i64 { return 50 }
+fn REG_BOUND1()   -> i64 { return 51 }
+fn REG_ZERO()     -> i64 { return 60 }
+fn REG_ONE()      -> i64 { return 61 }
+fn REG_NEG_ONE()  -> i64 { return 62 }
+fn REG_CONST()    -> i64 { return 63 }
+
+// ---------------------------------------------------------------------------
+// Section 2 — Kernel Pattern Builders
+// ---------------------------------------------------------------------------
+// Each function returns [i64] — an array of encoded VXB instructions.
+// All kernels follow the pattern:
+//   1. Load thread/block ID
+//   2. Compute linear element index
+//   3. Load operands from global memory
+//   4. Compute result
+//   5. Store result to global memory
+//   6. Return
+
+// --- Element-wise kernels ---------------------------------------------------
+
+// C[i] = A[i] + B[i]
+fn kern_elementwise_add() -> [i64] {
+    let instrs = []
+    // load thread id into r0
+    instrs = push(instrs, vxb_instr0(OP_THREAD_ID_X(), REG_TID_X()))
+    // load A[tid] into r8
+    instrs = push(instrs, vxb_instr(OP_LD_GLOBAL(), REG_DATA0(), REG_TID_X(), 0))
+    // load B[tid] into r9
+    instrs = push(instrs, vxb_instr(OP_LD_GLOBAL(), REG_DATA1(), REG_TID_X(), 1))
+    // r16 = r8 + r9
+    instrs = push(instrs, vxb_instr(OP_FADD(), REG_ACC0(), REG_DATA0(), REG_DATA1()))
+    // store r16 -> C[tid]
+    instrs = push(instrs, vxb_instr(OP_ST_GLOBAL(), REG_TID_X(), REG_ACC0(), 2))
+    instrs = push(instrs, vxb_instr0(OP_RET(), 0))
+    return instrs
+}
+
+// C[i] = A[i] * B[i]
+fn kern_elementwise_mul() -> [i64] {
+    let instrs = []
+    instrs = push(instrs, vxb_instr0(OP_THREAD_ID_X(), REG_TID_X()))
+    instrs = push(instrs, vxb_instr(OP_LD_GLOBAL(), REG_DATA0(), REG_TID_X(), 0))
+    instrs = push(instrs, vxb_instr(OP_LD_GLOBAL(), REG_DATA1(), REG_TID_X(), 1))
+    instrs = push(instrs, vxb_instr(OP_FMUL(), REG_ACC0(), REG_DATA0(), REG_DATA1()))
+    instrs = push(instrs, vxb_instr(OP_ST_GLOBAL(), REG_TID_X(), REG_ACC0(), 2))
+    instrs = push(instrs, vxb_instr0(OP_RET(), 0))
+    return instrs
+}
+
+// D[i] = A[i]*B[i] + C[i]
+fn kern_elementwise_fma() -> [i64] {
+    let instrs = []
+    instrs = push(instrs, vxb_instr0(OP_THREAD_ID_X(), REG_TID_X()))
+    // load A[tid] -> r8, B[tid] -> r9, C[tid] -> r10
+    instrs = push(instrs, vxb_instr(OP_LD_GLOBAL(), REG_DATA0(), REG_TID_X(), 0))
+    instrs = push(instrs, vxb_instr(OP_LD_GLOBAL(), REG_DATA1(), REG_TID_X(), 1))
+    instrs = push(instrs, vxb_instr(OP_LD_GLOBAL(), REG_DATA2(), REG_TID_X(), 2))
+    // r16 = FMA(r8, r9, r10)  — src2 field encodes accumulator reg
+    instrs = push(instrs, vxb_instr(OP_FMA(), REG_ACC0(), REG_DATA0(), REG_DATA1()))
+    // add C: r16 = r16 + r10
+    instrs = push(instrs, vxb_instr(OP_FADD(), REG_ACC0(), REG_ACC0(), REG_DATA2()))
+    instrs = push(instrs, vxb_instr(OP_ST_GLOBAL(), REG_TID_X(), REG_ACC0(), 3))
+    instrs = push(instrs, vxb_instr0(OP_RET(), 0))
+    return instrs
+}
+
+// B[i] = A[i] * scale  (scale_reg holds the scalar register index)
+fn kern_scale(scale_reg: i64) -> [i64] {
+    let instrs = []
+    instrs = push(instrs, vxb_instr0(OP_THREAD_ID_X(), REG_TID_X()))
+    instrs = push(instrs, vxb_instr(OP_LD_GLOBAL(), REG_DATA0(), REG_TID_X(), 0))
+    instrs = push(instrs, vxb_instr(OP_FMUL(), REG_ACC0(), REG_DATA0(), scale_reg))
+    instrs = push(instrs, vxb_instr(OP_ST_GLOBAL(), REG_TID_X(), REG_ACC0(), 1))
+    instrs = push(instrs, vxb_instr0(OP_RET(), 0))
+    return instrs
+}
+
+// B[i] = -A[i]
+fn kern_negate() -> [i64] {
+    let instrs = []
+    instrs = push(instrs, vxb_instr0(OP_THREAD_ID_X(), REG_TID_X()))
+    instrs = push(instrs, vxb_instr(OP_LD_GLOBAL(), REG_DATA0(), REG_TID_X(), 0))
+    instrs = push(instrs, vxb_instr(OP_FNEG(), REG_ACC0(), REG_DATA0(), 0))
+    instrs = push(instrs, vxb_instr(OP_ST_GLOBAL(), REG_TID_X(), REG_ACC0(), 1))
+    instrs = push(instrs, vxb_instr0(OP_RET(), 0))
+    return instrs
+}
+
+// --- Activation kernels -----------------------------------------------------
+
+// B[i] = max(0, A[i])
+fn kern_relu() -> [i64] {
+    let instrs = []
+    instrs = push(instrs, vxb_instr0(OP_THREAD_ID_X(), REG_TID_X()))
+    instrs = push(instrs, vxb_instr(OP_LD_GLOBAL(), REG_DATA0(), REG_TID_X(), 0))
+    // r60 = 0.0 (zero register by convention)
+    instrs = push(instrs, vxb_instr(OP_LD_CONST(), REG_ZERO(), 0, 0))
+    // r16 = max(r8, r60)
+    instrs = push(instrs, vxb_instr(OP_FMAX(), REG_ACC0(), REG_DATA0(), REG_ZERO()))
+    instrs = push(instrs, vxb_instr(OP_ST_GLOBAL(), REG_TID_X(), REG_ACC0(), 1))
+    instrs = push(instrs, vxb_instr0(OP_RET(), 0))
+    return instrs
+}
+
+// B[i] = GELU(A[i]) — uses the fused GELU opcode
+fn kern_gelu() -> [i64] {
+    let instrs = []
+    instrs = push(instrs, vxb_instr0(OP_THREAD_ID_X(), REG_TID_X()))
+    instrs = push(instrs, vxb_instr(OP_LD_GLOBAL(), REG_DATA0(), REG_TID_X(), 0))
+    // fused GELU: OP_FUSED_GELU dst=r16 src=r8
+    instrs = push(instrs, vxb_instr(OP_FUSED_GELU(), REG_ACC0(), REG_DATA0(), 0))
+    instrs = push(instrs, vxb_instr(OP_ST_GLOBAL(), REG_TID_X(), REG_ACC0(), 1))
+    instrs = push(instrs, vxb_instr0(OP_RET(), 0))
+    return instrs
+}
+
+// B[i] = SiLU(A[i]) = A[i] * sigmoid(A[i])
+// sigmoid(x) = 1 / (1 + exp(-x))
+fn kern_silu() -> [i64] {
+    let instrs = []
+    instrs = push(instrs, vxb_instr0(OP_THREAD_ID_X(), REG_TID_X()))
+    instrs = push(instrs, vxb_instr(OP_LD_GLOBAL(), REG_DATA0(), REG_TID_X(), 0))
+    // r24 = -x
+    instrs = push(instrs, vxb_instr(OP_FNEG(), REG_SCRATCH0(), REG_DATA0(), 0))
+    // r24 = exp(-x)
+    instrs = push(instrs, vxb_instr(OP_FEXP(), REG_SCRATCH0(), REG_SCRATCH0(), 0))
+    // r61 = 1.0 (one register by convention)
+    instrs = push(instrs, vxb_instr(OP_LD_CONST(), REG_ONE(), 1, 0))
+    // r25 = 1 + exp(-x)
+    instrs = push(instrs, vxb_instr(OP_FADD(), REG_SCRATCH1(), REG_ONE(), REG_SCRATCH0()))
+    // r25 = 1 / (1 + exp(-x))  = sigmoid(x)
+    instrs = push(instrs, vxb_instr(OP_FDIV(), REG_SCRATCH1(), REG_ONE(), REG_SCRATCH1()))
+    // r16 = x * sigmoid(x)
+    instrs = push(instrs, vxb_instr(OP_FMUL(), REG_ACC0(), REG_DATA0(), REG_SCRATCH1()))
+    instrs = push(instrs, vxb_instr(OP_ST_GLOBAL(), REG_TID_X(), REG_ACC0(), 1))
+    instrs = push(instrs, vxb_instr0(OP_RET(), 0))
+    return instrs
+}
+
+// B[i] = sigmoid(A[i]) = 1 / (1 + exp(-x))
+fn kern_sigmoid() -> [i64] {
+    let instrs = []
+    instrs = push(instrs, vxb_instr0(OP_THREAD_ID_X(), REG_TID_X()))
+    instrs = push(instrs, vxb_instr(OP_LD_GLOBAL(), REG_DATA0(), REG_TID_X(), 0))
+    // r24 = -x
+    instrs = push(instrs, vxb_instr(OP_FNEG(), REG_SCRATCH0(), REG_DATA0(), 0))
+    // r24 = exp(-x)
+    instrs = push(instrs, vxb_instr(OP_FEXP(), REG_SCRATCH0(), REG_SCRATCH0(), 0))
+    // r61 = 1.0
+    instrs = push(instrs, vxb_instr(OP_LD_CONST(), REG_ONE(), 1, 0))
+    // r25 = 1 + exp(-x)
+    instrs = push(instrs, vxb_instr(OP_FADD(), REG_SCRATCH1(), REG_ONE(), REG_SCRATCH0()))
+    // r16 = 1 / (1 + exp(-x))
+    instrs = push(instrs, vxb_instr(OP_FDIV(), REG_ACC0(), REG_ONE(), REG_SCRATCH1()))
+    instrs = push(instrs, vxb_instr(OP_ST_GLOBAL(), REG_TID_X(), REG_ACC0(), 1))
+    instrs = push(instrs, vxb_instr0(OP_RET(), 0))
+    return instrs
+}
+
+// B[i] = tanh(A[i]) = (exp(x) - exp(-x)) / (exp(x) + exp(-x))
+fn kern_tanh() -> [i64] {
+    let instrs = []
+    instrs = push(instrs, vxb_instr0(OP_THREAD_ID_X(), REG_TID_X()))
+    instrs = push(instrs, vxb_instr(OP_LD_GLOBAL(), REG_DATA0(), REG_TID_X(), 0))
+    // r24 = exp(x)
+    instrs = push(instrs, vxb_instr(OP_FEXP(), REG_SCRATCH0(), REG_DATA0(), 0))
+    // r25 = -x
+    instrs = push(instrs, vxb_instr(OP_FNEG(), REG_SCRATCH1(), REG_DATA0(), 0))
+    // r25 = exp(-x)
+    instrs = push(instrs, vxb_instr(OP_FEXP(), REG_SCRATCH1(), REG_SCRATCH1(), 0))
+    // r16 = exp(x) - exp(-x)   numerator
+    instrs = push(instrs, vxb_instr(OP_FSUB(), REG_ACC0(), REG_SCRATCH0(), REG_SCRATCH1()))
+    // r17 = exp(x) + exp(-x)   denominator
+    instrs = push(instrs, vxb_instr(OP_FADD(), REG_ACC1(), REG_SCRATCH0(), REG_SCRATCH1()))
+    // r16 = numerator / denominator
+    instrs = push(instrs, vxb_instr(OP_FDIV(), REG_ACC0(), REG_ACC0(), REG_ACC1()))
+    instrs = push(instrs, vxb_instr(OP_ST_GLOBAL(), REG_TID_X(), REG_ACC0(), 1))
+    instrs = push(instrs, vxb_instr0(OP_RET(), 0))
+    return instrs
+}
+
+// --- Reduction kernels -------------------------------------------------------
+
+// Warp-level sum reduction
+fn kern_reduce_sum() -> [i64] {
+    let instrs = []
+    instrs = push(instrs, vxb_instr0(OP_THREAD_ID_X(), REG_TID_X()))
+    instrs = push(instrs, vxb_instr(OP_LD_GLOBAL(), REG_DATA0(), REG_TID_X(), 0))
+    // warp reduce sum: dst=r16, src=r8 (aggregates across warp lanes)
+    instrs = push(instrs, vxb_instr(OP_WARP_REDUCE_SUM(), REG_ACC0(), REG_DATA0(), 0))
+    instrs = push(instrs, vxb_instr(OP_ST_GLOBAL(), REG_TID_X(), REG_ACC0(), 1))
+    instrs = push(instrs, vxb_instr0(OP_RET(), 0))
+    return instrs
+}
+
+// Warp-level max reduction
+fn kern_reduce_max() -> [i64] {
+    let instrs = []
+    instrs = push(instrs, vxb_instr0(OP_THREAD_ID_X(), REG_TID_X()))
+    instrs = push(instrs, vxb_instr(OP_LD_GLOBAL(), REG_DATA0(), REG_TID_X(), 0))
+    instrs = push(instrs, vxb_instr(OP_WARP_REDUCE_MAX(), REG_ACC0(), REG_DATA0(), 0))
+    instrs = push(instrs, vxb_instr(OP_ST_GLOBAL(), REG_TID_X(), REG_ACC0(), 1))
+    instrs = push(instrs, vxb_instr0(OP_RET(), 0))
+    return instrs
+}
+
+// Mean = sum then divide by count (r50 = bound/count register)
+fn kern_reduce_mean() -> [i64] {
+    let instrs = []
+    instrs = push(instrs, vxb_instr0(OP_THREAD_ID_X(), REG_TID_X()))
+    instrs = push(instrs, vxb_instr(OP_LD_GLOBAL(), REG_DATA0(), REG_TID_X(), 0))
+    // warp sum into r16
+    instrs = push(instrs, vxb_instr(OP_WARP_REDUCE_SUM(), REG_ACC0(), REG_DATA0(), 0))
+    // load element count from constant buffer into r50
+    instrs = push(instrs, vxb_instr(OP_LD_CONST(), REG_BOUND0(), 0, 0))
+    // convert count i64 -> f32
+    instrs = push(instrs, vxb_instr(OP_I2F(), REG_SCRATCH0(), REG_BOUND0(), 0))
+    // mean = sum / count
+    instrs = push(instrs, vxb_instr(OP_FDIV(), REG_ACC0(), REG_ACC0(), REG_SCRATCH0()))
+    instrs = push(instrs, vxb_instr(OP_ST_GLOBAL(), REG_TID_X(), REG_ACC0(), 1))
+    instrs = push(instrs, vxb_instr0(OP_RET(), 0))
+    return instrs
+}
+
+// --- Matrix kernels ----------------------------------------------------------
+
+// Tiled matrix multiply — delegates to OP_TILED_MATMUL fused op
+fn kern_matmul_tiled() -> [i64] {
+    let instrs = []
+    instrs = push(instrs, vxb_instr0(OP_THREAD_ID_X(), REG_TID_X()))
+    instrs = push(instrs, vxb_instr0(OP_THREAD_ID_X(), REG_TID_Y()))
+    instrs = push(instrs, vxb_instr0(OP_BLOCK_ID_X(), REG_BLOCK_X()))
+    // tiled matmul: src1=A base reg, src2=B base reg, dst=C base reg
+    instrs = push(instrs, vxb_instr(OP_TILED_MATMUL(), REG_ACC0(), REG_DATA0(), REG_DATA1()))
+    instrs = push(instrs, vxb_instr(OP_ST_GLOBAL(), REG_TID_X(), REG_ACC0(), 2))
+    instrs = push(instrs, vxb_instr0(OP_RET(), 0))
+    return instrs
+}
+
+// Naive matrix multiply — explicit FMA loop
+// For an M x K x N matmul: C[row][col] += A[row][k] * B[k][col]
+fn kern_matmul_naive() -> [i64] {
+    let instrs = []
+    // get 2D thread indices
+    instrs = push(instrs, vxb_instr0(OP_THREAD_ID_X(), REG_TID_X()))
+    instrs = push(instrs, vxb_instr0(OP_THREAD_ID_X(), REG_TID_Y()))
+    // load dimension K from constant buffer into loop bound r50
+    instrs = push(instrs, vxb_instr(OP_LD_CONST(), REG_BOUND0(), 0, 0))
+    // zero accumulator r16
+    instrs = push(instrs, vxb_instr(OP_LD_CONST(), REG_ACC0(), 0, 0))
+    // loop counter r48 = 0
+    instrs = push(instrs, vxb_instr(OP_LD_CONST(), REG_LOOP0(), 0, 0))
+    // loop body: addr_A = row*K + k -> load r8; addr_B = k*N + col -> load r9
+    instrs = push(instrs, vxb_instr(OP_IMUL(), REG_ADDR0(), REG_TID_Y(), REG_BOUND0()))
+    instrs = push(instrs, vxb_instr(OP_IADD(), REG_ADDR0(), REG_ADDR0(), REG_LOOP0()))
+    instrs = push(instrs, vxb_instr(OP_LD_GLOBAL(), REG_DATA0(), REG_ADDR0(), 0))
+    instrs = push(instrs, vxb_instr(OP_LD_CONST(), REG_BOUND1(), 1, 0))
+    instrs = push(instrs, vxb_instr(OP_IMUL(), REG_ADDR1(), REG_LOOP0(), REG_BOUND1()))
+    instrs = push(instrs, vxb_instr(OP_IADD(), REG_ADDR1(), REG_ADDR1(), REG_TID_X()))
+    instrs = push(instrs, vxb_instr(OP_LD_GLOBAL(), REG_DATA1(), REG_ADDR1(), 1))
+    // acc += A * B via FMA
+    instrs = push(instrs, vxb_instr(OP_FMA(), REG_ACC0(), REG_DATA0(), REG_DATA1()))
+    instrs = push(instrs, vxb_instr(OP_FADD(), REG_ACC0(), REG_ACC0(), REG_ACC0()))
+    // loop increment and branch
+    instrs = push(instrs, vxb_instr(OP_IADD(), REG_LOOP0(), REG_LOOP0(), REG_ONE()))
+    instrs = push(instrs, vxb_instr(OP_FLT(), REG_SCRATCH0(), REG_LOOP0(), REG_BOUND0()))
+    instrs = push(instrs, vxb_instr(OP_BRANCH_COND(), REG_SCRATCH0(), 0, 0))
+    // store result
+    instrs = push(instrs, vxb_instr(OP_LD_CONST(), REG_BOUND1(), 1, 0))
+    instrs = push(instrs, vxb_instr(OP_IMUL(), REG_ADDR2(), REG_TID_Y(), REG_BOUND1()))
+    instrs = push(instrs, vxb_instr(OP_IADD(), REG_ADDR2(), REG_ADDR2(), REG_TID_X()))
+    instrs = push(instrs, vxb_instr(OP_ST_GLOBAL(), REG_ADDR2(), REG_ACC0(), 2))
+    instrs = push(instrs, vxb_instr0(OP_RET(), 0))
+    return instrs
+}
+
+// Transpose via shared memory
+fn kern_transpose() -> [i64] {
+    let instrs = []
+    instrs = push(instrs, vxb_instr0(OP_THREAD_ID_X(), REG_TID_X()))
+    instrs = push(instrs, vxb_instr0(OP_THREAD_ID_X(), REG_TID_Y()))
+    // load A[row][col] -> r8
+    instrs = push(instrs, vxb_instr(OP_LD_CONST(), REG_BOUND0(), 0, 0))
+    instrs = push(instrs, vxb_instr(OP_IMUL(), REG_ADDR0(), REG_TID_Y(), REG_BOUND0()))
+    instrs = push(instrs, vxb_instr(OP_IADD(), REG_ADDR0(), REG_ADDR0(), REG_TID_X()))
+    instrs = push(instrs, vxb_instr(OP_LD_GLOBAL(), REG_DATA0(), REG_ADDR0(), 0))
+    // store to shared mem at transposed coords
+    instrs = push(instrs, vxb_instr(OP_IMUL(), REG_SHM0(), REG_TID_X(), REG_BOUND0()))
+    instrs = push(instrs, vxb_instr(OP_IADD(), REG_SHM0(), REG_SHM0(), REG_TID_Y()))
+    instrs = push(instrs, vxb_instr(OP_ST_SHARED(), REG_SHM0(), REG_DATA0(), 0))
+    instrs = push(instrs, vxb_instr0(OP_BARRIER(), 0))
+    // load from shared mem and write to global output
+    instrs = push(instrs, vxb_instr(OP_LD_SHARED(), REG_DATA1(), REG_SHM0(), 0))
+    instrs = push(instrs, vxb_instr(OP_ST_GLOBAL(), REG_ADDR0(), REG_DATA1(), 1))
+    instrs = push(instrs, vxb_instr0(OP_RET(), 0))
+    return instrs
+}
+
+// --- Normalization kernels ---------------------------------------------------
+
+// LayerNorm — uses OP_FUSED_LAYERNORM
+fn kern_layernorm() -> [i64] {
+    let instrs = []
+    instrs = push(instrs, vxb_instr0(OP_THREAD_ID_X(), REG_TID_X()))
+    instrs = push(instrs, vxb_instr(OP_LD_GLOBAL(), REG_DATA0(), REG_TID_X(), 0))
+    // fused layernorm: dst=r16 src=r8 weight=r9
+    instrs = push(instrs, vxb_instr(OP_LD_GLOBAL(), REG_DATA1(), REG_TID_X(), 1))
+    instrs = push(instrs, vxb_instr(OP_FUSED_LAYERNORM(), REG_ACC0(), REG_DATA0(), REG_DATA1()))
+    instrs = push(instrs, vxb_instr(OP_ST_GLOBAL(), REG_TID_X(), REG_ACC0(), 2))
+    instrs = push(instrs, vxb_instr0(OP_RET(), 0))
+    return instrs
+}
+
+// RMSNorm — manual: x / sqrt(mean(x^2) + epsilon)
+fn kern_rmsnorm() -> [i64] {
+    let instrs = []
+    instrs = push(instrs, vxb_instr0(OP_THREAD_ID_X(), REG_TID_X()))
+    instrs = push(instrs, vxb_instr(OP_LD_GLOBAL(), REG_DATA0(), REG_TID_X(), 0))
+    // r24 = x * x
+    instrs = push(instrs, vxb_instr(OP_FMUL(), REG_SCRATCH0(), REG_DATA0(), REG_DATA0()))
+    // warp sum of x^2
+    instrs = push(instrs, vxb_instr(OP_WARP_REDUCE_SUM(), REG_ACC0(), REG_SCRATCH0(), 0))
+    // mean = sum / N
+    instrs = push(instrs, vxb_instr(OP_LD_CONST(), REG_BOUND0(), 0, 0))
+    instrs = push(instrs, vxb_instr(OP_I2F(), REG_SCRATCH1(), REG_BOUND0(), 0))
+    instrs = push(instrs, vxb_instr(OP_FDIV(), REG_ACC0(), REG_ACC0(), REG_SCRATCH1()))
+    // add epsilon (loaded from const buffer into r61)
+    instrs = push(instrs, vxb_instr(OP_LD_CONST(), REG_ONE(), 2, 0))
+    instrs = push(instrs, vxb_instr(OP_FADD(), REG_ACC0(), REG_ACC0(), REG_ONE()))
+    // rms = sqrt(mean + eps)
+    instrs = push(instrs, vxb_instr(OP_FSQRT(), REG_ACC0(), REG_ACC0(), 0))
+    // normalized = x / rms
+    instrs = push(instrs, vxb_instr(OP_FDIV(), REG_ACC1(), REG_DATA0(), REG_ACC0()))
+    // scale by weight
+    instrs = push(instrs, vxb_instr(OP_LD_GLOBAL(), REG_DATA1(), REG_TID_X(), 1))
+    instrs = push(instrs, vxb_instr(OP_FMUL(), REG_ACC1(), REG_ACC1(), REG_DATA1()))
+    instrs = push(instrs, vxb_instr(OP_ST_GLOBAL(), REG_TID_X(), REG_ACC1(), 2))
+    instrs = push(instrs, vxb_instr0(OP_RET(), 0))
+    return instrs
+}
+
+// Softmax: max subtract, exp, sum, divide
+fn kern_softmax() -> [i64] {
+    let instrs = []
+    instrs = push(instrs, vxb_instr0(OP_THREAD_ID_X(), REG_TID_X()))
+    instrs = push(instrs, vxb_instr(OP_LD_GLOBAL(), REG_DATA0(), REG_TID_X(), 0))
+    // step 1: warp max
+    instrs = push(instrs, vxb_instr(OP_WARP_REDUCE_MAX(), REG_ACC0(), REG_DATA0(), 0))
+    // step 2: subtract max
+    instrs = push(instrs, vxb_instr(OP_FSUB(), REG_DATA0(), REG_DATA0(), REG_ACC0()))
+    // step 3: exp
+    instrs = push(instrs, vxb_instr(OP_FEXP(), REG_DATA0(), REG_DATA0(), 0))
+    // step 4: warp sum of exp values
+    instrs = push(instrs, vxb_instr(OP_WARP_REDUCE_SUM(), REG_ACC1(), REG_DATA0(), 0))
+    // step 5: divide by sum
+    instrs = push(instrs, vxb_instr(OP_FDIV(), REG_ACC0(), REG_DATA0(), REG_ACC1()))
+    instrs = push(instrs, vxb_instr(OP_ST_GLOBAL(), REG_TID_X(), REG_ACC0(), 1))
+    instrs = push(instrs, vxb_instr0(OP_RET(), 0))
+    return instrs
+}
+
+// --- Attention kernels -------------------------------------------------------
+
+// Standard attention — uses OP_FUSED_ATTENTION
+fn kern_attention() -> [i64] {
+    let instrs = []
+    instrs = push(instrs, vxb_instr0(OP_THREAD_ID_X(), REG_TID_X()))
+    // load Q, K, V base addresses from constant buffer
+    instrs = push(instrs, vxb_instr(OP_LD_CONST(), REG_ADDR0(), 0, 0))
+    instrs = push(instrs, vxb_instr(OP_LD_CONST(), REG_ADDR1(), 1, 0))
+    instrs = push(instrs, vxb_instr(OP_LD_CONST(), REG_ADDR2(), 2, 0))
+    // load Q[tid], K[tid], V[tid]
+    instrs = push(instrs, vxb_instr(OP_LD_GLOBAL(), REG_DATA0(), REG_ADDR0(), 0))
+    instrs = push(instrs, vxb_instr(OP_LD_GLOBAL(), REG_DATA1(), REG_ADDR1(), 0))
+    instrs = push(instrs, vxb_instr(OP_LD_GLOBAL(), REG_DATA2(), REG_ADDR2(), 0))
+    // fused attention: dst=r16 Q=r8 K=r9 (V encoded in src2 field)
+    instrs = push(instrs, vxb_instr(OP_FUSED_ATTENTION(), REG_ACC0(), REG_DATA0(), REG_DATA1()))
+    instrs = push(instrs, vxb_instr(OP_ST_GLOBAL(), REG_TID_X(), REG_ACC0(), 3))
+    instrs = push(instrs, vxb_instr0(OP_RET(), 0))
+    return instrs
+}
+
+// Flash attention — tiled with online softmax
+fn kern_flash_attention() -> [i64] {
+    let instrs = []
+    instrs = push(instrs, vxb_instr0(OP_THREAD_ID_X(), REG_TID_X()))
+    instrs = push(instrs, vxb_instr0(OP_BLOCK_ID_X(), REG_BLOCK_X()))
+    // load tile dimension from const buffer
+    instrs = push(instrs, vxb_instr(OP_LD_CONST(), REG_BOUND0(), 0, 0))
+    // initialize online softmax running max = -inf, running sum = 0
+    instrs = push(instrs, vxb_instr(OP_LD_CONST(), REG_ACC2(), 3, 0))
+    instrs = push(instrs, vxb_instr(OP_LD_CONST(), REG_ACC3(), 0, 0))
+    // outer loop counter r48 = 0
+    instrs = push(instrs, vxb_instr(OP_LD_CONST(), REG_LOOP0(), 0, 0))
+    // load Q tile for this block into shared mem
+    instrs = push(instrs, vxb_instr(OP_IMUL(), REG_ADDR0(), REG_BLOCK_X(), REG_BOUND0()))
+    instrs = push(instrs, vxb_instr(OP_IADD(), REG_ADDR0(), REG_ADDR0(), REG_TID_X()))
+    instrs = push(instrs, vxb_instr(OP_LD_GLOBAL(), REG_DATA0(), REG_ADDR0(), 0))
+    instrs = push(instrs, vxb_instr(OP_ST_SHARED(), REG_SHM0(), REG_DATA0(), 0))
+    instrs = push(instrs, vxb_instr0(OP_BARRIER(), 0))
+    // inner tile loop: load K tile, compute QK^T dot product
+    instrs = push(instrs, vxb_instr(OP_IMUL(), REG_ADDR1(), REG_LOOP0(), REG_BOUND0()))
+    instrs = push(instrs, vxb_instr(OP_IADD(), REG_ADDR1(), REG_ADDR1(), REG_TID_X()))
+    instrs = push(instrs, vxb_instr(OP_LD_GLOBAL(), REG_DATA1(), REG_ADDR1(), 1))
+    // score = Q . K
+    instrs = push(instrs, vxb_instr(OP_FMUL(), REG_SCRATCH0(), REG_DATA0(), REG_DATA1()))
+    instrs = push(instrs, vxb_instr(OP_WARP_REDUCE_SUM(), REG_SCRATCH0(), REG_SCRATCH0(), 0))
+    // online softmax: new_max = max(running_max, score)
+    instrs = push(instrs, vxb_instr(OP_FMAX(), REG_ACC4(), REG_ACC2(), REG_SCRATCH0()))
+    // correction factor = exp(old_max - new_max)
+    instrs = push(instrs, vxb_instr(OP_FSUB(), REG_SCRATCH1(), REG_ACC2(), REG_ACC4()))
+    instrs = push(instrs, vxb_instr(OP_FEXP(), REG_SCRATCH1(), REG_SCRATCH1(), 0))
+    // update running sum: sum = sum * correction + exp(score - new_max)
+    instrs = push(instrs, vxb_instr(OP_FMUL(), REG_ACC3(), REG_ACC3(), REG_SCRATCH1()))
+    instrs = push(instrs, vxb_instr(OP_FSUB(), REG_SCRATCH2(), REG_SCRATCH0(), REG_ACC4()))
+    instrs = push(instrs, vxb_instr(OP_FEXP(), REG_SCRATCH2(), REG_SCRATCH2(), 0))
+    instrs = push(instrs, vxb_instr(OP_FADD(), REG_ACC3(), REG_ACC3(), REG_SCRATCH2()))
+    // update running max
+    instrs = push(instrs, vxb_instr(OP_FADD(), REG_ACC2(), REG_ACC4(), REG_ZERO()))
+    // load V tile and accumulate weighted output
+    instrs = push(instrs, vxb_instr(OP_LD_GLOBAL(), REG_DATA2(), REG_ADDR1(), 2))
+    instrs = push(instrs, vxb_instr(OP_FMUL(), REG_SCRATCH3(), REG_SCRATCH2(), REG_DATA2()))
+    instrs = push(instrs, vxb_instr(OP_FADD(), REG_ACC0(), REG_ACC0(), REG_SCRATCH3()))
+    // loop increment
+    instrs = push(instrs, vxb_instr(OP_IADD(), REG_LOOP0(), REG_LOOP0(), REG_ONE()))
+    instrs = push(instrs, vxb_instr(OP_LD_CONST(), REG_BOUND1(), 4, 0))
+    instrs = push(instrs, vxb_instr(OP_FLT(), REG_SCRATCH0(), REG_LOOP0(), REG_BOUND1()))
+    instrs = push(instrs, vxb_instr(OP_BRANCH_COND(), REG_SCRATCH0(), 0, 0))
+    instrs = push(instrs, vxb_instr0(OP_BARRIER(), 0))
+    // normalize output by running sum
+    instrs = push(instrs, vxb_instr(OP_FDIV(), REG_ACC0(), REG_ACC0(), REG_ACC3()))
+    instrs = push(instrs, vxb_instr(OP_ST_GLOBAL(), REG_TID_X(), REG_ACC0(), 3))
+    instrs = push(instrs, vxb_instr0(OP_RET(), 0))
+    return instrs
+}
+
+// ---------------------------------------------------------------------------
+// Section 3 — Kernel Fusion Engine
+// ---------------------------------------------------------------------------
+
+// Check whether an instruction is a global store (OP_ST_GLOBAL = 65)
+// instr is a [i64] sub-array: [op, dst, src1, src2]
+fn is_store_global(instr: [i64]) -> bool {
+    let op = instr[0]
+    return op == OP_ST_GLOBAL()
+}
+
+// Check whether an instruction is a global load (OP_LD_GLOBAL = 64)
+fn is_load_global(instr: [i64]) -> bool {
+    let op = instr[0]
+    return op == OP_LD_GLOBAL()
+}
+
+// Check whether an instruction is a RET (OP_RET = 99)
+fn is_ret(instr: [i64]) -> bool {
+    let op = instr[0]
+    return op == OP_RET()
+}
+
+// Check whether an instruction is a NOP (OP_NOP = 0)
+fn is_nop(instr: [i64]) -> bool {
+    return instr[0] == 0
+}
+
+// Extract the opcode from an instruction
+fn instr_opcode(instr: [i64]) -> i64 {
+    return instr[0]
+}
+
+// Extract the destination register from an instruction
+fn instr_dst(instr: [i64]) -> i64 {
+    return instr[1]
+}
+
+// Extract src1 register from an instruction
+fn instr_src1(instr: [i64]) -> i64 {
+    return instr[2]
+}
+
+// Extract src2 register from an instruction
+fn instr_src2(instr: [i64]) -> i64 {
+    return instr[3]
+}
+
+// Fuse two element-wise kernels by removing trailing store/ret from 'a'
+// and leading load/tid from 'b', chaining them directly.
+fn fuse_kernels(a: [i64], b: [i64]) -> [i64] {
+    let fused = []
+    let n_a = len(a)
+    let n_b = len(b)
+    // copy all of kernel a except the trailing RET instruction
+    let i = 0
+    loop {
+        if i >= n_a {
+            break
+        }
+        let instr = a[i]
+        // skip the RET at end of a
+        if is_ret(instr) {
+            i = i + 1
+        } else {
+            fused = push(fused, instr)
+            i = i + 1
+        }
+    }
+    // copy kernel b, skipping the initial THREAD_ID_X and first LD_GLOBAL
+    // (they duplicate what kernel a already loaded)
+    let j = 0
+    let skip_loads = 2
+    loop {
+        if j >= n_b {
+            break
+        }
+        let instr = b[j]
+        if skip_loads > 0 {
+            if is_load_global(instr) {
+                skip_loads = skip_loads - 1
+                j = j + 1
+            } else {
+                fused = push(fused, instr)
+                j = j + 1
+            }
+        } else {
+            fused = push(fused, instr)
+            j = j + 1
+        }
+    }
+    return fused
+}
+
+// Peephole optimizer: remove NOPs, eliminate obviously dead register writes
+fn optimize_kernel(kern: [i64]) -> [i64] {
+    let n = len(kern)
+    let pass1 = []
+    // pass 1: strip NOPs
+    let i = 0
+    loop {
+        if i >= n {
+            break
+        }
+        let instr = kern[i]
+        if is_nop(instr) {
+            i = i + 1
+        } else {
+            pass1 = push(pass1, instr)
+            i = i + 1
+        }
+    }
+    // pass 2: dead-store elimination
+    // mark which dst registers are read by any subsequent instruction
+    let n2 = len(pass1)
+    let pass2 = []
+    let j = 0
+    loop {
+        if j >= n2 {
+            break
+        }
+        let instr = pass1[j]
+        let dst = instr_dst(instr)
+        // check if dst is used as src in any later instruction
+        let used = false
+        let k = j + 1
+        loop {
+            if k >= n2 {
+                break
+            }
+            let later = pass1[k]
+            let s1 = instr_src1(later)
+            if s1 == dst {
+                used = true
+            }
+            k = k + 1
+        }
+        // always keep stores, rets, branches, and barriers regardless
+        let op = instr_opcode(instr)
+        let is_side_effect = false
+        if op == OP_ST_GLOBAL() {
+            is_side_effect = true
+        }
+        if op == OP_ST_SHARED() {
+            is_side_effect = true
+        }
+        if op == OP_RET() {
+            is_side_effect = true
+        }
+        if op == OP_BARRIER() {
+            is_side_effect = true
+        }
+        if op == OP_BRANCH() {
+            is_side_effect = true
+        }
+        if op == OP_BRANCH_COND() {
+            is_side_effect = true
+        }
+        if used {
+            pass2 = push(pass2, instr)
+        } else {
+            if is_side_effect {
+                pass2 = push(pass2, instr)
+            }
+        }
+        j = j + 1
+    }
+    return pass2
+}
+
+// ---------------------------------------------------------------------------
+// Section 4 — Kernel Metadata
+// ---------------------------------------------------------------------------
+
+// Count arithmetic instructions (FADD, FSUB, FMUL, FDIV, FMA, FNEG, FABS,
+// FSQRT, FEXP, FLOG, FMAX, FMIN, IADD, ISUB, IMUL)
+fn kernel_flops(kern: [i64]) -> i64 {
+    let count = 0
+    let n = len(kern)
+    let i = 0
+    loop {
+        if i >= n {
+            break
+        }
+        let instr = kern[i]
+        let op = instr_opcode(instr)
+        let is_arith = false
+        if op == OP_FADD()  { is_arith = true }
+        if op == OP_FSUB()  { is_arith = true }
+        if op == OP_FMUL()  { is_arith = true }
+        if op == OP_FDIV()  { is_arith = true }
+        if op == OP_FMA()   { is_arith = true }
+        if op == OP_FNEG()  { is_arith = true }
+        if op == OP_FABS()  { is_arith = true }
+        if op == OP_FSQRT() { is_arith = true }
+        if op == OP_FEXP()  { is_arith = true }
+        if op == OP_FLOG()  { is_arith = true }
+        if op == OP_FMAX()  { is_arith = true }
+        if op == OP_FMIN()  { is_arith = true }
+        if op == OP_IADD()  { is_arith = true }
+        if op == OP_ISUB()  { is_arith = true }
+        if op == OP_IMUL()  { is_arith = true }
+        if is_arith {
+            count = count + 1
+        }
+        i = i + 1
+    }
+    return count
+}
+
+// Count memory instructions (LD_GLOBAL, ST_GLOBAL, LD_SHARED, ST_SHARED,
+// LD_CONST, WARP_REDUCE_SUM, WARP_REDUCE_MAX, WARP_SHUFFLE)
+fn kernel_mem_ops(kern: [i64]) -> i64 {
+    let count = 0
+    let n = len(kern)
+    let i = 0
+    loop {
+        if i >= n {
+            break
+        }
+        let instr = kern[i]
+        let op = instr_opcode(instr)
+        let is_mem = false
+        if op == OP_LD_GLOBAL()      { is_mem = true }
+        if op == OP_ST_GLOBAL()      { is_mem = true }
+        if op == OP_LD_SHARED()      { is_mem = true }
+        if op == OP_ST_SHARED()      { is_mem = true }
+        if op == OP_LD_CONST()       { is_mem = true }
+        if op == OP_WARP_REDUCE_SUM() { is_mem = true }
+        if op == OP_WARP_REDUCE_MAX() { is_mem = true }
+        if op == OP_WARP_SHUFFLE()   { is_mem = true }
+        if is_mem {
+            count = count + 1
+        }
+        i = i + 1
+    }
+    return count
+}
+
+// Arithmetic intensity = flops / mem_ops  (0.0 if no mem ops)
+fn kernel_arithmetic_intensity(kern: [i64]) -> f64 {
+    let flops = kernel_flops(kern)
+    let mops  = kernel_mem_ops(kern)
+    if mops == 0 {
+        return 0.0
+    }
+    return float(flops) / float(mops)
+}
+
+// ---------------------------------------------------------------------------
+// Section 5 — Helpers for pretty printing
+// ---------------------------------------------------------------------------
+
+fn print_kernel_stats(name: String, kern: [i64]) {
+    let nl = str_from_bytes([10])
+    let instrs  = len(kern)
+    let flops   = kernel_flops(kern)
+    let mops    = kernel_mem_ops(kern)
+    let ai      = kernel_arithmetic_intensity(kern)
+    print("  Kernel: " + name)
+    print("    instructions : " + to_string(instrs))
+    print("    flops        : " + to_string(flops))
+    print("    mem ops      : " + to_string(mops))
+    print("    arith intensity: " + to_string(ai))
+}
+
+// ---------------------------------------------------------------------------
+// Section 6 — main
+// ---------------------------------------------------------------------------
+
+fn main() {
+    let nl  = str_from_bytes([10])
+    let sep = "----------------------------------------"
+
+    print("Vortex Kernel Library — VXB ISA Edition")
+    print(sep)
+
+    // --- Build element-wise kernels ----------------------------------------
+    let k_add    = kern_elementwise_add()
+    let k_mul    = kern_elementwise_mul()
+    let k_fma    = kern_elementwise_fma()
+    let k_neg    = kern_negate()
+    let k_scale  = kern_scale(REG_CONST())
+
+    print(nl + "[1] Element-wise kernels")
+    print_kernel_stats("elementwise_add", k_add)
+    print_kernel_stats("elementwise_mul", k_mul)
+    print_kernel_stats("elementwise_fma", k_fma)
+    print_kernel_stats("negate",          k_neg)
+    print_kernel_stats("scale",           k_scale)
+
+    // --- Build activation kernels ------------------------------------------
+    let k_relu    = kern_relu()
+    let k_gelu    = kern_gelu()
+    let k_silu    = kern_silu()
+    let k_sigmoid = kern_sigmoid()
+    let k_tanh    = kern_tanh()
+
+    print(nl + "[2] Activation kernels")
+    print_kernel_stats("relu",    k_relu)
+    print_kernel_stats("gelu",    k_gelu)
+    print_kernel_stats("silu",    k_silu)
+    print_kernel_stats("sigmoid", k_sigmoid)
+    print_kernel_stats("tanh",    k_tanh)
+
+    // --- Build reduction kernels -------------------------------------------
+    let k_rsum  = kern_reduce_sum()
+    let k_rmax  = kern_reduce_max()
+    let k_rmean = kern_reduce_mean()
+
+    print(nl + "[3] Reduction kernels")
+    print_kernel_stats("reduce_sum",  k_rsum)
+    print_kernel_stats("reduce_max",  k_rmax)
+    print_kernel_stats("reduce_mean", k_rmean)
+
+    // --- Build matrix kernels -----------------------------------------------
+    let k_matmul_t = kern_matmul_tiled()
+    let k_matmul_n = kern_matmul_naive()
+    let k_transpose = kern_transpose()
+
+    print(nl + "[4] Matrix kernels")
+    print_kernel_stats("matmul_tiled", k_matmul_t)
+    print_kernel_stats("matmul_naive", k_matmul_n)
+    print_kernel_stats("transpose",    k_transpose)
+
+    // --- Build normalization kernels ----------------------------------------
+    let k_layernorm = kern_layernorm()
+    let k_rmsnorm   = kern_rmsnorm()
+    let k_softmax   = kern_softmax()
+
+    print(nl + "[5] Normalization kernels")
+    print_kernel_stats("layernorm", k_layernorm)
+    print_kernel_stats("rmsnorm",   k_rmsnorm)
+    print_kernel_stats("softmax",   k_softmax)
+
+    // --- Build attention kernels --------------------------------------------
+    let k_attn  = kern_attention()
+    let k_flash = kern_flash_attention()
+
+    print(nl + "[6] Attention kernels")
+    print_kernel_stats("attention",       k_attn)
+    print_kernel_stats("flash_attention", k_flash)
+
+    // --- Kernel fusion demo -------------------------------------------------
+    print(nl + "[7] Kernel Fusion — relu + scale")
+    let k_relu_scale_fused = fuse_kernels(k_relu, k_scale)
+    print("  relu instructions  : " + to_string(len(k_relu)))
+    print("  scale instructions : " + to_string(len(k_scale)))
+    print("  fused instructions : " + to_string(len(k_relu_scale_fused)))
+    let saved = len(k_relu) + len(k_scale) - len(k_relu_scale_fused)
+    print("  instructions saved : " + to_string(saved))
+    print_kernel_stats("relu_scale_fused", k_relu_scale_fused)
+
+    // --- Optimization demo --------------------------------------------------
+    print(nl + "[8] Peephole Optimizer")
+    let k_fma_opt = optimize_kernel(k_fma)
+    print("  fma before optimize : " + to_string(len(k_fma)))
+    print("  fma after optimize  : " + to_string(len(k_fma_opt)))
+
+    let k_matmul_opt = optimize_kernel(kern_matmul_naive())
+    print("  matmul_naive before : " + to_string(len(k_matmul_n)))
+    print("  matmul_naive after  : " + to_string(len(k_matmul_opt)))
+
+    // --- Full fusion + optimize pipeline ------------------------------------
+    print(nl + "[9] Full pipeline: fuse gelu + scale, then optimize")
+    let k_gelu_scale = fuse_kernels(k_gelu, k_scale)
+    let k_gelu_scale_opt = optimize_kernel(k_gelu_scale)
+    print("  gelu+scale fused     : " + to_string(len(k_gelu_scale)))
+    print("  gelu+scale optimized : " + to_string(len(k_gelu_scale_opt)))
+    print_kernel_stats("gelu_scale_opt", k_gelu_scale_opt)
+
+    // --- Arithmetic intensity comparison ------------------------------------
+    print(nl + "[10] Arithmetic Intensity Comparison")
+    print("  elementwise_add AI : " + to_string(kernel_arithmetic_intensity(k_add)))
+    print("  gelu AI            : " + to_string(kernel_arithmetic_intensity(k_gelu)))
+    print("  tanh AI            : " + to_string(kernel_arithmetic_intensity(k_tanh)))
+    print("  matmul_tiled AI    : " + to_string(kernel_arithmetic_intensity(k_matmul_t)))
+    print("  matmul_naive AI    : " + to_string(kernel_arithmetic_intensity(k_matmul_n)))
+    print("  flash_attention AI : " + to_string(kernel_arithmetic_intensity(k_flash)))
+    print("  rmsnorm AI         : " + to_string(kernel_arithmetic_intensity(k_rmsnorm)))
+    print("  softmax AI         : " + to_string(kernel_arithmetic_intensity(k_softmax)))
+
+    // --- Final summary -------------------------------------------------------
+    print(nl + sep)
+    let total_kernels = 20
+    print("Total kernels built : " + to_string(total_kernels))
+
+    let all_flops = kernel_flops(k_add) + kernel_flops(k_mul) + kernel_flops(k_fma)
+    let all_flops2 = all_flops + kernel_flops(k_neg) + kernel_flops(k_scale)
+    let all_flops3 = all_flops2 + kernel_flops(k_relu) + kernel_flops(k_gelu)
+    let all_flops4 = all_flops3 + kernel_flops(k_silu) + kernel_flops(k_sigmoid)
+    let all_flops5 = all_flops4 + kernel_flops(k_tanh) + kernel_flops(k_rsum)
+    let all_flops6 = all_flops5 + kernel_flops(k_rmax) + kernel_flops(k_rmean)
+    let all_flops7 = all_flops6 + kernel_flops(k_matmul_t) + kernel_flops(k_matmul_n)
+    let all_flops8 = all_flops7 + kernel_flops(k_transpose) + kernel_flops(k_layernorm)
+    let all_flops9 = all_flops8 + kernel_flops(k_rmsnorm) + kernel_flops(k_softmax)
+    let all_flopsa = all_flops9 + kernel_flops(k_attn) + kernel_flops(k_flash)
+
+    print("Total FLOPs encoded : " + to_string(all_flopsa))
+    print(sep)
+    print("Vortex Kernel Library — 20+ kernels, 0 CUDA dependencies")
+}

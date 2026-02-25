@@ -1,15 +1,487 @@
-pub struct SGD {
-    lr: float
-    momentum: float
-    velocity: Array
+// std/optim.vx — Pure Vortex Optimizer Library
+// State stored in flat arrays to avoid struct complexity
+//
+// SGD state layout: [lr, momentum, v0, v1, ..., v_{n-1}]   len = 2 + n
+// Adam state layout: [lr, beta1, beta2, eps, t, m0..m_{n-1}, v0..v_{n-1}]  len = 5 + 2*n
+
+// ─── Math helpers ─────────────────────────────────────────────────────────────
+
+fn abs_f(x: f64) -> f64 {
+    if x < 0.0 {
+        return 0.0 - x
+    }
+    return x
 }
 
-pub struct Adam {
-    lr: float
-    beta1: float
-    beta2: float
-    eps: float
-    t: int
-    m: Array
-    v: Array
+fn sqrt_approx(x: f64) -> f64 {
+    if x <= 0.0 {
+        return 0.0
+    }
+    var guess = x / 2.0
+    if guess < 1.0 {
+        guess = 1.0
+    }
+    var i = 0
+    while i < 60 {
+        let nxt = (guess + x / guess) / 2.0
+        let d = nxt - guess
+        if d < 0.0 {
+            if (0.0 - d) < 1.0e-15 {
+                return nxt
+            }
+        } else {
+            if d < 1.0e-15 {
+                return nxt
+            }
+        }
+        guess = nxt
+        i = i + 1
+    }
+    return guess
+}
+
+// Cosine via Taylor series (for cosine_lr scheduler)
+fn cos_approx(x: f64) -> f64 {
+    let two_pi = 6.28318530717958647692
+    let pi_val = 3.14159265358979323846
+    var v = x
+    while v > pi_val {
+        v = v - two_pi
+    }
+    while v < -pi_val {
+        v = v + two_pi
+    }
+    let x2 = v * v
+    var term = 1.0
+    var sum = 1.0
+    var n = 1
+    while n <= 20 {
+        term = 0.0 - term * x2 / float((2 * n - 1) * (2 * n))
+        sum = sum + term
+        n = n + 1
+    }
+    return sum
+}
+
+// ─── Gradient clipping ────────────────────────────────────────────────────────
+
+pub fn clip_grad_norm(grads: [f64], max_norm: f64) -> [f64] {
+    let n = len(grads)
+    if n == 0 {
+        return grads
+    }
+    var sum2 = 0.0
+    var i = 0
+    while i < n {
+        sum2 = sum2 + grads[i] * grads[i]
+        i = i + 1
+    }
+    let norm = sqrt_approx(sum2)
+    if norm <= max_norm {
+        return grads
+    }
+    let scale = max_norm / norm
+    var out: [f64] = []
+    i = 0
+    while i < n {
+        out = push(out, grads[i] * scale)
+        i = i + 1
+    }
+    return out
+}
+
+// ─── Learning rate schedulers ─────────────────────────────────────────────────
+
+// Cosine annealing: lr * 0.5 * (1 + cos(pi * step / total_steps))
+pub fn cosine_lr(base_lr: f64, step: i64, total_steps: i64) -> f64 {
+    if total_steps <= 0 {
+        return base_lr
+    }
+    if step >= total_steps {
+        return 0.0
+    }
+    let pi_val = 3.14159265358979323846
+    let progress = float(step) / float(total_steps)
+    return base_lr * 0.5 * (1.0 + cos_approx(pi_val * progress))
+}
+
+// Linear warmup: ramp from 0 to base_lr over warmup_steps
+pub fn warmup_lr(base_lr: f64, step: i64, warmup_steps: i64) -> f64 {
+    if warmup_steps <= 0 {
+        return base_lr
+    }
+    if step >= warmup_steps {
+        return base_lr
+    }
+    return base_lr * float(step) / float(warmup_steps)
+}
+
+// Linear decay: ramp from base_lr to 0 over total_steps
+pub fn linear_decay_lr(base_lr: f64, step: i64, total_steps: i64) -> f64 {
+    if total_steps <= 0 {
+        return base_lr
+    }
+    if step >= total_steps {
+        return 0.0
+    }
+    let progress = float(step) / float(total_steps)
+    return base_lr * (1.0 - progress)
+}
+
+// ─── SGD with momentum ────────────────────────────────────────────────────────
+
+// Returns state array: [lr, momentum, v0, v1, ..., v_{n-1}]
+pub fn sgd_new(lr: f64, momentum: f64, n_params: i64) -> [f64] {
+    var state: [f64] = []
+    state = push(state, lr)
+    state = push(state, momentum)
+    var i = 0
+    while i < n_params {
+        state = push(state, 0.0)
+        i = i + 1
+    }
+    return state
+}
+
+// Returns [new_state..., new_params...]
+// state: [lr, momentum, v0..v_{n-1}]
+// params, grads: length n_params
+pub fn sgd_step(state: [f64], params: [f64], grads: [f64]) -> [f64] {
+    let lr = state[0]
+    let momentum = state[1]
+    let n = len(params)
+
+    // Build new velocities and params
+    var new_state: [f64] = []
+    new_state = push(new_state, lr)
+    new_state = push(new_state, momentum)
+
+    var new_params: [f64] = []
+    var i = 0
+    while i < n {
+        let v_old = state[2 + i]
+        let g = grads[i]
+        // v = momentum * v_old + g
+        let v_new = momentum * v_old + g
+        new_state = push(new_state, v_new)
+        // param = param - lr * v
+        new_params = push(new_params, params[i] - lr * v_new)
+        i = i + 1
+    }
+
+    // Concatenate: new_state then new_params
+    var out: [f64] = []
+    i = 0
+    while i < len(new_state) {
+        out = push(out, new_state[i])
+        i = i + 1
+    }
+    i = 0
+    while i < len(new_params) {
+        out = push(out, new_params[i])
+        i = i + 1
+    }
+    return out
+}
+
+// ─── Adam ─────────────────────────────────────────────────────────────────────
+
+// State layout: [lr, beta1, beta2, eps, t, m0..m_{n-1}, v0..v_{n-1}]
+pub fn adam_new(lr: f64, beta1: f64, beta2: f64, eps: f64, n_params: i64) -> [f64] {
+    var state: [f64] = []
+    state = push(state, lr)
+    state = push(state, beta1)
+    state = push(state, beta2)
+    state = push(state, eps)
+    state = push(state, 0.0)   // t = 0
+    // m (first moment)
+    var i = 0
+    while i < n_params {
+        state = push(state, 0.0)
+        i = i + 1
+    }
+    // v (second moment)
+    i = 0
+    while i < n_params {
+        state = push(state, 0.0)
+        i = i + 1
+    }
+    return state
+}
+
+// Returns [new_state..., new_params...]
+pub fn adam_step(state: [f64], params: [f64], grads: [f64]) -> [f64] {
+    let lr    = state[0]
+    let beta1 = state[1]
+    let beta2 = state[2]
+    let eps   = state[3]
+    let t_old = state[4]
+    let t     = t_old + 1.0
+    let n     = len(params)
+
+    // bias correction
+    // bc1 = 1 - beta1^t,  bc2 = 1 - beta2^t
+    // Compute beta1^t via loop
+    var b1t = 1.0
+    var ii = 0
+    while ii < int(t) {
+        b1t = b1t * beta1
+        ii = ii + 1
+    }
+    var b2t = 1.0
+    ii = 0
+    while ii < int(t) {
+        b2t = b2t * beta2
+        ii = ii + 1
+    }
+    let bc1 = 1.0 - b1t
+    let bc2 = 1.0 - b2t
+
+    var new_params: [f64] = []
+    // Compute m[] and v[] cleanly, then params
+    var ms: [f64] = []
+    var vs: [f64] = []
+    var i = 0
+    while i < n {
+        let m_old = state[5 + i]
+        let v_old = state[5 + n + i]
+        let g = grads[i]
+        let m_new = beta1 * m_old + (1.0 - beta1) * g
+        let v_new = beta2 * v_old + (1.0 - beta2) * g * g
+        ms = push(ms, m_new)
+        vs = push(vs, v_new)
+        i = i + 1
+    }
+
+    i = 0
+    while i < n {
+        let m_hat = ms[i] / bc1
+        let v_hat = vs[i] / bc2
+        let p_new = params[i] - lr * m_hat / (sqrt_approx(v_hat) + eps)
+        new_params = push(new_params, p_new)
+        i = i + 1
+    }
+
+    // Rebuild clean state
+    var clean_state: [f64] = []
+    clean_state = push(clean_state, lr)
+    clean_state = push(clean_state, beta1)
+    clean_state = push(clean_state, beta2)
+    clean_state = push(clean_state, eps)
+    clean_state = push(clean_state, t)
+    i = 0
+    while i < n {
+        clean_state = push(clean_state, ms[i])
+        i = i + 1
+    }
+    i = 0
+    while i < n {
+        clean_state = push(clean_state, vs[i])
+        i = i + 1
+    }
+
+    // Concatenate state then params
+    var out: [f64] = []
+    i = 0
+    while i < len(clean_state) {
+        out = push(out, clean_state[i])
+        i = i + 1
+    }
+    i = 0
+    while i < len(new_params) {
+        out = push(out, new_params[i])
+        i = i + 1
+    }
+    return out
+}
+
+// ─── Helpers to extract parts of step output ──────────────────────────────────
+
+// Extract params from sgd_step output (state size = 2 + n_params)
+fn sgd_extract_params(out: [f64], n_params: i64) -> [f64] {
+    let state_size = 2 + n_params
+    var params: [f64] = []
+    var i = 0
+    while i < n_params {
+        params = push(params, out[state_size + i])
+        i = i + 1
+    }
+    return params
+}
+
+// Extract new state from sgd_step output
+fn sgd_extract_state(out: [f64], n_params: i64) -> [f64] {
+    let state_size = 2 + n_params
+    var state: [f64] = []
+    var i = 0
+    while i < state_size {
+        state = push(state, out[i])
+        i = i + 1
+    }
+    return state
+}
+
+// Extract params from adam_step output (state size = 5 + 2*n_params)
+fn adam_extract_params(out: [f64], n_params: i64) -> [f64] {
+    let state_size = 5 + 2 * n_params
+    var params: [f64] = []
+    var i = 0
+    while i < n_params {
+        params = push(params, out[state_size + i])
+        i = i + 1
+    }
+    return params
+}
+
+fn adam_extract_state(out: [f64], n_params: i64) -> [f64] {
+    let state_size = 5 + 2 * n_params
+    var state: [f64] = []
+    var i = 0
+    while i < state_size {
+        state = push(state, out[i])
+        i = i + 1
+    }
+    return state
+}
+
+// ─── Tests ────────────────────────────────────────────────────────────────────
+
+fn abs_diff(a: f64, b: f64) -> f64 {
+    let d = a - b
+    if d < 0.0 {
+        return 0.0 - d
+    }
+    return d
+}
+
+fn assert_near(label: str, got: f64, expected: f64, tol: f64) {
+    let d = abs_diff(got, expected)
+    if d < tol {
+        print("  PASS " + label + " = " + to_string(got))
+    } else {
+        print("  FAIL " + label + " got=" + to_string(got) + " expected~" + to_string(expected))
+    }
+}
+
+fn main() {
+    print("=== optim.vx Tests ===")
+    print("")
+
+    // ── Learning rate schedulers ──
+    print("--- LR Schedulers ---")
+    assert_near("cosine_lr(0.1, 0, 100)", cosine_lr(0.1, 0, 100), 0.1, 1.0e-10)
+    assert_near("cosine_lr(0.1, 50, 100)", cosine_lr(0.1, 50, 100), 0.05, 1.0e-8)
+    assert_near("cosine_lr(0.1, 100, 100)", cosine_lr(0.1, 100, 100), 0.0, 1.0e-10)
+    assert_near("warmup_lr(0.1, 0, 10)", warmup_lr(0.1, 0, 10), 0.0, 1.0e-10)
+    assert_near("warmup_lr(0.1, 5, 10)", warmup_lr(0.1, 5, 10), 0.05, 1.0e-10)
+    assert_near("warmup_lr(0.1, 10, 10)", warmup_lr(0.1, 10, 10), 0.1, 1.0e-10)
+    assert_near("linear_decay_lr(0.1, 0, 100)", linear_decay_lr(0.1, 0, 100), 0.1, 1.0e-10)
+    assert_near("linear_decay_lr(0.1, 50, 100)", linear_decay_lr(0.1, 50, 100), 0.05, 1.0e-10)
+    assert_near("linear_decay_lr(0.1, 100, 100)", linear_decay_lr(0.1, 100, 100), 0.0, 1.0e-10)
+
+    // ── Gradient clipping ──
+    print("")
+    print("--- clip_grad_norm ---")
+    let grads1 = [3.0, 4.0]
+    // norm = 5.0, max_norm = 5.0 => no change
+    let clipped1 = clip_grad_norm(grads1, 5.0)
+    assert_near("clip(no clip)[0]", clipped1[0], 3.0, 1.0e-10)
+    assert_near("clip(no clip)[1]", clipped1[1], 4.0, 1.0e-10)
+    // max_norm = 2.5 => scale by 0.5
+    let clipped2 = clip_grad_norm(grads1, 2.5)
+    assert_near("clip(half)[0]", clipped2[0], 1.5, 1.0e-10)
+    assert_near("clip(half)[1]", clipped2[1], 2.0, 1.0e-10)
+
+    // ── SGD converging on f(x) = x^2  (grad = 2x) ──
+    print("")
+    print("--- SGD on f(x)=x^2 ---")
+    // start at x=10, lr=0.1, no momentum
+    var sgd_state = sgd_new(0.1, 0.0, 1)
+    var sgd_params = [10.0]
+    var step = 0
+    while step < 50 {
+        let g = [2.0 * sgd_params[0]]
+        let result = sgd_step(sgd_state, sgd_params, g)
+        sgd_state = sgd_extract_state(result, 1)
+        sgd_params = sgd_extract_params(result, 1)
+        step = step + 1
+    }
+    print("  SGD x after 50 steps (start=10, lr=0.1): " + to_string(sgd_params[0]))
+    var sgd_ok = abs_diff(sgd_params[0], 0.0) < 0.01
+    if sgd_ok {
+        print("  PASS SGD converged near 0")
+    } else {
+        print("  FAIL SGD did not converge: x=" + to_string(sgd_params[0]))
+    }
+
+    // ── SGD with momentum on f(x,y) = x^2 + 4*y^2 ──
+    print("")
+    print("--- SGD+momentum on f(x,y)=x^2+4y^2 ---")
+    var sgdm_state = sgd_new(0.05, 0.9, 2)
+    var sgdm_params = [5.0, 5.0]
+    step = 0
+    while step < 100 {
+        let gx = 2.0 * sgdm_params[0]
+        let gy = 8.0 * sgdm_params[1]
+        let gv = [gx, gy]
+        let res = sgd_step(sgdm_state, sgdm_params, gv)
+        sgdm_state = sgd_extract_state(res, 2)
+        sgdm_params = sgd_extract_params(res, 2)
+        step = step + 1
+    }
+    print("  SGD+mom after 100 steps: x=" + to_string(sgdm_params[0]) + " y=" + to_string(sgdm_params[1]))
+    var sgdm_ok = abs_diff(sgdm_params[0], 0.0) < 0.5 && abs_diff(sgdm_params[1], 0.0) < 0.5
+    if sgdm_ok {
+        print("  PASS SGD+momentum converged near (0,0)")
+    } else {
+        print("  FAIL SGD+momentum did not converge")
+    }
+
+    // ── Adam converging on f(x) = x^2 ──
+    print("")
+    print("--- Adam on f(x)=x^2 ---")
+    // Use lr=0.1, but start from closer to optimum to converge in fewer steps
+    var adam_state = adam_new(0.1, 0.9, 0.999, 1.0e-8, 1)
+    var adam_params = [2.0]
+    step = 0
+    while step < 200 {
+        let g = [2.0 * adam_params[0]]
+        let res = adam_step(adam_state, adam_params, g)
+        adam_state = adam_extract_state(res, 1)
+        adam_params = adam_extract_params(res, 1)
+        step = step + 1
+    }
+    print("  Adam x after 200 steps (start=2, lr=0.1): " + to_string(adam_params[0]))
+    var adam_ok = abs_diff(adam_params[0], 0.0) < 0.5
+    if adam_ok {
+        print("  PASS Adam converged near 0")
+    } else {
+        print("  FAIL Adam did not converge: x=" + to_string(adam_params[0]))
+    }
+
+    // ── Adam on f(x,y) = x^2 + 10*y^2 ──
+    print("")
+    print("--- Adam on f(x,y)=x^2+10y^2 ---")
+    var adam2_state = adam_new(0.1, 0.9, 0.999, 1.0e-8, 2)
+    var adam2_params = [8.0, 8.0]
+    step = 0
+    while step < 200 {
+        let gx = 2.0 * adam2_params[0]
+        let gy = 20.0 * adam2_params[1]
+        let gv = [gx, gy]
+        let res = adam_step(adam2_state, adam2_params, gv)
+        adam2_state = adam_extract_state(res, 2)
+        adam2_params = adam_extract_params(res, 2)
+        step = step + 1
+    }
+    print("  Adam2 after 200 steps: x=" + to_string(adam2_params[0]) + " y=" + to_string(adam2_params[1]))
+    var adam2_ok = abs_diff(adam2_params[0], 0.0) < 0.5 && abs_diff(adam2_params[1], 0.0) < 0.5
+    if adam2_ok {
+        print("  PASS Adam converged near (0,0)")
+    } else {
+        print("  FAIL Adam did not converge")
+    }
+
+    print("")
+    print("=== All optim.vx tests complete ===")
 }

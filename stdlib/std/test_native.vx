@@ -1,0 +1,180 @@
+// stdlib/std/test_native.vx — Native test framework for Vortex
+// State: [total, passed, failed] as i64 array
+
+fn test_init() -> [i64] {
+    var s: [i64] = []
+    s = push(s, 0)
+    s = push(s, 0)
+    s = push(s, 0)
+    return s
+}
+
+fn _record_pass(state: [i64], name: String) -> [i64] {
+    println("  PASS: " + name)
+    var out: [i64] = []
+    out = push(out, state[0] + 1)
+    out = push(out, state[1] + 1)
+    out = push(out, state[2])
+    return out
+}
+
+fn _record_fail(state: [i64], name: String, msg: String) -> [i64] {
+    println("  FAIL: " + name + " (" + msg + ")")
+    var out: [i64] = []
+    out = push(out, state[0] + 1)
+    out = push(out, state[1])
+    out = push(out, state[2] + 1)
+    return out
+}
+
+fn assert_true(state: [i64], name: String, cond: bool) -> [i64] {
+    if cond {
+        return _record_pass(state, name)
+    }
+    return _record_fail(state, name, "expected true, got false")
+}
+
+fn assert_false(state: [i64], name: String, cond: bool) -> [i64] {
+    if cond == false {
+        return _record_pass(state, name)
+    }
+    return _record_fail(state, name, "expected false, got true")
+}
+
+fn assert_eq_int(state: [i64], name: String, actual: i64, expected: i64) -> [i64] {
+    if actual == expected {
+        return _record_pass(state, name)
+    }
+    return _record_fail(state, name, "expected " + to_string(expected) + ", got " + to_string(actual))
+}
+
+fn _float_abs(x: f64) -> f64 {
+    if x < 0.0 {
+        return 0.0 - x
+    }
+    return x
+}
+
+fn assert_eq_float(state: [i64], name: String, actual: f64, expected: f64, epsilon: f64) -> [i64] {
+    var delta: f64 = _float_abs(actual - expected)
+    if delta < epsilon {
+        return _record_pass(state, name)
+    }
+    return _record_fail(state, name, "expected " + to_string(expected) + ", got " + to_string(actual))
+}
+
+fn assert_eq_str(state: [i64], name: String, actual: String, expected: String) -> [i64] {
+    if actual == expected {
+        return _record_pass(state, name)
+    }
+    return _record_fail(state, name, "expected " + str_from_bytes([34]) + expected + str_from_bytes([34]) + ", got " + str_from_bytes([34]) + actual + str_from_bytes([34]))
+}
+
+fn assert_eq_bool(state: [i64], name: String, actual: bool, expected: bool) -> [i64] {
+    if actual == expected {
+        return _record_pass(state, name)
+    }
+    return _record_fail(state, name, "expected " + to_string(expected) + ", got " + to_string(actual))
+}
+
+fn assert_ne_int(state: [i64], name: String, actual: i64, unexpected: i64) -> [i64] {
+    if actual != unexpected {
+        return _record_pass(state, name)
+    }
+    return _record_fail(state, name, "expected not " + to_string(unexpected) + ", but got it")
+}
+
+fn assert_gt(state: [i64], name: String, actual: i64, threshold: i64) -> [i64] {
+    if actual > threshold {
+        return _record_pass(state, name)
+    }
+    return _record_fail(state, name, "expected " + to_string(actual) + " > " + to_string(threshold))
+}
+
+fn assert_lt(state: [i64], name: String, actual: i64, threshold: i64) -> [i64] {
+    if actual < threshold {
+        return _record_pass(state, name)
+    }
+    return _record_fail(state, name, "expected " + to_string(actual) + " < " + to_string(threshold))
+}
+
+fn assert_approx(state: [i64], name: String, actual: f64, expected: f64, tolerance: f64) -> [i64] {
+    var delta: f64 = _float_abs(actual - expected)
+    if delta <= tolerance {
+        return _record_pass(state, name)
+    }
+    return _record_fail(state, name, "expected " + to_string(expected) + " +/- " + to_string(tolerance) + ", got " + to_string(actual))
+}
+
+fn test_section(name: String) {
+    println("")
+    println("--- " + name + " ---")
+}
+
+fn test_summary(state: [i64]) {
+    println("")
+    println("=== Test Results ===")
+    println("Total: " + to_string(state[0]) + "  Passed: " + to_string(state[1]) + "  Failed: " + to_string(state[2]))
+    if state[2] == 0 {
+        println("ALL TESTS PASSED")
+    } else {
+        println("SOME TESTS FAILED")
+    }
+}
+
+fn test_passed(state: [i64]) -> bool {
+    return state[2] == 0
+}
+
+fn main() {
+    println("Vortex Native Test Framework — Self Test")
+
+    var s: [i64] = test_init()
+
+    test_section("assert_true / assert_false")
+    s = assert_true(s, "true is true", true)
+    s = assert_false(s, "false is false", false)
+    s = assert_true(s, "1 < 2", 1 < 2)
+    s = assert_false(s, "2 < 1", 2 < 1)
+    // Intentional failure
+    s = assert_true(s, "deliberate fail: false is not true", false)
+
+    test_section("assert_eq_int / assert_ne_int")
+    s = assert_eq_int(s, "2 + 3 == 5", 2 + 3, 5)
+    s = assert_eq_int(s, "10 * 4 == 40", 10 * 4, 40)
+    s = assert_ne_int(s, "7 != 8", 7, 8)
+    // Intentional failure
+    s = assert_eq_int(s, "deliberate fail: 3 * 3 == 10", 3 * 3, 10)
+
+    test_section("assert_eq_str")
+    s = assert_eq_str(s, "hello concat", "hello" + " world", "hello world")
+    s = assert_eq_str(s, "to_string(42)", to_string(42), "42")
+    // Intentional failure
+    s = assert_eq_str(s, "deliberate fail: foo != bar", "foo", "bar")
+
+    test_section("assert_eq_bool")
+    s = assert_eq_bool(s, "true == true", true, true)
+    s = assert_eq_bool(s, "false == false", false, false)
+    // Intentional failure
+    s = assert_eq_bool(s, "deliberate fail: true != false", true, false)
+
+    test_section("assert_eq_float / assert_approx")
+    s = assert_eq_float(s, "0.1 + 0.2 approx 0.3", 0.1 + 0.2, 0.3, 0.000001)
+    s = assert_approx(s, "sqrt(4) approx 2.0", sqrt(4.0), 2.0, 0.0001)
+    // Intentional failure
+    s = assert_approx(s, "deliberate fail: 1.0 approx 2.0", 1.0, 2.0, 0.01)
+
+    test_section("assert_gt / assert_lt")
+    s = assert_gt(s, "10 > 5", 10, 5)
+    s = assert_lt(s, "3 < 7", 3, 7)
+    // Intentional failure
+    s = assert_gt(s, "deliberate fail: 2 > 100", 2, 100)
+
+    test_summary(s)
+
+    if test_passed(s) {
+        println("(unexpected: should have deliberate failures)")
+    } else {
+        println("(expected: deliberate failures present)")
+    }
+}

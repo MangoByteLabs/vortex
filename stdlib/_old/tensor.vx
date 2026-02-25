@@ -2,26 +2,26 @@
 
 fn zeros(n) {
     let result = []
-    for i in 0..n { push(result, 0.0) }
+    for i in 0..n { result = push(result, 0.0) }
     result
 }
 
 fn ones(n) {
     let result = []
-    for i in 0..n { push(result, 1.0) }
+    for i in 0..n { result = push(result, 1.0) }
     result
 }
 
 fn full(n, val) {
     let result = []
-    for i in 0..n { push(result, val) }
+    for i in 0..n { result = push(result, val) }
     result
 }
 
 fn linspace(start, end, n) {
     let result = []
     let step = (end - start) / (n - 1)
-    for i in 0..n { push(result, start + i * step) }
+    for i in 0..n { result = push(result, start + i * step) }
     result
 }
 
@@ -29,7 +29,7 @@ fn arange(start, end, step) {
     let result = []
     let x = start
     while x < end {
-        push(result, x)
+        result = push(result, x)
         x = x + step
     }
     result
@@ -64,7 +64,7 @@ fn flatten(nested_array) {
     let result = []
     for i in 0..len(nested_array) {
         for j in 0..len(nested_array[i]) {
-            push(result, nested_array[i][j])
+            result = push(result, nested_array[i][j])
         }
     }
     result
@@ -75,9 +75,9 @@ fn reshape(flat, rows, cols) {
     for i in 0..rows {
         let row = []
         for j in 0..cols {
-            push(row, flat[i * cols + j])
+            row = push(row, flat[i * cols + j])
         }
-        push(result, row)
+        result = push(result, row)
     }
     result
 }

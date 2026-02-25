@@ -1,0 +1,768 @@
+// stdlib/ai/inference_native.vx — Fast transformer inference in pure Vortex
+// Key insight: orchestrator pattern with flat [f64] arrays, no string encoding
+// Tiny test model: vocab=16, dim=8, 1 layer, 2 heads, head_dim=4, hidden=16, seq=8
+
+// ─── Fast Math (minimal iterations for small values) ────────────────────────
+
+fn _abs(x: f64) -> f64 {
+    if x < 0.0 {
+        return 0.0 - x
+    }
+    return x
+}
+
+fn _sqrt(x: f64) -> f64 {
+    if x <= 0.0 {
+        return 0.0
+    }
+    var g = x / 2.0
+    if g < 1.0 {
+        g = 1.0
+    }
+    var i = 0
+    while i < 20 {
+        let n2 = (g + x / g) / 2.0
+        if _abs(n2 - g) < 1.0e-12 {
+            return n2
+        }
+        g = n2
+        i = i + 1
+    }
+    return g
+}
+
+fn _exp(x: f64) -> f64 {
+    // For small x (typical in softmax after subtracting max), fast Taylor
+    // Clamp to avoid overflow
+    if x > 80.0 {
+        return 5.5406e34
+    }
+    if x < -80.0 {
+        return 0.0
+    }
+    // Range reduction: exp(x) = 2^k * exp(r) where r = x - k*ln2
+    let ln2 = 0.6931471805599453
+    let k = int(x / ln2)
+    let r = x - float(k) * ln2
+    // Taylor for exp(r), |r| < ln2 ~ 0.693
+    var term = 1.0
+    var sum = 1.0
+    var n = 1
+    while n < 16 {
+        term = term * r / float(n)
+        sum = sum + term
+        if _abs(term) < 1.0e-12 {
+            n = 100
+        }
+        n = n + 1
+    }
+    // Multiply by 2^k
+    if k >= 0 {
+        var i = 0
+        while i < k {
+            sum = sum * 2.0
+            i = i + 1
+        }
+    } else {
+        var i = 0
+        let nk = 0 - k
+        while i < nk {
+            sum = sum / 2.0
+            i = i + 1
+        }
+    }
+    return sum
+}
+
+fn _sin(x: f64) -> f64 {
+    let pi = 3.14159265358979323846
+    let two_pi = 6.28318530717958647692
+    var v = x
+    while v > pi {
+        v = v - two_pi
+    }
+    while v < 0.0 - pi {
+        v = v + two_pi
+    }
+    let x2 = v * v
+    var term = v
+    var sum = v
+    var n = 1
+    while n < 10 {
+        term = 0.0 - term * x2 / float((2 * n) * (2 * n + 1))
+        sum = sum + term
+        n = n + 1
+    }
+    return sum
+}
+
+fn _cos(x: f64) -> f64 {
+    let pi = 3.14159265358979323846
+    let two_pi = 6.28318530717958647692
+    var v = x
+    while v > pi {
+        v = v - two_pi
+    }
+    while v < 0.0 - pi {
+        v = v + two_pi
+    }
+    let x2 = v * v
+    var term = 1.0
+    var sum = 1.0
+    var n = 1
+    while n < 10 {
+        term = 0.0 - term * x2 / float((2 * n - 1) * (2 * n))
+        sum = sum + term
+        n = n + 1
+    }
+    return sum
+}
+
+// ─── Flat Array Operations (no tensor headers) ─────────────────────────────
+// All internal compute uses raw [f64] where index = row*cols + col
+
+fn flat_matvec(mat: [f64], vec: [f64], rows: i64, cols: i64) -> [f64] {
+    // mat[rows,cols] @ vec[cols] -> result[rows]
+    var result: [f64] = []
+    var i = 0
+    while i < rows {
+        var sum = 0.0
+        let base = i * cols
+        var j = 0
+        while j < cols {
+            sum = sum + mat[base + j] * vec[j]
+            j = j + 1
+        }
+        result = push(result, sum)
+        i = i + 1
+    }
+    return result
+}
+
+fn flat_rms_norm(x: [f64], w: [f64], n: i64) -> [f64] {
+    var ss = 0.0
+    var i = 0
+    while i < n {
+        ss = ss + x[i] * x[i]
+        i = i + 1
+    }
+    let inv = 1.0 / _sqrt(ss / float(n) + 1.0e-5)
+    var result: [f64] = []
+    i = 0
+    while i < n {
+        result = push(result, x[i] * inv * w[i])
+        i = i + 1
+    }
+    return result
+}
+
+fn flat_softmax(x: [f64], n: i64) -> [f64] {
+    var mx = x[0]
+    var i = 1
+    while i < n {
+        if x[i] > mx {
+            mx = x[i]
+        }
+        i = i + 1
+    }
+    var result: [f64] = []
+    var sum = 0.0
+    i = 0
+    while i < n {
+        let e = _exp(x[i] - mx)
+        result = push(result, e)
+        sum = sum + e
+        i = i + 1
+    }
+    var out: [f64] = []
+    i = 0
+    while i < n {
+        out = push(out, result[i] / sum)
+        i = i + 1
+    }
+    return out
+}
+
+fn flat_add(a: [f64], b: [f64], n: i64) -> [f64] {
+    var result: [f64] = []
+    var i = 0
+    while i < n {
+        result = push(result, a[i] + b[i])
+        i = i + 1
+    }
+    return result
+}
+
+fn flat_silu_mul(gate: [f64], up: [f64], n: i64) -> [f64] {
+    // SiLU(gate) * up, fused
+    var result: [f64] = []
+    var i = 0
+    while i < n {
+        let sig = 1.0 / (1.0 + _exp(0.0 - gate[i]))
+        result = push(result, gate[i] * sig * up[i])
+        i = i + 1
+    }
+    return result
+}
+
+// ─── Weight Storage (flat arrays, direct indexed) ───────────────────────────
+// All weights stored in a single flat [f64] with an index table [i64]
+// Index: [offset0, size0, offset1, size1, ...]
+// Weight IDs (constants):
+//   0 = emb, 1 = rms_att, 2 = wq, 3 = wk, 4 = wv, 5 = wo
+//   6 = rms_ffn, 7 = w1, 8 = w2, 9 = w3, 10 = rms_final, 11 = w_out
+
+fn make_weights(vocab: i64, dim: i64, hidden: i64, kv_dim: i64) -> [f64] {
+    // Compute total size and generate all weights in one flat array
+    // emb: vocab*dim, rms_att: dim, wq: dim*dim, wk: kv_dim*dim, wv: kv_dim*dim
+    // wo: dim*dim, rms_ffn: dim, w1: hidden*dim, w2: dim*hidden, w3: hidden*dim
+    // rms_final: dim, w_out: vocab*dim
+    var all: [f64] = []
+    var seed = 123
+
+    // Simple LCG random
+    // emb
+    var i = 0
+    let emb_sz = vocab * dim
+    while i < emb_sz {
+        seed = seed * 1103515245 + 12345
+        if seed < 0 {
+            seed = 0 - seed
+        }
+        let val = float(seed % 10000) / 50000.0 - 0.1
+        all = push(all, val)
+        i = i + 1
+    }
+
+    // rms_att (ones)
+    i = 0
+    while i < dim {
+        all = push(all, 1.0)
+        i = i + 1
+    }
+
+    // wq: dim*dim
+    i = 0
+    let wq_sz = dim * dim
+    while i < wq_sz {
+        seed = seed * 1103515245 + 12345
+        if seed < 0 {
+            seed = 0 - seed
+        }
+        all = push(all, float(seed % 10000) / 50000.0 - 0.1)
+        i = i + 1
+    }
+
+    // wk: kv_dim*dim
+    i = 0
+    let wk_sz = kv_dim * dim
+    while i < wk_sz {
+        seed = seed * 1103515245 + 12345
+        if seed < 0 {
+            seed = 0 - seed
+        }
+        all = push(all, float(seed % 10000) / 50000.0 - 0.1)
+        i = i + 1
+    }
+
+    // wv: kv_dim*dim
+    i = 0
+    while i < wk_sz {
+        seed = seed * 1103515245 + 12345
+        if seed < 0 {
+            seed = 0 - seed
+        }
+        all = push(all, float(seed % 10000) / 50000.0 - 0.1)
+        i = i + 1
+    }
+
+    // wo: dim*dim
+    i = 0
+    while i < wq_sz {
+        seed = seed * 1103515245 + 12345
+        if seed < 0 {
+            seed = 0 - seed
+        }
+        all = push(all, float(seed % 10000) / 50000.0 - 0.1)
+        i = i + 1
+    }
+
+    // rms_ffn (ones)
+    i = 0
+    while i < dim {
+        all = push(all, 1.0)
+        i = i + 1
+    }
+
+    // w1: hidden*dim
+    i = 0
+    let w1_sz = hidden * dim
+    while i < w1_sz {
+        seed = seed * 1103515245 + 12345
+        if seed < 0 {
+            seed = 0 - seed
+        }
+        all = push(all, float(seed % 10000) / 50000.0 - 0.1)
+        i = i + 1
+    }
+
+    // w2: dim*hidden
+    i = 0
+    let w2_sz = dim * hidden
+    while i < w2_sz {
+        seed = seed * 1103515245 + 12345
+        if seed < 0 {
+            seed = 0 - seed
+        }
+        all = push(all, float(seed % 10000) / 50000.0 - 0.1)
+        i = i + 1
+    }
+
+    // w3: hidden*dim
+    i = 0
+    while i < w1_sz {
+        seed = seed * 1103515245 + 12345
+        if seed < 0 {
+            seed = 0 - seed
+        }
+        all = push(all, float(seed % 10000) / 50000.0 - 0.1)
+        i = i + 1
+    }
+
+    // rms_final (ones)
+    i = 0
+    while i < dim {
+        all = push(all, 1.0)
+        i = i + 1
+    }
+
+    // w_out: vocab*dim
+    i = 0
+    while i < emb_sz {
+        seed = seed * 1103515245 + 12345
+        if seed < 0 {
+            seed = 0 - seed
+        }
+        all = push(all, float(seed % 10000) / 50000.0 - 0.1)
+        i = i + 1
+    }
+
+    return all
+}
+
+fn w_offset(vocab: i64, dim: i64, hidden: i64, kv_dim: i64, id: i64) -> i64 {
+    // Returns starting offset for weight id in the flat array
+    let emb_sz = vocab * dim
+    let wq_sz = dim * dim
+    let wk_sz = kv_dim * dim
+    let w1_sz = hidden * dim
+    let w2_sz = dim * hidden
+
+    if id == 0 {
+        return 0
+    }
+    let o1 = emb_sz
+    if id == 1 {
+        return o1
+    }
+    let o2 = o1 + dim
+    if id == 2 {
+        return o2
+    }
+    let o3 = o2 + wq_sz
+    if id == 3 {
+        return o3
+    }
+    let o4 = o3 + wk_sz
+    if id == 4 {
+        return o4
+    }
+    let o5 = o4 + wk_sz
+    if id == 5 {
+        return o5
+    }
+    let o6 = o5 + wq_sz
+    if id == 6 {
+        return o6
+    }
+    let o7 = o6 + dim
+    if id == 7 {
+        return o7
+    }
+    let o8 = o7 + w1_sz
+    if id == 8 {
+        return o8
+    }
+    let o9 = o8 + w2_sz
+    if id == 9 {
+        return o9
+    }
+    let o10 = o9 + w1_sz
+    if id == 10 {
+        return o10
+    }
+    // id == 11: w_out
+    return o10 + dim
+}
+
+fn slice_flat(arr: [f64], start: i64, count: i64) -> [f64] {
+    var result: [f64] = []
+    var i = 0
+    while i < count {
+        result = push(result, arr[start + i])
+        i = i + 1
+    }
+    return result
+}
+
+// ─── Forward Pass (single token, no KV cache for simplicity) ────────────────
+
+fn forward(token: i64, pos: i64, w: [f64], vocab: i64, dim: i64, hidden: i64, n_heads: i64, kv_heads: i64) -> [f64] {
+    let head_dim = dim / n_heads
+    let kv_dim = kv_heads * head_dim
+
+    // Embedding lookup
+    let emb_off = w_offset(vocab, dim, hidden, kv_dim, 0)
+    var x: [f64] = []
+    var i = 0
+    while i < dim {
+        x = push(x, w[emb_off + token * dim + i])
+        i = i + 1
+    }
+
+    // === Layer 0 (single layer) ===
+
+    // RMS norm before attention
+    let rms_att_off = w_offset(vocab, dim, hidden, kv_dim, 1)
+    let rms_att_w = slice_flat(w, rms_att_off, dim)
+    let xn = flat_rms_norm(x, rms_att_w, dim)
+
+    // Q, K, V projections
+    let wq_off = w_offset(vocab, dim, hidden, kv_dim, 2)
+    let wk_off = w_offset(vocab, dim, hidden, kv_dim, 3)
+    let wv_off = w_offset(vocab, dim, hidden, kv_dim, 4)
+    let wo_off = w_offset(vocab, dim, hidden, kv_dim, 5)
+
+    let wq = slice_flat(w, wq_off, dim * dim)
+    let wk = slice_flat(w, wk_off, kv_dim * dim)
+    let wv = slice_flat(w, wv_off, kv_dim * dim)
+
+    let q = flat_matvec(wq, xn, dim, dim)
+    let k = flat_matvec(wk, xn, kv_dim, dim)
+    let v = flat_matvec(wv, xn, kv_dim, dim)
+
+    // Apply RoPE
+    var qr: [f64] = []
+    var kr: [f64] = []
+    var h = 0
+    while h < n_heads {
+        let half = head_dim / 2
+        var j = 0
+        while j < half {
+            let theta = float(pos) / _exp(float(2 * j) / float(head_dim) * 9.210340371976184)
+            let cos_t = _cos(theta)
+            let sin_t = _sin(theta)
+            let qi = h * head_dim + 2 * j
+            let q0 = q[qi]
+            let q1 = q[qi + 1]
+            qr = push(qr, q0 * cos_t - q1 * sin_t)
+            qr = push(qr, q0 * sin_t + q1 * cos_t)
+            j = j + 1
+        }
+        h = h + 1
+    }
+    h = 0
+    while h < kv_heads {
+        let half = head_dim / 2
+        var j = 0
+        while j < half {
+            let theta = float(pos) / _exp(float(2 * j) / float(head_dim) * 9.210340371976184)
+            let cos_t = _cos(theta)
+            let sin_t = _sin(theta)
+            let ki = h * head_dim + 2 * j
+            let k0 = k[ki]
+            let k1 = k[ki + 1]
+            kr = push(kr, k0 * cos_t - k1 * sin_t)
+            kr = push(kr, k0 * sin_t + k1 * cos_t)
+            j = j + 1
+        }
+        h = h + 1
+    }
+
+    // Single-token attention: Q @ K^T is just dot product per head, softmax is trivial (=1.0)
+    // So output = V directly (scaled by attention weight 1.0)
+    var attn_out: [f64] = []
+    h = 0
+    while h < n_heads {
+        let kv_h = h / (n_heads / kv_heads)
+        i = 0
+        while i < head_dim {
+            attn_out = push(attn_out, v[kv_h * head_dim + i])
+            i = i + 1
+        }
+        h = h + 1
+    }
+
+    // Output projection
+    let wo = slice_flat(w, wo_off, dim * dim)
+    let proj = flat_matvec(wo, attn_out, dim, dim)
+
+    // Residual
+    x = flat_add(x, proj, dim)
+
+    // RMS norm before FFN
+    let rms_ffn_off = w_offset(vocab, dim, hidden, kv_dim, 6)
+    let rms_ffn_w = slice_flat(w, rms_ffn_off, dim)
+    let xn2 = flat_rms_norm(x, rms_ffn_w, dim)
+
+    // FFN: SwiGLU
+    let w1_off = w_offset(vocab, dim, hidden, kv_dim, 7)
+    let w2_off = w_offset(vocab, dim, hidden, kv_dim, 8)
+    let w3_off = w_offset(vocab, dim, hidden, kv_dim, 9)
+
+    let fw1 = slice_flat(w, w1_off, hidden * dim)
+    let fw2 = slice_flat(w, w2_off, dim * hidden)
+    let fw3 = slice_flat(w, w3_off, hidden * dim)
+
+    let gate = flat_matvec(fw1, xn2, hidden, dim)
+    let up = flat_matvec(fw3, xn2, hidden, dim)
+    let hidden_act = flat_silu_mul(gate, up, hidden)
+    let ffn_out = flat_matvec(fw2, hidden_act, dim, hidden)
+
+    // Residual
+    x = flat_add(x, ffn_out, dim)
+
+    // Final RMS norm
+    let rms_final_off = w_offset(vocab, dim, hidden, kv_dim, 10)
+    let rms_final_w = slice_flat(w, rms_final_off, dim)
+    x = flat_rms_norm(x, rms_final_w, dim)
+
+    // Output projection to vocab
+    let wout_off = w_offset(vocab, dim, hidden, kv_dim, 11)
+    let wout = slice_flat(w, wout_off, vocab * dim)
+    let logits = flat_matvec(wout, x, vocab, dim)
+
+    return logits
+}
+
+// ─── Sampling ───────────────────────────────────────────────────────────────
+
+fn argmax(data: [f64], n: i64) -> i64 {
+    var best = 0
+    var best_val = data[0]
+    var i = 1
+    while i < n {
+        if data[i] > best_val {
+            best_val = data[i]
+            best = i
+        }
+        i = i + 1
+    }
+    return best
+}
+
+fn generate(prompt: [i64], n_gen: i64, w: [f64], vocab: i64, dim: i64, hidden: i64, n_heads: i64, kv_heads: i64) -> [i64] {
+    var tokens = prompt
+    let np = len(prompt)
+    var pos = 0
+
+    // Process prompt
+    while pos < np {
+        let logits = forward(tokens[pos], pos, w, vocab, dim, hidden, n_heads, kv_heads)
+        pos = pos + 1
+    }
+
+    // Generate
+    var gen = 0
+    while gen < n_gen {
+        let last = tokens[len(tokens) - 1]
+        let logits = forward(last, pos, w, vocab, dim, hidden, n_heads, kv_heads)
+        let next = argmax(logits, vocab)
+        tokens = push(tokens, next)
+        pos = pos + 1
+        gen = gen + 1
+    }
+
+    // Return only generated
+    var result: [i64] = []
+    var i = np
+    while i < len(tokens) {
+        result = push(result, tokens[i])
+        i = i + 1
+    }
+    return result
+}
+
+// ─── Tests ──────────────────────────────────────────────────────────────────
+
+fn main() {
+    let vocab = 16
+    let dim = 8
+    let hidden = 16
+    let n_heads = 2
+    let kv_heads = 2
+    let head_dim = 4
+    let kv_dim = kv_heads * head_dim
+
+    var pass_count = 0
+    var fail_count = 0
+
+    print("=== Vortex Native Transformer Inference (Fast) ===")
+    print("")
+
+    // Test 1: Weight creation
+    print("Test 1: Create tiny model weights")
+    let w = make_weights(vocab, dim, hidden, kv_dim)
+    let expected_sz = vocab * dim + dim + dim * dim + kv_dim * dim + kv_dim * dim + dim * dim + dim + hidden * dim + dim * hidden + hidden * dim + dim + vocab * dim
+    if len(w) == expected_sz {
+        print("  PASS: weights size = " + to_string(len(w)) + " (expected " + to_string(expected_sz) + ")")
+        pass_count = pass_count + 1
+    } else {
+        print("  FAIL: weights size = " + to_string(len(w)) + " (expected " + to_string(expected_sz) + ")")
+        fail_count = fail_count + 1
+    }
+
+    // Test 2: Forward pass produces vocab-sized output
+    print("Test 2: Forward pass (token=3, pos=0)")
+    let logits = forward(3, 0, w, vocab, dim, hidden, n_heads, kv_heads)
+    if len(logits) == vocab {
+        print("  PASS: logits length = " + to_string(vocab))
+        pass_count = pass_count + 1
+    } else {
+        print("  FAIL: logits length = " + to_string(len(logits)) + " (expected " + to_string(vocab) + ")")
+        fail_count = fail_count + 1
+    }
+
+    // Test 3: Softmax sums to ~1.0
+    print("Test 3: Softmax sums to ~1.0")
+    let probs = flat_softmax(logits, vocab)
+    var sum = 0.0
+    var i = 0
+    while i < vocab {
+        sum = sum + probs[i]
+        i = i + 1
+    }
+    if _abs(sum - 1.0) < 0.001 {
+        print("  PASS: softmax sum = " + to_string(sum))
+        pass_count = pass_count + 1
+    } else {
+        print("  FAIL: softmax sum = " + to_string(sum))
+        fail_count = fail_count + 1
+    }
+
+    // Test 4: argmax returns valid token
+    print("Test 4: argmax returns valid token")
+    let tok = argmax(logits, vocab)
+    if tok >= 0 && tok < vocab {
+        print("  PASS: argmax = " + to_string(tok))
+        pass_count = pass_count + 1
+    } else {
+        print("  FAIL: argmax = " + to_string(tok))
+        fail_count = fail_count + 1
+    }
+
+    // Test 5: RMS norm produces ~unit RMS
+    print("Test 5: RMS norm")
+    var test_x: [f64] = []
+    var test_w: [f64] = []
+    i = 0
+    while i < 8 {
+        test_x = push(test_x, float(i) * 0.5 - 2.0)
+        test_w = push(test_w, 1.0)
+        i = i + 1
+    }
+    let normed = flat_rms_norm(test_x, test_w, 8)
+    var rms = 0.0
+    i = 0
+    while i < 8 {
+        rms = rms + normed[i] * normed[i]
+        i = i + 1
+    }
+    rms = _sqrt(rms / 8.0)
+    if _abs(rms - 1.0) < 0.1 {
+        print("  PASS: RMS = " + to_string(rms))
+        pass_count = pass_count + 1
+    } else {
+        print("  FAIL: RMS = " + to_string(rms))
+        fail_count = fail_count + 1
+    }
+
+    // Test 6: Matvec basic check
+    print("Test 6: flat_matvec")
+    // Identity-like 2x2 matrix
+    var mat: [f64] = [1.0, 0.0, 0.0, 1.0]
+    var vec: [f64] = [3.0, 7.0]
+    let mv = flat_matvec(mat, vec, 2, 2)
+    if _abs(mv[0] - 3.0) < 0.001 && _abs(mv[1] - 7.0) < 0.001 {
+        print("  PASS: identity matvec correct")
+        pass_count = pass_count + 1
+    } else {
+        print("  FAIL: matvec = [" + to_string(mv[0]) + ", " + to_string(mv[1]) + "]")
+        fail_count = fail_count + 1
+    }
+
+    // Test 7: Different tokens produce different logits
+    print("Test 7: Different tokens -> different outputs")
+    let logits2 = forward(7, 0, w, vocab, dim, hidden, n_heads, kv_heads)
+    var same = true
+    i = 0
+    while i < vocab {
+        if _abs(logits[i] - logits2[i]) > 1.0e-10 {
+            same = false
+        }
+        i = i + 1
+    }
+    if same == false {
+        print("  PASS: token 3 and 7 produce different logits")
+        pass_count = pass_count + 1
+    } else {
+        print("  FAIL: identical logits for different tokens")
+        fail_count = fail_count + 1
+    }
+
+    // Test 8: Generate 3 tokens
+    print("Test 8: Generate 3 tokens")
+    var prompt: [i64] = [1, 5]
+    let generated = generate(prompt, 3, w, vocab, dim, hidden, n_heads, kv_heads)
+    let ng = len(generated)
+    var all_valid = true
+    i = 0
+    while i < ng {
+        if generated[i] < 0 || generated[i] >= vocab {
+            all_valid = false
+        }
+        i = i + 1
+    }
+    if ng == 3 && all_valid {
+        print("  PASS: generated [" + to_string(generated[0]) + ", " + to_string(generated[1]) + ", " + to_string(generated[2]) + "]")
+        pass_count = pass_count + 1
+    } else {
+        print("  FAIL: generated " + to_string(ng) + " tokens")
+        fail_count = fail_count + 1
+    }
+
+    // Test 9: Multiple forward passes are fast
+    print("Test 9: Run 5 forward passes")
+    var fwd_ok = true
+    i = 0
+    while i < 5 {
+        let lg = forward(i, i, w, vocab, dim, hidden, n_heads, kv_heads)
+        if len(lg) != vocab {
+            fwd_ok = false
+        }
+        i = i + 1
+    }
+    if fwd_ok {
+        print("  PASS: 5 forward passes completed")
+        pass_count = pass_count + 1
+    } else {
+        print("  FAIL: forward pass error")
+        fail_count = fail_count + 1
+    }
+
+    print("")
+    print("=== Results: " + to_string(pass_count) + " PASS, " + to_string(fail_count) + " FAIL ===")
+    if fail_count == 0 {
+        print("ALL TESTS PASSED")
+    }
+}

@@ -4,14 +4,14 @@
 fn relu(x) { if x > 0.0 { x } else { 0.0 } }
 fn relu_array(arr) {
     let result = []
-    for i in 0..len(arr) { push(result, relu(arr[i])) }
+    for i in 0..len(arr) { result = push(result, relu(arr[i])) }
     result
 }
 
 fn sigmoid(x) { 1.0 / (1.0 + exp(-x)) }
 fn sigmoid_array(arr) {
     let result = []
-    for i in 0..len(arr) { push(result, sigmoid(arr[i])) }
+    for i in 0..len(arr) { result = push(result, sigmoid(arr[i])) }
     result
 }
 
@@ -29,11 +29,11 @@ fn softmax_array(arr) {
     let sum_exp = 0.0
     for i in 0..len(arr) {
         let e = exp(arr[i] - max_val)
-        push(exps, e)
+        exps = push(exps, e)
         sum_exp = sum_exp + e
     }
     let result = []
-    for i in 0..len(exps) { push(result, exps[i] / sum_exp) }
+    for i in 0..len(exps) { result = push(result, exps[i] / sum_exp) }
     result
 }
 
@@ -66,7 +66,7 @@ fn layer_norm_fn(x, gamma, beta, eps) {
     let result = []
     for i in 0..n {
         let norm_x = (x[i] - mean_val) / sqrt(var_val + eps)
-        push(result, gamma[i] * norm_x + beta[i])
+        result = push(result, gamma[i] * norm_x + beta[i])
     }
     result
 }
@@ -79,7 +79,7 @@ fn dense(input, weights, bias, n_in, n_out) {
         for i in 0..n_in {
             s = s + input[i] * weights[i * n_out + j]
         }
-        push(result, s)
+        result = push(result, s)
     }
     result
 }
@@ -90,8 +90,8 @@ fn dropout(x, rate) {
     let scale = 1.0 / (1.0 - rate)
     for i in 0..len(x) {
         // Simple deterministic "dropout" for interpreter
-        if i % 3 == 0 { push(result, 0.0) }
-        else { push(result, x[i] * scale) }
+        if i % 3 == 0 { result = push(result, 0.0) }
+        else { result = push(result, x[i] * scale) }
     }
     result
 }

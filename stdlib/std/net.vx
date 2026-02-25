@@ -1,0 +1,331 @@
+// Vortex Standard Library — Network (TCP/HTTP)
+// Uses Linux syscalls directly via syscall0..syscall6 builtins.
+//
+// Linux x86-64 syscall numbers used:
+//   SYS_READ    = 0
+//   SYS_WRITE   = 1
+//   SYS_CLOSE   = 3
+//   SYS_SOCKET  = 41
+//   SYS_CONNECT = 42
+//   SYS_ACCEPT  = 43
+//   SYS_BIND    = 49
+//   SYS_LISTEN  = 50
+//   SYS_SETSOCKOPT = 54
+//
+// sockaddr_in is constructed as a raw byte buffer via mem_alloc/mem_write_u8.
+// AF_INET = 2, SOCK_STREAM = 1, IPPROTO_TCP = 6, SOL_SOCKET = 1, SO_REUSEADDR = 2.
+
+// Special character helpers (Vortex strings do not process escape sequences)
+fn _cr() -> String { return str_from_bytes([13]) }
+fn _nl() -> String { return str_from_bytes([10]) }
+fn _crlf() -> String { return str_from_bytes([13, 10]) }
+
+// ---- syscall constants ----
+fn SYS_READ()      -> i64 { return 0 }
+fn SYS_WRITE()     -> i64 { return 1 }
+fn SYS_CLOSE()     -> i64 { return 3 }
+fn SYS_SOCKET()    -> i64 { return 41 }
+fn SYS_CONNECT()   -> i64 { return 42 }
+fn SYS_ACCEPT()    -> i64 { return 43 }
+fn SYS_BIND()      -> i64 { return 49 }
+fn SYS_LISTEN()    -> i64 { return 50 }
+fn SYS_SETSOCKOPT() -> i64 { return 54 }
+
+fn AF_INET()     -> i64 { return 2 }
+fn SOCK_STREAM() -> i64 { return 1 }
+fn IPPROTO_TCP() -> i64 { return 6 }
+fn SOL_SOCKET()  -> i64 { return 1 }
+fn SO_REUSEADDR() -> i64 { return 2 }
+
+// ---- helpers ----
+
+// htons: convert 16-bit value to network byte order (big-endian)
+fn htons(port: i64) -> i64 {
+    let lo = port % 256
+    let hi = port / 256
+    return lo * 256 + hi
+}
+
+// ipv4_to_u32: "a.b.c.d" -> 32-bit network-order integer
+// For simplicity, only handles "127.0.0.1" and "0.0.0.0" symbolically;
+// a real implementation would parse each octet.
+fn ipv4_to_u32(addr: String) -> i64 {
+    if addr == "0.0.0.0" {
+        return 0
+    }
+    if addr == "127.0.0.1" {
+        // 127=0x7F, 0, 0, 1  big-endian = 0x0100007F on little-endian host
+        return 16777343
+    }
+    if addr == "localhost" {
+        return 16777343
+    }
+    // Generic: parse a.b.c.d
+    var octet = 0
+    var result = 0
+    var shift = 0
+    var dot_count = 0
+    let n = len(addr)
+    var octets = [0, 0, 0, 0]
+    var cur = 0
+    var oi = 0
+    for i in range(0, n) {
+        let ch = str_char_at(addr, i)
+        if ch == "." {
+            octets = [octets[0], octets[1], octets[2], octets[3]]
+            // store cur into octets[oi]
+            if oi == 0 { octets = [cur, octets[1], octets[2], octets[3]] }
+            if oi == 1 { octets = [octets[0], cur, octets[2], octets[3]] }
+            if oi == 2 { octets = [octets[0], octets[1], cur, octets[3]] }
+            oi = oi + 1
+            cur = 0
+        } else {
+            cur = cur * 10 + int(ch)
+        }
+    }
+    // last octet
+    if oi == 3 { octets = [octets[0], octets[1], octets[2], cur] }
+    // network byte order: a.b.c.d -> a<<24|b<<16|c<<8|d on big-endian
+    // on little-endian x86 stored as bytes [a,b,c,d]
+    return octets[0] * 16777216 + octets[1] * 65536 + octets[2] * 256 + octets[3]
+}
+
+// make_sockaddr_in: allocate 16-byte sockaddr_in, return pointer
+// struct sockaddr_in { sa_family_t sin_family (2B); in_port_t sin_port (2B); struct in_addr (4B); char pad[8] }
+fn make_sockaddr_in(addr_str: String, port: i64) -> i64 {
+    let buf = mem_alloc(16)
+    let port_be = htons(port)
+    let ip_u32  = ipv4_to_u32(addr_str)
+    // sin_family = AF_INET (2) little-endian
+    mem_write_u8(buf, 0, AF_INET() % 256)
+    mem_write_u8(buf, 1, AF_INET() / 256)
+    // sin_port big-endian
+    mem_write_u8(buf, 2, port_be / 256)
+    mem_write_u8(buf, 3, port_be % 256)
+    // sin_addr (network byte order = big-endian)
+    mem_write_u8(buf, 4, (ip_u32 / 16777216) % 256)
+    mem_write_u8(buf, 5, (ip_u32 / 65536) % 256)
+    mem_write_u8(buf, 6, (ip_u32 / 256) % 256)
+    mem_write_u8(buf, 7, ip_u32 % 256)
+    // padding
+    for i in range(8, 16) {
+        mem_write_u8(buf, i, 0)
+    }
+    return buf
+}
+
+// ---- TCP API ----
+
+// tcp_socket: create a TCP socket, return fd or -1 on error
+fn tcp_socket() -> i64 {
+    return syscall3(SYS_SOCKET(), AF_INET(), SOCK_STREAM(), IPPROTO_TCP())
+}
+
+// tcp_listen: bind + listen on port, return server fd
+fn tcp_listen(port: i64) -> i64 {
+    let fd = tcp_socket()
+    if fd < 0 {
+        println("tcp_listen: socket() failed: " + str(fd))
+        return -1
+    }
+    // setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &1, 4)
+    let opt_buf = mem_alloc(4)
+    mem_write_u8(opt_buf, 0, 1)
+    mem_write_u8(opt_buf, 1, 0)
+    mem_write_u8(opt_buf, 2, 0)
+    mem_write_u8(opt_buf, 3, 0)
+    syscall5(SYS_SETSOCKOPT(), fd, SOL_SOCKET(), SO_REUSEADDR(), opt_buf, 4)
+    mem_free(opt_buf)
+    // bind
+    let addr_buf = make_sockaddr_in("0.0.0.0", port)
+    let bind_ret = syscall3(SYS_BIND(), fd, addr_buf, 16)
+    mem_free(addr_buf)
+    if bind_ret < 0 {
+        println("tcp_listen: bind() failed: " + str(bind_ret))
+        syscall1(SYS_CLOSE(), fd)
+        return -1
+    }
+    // listen(fd, backlog=128)
+    let listen_ret = syscall2(SYS_LISTEN(), fd, 128)
+    if listen_ret < 0 {
+        println("tcp_listen: listen() failed: " + str(listen_ret))
+        syscall1(SYS_CLOSE(), fd)
+        return -1
+    }
+    return fd
+}
+
+// tcp_accept: accept one incoming connection, return client fd
+fn tcp_accept(server_fd: i64) -> i64 {
+    // accept4: pass NULL for addr/addrlen (pass 0)
+    return syscall3(SYS_ACCEPT(), server_fd, 0, 0)
+}
+
+// tcp_connect: connect to host:port, return fd or -1
+fn tcp_connect(host: String, port: i64) -> i64 {
+    let fd = tcp_socket()
+    if fd < 0 {
+        return -1
+    }
+    let addr_buf = make_sockaddr_in(host, port)
+    let ret = syscall3(SYS_CONNECT(), fd, addr_buf, 16)
+    mem_free(addr_buf)
+    if ret < 0 {
+        syscall1(SYS_CLOSE(), fd)
+        return -1
+    }
+    return fd
+}
+
+// tcp_send: write data string to fd, return bytes written
+fn tcp_send(fd: i64, data: String) -> i64 {
+    let bytes = str_bytes(data)
+    let n = len(bytes)
+    let buf = mem_alloc(n)
+    for i in range(0, n) {
+        mem_write_u8(buf, i, int(bytes[i]))
+    }
+    let written = syscall3(SYS_WRITE(), fd, buf, n)
+    mem_free(buf)
+    return written
+}
+
+// tcp_recv: read up to max_len bytes from fd, return as String
+fn tcp_recv(fd: i64, max_len: i64) -> String {
+    let buf = mem_alloc(max_len)
+    let n = syscall3(SYS_READ(), fd, buf, max_len)
+    if n <= 0 {
+        mem_free(buf)
+        return ""
+    }
+    var byte_arr = []
+    for i in range(0, n) {
+        byte_arr = push(byte_arr, str(mem_read_u8(buf, i)))
+    }
+    mem_free(buf)
+    return str_from_bytes(byte_arr)
+}
+
+// socket_close: close a file descriptor
+fn socket_close(fd: i64) {
+    syscall1(SYS_CLOSE(), fd)
+}
+
+// ---- HTTP ----
+
+// http_parse_host: extract host from "http://host/path" or "host/path"
+fn http_parse_host(url: String) -> String {
+    var start = 0
+    // Skip "http://" or "https://"
+    let scheme_http = "http://"
+    let scheme_https = "https://"
+    let url_len = len(url)
+    if url_len >= 7 {
+        let prefix = str_substr(url, 0, 7)
+        if prefix == scheme_http {
+            start = 7
+        }
+    }
+    if url_len >= 8 {
+        let prefix = str_substr(url, 0, 8)
+        if prefix == scheme_https {
+            start = 8
+        }
+    }
+    // Find '/' after host
+    let rest = str_substr(url, start, url_len - start)
+    let slash = unwrap_or(str_find(rest, "/"), -1)
+    if slash < 0 {
+        return rest
+    }
+    return str_substr(url, start, slash)
+}
+
+// http_parse_path: extract path from URL (everything after host)
+fn http_parse_path(url: String) -> String {
+    var start = 0
+    let url_len = len(url)
+    if url_len >= 7 {
+        if str_substr(url, 0, 7) == "http://" {
+            start = 7
+        }
+    }
+    if url_len >= 8 {
+        if str_substr(url, 0, 8) == "https://" {
+            start = 8
+        }
+    }
+    let rest = str_substr(url, start, url_len - start)
+    let slash = unwrap_or(str_find(rest, "/"), -1)
+    if slash < 0 {
+        return "/"
+    }
+    return str_substr(rest, slash, len(rest) - slash)
+}
+
+// http_get: perform a simple HTTP/1.0 GET, return response body
+fn http_get(url: String) -> String {
+    let host = http_parse_host(url)
+    let path = http_parse_path(url)
+    let fd = tcp_connect(host, 80)
+    if fd < 0 {
+        return "ERROR: could not connect to " + host + ":80"
+    }
+    let request = "GET " + path + " HTTP/1.0" + _crlf() + "Host: " + host + _crlf() + "Connection: close" + _crlf() + _crlf()
+    tcp_send(fd, request)
+    // Read response in chunks
+    var response = ""
+    var chunk = tcp_recv(fd, 4096)
+    var iterations = 0
+    while len(chunk) > 0 && iterations < 256 {
+        response = response + chunk
+        chunk = tcp_recv(fd, 4096)
+        iterations = iterations + 1
+    }
+    socket_close(fd)
+    // Strip headers: find CRLFCRLF separator
+    let crlfcrlf = _crlf() + _crlf()
+    let sep = unwrap_or(str_find(response, crlfcrlf), -1)
+    if sep >= 0 {
+        return str_substr(response, sep + 4, len(response) - sep - 4)
+    }
+    return response
+}
+
+// ---- Demo ----
+
+fn main() {
+    println("=== Net Demo ===")
+    println("")
+    println("htons(80) = " + str(htons(80)))
+    println("htons(8080) = " + str(htons(8080)))
+    println("ipv4_to_u32(127.0.0.1) = " + str(ipv4_to_u32("127.0.0.1")))
+    println("ipv4_to_u32(0.0.0.0)   = " + str(ipv4_to_u32("0.0.0.0")))
+    println("")
+    println("http_parse_host(http://example.com/foo) = " + http_parse_host("http://example.com/foo"))
+    println("http_parse_path(http://example.com/foo) = " + http_parse_path("http://example.com/foo"))
+    println("")
+
+    println("--- Echo server concept ---")
+    println("To start an echo server on port 7777:")
+    println("  let srv = tcp_listen(7777)")
+    println("  let cli = tcp_accept(srv)")
+    println("  let data = tcp_recv(cli, 1024)")
+    println("  tcp_send(cli, data)")
+    println("  socket_close(cli)")
+    println("  socket_close(srv)")
+    println("")
+
+    println("--- TCP listen test ---")
+    let srv = tcp_listen(17777)
+    if srv < 0 {
+        println("Could not bind (port in use or permission denied) — skipping accept loop")
+    } else {
+        println("Listening on :17777, fd=" + str(srv))
+        println("(Not blocking on accept in demo mode)")
+        socket_close(srv)
+        println("Server socket closed.")
+    }
+    println("")
+    println("=== Net Demo complete ===")
+}

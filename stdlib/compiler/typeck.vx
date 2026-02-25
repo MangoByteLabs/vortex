@@ -1,0 +1,724 @@
+// Vortex Self-Hosting Type Checker
+// Operates on the AST produced by parser.vx (array-based nodes)
+//
+// AST nodes: ["kind", field1, field2, ...]
+// Type environment: flat array of [name, type] pairs (most-recent binding wins)
+// Errors: array of strings collected without halting
+//
+// Type strings:
+//   "i64"        integer
+//   "f64"        float
+//   "bool"       boolean
+//   "String"     string
+//   "[T]"        array of T
+//   "void"       no value / unit
+//   "any"        unknown / dynamic (suppress further errors)
+//   "fn(T1,T2)->R"  function type
+//   "error"      type error sentinel (like "any" but marks a known bad site)
+
+// --- String Helpers ---
+
+// str_find_idx: find needle in haystack, return index or -1
+fn str_find_idx(haystack: String, needle: String) -> i64 {
+    return unwrap_or(str_find(haystack, needle), -1)
+}
+
+// --- Environment Helpers ---
+
+// env_push: add a new binding (most-recent shadows older)
+fn env_push(env: [String], name: String, typ: String) -> [String] {
+    let entry = name + ":" + typ
+    let new_env = env
+    new_env = push(new_env, entry)
+    return new_env
+}
+
+// env_lookup: find the most-recent binding for name; returns "any" if missing
+fn env_lookup(env: [String], name: String) -> String {
+    let result = "any"
+    let i = 0
+    let n = len(env)
+    for i in range(0, n) {
+        let entry = env[i]
+        let sep = str_find_idx(entry, ":")
+        if sep >= 0 {
+            let ename = str_substr(entry, 0, sep)
+            if ename == name {
+                let etype = str_substr(entry, sep + 1, len(entry))
+                result = etype
+            }
+        }
+    }
+    return result
+}
+
+// env_push_params: add all params from a params array [["param", name, type], ...]
+fn env_push_params(env: [String], params: [String]) -> [String] {
+    let cur_env = env
+    let i = 0
+    let n = len(params)
+    for i in range(0, n) {
+        let p = params[i]
+        // param node: ["param", name, type_str]
+        if len(p) >= 3 {
+            let pname = p[1]
+            let ptype = p[2]
+            cur_env = env_push(cur_env, pname, ptype)
+        }
+    }
+    return cur_env
+}
+
+// --- Error Helpers ---
+
+fn push_error(errors: [String], msg: String) -> [String] {
+    errors = push(errors, msg)
+    return errors
+}
+
+fn type_error(errors: [String], msg: String, line: String) -> [String] {
+    let full = "TypeError at line " + line + ": " + msg
+    return push_error(errors, full)
+}
+
+// --- Type Compatibility ---
+
+// is_numeric: true for i64 and f64
+fn is_numeric(typ: String) -> bool {
+    return typ == "i64" || typ == "f64"
+}
+
+// numeric_result: widening for arithmetic (i64 op f64 -> f64)
+fn numeric_result(a: String, b: String) -> String {
+    if a == "f64" || b == "f64" {
+        return "f64"
+    }
+    return "i64"
+}
+
+// types_compatible: check assignability (any matches everything)
+fn types_compatible(expected: String, actual: String) -> bool {
+    if expected == "any" || actual == "any" {
+        return true
+    }
+    if expected == "error" || actual == "error" {
+        return true
+    }
+    return expected == actual
+}
+
+// array_elem_type: given "[T]" return "T", else "any"
+fn array_elem_type(arr_type: String) -> String {
+    let n = len(arr_type)
+    if n >= 3 {
+        let first = str_substr(arr_type, 0, 1)
+        let last = str_substr(arr_type, n - 1, n)
+        if first == "[" && last == "]" {
+            return str_substr(arr_type, 1, n - 1)
+        }
+    }
+    return "any"
+}
+
+// make_array_type: wrap elem type in brackets
+fn make_array_type(elem: String) -> String {
+    return "[" + elem + "]"
+}
+
+// --- Literal / Primary Expression Inference ---
+
+fn infer_literal(node: [String]) -> String {
+    let kind = node[0]
+    if kind == "int" {
+        return "i64"
+    }
+    if kind == "float" {
+        return "f64"
+    }
+    if kind == "bool" {
+        return "bool"
+    }
+    if kind == "string" {
+        return "String"
+    }
+    return "any"
+}
+
+// --- Expression Type Inference ---
+
+fn infer_expr(env: [String], expr: [String]) -> String {
+    if len(expr) == 0 {
+        return "void"
+    }
+    let kind = expr[0]
+
+    // Literals
+    if kind == "int" || kind == "float" || kind == "bool" || kind == "string" {
+        return infer_literal(expr)
+    }
+
+    // Identifier: look up in env
+    if kind == "ident" {
+        if len(expr) >= 2 {
+            return env_lookup(env, expr[1])
+        }
+        return "any"
+    }
+
+    // Binary expression: ["binary", op, left, right]
+    if kind == "binary" {
+        if len(expr) >= 4 {
+            let op = expr[1]
+            let lt = infer_expr(env, expr[2])
+            let rt = infer_expr(env, expr[3])
+            return infer_binary_type(op, lt, rt)
+        }
+        return "any"
+    }
+
+    // Unary expression: ["unary", op, expr]
+    if kind == "unary" {
+        if len(expr) >= 3 {
+            let op = expr[1]
+            let t = infer_expr(env, expr[2])
+            if op == "!" {
+                return "bool"
+            }
+            if op == "-" {
+                if is_numeric(t) {
+                    return t
+                }
+                return "i64"
+            }
+        }
+        return "any"
+    }
+
+    // Function call: ["call", callee_expr, arg1, arg2, ...]
+    if kind == "call" {
+        if len(expr) >= 2 {
+            let callee_type = infer_expr(env, expr[1])
+            return infer_call_return(callee_type)
+        }
+        return "any"
+    }
+
+    // Array literal: ["array", elem1, elem2, ...]
+    if kind == "array" {
+        if len(expr) >= 2 {
+            let elem_t = infer_expr(env, expr[1])
+            return make_array_type(elem_t)
+        }
+        return "[any]"
+    }
+
+    // Index expression: ["index", expr, index_expr]
+    if kind == "index" {
+        if len(expr) >= 2 {
+            let arr_t = infer_expr(env, expr[1])
+            return array_elem_type(arr_t)
+        }
+        return "any"
+    }
+
+    // Field access: ["field", expr, field_name] -> "any" (structs not fully resolved)
+    if kind == "field" {
+        return "any"
+    }
+
+    // Block: ["block", stmt1, stmt2, ...] — type is last stmt if it's an expr, else void
+    if kind == "block" {
+        return "void"
+    }
+
+    // Closure: ["closure", params, body] -> function type (simplified)
+    if kind == "closure" {
+        return "fn()->any"
+    }
+
+    return "any"
+}
+
+// infer_binary_type: determine result type of a binary operation
+fn infer_binary_type(op: String, lt: String, rt: String) -> String {
+    // Arithmetic operators
+    if op == "+" {
+        if lt == "String" || rt == "String" {
+            return "String"
+        }
+        if is_numeric(lt) && is_numeric(rt) {
+            return numeric_result(lt, rt)
+        }
+        return "any"
+    }
+    if op == "-" || op == "*" || op == "/" || op == "%" {
+        if is_numeric(lt) && is_numeric(rt) {
+            return numeric_result(lt, rt)
+        }
+        return "i64"
+    }
+    // Comparison operators -> bool
+    if op == "==" || op == "!=" || op == "<" || op == ">" || op == "<=" || op == ">=" {
+        return "bool"
+    }
+    // Logical operators -> bool
+    if op == "&&" || op == "||" {
+        return "bool"
+    }
+    return "any"
+}
+
+// infer_call_return: extract return type from fn type string
+fn infer_call_return(fn_type: String) -> String {
+    // fn type looks like "fn(T1,T2)->R"
+    let arrow = str_find_idx(fn_type, "->")
+    if arrow >= 0 {
+        return str_substr(fn_type, arrow + 2, len(fn_type))
+    }
+    // Unknown function type: return any
+    return "any"
+}
+
+// --- Statement Checking ---
+
+// check_stmt: check a statement, return updated env
+fn check_stmt(env: [String], stmt: [String], errors: [String], ret_type: String) -> [String] {
+    if len(stmt) == 0 {
+        return env
+    }
+    let kind = stmt[0]
+
+    // let binding: ["let", name, type_or_empty, expr]
+    if kind == "let" || kind == "var" {
+        if len(stmt) >= 4 {
+            let vname = stmt[1]
+            let ann = stmt[2]
+            let expr = stmt[3]
+            let inferred = infer_expr(env, expr)
+            let final_type = inferred
+            if ann != "" && ann != "any" {
+                if !types_compatible(ann, inferred) {
+                    let msg = "variable '" + vname + "' declared as " + ann + " but got " + inferred
+                    errors = type_error(errors, msg, "?")
+                }
+                final_type = ann
+            }
+            env = env_push(env, vname, final_type)
+        }
+        return env
+    }
+
+    // assignment: ["assign", target, value]
+    if kind == "assign" {
+        if len(stmt) >= 3 {
+            let target_type = infer_expr(env, stmt[1])
+            let val_type = infer_expr(env, stmt[2])
+            if !types_compatible(target_type, val_type) {
+                let msg = "cannot assign " + val_type + " to " + target_type
+                errors = type_error(errors, msg, "?")
+            }
+        }
+        return env
+    }
+
+    // return statement: ["return", expr]
+    if kind == "return" {
+        if len(stmt) >= 2 {
+            let expr_type = infer_expr(env, stmt[1])
+            if !types_compatible(ret_type, expr_type) {
+                let msg = "return type mismatch: expected " + ret_type + ", got " + expr_type
+                errors = type_error(errors, msg, "?")
+            }
+        } else {
+            if !types_compatible(ret_type, "void") {
+                let msg = "bare return in function expecting " + ret_type
+                errors = type_error(errors, msg, "?")
+            }
+        }
+        return env
+    }
+
+    // if statement: ["if", cond, then_block, else_block_or_empty]
+    if kind == "if" {
+        if len(stmt) >= 3 {
+            let cond_type = infer_expr(env, stmt[1])
+            if cond_type != "bool" && cond_type != "any" {
+                let msg = "if condition must be bool, got " + cond_type
+                errors = type_error(errors, msg, "?")
+            }
+            errors = check_block(env, stmt[2], errors, ret_type)
+            if len(stmt) >= 4 {
+                let else_b = stmt[3]
+                if len(else_b) > 0 {
+                    errors = check_block(env, else_b, errors, ret_type)
+                }
+            }
+        }
+        return env
+    }
+
+    // while loop: ["while", cond, body]
+    if kind == "while" {
+        if len(stmt) >= 3 {
+            let cond_type = infer_expr(env, stmt[1])
+            if cond_type != "bool" && cond_type != "any" {
+                let msg = "while condition must be bool, got " + cond_type
+                errors = type_error(errors, msg, "?")
+            }
+            errors = check_block(env, stmt[2], errors, ret_type)
+        }
+        return env
+    }
+
+    // for loop: ["for", var_name, iter_expr, body]
+    if kind == "for" {
+        if len(stmt) >= 4 {
+            let var_name = stmt[1]
+            let iter_type = infer_expr(env, stmt[2])
+            let elem_type = array_elem_type(iter_type)
+            let loop_env = env_push(env, var_name, elem_type)
+            errors = check_block(loop_env, stmt[3], errors, ret_type)
+        }
+        return env
+    }
+
+    // function definition nested: ["fn", name, params, ret_type, body]
+    if kind == "fn" {
+        errors = check_fn(env, stmt, errors)
+        if len(stmt) >= 3 {
+            let fname = stmt[1]
+            let fn_type = build_fn_type(stmt)
+            env = env_push(env, fname, fn_type)
+        }
+        return env
+    }
+
+    // block: ["block", stmt1, ...]
+    if kind == "block" {
+        errors = check_block(env, stmt, errors, ret_type)
+        return env
+    }
+
+    // expression statement (call, etc.) — just infer, ignore type
+    infer_expr(env, stmt)
+    return env
+}
+
+// build_fn_type: construct "fn(T1,T2)->R" string from fn node
+fn build_fn_type(node: [String]) -> String {
+    // ["fn", name, params, ret_type, body]
+    let param_types = ""
+    if len(node) >= 3 {
+        let params = node[2]
+        let i = 0
+        let n = len(params)
+        for i in range(0, n) {
+            let p = params[i]
+            if len(p) >= 3 {
+                if i > 0 {
+                    param_types = param_types + ","
+                }
+                param_types = param_types + p[2]
+            }
+        }
+    }
+    let ret = "void"
+    if len(node) >= 4 {
+        let r = node[3]
+        if r != "" {
+            ret = r
+        }
+    }
+    return "fn(" + param_types + ")->" + ret
+}
+
+// check_block: check all statements in a block node
+fn check_block(env: [String], block: [String], errors: [String], ret_type: String) -> [String] {
+    if len(block) == 0 {
+        return errors
+    }
+    let kind = block[0]
+    let stmts_start = 1
+    if kind != "block" {
+        stmts_start = 0
+    }
+    let cur_env = env
+    let i = stmts_start
+    let n = len(block)
+    for i in range(stmts_start, n) {
+        let stmt = block[i]
+        cur_env = check_stmt(cur_env, stmt, errors, ret_type)
+    }
+    return errors
+}
+
+// --- Function Checking ---
+
+fn check_fn(env: [String], node: [String], errors: [String]) -> [String] {
+    // ["fn", name, params, ret_type, body]
+    if len(node) < 5 {
+        return errors
+    }
+    let fname = node[1]
+    let params = node[2]
+    let ret_type = node[3]
+    let body = node[4]
+
+    if ret_type == "" {
+        ret_type = "void"
+    }
+
+    // Build inner env with params
+    let inner_env = env_push_params(env, params)
+
+    // Check all statements in the body block
+    errors = check_block(inner_env, body, errors, ret_type)
+
+    return errors
+}
+
+// check_call_args: validate argument types at a call site
+fn check_call_args(env: [String], call_node: [String], errors: [String]) -> [String] {
+    // ["call", callee_expr, arg1, arg2, ...]
+    if len(call_node) < 2 {
+        return errors
+    }
+    let callee = call_node[1]
+    let callee_type = infer_expr(env, callee)
+    let expected_args = parse_fn_param_types(callee_type)
+    let n_expected = len(expected_args)
+    let n_actual = len(call_node) - 2
+    if n_expected > 0 && n_expected != n_actual {
+        let msg = "wrong number of arguments: expected " + str(n_expected) + ", got " + str(n_actual)
+        errors = type_error(errors, msg, "?")
+    }
+    // Check individual arg types when expected is known
+    let i = 0
+    for i in range(0, n_actual) {
+        if i < n_expected {
+            let arg_type = infer_expr(env, call_node[i + 2])
+            let exp_t = expected_args[i]
+            if !types_compatible(exp_t, arg_type) {
+                let msg = "argument " + str(i) + ": expected " + exp_t + ", got " + arg_type
+                errors = type_error(errors, msg, "?")
+            }
+        }
+    }
+    return errors
+}
+
+// parse_fn_param_types: extract param type list from "fn(T1,T2)->R"
+// Returns array of type strings; empty array if not a known fn type
+fn parse_fn_param_types(fn_type: String) -> [String] {
+    let result = []
+    let open = str_find_idx(fn_type, "(")
+    let close = str_find_idx(fn_type, ")")
+    if open < 0 || close < 0 || close <= open + 1 {
+        return result
+    }
+    let inner = str_substr(fn_type, open + 1, close)
+    if inner == "" {
+        return result
+    }
+    // Split by comma (simple single-level split)
+    result = str_split(inner, ",")
+    return result
+}
+
+// --- Struct Checking ---
+
+fn check_struct(env: [String], node: [String], errors: [String]) -> [String] {
+    // ["struct", name, field1, field2, ...] where fields are ["field", name, type]
+    // Validate that field types are non-empty strings
+    if len(node) < 2 {
+        return errors
+    }
+    let sname = node[1]
+    let i = 2
+    let n = len(node)
+    for i in range(2, n) {
+        let f = node[i]
+        if len(f) >= 3 {
+            let ftype = f[2]
+            if ftype == "" {
+                let msg = "struct '" + sname + "' field '" + f[1] + "' missing type annotation"
+                errors = push_error(errors, msg)
+            }
+        }
+    }
+    return errors
+}
+
+// --- Top-Level Program Checking ---
+
+// typeck: main entry point — returns array of error strings
+fn typeck(ast: [String]) -> [String] {
+    let errors = []
+    if len(ast) == 0 {
+        return errors
+    }
+    let kind = ast[0]
+    if kind != "program" {
+        errors = push_error(errors, "Expected 'program' node, got '" + kind + "'")
+        return errors
+    }
+
+    // Build top-level env by scanning all fn/struct names first (forward declarations)
+    let top_env = []
+    let i = 1
+    let n = len(ast)
+    for i in range(1, n) {
+        let item = ast[i]
+        if len(item) >= 2 {
+            let ik = item[0]
+            if ik == "fn" {
+                let fn_type = build_fn_type(item)
+                top_env = env_push(top_env, item[1], fn_type)
+            }
+            if ik == "struct" {
+                top_env = env_push(top_env, item[1], item[1])
+            }
+        }
+    }
+
+    // Now type-check each top-level item
+    for i in range(1, n) {
+        let item = ast[i]
+        if len(item) >= 1 {
+            let ik = item[0]
+            if ik == "fn" {
+                errors = check_fn(top_env, item, errors)
+            }
+            if ik == "struct" {
+                errors = check_struct(top_env, item, errors)
+            }
+        }
+    }
+
+    return errors
+}
+
+// --- Main: Self-Test ---
+
+fn main() {
+    println("=== Vortex Type Checker Self-Test ===")
+
+    // Build a small test AST manually:
+    //
+    //   fn add(x: i64, y: i64) -> i64 {
+    //       return x + y
+    //   }
+    //
+    //   fn greet(name: String) -> String {
+    //       let msg: String = "Hello, " + name
+    //       return msg
+    //   }
+    //
+    //   fn bad_return(x: i64) -> bool {
+    //       return x + 1    // error: expected bool, got i64
+    //   }
+    //
+    //   fn bad_cond(x: i64) -> void {
+    //       if x {          // error: if condition must be bool
+    //           let y = 1
+    //       }
+    //   }
+
+    let param_x_i64 = ["param", "x", "i64"]
+    let param_y_i64 = ["param", "y", "i64"]
+    let param_name_str = ["param", "name", "String"]
+
+    let fn_add = [
+        "fn",
+        "add",
+        [param_x_i64, param_y_i64],
+        "i64",
+        ["block",
+            ["return", ["binary", "+", ["ident", "x"], ["ident", "y"]]]
+        ]
+    ]
+
+    let fn_greet = [
+        "fn",
+        "greet",
+        [param_name_str],
+        "String",
+        ["block",
+            ["let", "msg", "String", ["binary", "+", ["string", "Hello, "], ["ident", "name"]]],
+            ["return", ["ident", "msg"]]
+        ]
+    ]
+
+    let fn_bad_return = [
+        "fn",
+        "bad_return",
+        [param_x_i64],
+        "bool",
+        ["block",
+            ["return", ["binary", "+", ["ident", "x"], ["int", "1"]]]
+        ]
+    ]
+
+    let fn_bad_cond = [
+        "fn",
+        "bad_cond",
+        [param_x_i64],
+        "void",
+        ["block",
+            ["if",
+                ["ident", "x"],
+                ["block", ["let", "y", "", ["int", "1"]]],
+                []
+            ]
+        ]
+    ]
+
+    let program = ["program", fn_add, fn_greet, fn_bad_return, fn_bad_cond]
+
+    let errors = typeck(program)
+    let n_errors = len(errors)
+
+    if n_errors == 0 {
+        println("No type errors found (unexpected for this test!)")
+    } else {
+        println("Found " + str(n_errors) + " type error(s):")
+        let i = 0
+        for i in range(0, n_errors) {
+            println("  [" + str(i + 1) + "] " + errors[i])
+        }
+    }
+
+    println("")
+    println("Expected errors:")
+    println("  [1] return type mismatch in bad_return (expected bool, got i64)")
+    println("  [2] if condition must be bool in bad_cond (got i64)")
+    println("")
+
+    // Test env helpers directly
+    println("--- env helper tests ---")
+    let env = []
+    env = env_push(env, "x", "i64")
+    env = env_push(env, "y", "f64")
+    env = env_push(env, "x", "bool")   // shadow x
+    let t1 = env_lookup(env, "x")      // should be "bool"
+    let t2 = env_lookup(env, "y")      // should be "f64"
+    let t3 = env_lookup(env, "z")      // should be "any"
+    println("lookup x (shadowed) = " + t1 + " (expected: bool)")
+    println("lookup y = " + t2 + " (expected: f64)")
+    println("lookup z (missing) = " + t3 + " (expected: any)")
+
+    println("")
+    println("--- type inference tests ---")
+    let env2 = env_push([], "n", "i64")
+    let t_add = infer_expr(env2, ["binary", "+", ["ident", "n"], ["int", "5"]])
+    let t_cmp = infer_expr(env2, ["binary", "<", ["ident", "n"], ["int", "10"]])
+    let t_arr = infer_expr(env2, ["array", ["int", "1"]])
+    let t_idx = infer_expr(env2, ["index", ["array", ["int", "1"]], ["int", "0"]])
+    println("i64 + i64 = " + t_add + " (expected: i64)")
+    println("i64 < i64 = " + t_cmp + " (expected: bool)")
+    println("array of int = " + t_arr + " (expected: [i64])")
+    println("index [i64] = " + t_idx + " (expected: i64)")
+
+    println("")
+    println("=== Type Checker Test Complete ===")
+}

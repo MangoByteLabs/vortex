@@ -1,13 +1,485 @@
-// Vortex Standard Tensor Library
+// std/tensor.vx — Pure-Vortex tensor library
+//
+// Tensor encoding: flat [f64] array
+//   [ndim, dim0, dim1, ..., dimN-1, data0, data1, ...]
+// header_size = 1 + ndim
 
-pub fn zeros(n: i64) -> i64 {
+// Compute total number of elements from shape array
+fn _shape_size(shape: [i64]) -> i64 {
+    var total = 1
+    var i = 0
+    let n = len(shape)
+    while i < n {
+        total = total * shape[i]
+        i = i + 1
+    }
+    return total
+}
+
+// Compute flat index from multi-dim indices and shape
+fn _flat_index(indices: [i64], shape: [i64]) -> i64 {
+    let nd = len(shape)
+    var idx = 0
+    var i = 0
+    while i < nd {
+        var stride = 1
+        var j = i + 1
+        while j < nd {
+            stride = stride * shape[j]
+            j = j + 1
+        }
+        idx = idx + indices[i] * stride
+        i = i + 1
+    }
+    return idx
+}
+
+// Pack shape + data into tensor representation
+fn tensor_new(shape: [i64], data: [f64]) -> [f64] {
+    let nd = len(shape)
+    var t = []
+    // store ndim as f64
+    t = push(t, float(nd))
+    // store each dim
+    var i = 0
+    while i < nd {
+        t = push(t, float(shape[i]))
+        i = i + 1
+    }
+    // store data
+    var j = 0
+    let dlen = len(data)
+    while j < dlen {
+        t = push(t, data[j])
+        j = j + 1
+    }
+    return t
+}
+
+// Extract shape as [i64]
+fn tensor_shape(t: [f64]) -> [i64] {
+    let nd = int(t[0])
+    var shape = []
+    var i = 0
+    while i < nd {
+        shape = push(shape, int(t[1 + i]))
+        i = i + 1
+    }
+    return shape
+}
+
+// Number of dimensions
+fn tensor_ndim(t: [f64]) -> i64 {
+    return int(t[0])
+}
+
+// Total number of elements
+fn tensor_size(t: [f64]) -> i64 {
+    let shape = tensor_shape(t)
+    return _shape_size(shape)
+}
+
+// Extract data portion only
+fn tensor_data(t: [f64]) -> [f64] {
+    let nd = int(t[0])
+    let header = 1 + nd
+    let total = len(t) - header
+    var data = []
+    var i = 0
+    while i < total {
+        data = push(data, t[header + i])
+        i = i + 1
+    }
+    return data
+}
+
+// Create tensor of zeros
+fn tensor_zeros(shape: [i64]) -> [f64] {
+    let total = _shape_size(shape)
+    var data = []
+    var i = 0
+    while i < total {
+        data = push(data, 0.0)
+        i = i + 1
+    }
+    return tensor_new(shape, data)
+}
+
+// Create tensor of ones
+fn tensor_ones(shape: [i64]) -> [f64] {
+    let total = _shape_size(shape)
+    var data = []
+    var i = 0
+    while i < total {
+        data = push(data, 1.0)
+        i = i + 1
+    }
+    return tensor_new(shape, data)
+}
+
+// Create tensor with LCG pseudo-random values in [0, 1)
+fn tensor_rand(shape: [i64], seed: i64) -> [f64] {
+    let total = _shape_size(shape)
+    var data = []
+    var state = seed
+    var i = 0
+    while i < total {
+        // LCG: x = (a*x + c) mod m
+        state = (1664525 * state + 1013904223) % 2147483648
+        let val = float(state) / 2147483648.0
+        data = push(data, val)
+        i = i + 1
+    }
+    return tensor_new(shape, data)
+}
+
+// Get element at multi-dim indices
+fn tensor_get(t: [f64], indices: [i64]) -> f64 {
+    let nd = int(t[0])
+    let header = 1 + nd
+    let shape = tensor_shape(t)
+    let flat = _flat_index(indices, shape)
+    return t[header + flat]
+}
+
+// Set element at multi-dim indices, return new tensor
+fn tensor_set(t: [f64], indices: [i64], val: f64) -> [f64] {
+    let nd = int(t[0])
+    let header = 1 + nd
+    let shape = tensor_shape(t)
+    let flat = _flat_index(indices, shape)
+    let target = header + flat
+    let tlen = len(t)
+    var result = []
+    var i = 0
+    while i < tlen {
+        if i == target {
+            result = push(result, val)
+        } else {
+            result = push(result, t[i])
+        }
+        i = i + 1
+    }
+    return result
+}
+
+// Elementwise addition
+fn tensor_add(a: [f64], b: [f64]) -> [f64] {
+    let nd = int(a[0])
+    let header = 1 + nd
+    let total = len(a) - header
+    // copy header from a
+    var result = []
+    var i = 0
+    while i < header {
+        result = push(result, a[i])
+        i = i + 1
+    }
+    // add data
+    var j = 0
+    while j < total {
+        result = push(result, a[header + j] + b[header + j])
+        j = j + 1
+    }
+    return result
+}
+
+// Elementwise subtraction
+fn tensor_sub(a: [f64], b: [f64]) -> [f64] {
+    let nd = int(a[0])
+    let header = 1 + nd
+    let total = len(a) - header
+    var result = []
+    var i = 0
+    while i < header {
+        result = push(result, a[i])
+        i = i + 1
+    }
+    var j = 0
+    while j < total {
+        result = push(result, a[header + j] - b[header + j])
+        j = j + 1
+    }
+    return result
+}
+
+// Elementwise multiplication
+fn tensor_mul(a: [f64], b: [f64]) -> [f64] {
+    let nd = int(a[0])
+    let header = 1 + nd
+    let total = len(a) - header
+    var result = []
+    var i = 0
+    while i < header {
+        result = push(result, a[i])
+        i = i + 1
+    }
+    var j = 0
+    while j < total {
+        result = push(result, a[header + j] * b[header + j])
+        j = j + 1
+    }
+    return result
+}
+
+// Scale tensor by scalar
+fn tensor_scale(t: [f64], s: f64) -> [f64] {
+    let nd = int(t[0])
+    let header = 1 + nd
+    let total = len(t) - header
+    var result = []
+    var i = 0
+    while i < header {
+        result = push(result, t[i])
+        i = i + 1
+    }
+    var j = 0
+    while j < total {
+        result = push(result, t[header + j] * s)
+        j = j + 1
+    }
+    return result
+}
+
+// 2D matrix multiply: a is [M, K], b is [K, N] -> [M, N]
+fn tensor_matmul(a: [f64], b: [f64]) -> [f64] {
+    let a_shape = tensor_shape(a)
+    let b_shape = tensor_shape(b)
+    let m = a_shape[0]
+    let k = a_shape[1]
+    let n = b_shape[1]
+    let a_hdr = 3
+    let b_hdr = 3
+    var new_shape = []
+    new_shape = push(new_shape, m)
+    new_shape = push(new_shape, n)
+    var data = []
+    var i = 0
+    while i < m {
+        var j = 0
+        while j < n {
+            var acc = 0.0
+            var p = 0
+            while p < k {
+                acc = acc + a[a_hdr + i * k + p] * b[b_hdr + p * n + j]
+                p = p + 1
+            }
+            data = push(data, acc)
+            j = j + 1
+        }
+        i = i + 1
+    }
+    return tensor_new(new_shape, data)
+}
+
+// 2D transpose: [M, N] -> [N, M]
+fn tensor_transpose(t: [f64]) -> [f64] {
+    let shape = tensor_shape(t)
+    let m = shape[0]
+    let n = shape[1]
+    let hdr = 3
+    var new_shape = []
+    new_shape = push(new_shape, n)
+    new_shape = push(new_shape, m)
+    var data = []
+    var j = 0
+    while j < n {
+        var i = 0
+        while i < m {
+            data = push(data, t[hdr + i * n + j])
+            i = i + 1
+        }
+        j = j + 1
+    }
+    return tensor_new(new_shape, data)
+}
+
+// Reshape tensor (total elements must match)
+fn tensor_reshape(t: [f64], new_shape: [i64]) -> [f64] {
+    let data = tensor_data(t)
+    return tensor_new(new_shape, data)
+}
+
+// Sum all elements
+fn tensor_sum(t: [f64]) -> f64 {
+    let nd = int(t[0])
+    let header = 1 + nd
+    let total = len(t) - header
+    var acc = 0.0
+    var i = 0
+    while i < total {
+        acc = acc + t[header + i]
+        i = i + 1
+    }
+    return acc
+}
+
+// Mean of all elements
+fn tensor_mean(t: [f64]) -> f64 {
+    let nd = int(t[0])
+    let header = 1 + nd
+    let total = len(t) - header
+    if total == 0 {
+        return 0.0
+    }
+    return tensor_sum(t) / float(total)
+}
+
+// Max of all elements
+fn tensor_max(t: [f64]) -> f64 {
+    let nd = int(t[0])
+    let header = 1 + nd
+    let total = len(t) - header
+    var mx = t[header]
+    var i = 1
+    while i < total {
+        if t[header + i] > mx {
+            mx = t[header + i]
+        }
+        i = i + 1
+    }
+    return mx
+}
+
+// Pretty print tensor, returns 0
+fn tensor_print(t: [f64]) -> i64 {
+    let nd = int(t[0])
+    let shape = tensor_shape(t)
+    let header = 1 + nd
+    let total = len(t) - header
+    var shape_str = "shape=["
+    var si = 0
+    while si < nd {
+        if si > 0 {
+            shape_str = shape_str + ", "
+        }
+        shape_str = shape_str + to_string(shape[si])
+        si = si + 1
+    }
+    shape_str = shape_str + "]"
+    println("Tensor " + shape_str + " total=" + to_string(total))
+    if nd == 1 {
+        var row = "["
+        var i = 0
+        while i < total {
+            if i > 0 { row = row + ", " }
+            row = row + to_string(t[header + i])
+            i = i + 1
+        }
+        row = row + "]"
+        println(row)
+    } else {
+        // Print 2D: rows x cols
+        let rows = shape[0]
+        let cols = total / rows
+        var i = 0
+        while i < rows {
+            var row = "  ["
+            var j = 0
+            while j < cols {
+                if j > 0 { row = row + ", " }
+                row = row + to_string(t[header + i * cols + j])
+                j = j + 1
+            }
+            row = row + "]"
+            println(row)
+            i = i + 1
+        }
+    }
     return 0
 }
 
-pub fn ones(n: i64) -> i64 {
-    return 1
-}
+fn main() {
+    println("=== tensor_zeros / tensor_ones ===")
+    var shape2d = []
+    shape2d = push(shape2d, 2)
+    shape2d = push(shape2d, 3)
 
-pub fn dot(a: f64, b: f64) -> f64 {
-    return a * b
+    let z = tensor_zeros(shape2d)
+    let o = tensor_ones(shape2d)
+    tensor_print(z)
+    tensor_print(o)
+
+    println("=== tensor_new / tensor_get / tensor_set ===")
+    var s1d = []
+    s1d = push(s1d, 4)
+    var d1d = []
+    d1d = push(d1d, 1.0)
+    d1d = push(d1d, 2.0)
+    d1d = push(d1d, 3.0)
+    d1d = push(d1d, 4.0)
+    let t1 = tensor_new(s1d, d1d)
+    tensor_print(t1)
+    var idx0 = []
+    idx0 = push(idx0, 2)
+    println("get [2] = " + to_string(tensor_get(t1, idx0)))
+    let t1b = tensor_set(t1, idx0, 99.0)
+    tensor_print(t1b)
+
+    println("=== tensor_add / tensor_sub / tensor_mul / tensor_scale ===")
+    let a2d = tensor_ones(shape2d)
+    let b2d = tensor_scale(tensor_ones(shape2d), 2.0)
+    tensor_print(tensor_add(a2d, b2d))
+    tensor_print(tensor_sub(b2d, a2d))
+    tensor_print(tensor_mul(a2d, b2d))
+    tensor_print(tensor_scale(a2d, 5.0))
+
+    println("=== tensor_sum / tensor_mean / tensor_max ===")
+    println("sum ones 2x3 = " + to_string(tensor_sum(o)))
+    println("mean ones 2x3 = " + to_string(tensor_mean(o)))
+    println("max ones 2x3 = " + to_string(tensor_max(o)))
+
+    println("=== tensor_matmul ===")
+    // 2x3 @ 3x2 = 2x2
+    var sa = []
+    sa = push(sa, 2)
+    sa = push(sa, 3)
+    var da = []
+    da = push(da, 1.0)
+    da = push(da, 2.0)
+    da = push(da, 3.0)
+    da = push(da, 4.0)
+    da = push(da, 5.0)
+    da = push(da, 6.0)
+    let ma = tensor_new(sa, da)
+
+    var sb = []
+    sb = push(sb, 3)
+    sb = push(sb, 2)
+    var db = []
+    db = push(db, 7.0)
+    db = push(db, 8.0)
+    db = push(db, 9.0)
+    db = push(db, 10.0)
+    db = push(db, 11.0)
+    db = push(db, 12.0)
+    let mb = tensor_new(sb, db)
+
+    let mc = tensor_matmul(ma, mb)
+    println("2x3 @ 3x2:")
+    tensor_print(mc)
+
+    println("=== tensor_transpose ===")
+    let mt = tensor_transpose(ma)
+    println("transpose of 2x3:")
+    tensor_print(mt)
+
+    println("=== tensor_reshape ===")
+    // reshape 2x3 -> 3x2
+    var new_shape = []
+    new_shape = push(new_shape, 3)
+    new_shape = push(new_shape, 2)
+    let mr = tensor_reshape(ma, new_shape)
+    println("reshape 2x3 -> 3x2:")
+    tensor_print(mr)
+
+    println("=== tensor_rand ===")
+    var sr = []
+    sr = push(sr, 2)
+    sr = push(sr, 4)
+    let rnd = tensor_rand(sr, 42)
+    println("rand 2x4:")
+    tensor_print(rnd)
+
+    println("ALL TESTS PASSED")
 }

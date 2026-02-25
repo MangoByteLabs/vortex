@@ -4,6 +4,34 @@ use codespan_reporting::diagnostic::{Diagnostic, Label};
 
 type FileId = usize;
 
+/// Process escape sequences in a string literal (after quotes have been stripped).
+fn process_escape_sequences(s: &str) -> String {
+    let mut result = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            match chars.next() {
+                Some('n') => result.push('\n'),
+                Some('t') => result.push('\t'),
+                Some('r') => result.push('\r'),
+                Some('0') => result.push('\0'),
+                Some('\\') => result.push('\\'),
+                Some('"') => result.push('"'),
+                Some('\'') => result.push('\''),
+                Some(other) => {
+                    // Unknown escape: keep as-is
+                    result.push('\\');
+                    result.push(other);
+                }
+                None => result.push('\\'),
+            }
+        } else {
+            result.push(c);
+        }
+    }
+    result
+}
+
 pub fn parse(
     tokens: Vec<Token>,
     file_id: FileId,
@@ -531,6 +559,19 @@ impl Parser {
             TokenKind::Import => ItemKind::Import(self.parse_import()?),
             TokenKind::From => ItemKind::Import(self.parse_from_import()?),
             TokenKind::Const => ItemKind::Const(self.parse_const()?),
+            TokenKind::Let | TokenKind::Var => {
+                let mutable = self.peek().kind == TokenKind::Var;
+                self.advance(); // consume let/var
+                let name = self.parse_ident()?;
+                let ty = if self.eat(TokenKind::Colon).is_some() {
+                    Some(self.parse_type()?)
+                } else {
+                    None
+                };
+                self.expect(TokenKind::Eq)?;
+                let value = self.parse_expr()?;
+                ItemKind::Static(crate::ast::StaticDecl { name, ty, value, mutable })
+            }
             TokenKind::Type => ItemKind::TypeAlias(self.parse_type_alias()?),
             TokenKind::Field => ItemKind::FieldDef(self.parse_field_def()?),
             _ => {
@@ -813,6 +854,21 @@ impl Parser {
     fn parse_import(&mut self) -> Result<ImportDecl, ()> {
         let start = self.span();
         self.expect(TokenKind::Import)?;
+
+        // Handle `import "path/to/file"` string literal syntax
+        if self.check(TokenKind::StringLiteral) {
+            let tok = self.advance().clone();
+            let raw = &tok.text[1..tok.text.len() - 1];
+            let path_str = process_escape_sequences(raw);
+            // Store the raw string as a single path segment with a \x00 prefix to mark it as a string path
+            let path = vec![Ident { name: format!("__string_import__{}", path_str), span: start }];
+            let end = self.span();
+            return Ok(ImportDecl {
+                path,
+                items: ImportItems::Wildcard,
+                span: start.merge(end),
+            });
+        }
 
         let mut path = vec![self.parse_ident()?];
         while self.eat(TokenKind::Dot).is_some() {
@@ -2089,8 +2145,9 @@ impl Parser {
             }
             TokenKind::StringLiteral => {
                 self.advance();
-                // Strip quotes
-                let s = tok.text[1..tok.text.len() - 1].to_string();
+                // Strip quotes and process escape sequences
+                let raw = &tok.text[1..tok.text.len() - 1];
+                let s = process_escape_sequences(raw);
                 Ok(Expr {
                     kind: ExprKind::StringLiteral(s),
                     span: start,

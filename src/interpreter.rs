@@ -692,6 +692,10 @@ impl Env {
         // String / utility builtins
         self.functions.insert("len".to_string(), FnDef::Builtin(builtin_len));
         self.functions.insert("to_string".to_string(), FnDef::Builtin(builtin_to_string));
+        self.functions.insert("str".to_string(), FnDef::Builtin(builtin_to_string));
+        self.functions.insert("int".to_string(), FnDef::Builtin(builtin_int));
+        self.functions.insert("float".to_string(), FnDef::Builtin(builtin_float));
+        self.functions.insert("type_of".to_string(), FnDef::Builtin(builtin_type_of));
         self.functions.insert("format".to_string(), FnDef::Builtin(builtin_format));
         self.functions.insert("push".to_string(), FnDef::Builtin(builtin_push));
         self.functions.insert("assert".to_string(), FnDef::Builtin(builtin_assert));
@@ -1887,6 +1891,49 @@ fn builtin_to_string(_env: &mut Env, args: Vec<Value>) -> Result<Value, String> 
     Ok(Value::String(format!("{}", args[0])))
 }
 
+fn builtin_int(_env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    if args.len() != 1 { return Err("int expects 1 argument".to_string()); }
+    match &args[0] {
+        Value::Int(n) => Ok(Value::Int(*n)),
+        Value::Float(f) => Ok(Value::Int(*f as i128)),
+        Value::Bool(b) => Ok(Value::Int(if *b { 1 } else { 0 })),
+        Value::String(s) => s.trim().parse::<i128>()
+            .map(Value::Int)
+            .map_err(|_| format!("int: cannot parse '{}'", s)),
+        other => Err(format!("int: cannot convert {} to int", other)),
+    }
+}
+
+fn builtin_float(_env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    if args.len() != 1 { return Err("float expects 1 argument".to_string()); }
+    match &args[0] {
+        Value::Float(f) => Ok(Value::Float(*f)),
+        Value::Int(n) => Ok(Value::Float(*n as f64)),
+        Value::Bool(b) => Ok(Value::Float(if *b { 1.0 } else { 0.0 })),
+        Value::String(s) => s.trim().parse::<f64>()
+            .map(Value::Float)
+            .map_err(|_| format!("float: cannot parse '{}'", s)),
+        other => Err(format!("float: cannot convert {} to float", other)),
+    }
+}
+
+fn builtin_type_of(_env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+    if args.len() != 1 { return Err("type_of expects 1 argument".to_string()); }
+    let t = match &args[0] {
+        Value::Int(_) => "int",
+        Value::Float(_) => "float",
+        Value::Bool(_) => "bool",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Tuple(_) => "tuple",
+        Value::Pointer(_) => "pointer",
+        Value::Closure { .. } => "closure",
+        Value::Function { .. } => "function",
+        _ => "unknown",
+    };
+    Ok(Value::String(t.to_string()))
+}
+
 fn builtin_format(_env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
     if args.is_empty() { return Err("format expects at least 1 argument".to_string()); }
     let template = match &args[0] {
@@ -2655,6 +2702,38 @@ fn builtin_g1_scalar_mul(_env: &mut Env, args: Vec<Value>) -> Result<Value, Stri
 // --- Module import resolution ---
 
 fn resolve_module_path(path: &[Ident]) -> Result<PathBuf, String> {
+    // Handle `import "path/to/file"` string literal syntax (sentinel: name starts with \x00)
+    if path.len() == 1 && path[0].name.starts_with("__string_import__") {
+        let raw_path = &path[0].name["__string_import__".len()..]; // strip sentinel
+        let pb = PathBuf::from(raw_path);
+        // Add .vx extension if not present
+        let with_ext = if pb.extension().map(|e| e == "vx").unwrap_or(false) {
+            pb.clone()
+        } else {
+            pb.with_extension("vx")
+        };
+        // If absolute path, use directly
+        if with_ext.is_absolute() {
+            if with_ext.exists() {
+                return Ok(with_ext);
+            }
+            return Err(format!("module file '{}' not found", with_ext.display()));
+        }
+        // Relative path: try cwd first, then stdlib
+        let cwd = std::env::current_dir().unwrap_or_default();
+        let cwd_path = cwd.join(&with_ext);
+        if cwd_path.exists() {
+            return Ok(cwd_path);
+        }
+        // Try stdlib dir
+        let stdlib_path = PathBuf::from("stdlib").join(&with_ext);
+        if stdlib_path.exists() {
+            return Ok(stdlib_path);
+        }
+        return Err(format!("module '{}' not found (tried {} and stdlib/{})",
+            raw_path, cwd_path.display(), with_ext.display()));
+    }
+
     let path_str: Vec<&str> = path.iter().map(|id| id.name.as_str()).collect();
     let module_name = path_str.join(".");
     let mut fs_path = PathBuf::new();
@@ -2701,6 +2780,7 @@ fn resolve_import(env: &mut Env, import: &ImportDecl) -> Result<(), String> {
             ItemKind::Struct(s) => Some(s.name.name.clone()),
             ItemKind::Enum(e) => Some(e.name.name.clone()),
             ItemKind::Const(c) => Some(c.name.name.clone()),
+            ItemKind::Static(s) => Some(s.name.name.clone()),
             ItemKind::Trait(t) => Some(t.name.name.clone()),
             _ => None,
         };
@@ -2733,7 +2813,8 @@ fn resolve_import(env: &mut Env, import: &ImportDecl) -> Result<(), String> {
         if let Some(name) = item_name {
             let should_import = match &requested {
                 Some(names) => names.contains(&name),
-                None => true,
+                // For wildcard imports, skip `main` to avoid re-executing the imported file's entrypoint
+                None => name != "main",
             };
             if should_import {
                 let alias = if let ImportItems::Named(items) = &import.items {
@@ -2762,6 +2843,10 @@ fn resolve_import(env: &mut Env, import: &ImportDecl) -> Result<(), String> {
                     }
                     ItemKind::Const(c) => {
                         let val = eval_expr(env, &c.value)?;
+                        env.define(&register_name, val);
+                    }
+                    ItemKind::Static(s) => {
+                        let val = eval_expr(env, &s.value)?;
                         env.define(&register_name, val);
                     }
                     ItemKind::Trait(trait_def) => {
@@ -2904,6 +2989,10 @@ pub fn interpret(program: &Program) -> Result<Vec<String>, String> {
             ItemKind::Const(c) => {
                 let val = eval_expr(&mut env, &c.value)?;
                 env.define(&c.name.name, val);
+            }
+            ItemKind::Static(s) => {
+                let val = eval_expr(&mut env, &s.value)?;
+                env.define(&s.name.name, val);
             }
             ItemKind::Struct(s) => {
                 let field_names: Vec<String> = s.fields.iter().map(|f| f.name.name.clone()).collect();
@@ -4877,7 +4966,7 @@ fn value_sub(a: &Value, b: &Value) -> Result<Value, String> {
 
 fn value_mul(a: &Value, b: &Value) -> Result<Value, String> {
     match (a, b) {
-        (Value::Int(x), Value::Int(y)) => Ok(Value::Int(x * y)),
+        (Value::Int(x), Value::Int(y)) => Ok(Value::Int(x.wrapping_mul(*y))),
         (Value::Float(x), Value::Float(y)) => Ok(Value::Float(x * y)),
         (Value::Int(x), Value::Float(y)) => Ok(Value::Float(*x as f64 * y)),
         (Value::Float(x), Value::Int(y)) => Ok(Value::Float(x * *y as f64)),

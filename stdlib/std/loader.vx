@@ -1,0 +1,328 @@
+// std/loader.vx — File loading and module resolution for Vortex
+// Provides read/write file I/O via raw Linux x86-64 syscalls.
+// No dependencies on other stdlib modules.
+
+// ─── Syscall constants ────────────────────────────────────────────────────────
+
+fn _SYS_OPEN() -> i64  { return 2 }
+fn _SYS_CLOSE() -> i64 { return 3 }
+fn _SYS_READ() -> i64  { return 0 }
+fn _SYS_WRITE() -> i64 { return 1 }
+fn _SYS_LSEEK() -> i64 { return 8 }
+fn _SYS_STAT() -> i64  { return 4 }
+
+fn _O_RDONLY() -> i64  { return 0 }
+fn _O_WRONLY() -> i64  { return 1 }
+fn _O_CREAT() -> i64   { return 64 }
+fn _O_TRUNC() -> i64   { return 512 }
+
+// ─── Internal helpers ─────────────────────────────────────────────────────────
+
+// _null_terminate: allocate a buffer, write string bytes + null terminator.
+// Returns the memory pointer as i64. Caller must mem_free it.
+fn _null_terminate(s: String) -> i64 {
+    let bytes = str_bytes(s)
+    let n = len(bytes)
+    let buf = mem_alloc(n + 1)
+    var i = 0
+    while i < n {
+        mem_write_u8(buf, i, int(bytes[i]))
+        i = i + 1
+    }
+    mem_write_u8(buf, n, 0)
+    return buf
+}
+
+// _read_cstring: read bytes from a memory pointer until null byte or max_len.
+// Returns the resulting string.
+fn _read_cstring(ptr: i64, max_len: i64) -> String {
+    var byte_arr = []
+    var i = 0
+    var cont = true
+    while cont && i < max_len {
+        let b = mem_read_u8(ptr, i)
+        if b == 0 {
+            cont = false
+        } else {
+            byte_arr = push(byte_arr, b)
+            i = i + 1
+        }
+    }
+    return str_from_bytes(byte_arr)
+}
+
+// ─── Core file operations ─────────────────────────────────────────────────────
+
+// read_file: open a file and return its entire contents as a String.
+// Returns "" on error. Reads up to 8 MB.
+fn read_file(path: String) -> String {
+    let path_ptr = _null_terminate(path)
+    let fd = syscall2(_SYS_OPEN(), path_ptr, _O_RDONLY())
+    mem_free(path_ptr)
+    if fd < 0 {
+        return ""
+    }
+    let buf_size = 8388608
+    let buf = mem_alloc(buf_size)
+    let n_read = syscall3(_SYS_READ(), fd, buf, buf_size)
+    syscall1(_SYS_CLOSE(), fd)
+    if n_read <= 0 {
+        mem_free(buf)
+        return ""
+    }
+    var byte_arr = []
+    var i = 0
+    while i < n_read {
+        byte_arr = push(byte_arr, mem_read_u8(buf, i))
+        i = i + 1
+    }
+    mem_free(buf)
+    return str_from_bytes(byte_arr)
+}
+
+// write_file: write a string to a file (create/truncate).
+// Returns true on success, false on error.
+fn write_file(path: String, content: String) -> bool {
+    let path_ptr = _null_terminate(path)
+    let flags = _O_WRONLY() + _O_CREAT() + _O_TRUNC()
+    let fd = syscall3(_SYS_OPEN(), path_ptr, flags, 420)
+    mem_free(path_ptr)
+    if fd < 0 {
+        return false
+    }
+    let bytes = str_bytes(content)
+    let n = len(bytes)
+    if n == 0 {
+        syscall1(_SYS_CLOSE(), fd)
+        return true
+    }
+    let buf = mem_alloc(n)
+    var i = 0
+    while i < n {
+        mem_write_u8(buf, i, int(bytes[i]))
+        i = i + 1
+    }
+    let written = syscall3(_SYS_WRITE(), fd, buf, n)
+    mem_free(buf)
+    syscall1(_SYS_CLOSE(), fd)
+    return written == n
+}
+
+// file_exists: return true if the file can be opened for reading.
+fn file_exists(path: String) -> bool {
+    let path_ptr = _null_terminate(path)
+    let fd = syscall2(_SYS_OPEN(), path_ptr, _O_RDONLY())
+    mem_free(path_ptr)
+    if fd < 0 {
+        return false
+    }
+    syscall1(_SYS_CLOSE(), fd)
+    return true
+}
+
+// file_size: return the size of a file in bytes, or -1 on error.
+// Uses SYS_LSEEK with SEEK_END (whence=2) then SEEK_SET (whence=0) to restore.
+fn file_size(path: String) -> i64 {
+    let path_ptr = _null_terminate(path)
+    let fd = syscall2(_SYS_OPEN(), path_ptr, _O_RDONLY())
+    mem_free(path_ptr)
+    if fd < 0 {
+        return -1
+    }
+    // lseek(fd, 0, SEEK_END=2)
+    let size = syscall3(_SYS_LSEEK(), fd, 0, 2)
+    syscall1(_SYS_CLOSE(), fd)
+    if size < 0 {
+        return -1
+    }
+    return size
+}
+
+// ─── Line-oriented reading ────────────────────────────────────────────────────
+
+// read_lines: read a file and split its contents into lines.
+// The newline character (byte 10) is the delimiter. Empty trailing lines dropped.
+fn read_lines(path: String) -> [String] {
+    let content = read_file(path)
+    if len(content) == 0 {
+        return []
+    }
+    let bytes = str_bytes(content)
+    var lines = []
+    var cur_bytes = []
+    var i = 0
+    while i < len(bytes) {
+        let b = int(bytes[i])
+        if b == 10 {
+            lines = push(lines, str_from_bytes(cur_bytes))
+            cur_bytes = []
+        } else {
+            cur_bytes = push(cur_bytes, b)
+        }
+        i = i + 1
+    }
+    // Flush any trailing bytes (no final newline)
+    if len(cur_bytes) > 0 {
+        lines = push(lines, str_from_bytes(cur_bytes))
+    }
+    return lines
+}
+
+// ─── Path utilities ───────────────────────────────────────────────────────────
+
+// path_join: concatenate base and name with a "/" separator.
+// If base is empty, returns name unchanged.
+fn path_join(base: String, name: String) -> String {
+    if len(base) == 0 {
+        return name
+    }
+    // Check if base already ends with "/"
+    let last_byte = str_bytes(base)[len(base) - 1]
+    if int(last_byte) == 47 {
+        return base + name
+    }
+    return base + "/" + name
+}
+
+// path_dirname: return everything before the last "/" in path.
+// Returns "." when no slash is found.
+fn path_dirname(path: String) -> String {
+    let bytes = str_bytes(path)
+    let n = len(bytes)
+    var last_slash = -1
+    var i = n - 1
+    while i >= 0 {
+        if int(bytes[i]) == 47 {
+            last_slash = i
+            i = -1
+        }
+        i = i - 1
+    }
+    if last_slash < 0 {
+        return "."
+    }
+    if last_slash == 0 {
+        return "/"
+    }
+    return str_substr(path, 0, last_slash)
+}
+
+// path_basename: return the final component after the last "/" in path.
+fn path_basename(path: String) -> String {
+    let bytes = str_bytes(path)
+    let n = len(bytes)
+    var last_slash = -1
+    var i = n - 1
+    while i >= 0 {
+        if int(bytes[i]) == 47 {
+            last_slash = i
+            i = -1
+        }
+        i = i - 1
+    }
+    if last_slash < 0 {
+        return path
+    }
+    let start = last_slash + 1
+    return str_substr(path, start, n - start)
+}
+
+// path_extension: return everything after the last "." in the basename.
+// Returns "" if no extension is found.
+fn path_extension(path: String) -> String {
+    let base = path_basename(path)
+    let bytes = str_bytes(base)
+    let n = len(bytes)
+    var last_dot = -1
+    var i = n - 1
+    while i >= 0 {
+        if int(bytes[i]) == 46 {
+            last_dot = i
+            i = -1
+        }
+        i = i - 1
+    }
+    if last_dot < 0 {
+        return ""
+    }
+    let start = last_dot + 1
+    return str_substr(base, start, n - start)
+}
+
+// ─── Module resolution ────────────────────────────────────────────────────────
+
+// resolve_module: search for <name>.vx in each directory of search_paths.
+// Returns the full path of the first match, or "" if not found.
+fn resolve_module(name: String, search_paths: [String]) -> String {
+    let filename = name + ".vx"
+    var i = 0
+    while i < len(search_paths) {
+        let candidate = path_join(search_paths[i], filename)
+        if file_exists(candidate) {
+            return candidate
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+// load_source: read a .vx source file; print an error and return "" on failure.
+fn load_source(path: String) -> String {
+    if file_exists(path) {
+        return read_file(path)
+    }
+    println("loader error: file not found: " + path)
+    return ""
+}
+
+// ─── Demo / self-test ─────────────────────────────────────────────────────────
+
+fn main() {
+    println("=== loader.vx self-test ===")
+    let newline = str_from_bytes([10])
+
+    // Read this file itself
+    let self_path = "/root/vortex/stdlib/std/loader.vx"
+    let src = read_file(self_path)
+    let lines = read_lines(self_path)
+    println("read_file returned " + str(len(src)) + " bytes")
+    println("read_lines returned " + str(len(lines)) + " lines")
+    println("")
+
+    // file_exists
+    println("file_exists(loader.vx): " + str(file_exists(self_path)))
+    println("file_exists(/no/such/file): " + str(file_exists("/no/such/file")))
+    println("")
+
+    // file_size
+    let sz = file_size(self_path)
+    println("file_size(loader.vx): " + str(sz) + " bytes")
+    println("")
+
+    // path utilities
+    let p = "/foo/bar/baz.vx"
+    println("path: " + p)
+    println("  dirname:   " + path_dirname(p))
+    println("  basename:  " + path_basename(p))
+    println("  extension: " + path_extension(p))
+    println("")
+
+    let joined = path_join("/usr/lib/vortex", "std/math.vx")
+    println("path_join: " + joined)
+    println("")
+
+    // resolve_module
+    let search = ["/root/vortex/stdlib/std", "/tmp"]
+    let resolved = resolve_module("math", search)
+    println("resolve_module(math): " + resolved)
+    println("")
+
+    // write_file round-trip
+    let tmp = "/tmp/loader_test.txt"
+    let ok = write_file(tmp, "hello from loader" + newline)
+    println("write_file ok: " + str(ok))
+    let back = read_file(tmp)
+    println("read back: " + back)
+
+    println("=== loader.vx done ===")
+}

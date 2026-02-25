@@ -107,6 +107,52 @@ impl ModuleResolver {
 
     /// Load and parse a module
     pub fn load_module(&mut self, import_path: &[String]) -> Result<Module, String> {
+        // Handle string import: `import "path/to/file"`
+        if import_path.len() == 1 && import_path[0].starts_with("__string_import__") {
+            let raw_path = &import_path[0]["__string_import__".len()..];
+            let pb = PathBuf::from(raw_path);
+            let with_ext = if pb.extension().map(|e| e == "vx").unwrap_or(false) {
+                pb.clone()
+            } else {
+                pb.with_extension("vx")
+            };
+            let file_path = if with_ext.is_absolute() {
+                if with_ext.exists() { with_ext.clone() }
+                else { return Err(format!("module file '{}' not found", with_ext.display())); }
+            } else {
+                // Try cwd, then search paths, then all search_paths
+                let cwd = std::env::current_dir().unwrap_or_default();
+                let cwd_path = cwd.join(&with_ext);
+                if cwd_path.exists() { cwd_path }
+                else {
+                    let mut found = None;
+                    for sp in &self.search_paths {
+                        let sp_path = sp.join(&with_ext);
+                        if sp_path.exists() { found = Some(sp_path); break; }
+                    }
+                    if let Some(sp) = self.stdlib_path.as_ref() {
+                        if found.is_none() {
+                            let sp_path = sp.join(&with_ext);
+                            if sp_path.exists() { found = Some(sp_path); }
+                        }
+                    }
+                    found.ok_or_else(|| format!("module '{}' not found", raw_path))?
+                }
+            };
+            let path_key = raw_path.to_string();
+            if let Some(module) = self.modules.get(&path_key) {
+                return Ok(module.clone());
+            }
+            let source = std::fs::read_to_string(&file_path)
+                .map_err(|e| format!("cannot read {}: {}", file_path.display(), e))?;
+            let tokens = lexer::lex(&source);
+            let program = parser::parse(tokens, 0)
+                .map_err(|diags| format!("parse errors in {}: {} error(s)", file_path.display(), diags.len()))?;
+            let module = Module { name: path_key.clone(), path: file_path, program };
+            self.modules.insert(path_key, module.clone());
+            return Ok(module);
+        }
+
         let path_key = import_path.join(".");
 
         // Check for circular dependencies
@@ -179,6 +225,8 @@ impl ModuleResolver {
                     .map(|id| id.name.clone())
                     .collect();
 
+                let is_string_import = raw_path.first().map(|s| s.starts_with("__string_import__")).unwrap_or(false);
+
                 // Handle relative imports: if path starts with ".", resolve relative to root
                 let path = if raw_path.first().map(|s| s.as_str()) == Some(".") {
                     raw_path[1..].to_vec()
@@ -194,9 +242,14 @@ impl ModuleResolver {
                         let mut namespace_items = Vec::new();
                         match &import.items {
                             ImportItems::Wildcard => {
-                                // Import all public items
+                                // Import all items (for string imports) or only pub items
                                 for mod_item in &module.program.items {
-                                    if mod_item.is_pub {
+                                    let should_import = is_string_import || mod_item.is_pub;
+                                    // Skip main() from imported modules
+                                    if let Some(name) = get_item_name(&mod_item.kind) {
+                                        if name == "main" { continue; }
+                                    }
+                                    if should_import {
                                         let mut imported = mod_item.clone();
                                         imported.is_pub = is_reexport;
                                         if let Some(name) = get_item_name(&imported.kind) {

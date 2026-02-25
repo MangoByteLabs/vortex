@@ -1,0 +1,1258 @@
+// Vortex Self-Hosting x86-64 Native Code Generator
+// Compiles AST nodes (array-based: ["kind", field1, ...]) to x86-64 machine code bytes.
+// This is the critical piece for Vortex self-hosting: with this, Vortex can emit
+// native binaries without depending on Rust/LLVM.
+//
+// Machine code is represented as [i64] where each element is a byte (0-255).
+// Uses System V AMD64 calling convention:
+//   Args: RDI, RSI, RDX, RCX, R8, R9
+//   Return: RAX
+//   Callee-saved: RBX, RBP, R12-R15
+//
+// All mutable state is threaded through a ctx: [String] parameter.
+// ctx layout (8 fixed slots):
+//   ctx[0] = label_counter (as string)
+//   ctx[1] = fixup_positions (comma-separated i64 strings, or "")
+//   ctx[2] = fixup_labels (comma-separated strings, or "")
+//   ctx[3] = label_names (comma-separated strings, or "")
+//   ctx[4] = label_addrs (comma-separated i64 strings, or "")
+//   ctx[5] = func_names (comma-separated strings, or "")
+//   ctx[6] = func_addrs (comma-separated i64 strings, or "")
+//   ctx[7] = locals (comma-separated strings, or "")
+//
+// Functions that produce both code and ctx return a [String] "result":
+//   result[0] = code length (as string)
+//   result[1..1+code_len] = code bytes (as strings)
+//   result[1+code_len .. 1+code_len+8] = ctx (8 elements)
+
+// ─── Register constants ──────────────────────────────────────────────────────
+
+fn REG_RAX() -> i64 { return 0 }
+fn REG_RCX() -> i64 { return 1 }
+fn REG_RDX() -> i64 { return 2 }
+fn REG_RBX() -> i64 { return 3 }
+fn REG_RSP() -> i64 { return 4 }
+fn REG_RBP() -> i64 { return 5 }
+fn REG_RSI() -> i64 { return 6 }
+fn REG_RDI() -> i64 { return 7 }
+fn REG_R8()  -> i64 { return 8 }
+fn REG_R9()  -> i64 { return 9 }
+fn REG_R10() -> i64 { return 10 }
+fn REG_R11() -> i64 { return 11 }
+fn REG_R12() -> i64 { return 12 }
+fn REG_R13() -> i64 { return 13 }
+fn REG_R14() -> i64 { return 14 }
+fn REG_R15() -> i64 { return 15 }
+
+// Argument registers in calling convention order
+fn arg_reg(index: i64) -> i64 {
+    if index == 0 { return 7 }
+    if index == 1 { return 6 }
+    if index == 2 { return 2 }
+    if index == 3 { return 1 }
+    if index == 4 { return 8 }
+    if index == 5 { return 9 }
+    return 0
+}
+
+// ─── Byte emission helpers ───────────────────────────────────────────────────
+
+fn emit_u8(code: [i64], byte: i64) -> [i64] {
+    code = push(code, byte % 256)
+    return code
+}
+
+fn emit_u32_le(code: [i64], val: i64) -> [i64] {
+    var v = val
+    if v < 0 {
+        v = v + 4294967296
+    }
+    code = push(code, v % 256)
+    v = v / 256
+    code = push(code, v % 256)
+    v = v / 256
+    code = push(code, v % 256)
+    v = v / 256
+    code = push(code, v % 256)
+    return code
+}
+
+fn emit_u64_le(code: [i64], val: i64) -> [i64] {
+    var v = val
+    if v < 0 {
+        v = v + 4294967296 * 4294967296
+    }
+    var i = 0
+    while i < 8 {
+        code = push(code, v % 256)
+        v = v / 256
+        i = i + 1
+    }
+    return code
+}
+
+// ─── Hex helper ──────────────────────────────────────────────────────────────
+
+fn int_to_hex(val: i64) -> String {
+    var hex_chars = "0123456789ABCDEF"
+    if val < 0 {
+        return "-" + int_to_hex(0 - val)
+    }
+    if val == 0 {
+        return "00"
+    }
+    var v = val % 256
+    var lo = v % 16
+    var hi = v / 16
+    var result = str_char_at(hex_chars, hi) + str_char_at(hex_chars, lo)
+    return result
+}
+
+// ─── REX prefix helpers ─────────────────────────────────────────────────────
+
+fn rex_w() -> i64 { return 72 }
+fn rex_wb() -> i64 { return 73 }
+fn rex_wr() -> i64 { return 76 }
+fn rex_wrb() -> i64 { return 77 }
+
+fn rex_for_regs(reg: i64, rm: i64) -> i64 {
+    var base = 72
+    if reg >= 8 {
+        base = base + 4
+    }
+    if rm >= 8 {
+        base = base + 1
+    }
+    return base
+}
+
+fn modrm_reg(reg: i64, rm: i64) -> i64 {
+    return 192 + (reg % 8) * 8 + (rm % 8)
+}
+
+fn modrm_disp8(reg: i64) -> i64 {
+    return 64 + (reg % 8) * 8 + 5
+}
+
+fn modrm_disp32(reg: i64) -> i64 {
+    return 128 + (reg % 8) * 8 + 5
+}
+
+// ─── Instruction emitters ────────────────────────────────────────────────────
+
+fn emit_mov_reg_imm64(code: [i64], reg: i64, imm: i64) -> [i64] {
+    if reg >= 8 {
+        code = emit_u8(code, rex_wb())
+    } else {
+        code = emit_u8(code, rex_w())
+    }
+    code = emit_u8(code, 184 + (reg % 8))
+    code = emit_u64_le(code, imm)
+    return code
+}
+
+fn emit_mov_reg_reg(code: [i64], dst: i64, src: i64) -> [i64] {
+    code = emit_u8(code, rex_for_regs(src, dst))
+    code = emit_u8(code, 137)
+    code = emit_u8(code, modrm_reg(src, dst))
+    return code
+}
+
+fn emit_push_reg(code: [i64], reg: i64) -> [i64] {
+    if reg >= 8 {
+        code = emit_u8(code, 65)
+        code = emit_u8(code, 80 + (reg % 8))
+    } else {
+        code = emit_u8(code, 80 + reg)
+    }
+    return code
+}
+
+fn emit_pop_reg(code: [i64], reg: i64) -> [i64] {
+    if reg >= 8 {
+        code = emit_u8(code, 65)
+        code = emit_u8(code, 88 + (reg % 8))
+    } else {
+        code = emit_u8(code, 88 + reg)
+    }
+    return code
+}
+
+fn emit_add_reg_reg(code: [i64], dst: i64, src: i64) -> [i64] {
+    code = emit_u8(code, rex_for_regs(src, dst))
+    code = emit_u8(code, 1)
+    code = emit_u8(code, modrm_reg(src, dst))
+    return code
+}
+
+fn emit_sub_reg_reg(code: [i64], dst: i64, src: i64) -> [i64] {
+    code = emit_u8(code, rex_for_regs(src, dst))
+    code = emit_u8(code, 41)
+    code = emit_u8(code, modrm_reg(src, dst))
+    return code
+}
+
+fn emit_imul_reg_reg(code: [i64], dst: i64, src: i64) -> [i64] {
+    code = emit_u8(code, rex_for_regs(dst, src))
+    code = emit_u8(code, 15)
+    code = emit_u8(code, 175)
+    code = emit_u8(code, modrm_reg(dst, src))
+    return code
+}
+
+fn emit_cmp_reg_reg(code: [i64], a: i64, b: i64) -> [i64] {
+    code = emit_u8(code, rex_for_regs(b, a))
+    code = emit_u8(code, 57)
+    code = emit_u8(code, modrm_reg(b, a))
+    return code
+}
+
+fn emit_je(code: [i64], offset: i64) -> [i64] {
+    code = emit_u8(code, 15)
+    code = emit_u8(code, 132)
+    code = emit_u32_le(code, offset)
+    return code
+}
+
+fn emit_jne(code: [i64], offset: i64) -> [i64] {
+    code = emit_u8(code, 15)
+    code = emit_u8(code, 133)
+    code = emit_u32_le(code, offset)
+    return code
+}
+
+fn emit_jmp(code: [i64], offset: i64) -> [i64] {
+    code = emit_u8(code, 233)
+    code = emit_u32_le(code, offset)
+    return code
+}
+
+fn emit_jl(code: [i64], offset: i64) -> [i64] {
+    code = emit_u8(code, 15)
+    code = emit_u8(code, 140)
+    code = emit_u32_le(code, offset)
+    return code
+}
+
+fn emit_jge(code: [i64], offset: i64) -> [i64] {
+    code = emit_u8(code, 15)
+    code = emit_u8(code, 141)
+    code = emit_u32_le(code, offset)
+    return code
+}
+
+fn emit_call(code: [i64], offset: i64) -> [i64] {
+    code = emit_u8(code, 232)
+    code = emit_u32_le(code, offset)
+    return code
+}
+
+fn emit_ret(code: [i64]) -> [i64] {
+    code = emit_u8(code, 195)
+    return code
+}
+
+fn emit_syscall(code: [i64]) -> [i64] {
+    code = emit_u8(code, 15)
+    code = emit_u8(code, 5)
+    return code
+}
+
+fn emit_xor_rax_rax(code: [i64]) -> [i64] {
+    code = emit_u8(code, 72)
+    code = emit_u8(code, 49)
+    code = emit_u8(code, 192)
+    return code
+}
+
+// ─── Stack frame instructions ────────────────────────────────────────────────
+
+fn emit_prologue(code: [i64], stack_size: i64) -> [i64] {
+    code = emit_u8(code, 85)
+    code = emit_u8(code, 72)
+    code = emit_u8(code, 137)
+    code = emit_u8(code, 229)
+    if stack_size > 0 {
+        code = emit_u8(code, 72)
+        code = emit_u8(code, 131)
+        code = emit_u8(code, 236)
+        code = emit_u8(code, stack_size % 256)
+    }
+    return code
+}
+
+fn emit_epilogue(code: [i64]) -> [i64] {
+    code = emit_u8(code, 72)
+    code = emit_u8(code, 137)
+    code = emit_u8(code, 236)
+    code = emit_u8(code, 93)
+    code = emit_u8(code, 195)
+    return code
+}
+
+fn emit_store_local(code: [i64], reg: i64, offset: i64) -> [i64] {
+    var neg_off = 0 - offset
+    code = emit_u8(code, rex_for_regs(reg, 5))
+    code = emit_u8(code, 137)
+    if offset <= 128 {
+        code = emit_u8(code, modrm_disp8(reg))
+        code = emit_u8(code, neg_off % 256)
+    } else {
+        code = emit_u8(code, modrm_disp32(reg))
+        code = emit_u32_le(code, neg_off)
+    }
+    return code
+}
+
+fn emit_load_local(code: [i64], offset: i64, reg: i64) -> [i64] {
+    var neg_off = 0 - offset
+    code = emit_u8(code, rex_for_regs(reg, 5))
+    code = emit_u8(code, 139)
+    if offset <= 128 {
+        code = emit_u8(code, modrm_disp8(reg))
+        code = emit_u8(code, neg_off % 256)
+    } else {
+        code = emit_u8(code, modrm_disp32(reg))
+        code = emit_u32_le(code, neg_off)
+    }
+    return code
+}
+
+fn emit_sub_rsp_imm8(code: [i64], imm: i64) -> [i64] {
+    code = emit_u8(code, 72)
+    code = emit_u8(code, 131)
+    code = emit_u8(code, 236)
+    code = emit_u8(code, imm % 256)
+    return code
+}
+
+fn emit_add_rsp_imm8(code: [i64], imm: i64) -> [i64] {
+    code = emit_u8(code, 72)
+    code = emit_u8(code, 131)
+    code = emit_u8(code, 196)
+    code = emit_u8(code, imm % 256)
+    return code
+}
+
+// ─── Locals management ───────────────────────────────────────────────────────
+
+fn locals_find(locals: [String], name: String) -> i64 {
+    var i = 0
+    while i < len(locals) {
+        if locals[i] == name {
+            return i
+        }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+fn locals_offset(index: i64) -> i64 {
+    return (index + 1) * 8
+}
+
+fn locals_add(locals: [String], name: String) -> [String] {
+    locals = push(locals, name)
+    return locals
+}
+
+// ─── CSV helpers for ctx fields ──────────────────────────────────────────────
+
+fn csv_append(csv: String, val: String) -> String {
+    if len(csv) == 0 {
+        return val
+    }
+    return csv + "," + val
+}
+
+fn csv_split(csv: String) -> [String] {
+    var result: [String] = []
+    if len(csv) == 0 {
+        return result
+    }
+    var current = ""
+    var i = 0
+    while i < len(csv) {
+        var ch = str_char_at(csv, i)
+        if ch == "," {
+            result = push(result, current)
+            current = ""
+        } else {
+            current = current + ch
+        }
+        i = i + 1
+    }
+    result = push(result, current)
+    return result
+}
+
+fn csv_len(csv: String) -> i64 {
+    if len(csv) == 0 {
+        return 0
+    }
+    var count = 1
+    var i = 0
+    while i < len(csv) {
+        if str_char_at(csv, i) == "," {
+            count = count + 1
+        }
+        i = i + 1
+    }
+    return count
+}
+
+fn csv_get(csv: String, index: i64) -> String {
+    var parts = csv_split(csv)
+    return parts[index]
+}
+
+// ─── Context creation and accessors ──────────────────────────────────────────
+
+fn ctx_new() -> [String] {
+    var ctx: [String] = []
+    ctx = push(ctx, "0")   // [0] label_counter
+    ctx = push(ctx, "")    // [1] fixup_positions
+    ctx = push(ctx, "")    // [2] fixup_labels
+    ctx = push(ctx, "")    // [3] label_names
+    ctx = push(ctx, "")    // [4] label_addrs
+    ctx = push(ctx, "")    // [5] func_names
+    ctx = push(ctx, "")    // [6] func_addrs
+    ctx = push(ctx, "")    // [7] locals
+    return ctx
+}
+
+fn ctx_get_label_counter(ctx: [String]) -> i64 {
+    return int(ctx[0])
+}
+
+fn ctx_set_label_counter(ctx: [String], val: i64) -> [String] {
+    ctx[0] = to_string(val)
+    return ctx
+}
+
+fn ctx_get_locals(ctx: [String]) -> [String] {
+    return csv_split(ctx[7])
+}
+
+fn ctx_set_locals(ctx: [String], locals: [String]) -> [String] {
+    var csv = ""
+    var i = 0
+    while i < len(locals) {
+        csv = csv_append(csv, locals[i])
+        i = i + 1
+    }
+    ctx[7] = csv
+    return ctx
+}
+
+fn ctx_add_fixup(ctx: [String], pos: i64, label: String) -> [String] {
+    ctx[1] = csv_append(ctx[1], to_string(pos))
+    ctx[2] = csv_append(ctx[2], label)
+    return ctx
+}
+
+fn ctx_add_label(ctx: [String], name: String, addr: i64) -> [String] {
+    ctx[3] = csv_append(ctx[3], name)
+    ctx[4] = csv_append(ctx[4], to_string(addr))
+    return ctx
+}
+
+fn ctx_add_func(ctx: [String], name: String, addr: i64) -> [String] {
+    ctx[5] = csv_append(ctx[5], name)
+    ctx[6] = csv_append(ctx[6], to_string(addr))
+    return ctx
+}
+
+fn ctx_find_func(ctx: [String], name: String) -> i64 {
+    var names = csv_split(ctx[5])
+    var addrs = csv_split(ctx[6])
+    var i = 0
+    while i < len(names) {
+        if names[i] == name {
+            return int(addrs[i])
+        }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+fn ctx_fresh_label(ctx: [String], prefix: String) -> [String] {
+    // Returns [label_string, ctx0, ctx1, ..., ctx7] (9 elements)
+    var counter = ctx_get_label_counter(ctx)
+    var lbl = prefix + "_" + to_string(counter)
+    ctx = ctx_set_label_counter(ctx, counter + 1)
+    var result: [String] = []
+    result = push(result, lbl)
+    var i = 0
+    while i < 8 {
+        result = push(result, ctx[i])
+        i = i + 1
+    }
+    return result
+}
+
+fn fl_label(fl: [String]) -> String {
+    return fl[0]
+}
+
+fn fl_ctx(fl: [String]) -> [String] {
+    var ctx: [String] = []
+    var i = 0
+    while i < 8 {
+        ctx = push(ctx, fl[i + 1])
+        i = i + 1
+    }
+    return ctx
+}
+
+// ─── Result packing: code + ctx ──────────────────────────────────────────────
+
+fn pack_result(code: [i64], ctx: [String]) -> [String] {
+    var result: [String] = []
+    result = push(result, to_string(len(code)))
+    var i = 0
+    while i < len(code) {
+        result = push(result, to_string(code[i]))
+        i = i + 1
+    }
+    i = 0
+    while i < 8 {
+        result = push(result, ctx[i])
+        i = i + 1
+    }
+    return result
+}
+
+fn unpack_code(result: [String]) -> [i64] {
+    var code_len = int(result[0])
+    var code: [i64] = []
+    var i = 0
+    while i < code_len {
+        code = push(code, int(result[i + 1]))
+        i = i + 1
+    }
+    return code
+}
+
+fn unpack_ctx(result: [String]) -> [String] {
+    var code_len = int(result[0])
+    var ctx: [String] = []
+    var i = 0
+    while i < 8 {
+        ctx = push(ctx, result[code_len + 1 + i])
+        i = i + 1
+    }
+    return ctx
+}
+
+// ─── Fixup resolution ────────────────────────────────────────────────────────
+
+fn fixup_resolve(code: [i64], ctx: [String]) -> [i64] {
+    var fixup_positions = csv_split(ctx[1])
+    var fixup_labels = csv_split(ctx[2])
+    var label_names = csv_split(ctx[3])
+    var label_addrs = csv_split(ctx[4])
+    var i = 0
+    while i < len(fixup_positions) {
+        if len(fixup_positions[i]) == 0 {
+            i = i + 1
+            // skip empty
+        } else {
+            var pos = int(fixup_positions[i])
+            var target_name = fixup_labels[i]
+            var target_addr = 0
+            var j = 0
+            while j < len(label_names) {
+                if label_names[j] == target_name {
+                    target_addr = int(label_addrs[j])
+                }
+                j = j + 1
+            }
+            var rel = target_addr - (pos + 4)
+            var v = rel
+            if v < 0 {
+                v = v + 4294967296
+            }
+            code[pos] = v % 256
+            v = v / 256
+            code[pos + 1] = v % 256
+            v = v / 256
+            code[pos + 2] = v % 256
+            v = v / 256
+            code[pos + 3] = v % 256
+            i = i + 1
+        }
+    }
+    return code
+}
+
+// ─── Parse comma-separated param string ──────────────────────────────────────
+
+fn parse_params(params_str: String) -> [String] {
+    var result: [String] = []
+    if len(params_str) == 0 {
+        return result
+    }
+    var current = ""
+    var i = 0
+    while i < len(params_str) {
+        var ch = str_char_at(params_str, i)
+        if ch == "," {
+            result = push(result, current)
+            current = ""
+        } else {
+            current = current + ch
+        }
+        i = i + 1
+    }
+    result = push(result, current)
+    return result
+}
+
+// ─── Expression compiler ─────────────────────────────────────────────────────
+// Returns packed [String] result (code + ctx)
+
+fn compile_expr(code: [i64], expr: [String], ctx: [String]) -> [String] {
+    var kind = expr[0]
+
+    if kind == "int" {
+        var val = int(expr[1])
+        code = emit_mov_reg_imm64(code, REG_RAX(), val)
+        return pack_result(code, ctx)
+    }
+
+    if kind == "ident" {
+        var name = expr[1]
+        var locals = ctx_get_locals(ctx)
+        var idx = locals_find(locals, name)
+        if idx >= 0 {
+            var off = locals_offset(idx)
+            code = emit_load_local(code, off, REG_RAX())
+        }
+        return pack_result(code, ctx)
+    }
+
+    if kind == "+" {
+        var r = compile_expr(code, expr[2], ctx)
+        code = unpack_code(r)
+        ctx = unpack_ctx(r)
+        code = emit_push_reg(code, REG_RAX())
+        r = compile_expr(code, expr[1], ctx)
+        code = unpack_code(r)
+        ctx = unpack_ctx(r)
+        code = emit_pop_reg(code, REG_RCX())
+        code = emit_add_reg_reg(code, REG_RAX(), REG_RCX())
+        return pack_result(code, ctx)
+    }
+
+    if kind == "-" {
+        var r = compile_expr(code, expr[2], ctx)
+        code = unpack_code(r)
+        ctx = unpack_ctx(r)
+        code = emit_push_reg(code, REG_RAX())
+        r = compile_expr(code, expr[1], ctx)
+        code = unpack_code(r)
+        ctx = unpack_ctx(r)
+        code = emit_pop_reg(code, REG_RCX())
+        code = emit_sub_reg_reg(code, REG_RAX(), REG_RCX())
+        return pack_result(code, ctx)
+    }
+
+    if kind == "*" {
+        var r = compile_expr(code, expr[2], ctx)
+        code = unpack_code(r)
+        ctx = unpack_ctx(r)
+        code = emit_push_reg(code, REG_RAX())
+        r = compile_expr(code, expr[1], ctx)
+        code = unpack_code(r)
+        ctx = unpack_ctx(r)
+        code = emit_pop_reg(code, REG_RCX())
+        code = emit_imul_reg_reg(code, REG_RAX(), REG_RCX())
+        return pack_result(code, ctx)
+    }
+
+    if kind == "==" {
+        var r = compile_expr(code, expr[2], ctx)
+        code = unpack_code(r)
+        ctx = unpack_ctx(r)
+        code = emit_push_reg(code, REG_RAX())
+        r = compile_expr(code, expr[1], ctx)
+        code = unpack_code(r)
+        ctx = unpack_ctx(r)
+        code = emit_pop_reg(code, REG_RCX())
+        code = emit_cmp_reg_reg(code, REG_RAX(), REG_RCX())
+        code = emit_u8(code, 15)
+        code = emit_u8(code, 148)
+        code = emit_u8(code, 192)
+        code = emit_u8(code, 72)
+        code = emit_u8(code, 15)
+        code = emit_u8(code, 182)
+        code = emit_u8(code, 192)
+        return pack_result(code, ctx)
+    }
+
+    if kind == "!=" {
+        var r = compile_expr(code, expr[2], ctx)
+        code = unpack_code(r)
+        ctx = unpack_ctx(r)
+        code = emit_push_reg(code, REG_RAX())
+        r = compile_expr(code, expr[1], ctx)
+        code = unpack_code(r)
+        ctx = unpack_ctx(r)
+        code = emit_pop_reg(code, REG_RCX())
+        code = emit_cmp_reg_reg(code, REG_RAX(), REG_RCX())
+        code = emit_u8(code, 15)
+        code = emit_u8(code, 149)
+        code = emit_u8(code, 192)
+        code = emit_u8(code, 72)
+        code = emit_u8(code, 15)
+        code = emit_u8(code, 182)
+        code = emit_u8(code, 192)
+        return pack_result(code, ctx)
+    }
+
+    if kind == "<" {
+        var r = compile_expr(code, expr[2], ctx)
+        code = unpack_code(r)
+        ctx = unpack_ctx(r)
+        code = emit_push_reg(code, REG_RAX())
+        r = compile_expr(code, expr[1], ctx)
+        code = unpack_code(r)
+        ctx = unpack_ctx(r)
+        code = emit_pop_reg(code, REG_RCX())
+        code = emit_cmp_reg_reg(code, REG_RAX(), REG_RCX())
+        code = emit_u8(code, 15)
+        code = emit_u8(code, 156)
+        code = emit_u8(code, 192)
+        code = emit_u8(code, 72)
+        code = emit_u8(code, 15)
+        code = emit_u8(code, 182)
+        code = emit_u8(code, 192)
+        return pack_result(code, ctx)
+    }
+
+    if kind == ">=" {
+        var r = compile_expr(code, expr[2], ctx)
+        code = unpack_code(r)
+        ctx = unpack_ctx(r)
+        code = emit_push_reg(code, REG_RAX())
+        r = compile_expr(code, expr[1], ctx)
+        code = unpack_code(r)
+        ctx = unpack_ctx(r)
+        code = emit_pop_reg(code, REG_RCX())
+        code = emit_cmp_reg_reg(code, REG_RAX(), REG_RCX())
+        code = emit_u8(code, 15)
+        code = emit_u8(code, 157)
+        code = emit_u8(code, 192)
+        code = emit_u8(code, 72)
+        code = emit_u8(code, 15)
+        code = emit_u8(code, 182)
+        code = emit_u8(code, 192)
+        return pack_result(code, ctx)
+    }
+
+    if kind == ">" {
+        var r = compile_expr(code, expr[1], ctx)
+        code = unpack_code(r)
+        ctx = unpack_ctx(r)
+        code = emit_push_reg(code, REG_RAX())
+        r = compile_expr(code, expr[2], ctx)
+        code = unpack_code(r)
+        ctx = unpack_ctx(r)
+        code = emit_pop_reg(code, REG_RCX())
+        code = emit_cmp_reg_reg(code, REG_RAX(), REG_RCX())
+        code = emit_u8(code, 15)
+        code = emit_u8(code, 156)
+        code = emit_u8(code, 192)
+        code = emit_u8(code, 72)
+        code = emit_u8(code, 15)
+        code = emit_u8(code, 182)
+        code = emit_u8(code, 192)
+        return pack_result(code, ctx)
+    }
+
+    if kind == "<=" {
+        var r = compile_expr(code, expr[1], ctx)
+        code = unpack_code(r)
+        ctx = unpack_ctx(r)
+        code = emit_push_reg(code, REG_RAX())
+        r = compile_expr(code, expr[2], ctx)
+        code = unpack_code(r)
+        ctx = unpack_ctx(r)
+        code = emit_pop_reg(code, REG_RCX())
+        code = emit_cmp_reg_reg(code, REG_RAX(), REG_RCX())
+        code = emit_u8(code, 15)
+        code = emit_u8(code, 157)
+        code = emit_u8(code, 192)
+        code = emit_u8(code, 72)
+        code = emit_u8(code, 15)
+        code = emit_u8(code, 182)
+        code = emit_u8(code, 192)
+        return pack_result(code, ctx)
+    }
+
+    if kind == "neg" {
+        var r = compile_expr(code, expr[1], ctx)
+        code = unpack_code(r)
+        ctx = unpack_ctx(r)
+        code = emit_u8(code, 72)
+        code = emit_u8(code, 247)
+        code = emit_u8(code, 216)
+        return pack_result(code, ctx)
+    }
+
+    if kind == "call" {
+        var fname = expr[1]
+        var argc = len(expr) - 2
+        var a = argc - 1
+        while a >= 0 {
+            var r = compile_expr(code, expr[a + 2], ctx)
+            code = unpack_code(r)
+            ctx = unpack_ctx(r)
+            code = emit_push_reg(code, REG_RAX())
+            a = a - 1
+        }
+        var b = 0
+        while b < argc {
+            code = emit_pop_reg(code, arg_reg(b))
+            b = b + 1
+        }
+        code = emit_u8(code, 232)
+        var fixup_pos = len(code)
+        ctx = ctx_add_fixup(ctx, fixup_pos, fname)
+        code = emit_u32_le(code, 0)
+        return pack_result(code, ctx)
+    }
+
+    if kind == "return" {
+        var r = compile_expr(code, expr[1], ctx)
+        code = unpack_code(r)
+        ctx = unpack_ctx(r)
+        code = emit_epilogue(code)
+        return pack_result(code, ctx)
+    }
+
+    return pack_result(code, ctx)
+}
+
+// ─── Statement compiler ──────────────────────────────────────────────────────
+// Returns packed [String] result (code + ctx)
+
+fn compile_stmt(code: [i64], stmt: [String], ctx: [String]) -> [String] {
+    var kind = stmt[0]
+
+    if kind == "let" {
+        var name = stmt[1]
+        var locals = ctx_get_locals(ctx)
+        locals = locals_add(locals, name)
+        ctx = ctx_set_locals(ctx, locals)
+        var idx = len(locals) - 1
+        var r = compile_expr(code, stmt[2], ctx)
+        code = unpack_code(r)
+        ctx = unpack_ctx(r)
+        var off = locals_offset(idx)
+        code = emit_store_local(code, REG_RAX(), off)
+        return pack_result(code, ctx)
+    }
+
+    if kind == "assign" {
+        var name = stmt[1]
+        var locals = ctx_get_locals(ctx)
+        var r = compile_expr(code, stmt[2], ctx)
+        code = unpack_code(r)
+        ctx = unpack_ctx(r)
+        var idx = locals_find(locals, name)
+        if idx >= 0 {
+            var off = locals_offset(idx)
+            code = emit_store_local(code, REG_RAX(), off)
+        }
+        return pack_result(code, ctx)
+    }
+
+    if kind == "return" {
+        var r = compile_expr(code, stmt[1], ctx)
+        code = unpack_code(r)
+        ctx = unpack_ctx(r)
+        code = emit_epilogue(code)
+        return pack_result(code, ctx)
+    }
+
+    if kind == "if" {
+        var fl = ctx_fresh_label(ctx, "else")
+        var else_label = fl_label(fl)
+        ctx = fl_ctx(fl)
+        fl = ctx_fresh_label(ctx, "endif")
+        var end_label = fl_label(fl)
+        ctx = fl_ctx(fl)
+        var r = compile_expr(code, stmt[1], ctx)
+        code = unpack_code(r)
+        ctx = unpack_ctx(r)
+        code = emit_u8(code, 72)
+        code = emit_u8(code, 131)
+        code = emit_u8(code, 248)
+        code = emit_u8(code, 0)
+        code = emit_u8(code, 15)
+        code = emit_u8(code, 132)
+        var fixup1 = len(code)
+        ctx = ctx_add_fixup(ctx, fixup1, else_label)
+        code = emit_u32_le(code, 0)
+        r = compile_block(code, stmt[2], ctx)
+        code = unpack_code(r)
+        ctx = unpack_ctx(r)
+        code = emit_u8(code, 233)
+        var fixup2 = len(code)
+        ctx = ctx_add_fixup(ctx, fixup2, end_label)
+        code = emit_u32_le(code, 0)
+        ctx = ctx_add_label(ctx, else_label, len(code))
+        if len(stmt) > 3 {
+            r = compile_block(code, stmt[3], ctx)
+            code = unpack_code(r)
+            ctx = unpack_ctx(r)
+        }
+        ctx = ctx_add_label(ctx, end_label, len(code))
+        return pack_result(code, ctx)
+    }
+
+    if kind == "while" {
+        var fl = ctx_fresh_label(ctx, "while")
+        var loop_label = fl_label(fl)
+        ctx = fl_ctx(fl)
+        fl = ctx_fresh_label(ctx, "endwhile")
+        var end_label = fl_label(fl)
+        ctx = fl_ctx(fl)
+        ctx = ctx_add_label(ctx, loop_label, len(code))
+        var r = compile_expr(code, stmt[1], ctx)
+        code = unpack_code(r)
+        ctx = unpack_ctx(r)
+        code = emit_u8(code, 72)
+        code = emit_u8(code, 131)
+        code = emit_u8(code, 248)
+        code = emit_u8(code, 0)
+        code = emit_u8(code, 15)
+        code = emit_u8(code, 132)
+        var fixup1 = len(code)
+        ctx = ctx_add_fixup(ctx, fixup1, end_label)
+        code = emit_u32_le(code, 0)
+        r = compile_block(code, stmt[2], ctx)
+        code = unpack_code(r)
+        ctx = unpack_ctx(r)
+        code = emit_u8(code, 233)
+        var fixup2 = len(code)
+        ctx = ctx_add_fixup(ctx, fixup2, loop_label)
+        code = emit_u32_le(code, 0)
+        ctx = ctx_add_label(ctx, end_label, len(code))
+        return pack_result(code, ctx)
+    }
+
+    if kind == "expr" {
+        var r = compile_expr(code, stmt[1], ctx)
+        return r
+    }
+
+    if kind == "block" {
+        var i = 1
+        while i < len(stmt) {
+            var r = compile_stmt(code, stmt[i], ctx)
+            code = unpack_code(r)
+            ctx = unpack_ctx(r)
+            i = i + 1
+        }
+        return pack_result(code, ctx)
+    }
+
+    return pack_result(code, ctx)
+}
+
+// Compile a block (which is an array of statements)
+fn compile_block(code: [i64], block: [String], ctx: [String]) -> [String] {
+    if len(block) > 0 {
+        if block[0] == "block" {
+            var i = 1
+            while i < len(block) {
+                var r = compile_stmt(code, block[i], ctx)
+                code = unpack_code(r)
+                ctx = unpack_ctx(r)
+                i = i + 1
+            }
+            return pack_result(code, ctx)
+        }
+    }
+    return compile_stmt(code, block, ctx)
+}
+
+// ─── Function compiler ───────────────────────────────────────────────────────
+// Returns packed [String] result (code + ctx)
+
+fn compile_function(code: [i64], func: [String], ctx: [String]) -> [String] {
+    var name = func[1]
+    var params_str = func[2]
+    var body = func[3]
+
+    // Register function address
+    ctx = ctx_add_func(ctx, name, len(code))
+
+    // Parse parameters
+    var params = parse_params(params_str)
+
+    // Reset locals for this function, set to params
+    var locals: [String] = []
+    var p = 0
+    while p < len(params) {
+        locals = locals_add(locals, params[p])
+        p = p + 1
+    }
+    ctx = ctx_set_locals(ctx, locals)
+
+    // Calculate stack size: align to 16 bytes
+    var num_locals = len(params) + 16
+    var stack_size = num_locals * 8
+    if stack_size % 16 != 0 {
+        stack_size = stack_size + (16 - (stack_size % 16))
+    }
+
+    // Emit prologue
+    code = emit_prologue(code, stack_size)
+
+    // Store argument registers into local slots
+    var a = 0
+    while a < len(params) {
+        var off = locals_offset(a)
+        code = emit_store_local(code, arg_reg(a), off)
+        a = a + 1
+    }
+
+    // Compile body
+    var r = compile_stmt(code, body, ctx)
+    code = unpack_code(r)
+    ctx = unpack_ctx(r)
+
+    // Emit trailing epilogue
+    code = emit_epilogue(code)
+
+    return pack_result(code, ctx)
+}
+
+// ─── Program compiler ────────────────────────────────────────────────────────
+
+fn compile_program(program: [String]) -> [String] {
+    var code: [i64] = []
+    var ctx = ctx_new()
+
+    // First pass: compile all functions
+    var i = 0
+    while i < len(program) {
+        var r = compile_function(code, program[i], ctx)
+        code = unpack_code(r)
+        ctx = unpack_ctx(r)
+        i = i + 1
+    }
+
+    // Second pass: add function addresses to label table, then resolve fixups
+    var func_names = csv_split(ctx[5])
+    var func_addrs = csv_split(ctx[6])
+    var f = 0
+    while f < len(func_names) {
+        if len(func_names[f]) > 0 {
+            ctx = ctx_add_label(ctx, func_names[f], int(func_addrs[f]))
+        }
+        f = f + 1
+    }
+
+    code = fixup_resolve(code, ctx)
+
+    // Return packed result
+    return pack_result(code, ctx)
+}
+
+// ─── ELF binary writer ───────────────────────────────────────────────────────
+
+fn write_elf_header(buf: [i64], entry_offset: i64) -> [i64] {
+    buf = emit_u8(buf, 127)
+    buf = emit_u8(buf, 69)
+    buf = emit_u8(buf, 76)
+    buf = emit_u8(buf, 70)
+    buf = emit_u8(buf, 2)
+    buf = emit_u8(buf, 1)
+    buf = emit_u8(buf, 1)
+    buf = emit_u8(buf, 0)
+    var pad = 0
+    while pad < 8 {
+        buf = emit_u8(buf, 0)
+        pad = pad + 1
+    }
+    buf = emit_u8(buf, 2)
+    buf = emit_u8(buf, 0)
+    buf = emit_u8(buf, 62)
+    buf = emit_u8(buf, 0)
+    buf = emit_u32_le(buf, 1)
+    var base_addr = 4194304
+    var code_start = base_addr + 120 + 56
+    buf = emit_u64_le(buf, code_start + entry_offset)
+    buf = emit_u64_le(buf, 64)
+    buf = emit_u64_le(buf, 0)
+    buf = emit_u32_le(buf, 0)
+    buf = emit_u8(buf, 64)
+    buf = emit_u8(buf, 0)
+    buf = emit_u8(buf, 56)
+    buf = emit_u8(buf, 0)
+    buf = emit_u8(buf, 1)
+    buf = emit_u8(buf, 0)
+    buf = emit_u8(buf, 0)
+    buf = emit_u8(buf, 0)
+    buf = emit_u8(buf, 0)
+    buf = emit_u8(buf, 0)
+    buf = emit_u8(buf, 0)
+    buf = emit_u8(buf, 0)
+    buf = emit_u32_le(buf, 1)
+    buf = emit_u32_le(buf, 7)
+    buf = emit_u64_le(buf, 0)
+    buf = emit_u64_le(buf, base_addr)
+    buf = emit_u64_le(buf, base_addr)
+    buf = emit_u64_le(buf, 0)
+    buf = emit_u64_le(buf, 0)
+    buf = emit_u64_le(buf, 2097152)
+    return buf
+}
+
+fn patch_elf_sizes(buf: [i64], total_size: i64) -> [i64] {
+    var v = total_size
+    if v < 0 {
+        v = v + 4294967296
+    }
+    buf[96] = v % 256
+    buf[97] = (v / 256) % 256
+    buf[98] = (v / 65536) % 256
+    buf[99] = (v / 16777216) % 256
+    buf[100] = 0
+    buf[101] = 0
+    buf[102] = 0
+    buf[103] = 0
+    buf[104] = v % 256
+    buf[105] = (v / 256) % 256
+    buf[106] = (v / 65536) % 256
+    buf[107] = (v / 16777216) % 256
+    buf[108] = 0
+    buf[109] = 0
+    buf[110] = 0
+    buf[111] = 0
+    return buf
+}
+
+fn build_elf(machine_code: [i64], entry_offset: i64) -> [i64] {
+    var buf: [i64] = []
+    buf = write_elf_header(buf, entry_offset)
+    var i = 0
+    while i < len(machine_code) {
+        buf = emit_u8(buf, machine_code[i])
+        i = i + 1
+    }
+    buf = patch_elf_sizes(buf, len(buf))
+    return buf
+}
+
+fn write_file(path: String, data: [i64]) -> i64 {
+    var size = len(data)
+    var ptr = mem_alloc(size)
+    var i = 0
+    while i < size {
+        mem_write_u8(ptr + i, data[i])
+        i = i + 1
+    }
+    var path_bytes = str_bytes(path)
+    var path_len = len(path_bytes)
+    var path_buf = mem_alloc(path_len + 1)
+    var j = 0
+    while j < path_len {
+        mem_write_u8(path_buf + j, path_bytes[j])
+        j = j + 1
+    }
+    mem_write_u8(path_buf + path_len, 0)
+    var fd = syscall3(2, path_buf, 577, 493)
+    var written = syscall3(1, fd, ptr, size)
+    syscall1(3, fd)
+    mem_free(path_buf)
+    mem_free(ptr)
+    return written
+}
+
+// ─── Emit Linux exit syscall sequence ────────────────────────────────────────
+fn emit_exit(code: [i64], exit_code: i64) -> [i64] {
+    code = emit_mov_reg_imm64(code, REG_RAX(), 60)
+    code = emit_mov_reg_imm64(code, REG_RDI(), exit_code)
+    code = emit_syscall(code)
+    return code
+}
+
+fn emit_write_syscall(code: [i64]) -> [i64] {
+    code = emit_mov_reg_imm64(code, REG_RAX(), 1)
+    code = emit_syscall(code)
+    return code
+}
+
+// ─── Main: test the code generator ──────────────────────────────────────────
+
+fn main() {
+    var func = ["fn", "add", "a,b", ["return", ["+", ["ident", "a"], ["ident", "b"]]]]
+    var ctx = ctx_new()
+    var r = compile_function([], func, ctx)
+    var code = unpack_code(r)
+
+    // Print hex dump
+    var i = 0
+    while i < len(code) {
+        var byte = code[i]
+        print(int_to_hex(byte))
+        print(" ")
+        i = i + 1
+    }
+    println("")
+    println("Total bytes: " + to_string(len(code)))
+
+    // Verify prologue: 55 48 89 E5
+    var ok = true
+    if code[0] != 85 { ok = false }
+    if code[1] != 72 { ok = false }
+    if code[2] != 137 { ok = false }
+    if code[3] != 229 { ok = false }
+
+    if ok {
+        println("PASS: prologue correct")
+    }
+    if ok == false {
+        println("FAIL: prologue incorrect")
+    }
+
+    // Verify sub rsp follows (48 83 EC)
+    var ok2 = true
+    if code[4] != 72 { ok2 = false }
+    if code[5] != 131 { ok2 = false }
+    if code[6] != 236 { ok2 = false }
+
+    if ok2 {
+        println("PASS: sub rsp emitted")
+    }
+    if ok2 == false {
+        println("FAIL: sub rsp missing")
+    }
+
+    // Verify epilogue at end: 48 89 EC 5D C3
+    var n = len(code)
+    var ok3 = true
+    if code[n - 5] != 72 { ok3 = false }
+    if code[n - 4] != 137 { ok3 = false }
+    if code[n - 3] != 236 { ok3 = false }
+    if code[n - 2] != 93 { ok3 = false }
+    if code[n - 1] != 195 { ok3 = false }
+
+    if ok3 {
+        println("PASS: epilogue correct")
+    }
+    if ok3 == false {
+        println("FAIL: epilogue incorrect")
+    }
+
+    println("")
+    println("=== x86-64 codegen ready ===")
+    println("Supports: mov, push, pop, add, sub, imul, cmp, jcc, call, ret, syscall")
+    println("Features: function prologue/epilogue, local variables, label fixups, ELF output")
+}

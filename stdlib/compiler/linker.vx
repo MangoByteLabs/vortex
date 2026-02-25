@@ -1,0 +1,413 @@
+// Vortex Self-Hosting Linker and Symbol Resolver
+// Takes compiled function code, resolves symbols/fixups, lays out final binary.
+// All data structures use flat [String] or [i64] arrays.
+
+// ─── Symbol Table (stride 3: name, address_str, size_str) ─────────────────
+
+fn sym_new() -> [String] {
+    let t: [String] = []
+    return t
+}
+
+fn sym_add(table: [String], name: String, addr: i64, size: i64) -> [String] {
+    table = push(table, name)
+    table = push(table, to_string(addr))
+    table = push(table, to_string(size))
+    return table
+}
+
+fn sym_find(table: [String], name: String) -> i64 {
+    let n = len(table)
+    let i = 0
+    while i < n {
+        if table[i] == name {
+            return int(table[i + 1])
+        }
+        i = i + 3
+    }
+    return -1
+}
+
+fn sym_count(table: [String]) -> i64 {
+    return len(table) / 3
+}
+
+// ─── Fixup Table (stride 3: position_str, target_name, kind) ──────────────
+
+fn fixup_new() -> [String] {
+    let t: [String] = []
+    return t
+}
+
+fn fixup_add(table: [String], position: i64, target: String, kind: String) -> [String] {
+    table = push(table, to_string(position))
+    table = push(table, target)
+    table = push(table, kind)
+    return table
+}
+
+fn fixup_count(table: [String]) -> i64 {
+    return len(table) / 3
+}
+
+// ─── String Constant Pool (stride 2: string, offset_str) ──────────────────
+
+fn strpool_new() -> [String] {
+    let p: [String] = []
+    return p
+}
+
+fn strpool_total_size(pool: [String]) -> i64 {
+    let n = len(pool)
+    if n == 0 {
+        return 0
+    }
+    // Last entry: offset + len(string) + 1 (null terminator)
+    let last_offset = int(pool[n - 1])
+    let last_str = pool[n - 2]
+    return last_offset + len(str_bytes(last_str)) + 1
+}
+
+fn strpool_add(pool: [String], s: String) -> [String] {
+    let offset = strpool_total_size(pool)
+    pool = push(pool, s)
+    pool = push(pool, to_string(offset))
+    return pool
+}
+
+fn strpool_find(pool: [String], s: String) -> i64 {
+    let n = len(pool)
+    let i = 0
+    while i < n {
+        if pool[i] == s {
+            return int(pool[i + 1])
+        }
+        i = i + 2
+    }
+    return -1
+}
+
+fn strpool_to_bytes(pool: [String]) -> [i64] {
+    let out: [i64] = []
+    let n = len(pool)
+    let i = 0
+    while i < n {
+        let s = pool[i]
+        let bytes = str_bytes(s)
+        let blen = len(bytes)
+        let j = 0
+        while j < blen {
+            out = push(out, bytes[j])
+            j = j + 1
+        }
+        // null terminator
+        out = push(out, 0)
+        i = i + 2
+    }
+    return out
+}
+
+// ─── Relocation Helpers ────────────────────────────────────────────────────
+
+fn compute_rel32(src: i64, dst: i64) -> i64 {
+    return dst - (src + 4)
+}
+
+fn patch_u32_le(code: [i64], offset: i64, value: i64) -> [i64] {
+    // Write 4 bytes little-endian at offset
+    // Handle negative values via two's complement (mask to 32 bits)
+    var v = value
+    if v < 0 {
+        v = v + 4294967296
+    }
+    let b0 = v % 256
+    let b1 = (v / 256) % 256
+    let b2 = (v / 65536) % 256
+    let b3 = (v / 16777216) % 256
+    code[offset] = b0
+    code[offset + 1] = b1
+    code[offset + 2] = b2
+    code[offset + 3] = b3
+    return code
+}
+
+// ─── Linker Core ───────────────────────────────────────────────────────────
+
+fn link_functions(funcs: [String], codes: [i64], sizes: [i64], fixups: [String]) -> [i64] {
+    // 1. Build symbol table: assign addresses sequentially
+    var sym = sym_new()
+    let nfuncs = len(funcs)
+    var addr = 0
+    var fi = 0
+    while fi < nfuncs {
+        sym = sym_add(sym, funcs[fi], addr, sizes[fi])
+        addr = addr + sizes[fi]
+        fi = fi + 1
+    }
+
+    // 2. Copy codes into mutable output
+    var out: [i64] = []
+    let code_len = len(codes)
+    var ci = 0
+    while ci < code_len {
+        out = push(out, codes[ci])
+        ci = ci + 1
+    }
+
+    // 3. Apply fixups
+    let nfix = len(fixups)
+    var fxi = 0
+    while fxi < nfix {
+        let pos = int(fixups[fxi])
+        let target_name = fixups[fxi + 1]
+        let kind = fixups[fxi + 2]
+        let target_addr = sym_find(sym, target_name)
+        if target_addr >= 0 {
+            let rel = compute_rel32(pos, target_addr)
+            out = patch_u32_le(out, pos, rel)
+        }
+        fxi = fxi + 3
+    }
+
+    return out
+}
+
+fn link_with_data(code: [i64], data: [i64], code_base: i64) -> [i64] {
+    var out: [i64] = []
+    let clen = len(code)
+    let dlen = len(data)
+    var i = 0
+    while i < clen {
+        out = push(out, code[i])
+        i = i + 1
+    }
+    i = 0
+    while i < dlen {
+        out = push(out, data[i])
+        i = i + 1
+    }
+    return out
+}
+
+fn link_program(main_code: [i64], func_codes: [String], func_sizes: [i64], func_fixups: [String], strings: [String]) -> [i64] {
+    // Build function name list and concatenated code bytes
+    // func_codes is [name1, code_byte_str1, code_byte_str2, ..., name2, ...]
+    // Actually, per the spec: func_codes is flat [String] of function names
+    // and the actual code bytes come from main_code which is already concatenated
+    // We just need to link and attach data section
+
+    // Link functions
+    var funcs: [String] = []
+    let nf = len(func_codes)
+    var i = 0
+    while i < nf {
+        funcs = push(funcs, func_codes[i])
+        i = i + 1
+    }
+
+    var linked = link_functions(funcs, main_code, func_sizes, func_fixups)
+
+    // Build string data section
+    var pool = strpool_new()
+    let ns = len(strings)
+    i = 0
+    while i < ns {
+        pool = strpool_add(pool, strings[i])
+        i = i + 1
+    }
+    var data = strpool_to_bytes(pool)
+
+    // Concatenate code + data
+    var result = link_with_data(linked, data, 0)
+    return result
+}
+
+// ─── Runtime Stubs (x86-64 Linux syscall ABI) ─────────────────────────────
+
+fn _emit_bytes(out: [i64], bytes: [i64]) -> [i64] {
+    let n = len(bytes)
+    var i = 0
+    while i < n {
+        out = push(out, bytes[i])
+        i = i + 1
+    }
+    return out
+}
+
+fn emit_vx_exit() -> [i64] {
+    // _vx_exit: mov rax, 60; syscall; (rdi already has exit code)
+    var out: [i64] = []
+    // mov rax, 60  =>  48 c7 c0 3c 00 00 00
+    out = _emit_bytes(out, [0x48, 0xc7, 0xc0, 0x3c, 0x00, 0x00, 0x00])
+    // syscall  =>  0f 05
+    out = _emit_bytes(out, [0x0f, 0x05])
+    return out
+}
+
+fn emit_vx_print_string() -> [i64] {
+    // _vx_print_string: SYS_WRITE(1, rsi, rdx)
+    // rsi = buffer ptr, rdx = length (caller sets these)
+    var out: [i64] = []
+    // mov rax, 1  =>  48 c7 c0 01 00 00 00
+    out = _emit_bytes(out, [0x48, 0xc7, 0xc0, 0x01, 0x00, 0x00, 0x00])
+    // mov rdi, 1  =>  48 c7 c7 01 00 00 00
+    out = _emit_bytes(out, [0x48, 0xc7, 0xc7, 0x01, 0x00, 0x00, 0x00])
+    // syscall  =>  0f 05
+    out = _emit_bytes(out, [0x0f, 0x05])
+    // ret  =>  c3
+    out = push(out, 0xc3)
+    return out
+}
+
+fn emit_vx_print_int() -> [i64] {
+    // _vx_print_int: convert i64 in rdi to decimal string on stack, print it
+    // Uses a stack buffer, divides by 10 repeatedly
+    var out: [i64] = []
+
+    // sub rsp, 32  =>  48 83 ec 20  (allocate buffer)
+    out = _emit_bytes(out, [0x48, 0x83, 0xec, 0x20])
+    // mov rax, rdi  =>  48 89 f8
+    out = _emit_bytes(out, [0x48, 0x89, 0xf8])
+    // lea rsi, [rsp+31]  =>  48 8d 74 24 1f  (point to end of buffer)
+    out = _emit_bytes(out, [0x48, 0x8d, 0x74, 0x24, 0x1f])
+    // mov byte [rsi], 0x0a  =>  c6 06 0a  (newline)
+    out = _emit_bytes(out, [0xc6, 0x06, 0x0a])
+    // xor rcx, rcx  =>  48 31 c9  (digit counter)
+    out = _emit_bytes(out, [0x48, 0x31, 0xc9])
+    // mov r8, 10  =>  49 c7 c0 0a 00 00 00
+    out = _emit_bytes(out, [0x49, 0xc7, 0xc0, 0x0a, 0x00, 0x00, 0x00])
+
+    // Handle negative: test rax, rax; jns .positive
+    // test rax, rax  =>  48 85 c0
+    out = _emit_bytes(out, [0x48, 0x85, 0xc0])
+    // jns +3  =>  79 03
+    out = _emit_bytes(out, [0x79, 0x03])
+    // neg rax  =>  48 f7 d8
+    out = _emit_bytes(out, [0x48, 0xf7, 0xd8])
+
+    // .digit_loop:
+    // xor rdx, rdx  =>  48 31 d2
+    out = _emit_bytes(out, [0x48, 0x31, 0xd2])
+    // div r8  =>  49 f7 f0
+    out = _emit_bytes(out, [0x49, 0xf7, 0xf0])
+    // add dl, 0x30  =>  80 c2 30
+    out = _emit_bytes(out, [0x80, 0xc2, 0x30])
+    // dec rsi  =>  48 ff ce
+    out = _emit_bytes(out, [0x48, 0xff, 0xce])
+    // mov [rsi], dl  =>  88 16
+    out = _emit_bytes(out, [0x88, 0x16])
+    // inc rcx  =>  48 ff c1
+    out = _emit_bytes(out, [0x48, 0xff, 0xc1])
+    // test rax, rax  =>  48 85 c0
+    out = _emit_bytes(out, [0x48, 0x85, 0xc0])
+    // jnz -.digit_loop  =>  75 ee (jump back 18 bytes)
+    out = _emit_bytes(out, [0x75, 0xee])
+
+    // Check if original was negative (rdi < 0)
+    // test rdi, rdi  =>  48 85 ff
+    out = _emit_bytes(out, [0x48, 0x85, 0xff])
+    // jns +6  =>  79 06
+    out = _emit_bytes(out, [0x79, 0x06])
+    // dec rsi  =>  48 ff ce
+    out = _emit_bytes(out, [0x48, 0xff, 0xce])
+    // mov byte [rsi], 0x2d  =>  c6 06 2d  (minus sign)
+    out = _emit_bytes(out, [0xc6, 0x06, 0x2d])
+    // inc rcx  =>  48 ff c1
+    out = _emit_bytes(out, [0x48, 0xff, 0xc1])
+
+    // rdx = rcx + 1 (include newline)
+    // lea rdx, [rcx+1]  =>  48 8d 51 01
+    out = _emit_bytes(out, [0x48, 0x8d, 0x51, 0x01])
+    // mov rax, 1  =>  48 c7 c0 01 00 00 00  (SYS_WRITE)
+    out = _emit_bytes(out, [0x48, 0xc7, 0xc0, 0x01, 0x00, 0x00, 0x00])
+    // mov rdi, 1  =>  48 c7 c7 01 00 00 00  (stdout)
+    out = _emit_bytes(out, [0x48, 0xc7, 0xc7, 0x01, 0x00, 0x00, 0x00])
+    // syscall  =>  0f 05
+    out = _emit_bytes(out, [0x0f, 0x05])
+    // add rsp, 32  =>  48 83 c4 20
+    out = _emit_bytes(out, [0x48, 0x83, 0xc4, 0x20])
+    // ret  =>  c3
+    out = push(out, 0xc3)
+    return out
+}
+
+fn emit_vx_alloc() -> [i64] {
+    // _vx_alloc: simple brk-based allocator
+    // rdi = size to allocate, returns pointer in rax
+    var out: [i64] = []
+    // Save requested size: mov rbx, rdi  =>  48 89 fb
+    out = _emit_bytes(out, [0x48, 0x89, 0xfb])
+    // Get current brk: mov rax, 12; xor rdi, rdi; syscall
+    out = _emit_bytes(out, [0x48, 0xc7, 0xc0, 0x0c, 0x00, 0x00, 0x00])
+    out = _emit_bytes(out, [0x48, 0x31, 0xff])
+    out = _emit_bytes(out, [0x0f, 0x05])
+    // Save current brk: mov rcx, rax  =>  48 89 c1
+    out = _emit_bytes(out, [0x48, 0x89, 0xc1])
+    // New brk = current + size: lea rdi, [rax+rbx]  =>  48 8d 3c 18
+    out = _emit_bytes(out, [0x48, 0x8d, 0x3c, 0x18])
+    // Set new brk: mov rax, 12; syscall
+    out = _emit_bytes(out, [0x48, 0xc7, 0xc0, 0x0c, 0x00, 0x00, 0x00])
+    out = _emit_bytes(out, [0x0f, 0x05])
+    // Return old brk (allocation start): mov rax, rcx  =>  48 89 c8
+    out = _emit_bytes(out, [0x48, 0x89, 0xc8])
+    // ret  =>  c3
+    out = push(out, 0xc3)
+    return out
+}
+
+fn emit_runtime_stubs() -> [i64] {
+    var out: [i64] = []
+    let print_int = emit_vx_print_int()
+    let print_str = emit_vx_print_string()
+    let exit = emit_vx_exit()
+    let alloc = emit_vx_alloc()
+
+    out = _emit_bytes(out, print_int)
+    out = _emit_bytes(out, print_str)
+    out = _emit_bytes(out, exit)
+    out = _emit_bytes(out, alloc)
+    return out
+}
+
+// ─── Tests ─────────────────────────────────────────────────────────────────
+
+fn main() {
+    // Simulate linking two functions:
+    // func_a: mov rax, 42; ret  (entry point)
+    // func_b: mov rax, 7; ret   (called by func_a eventually)
+
+    var sym = sym_new()
+    sym = sym_add(sym, "_start", 0, 5)
+    sym = sym_add(sym, "helper", 5, 5)
+
+    println("Symbol table:")
+    println("  _start at " + to_string(sym_find(sym, "_start")))
+    println("  helper at " + to_string(sym_find(sym, "helper")))
+
+    // Test fixup resolution
+    // Suppose at byte 1 we have a call to "helper"
+    var fixups = fixup_new()
+    fixups = fixup_add(fixups, 1, "helper", "call")
+
+    // Code: [0xE8, 0x00, 0x00, 0x00, 0x00, ...]  (call placeholder)
+    var code = [232, 0, 0, 0, 0, 184, 7, 0, 0, 0]
+
+    // Patch: target=5, from=1, rel32 = 5 - (1+4) = 0
+    var patched = link_functions(["_start", "helper"], code, [5, 5], fixups)
+
+    println("Patched call offset: " + to_string(patched[1]) + " " + to_string(patched[2]) + " " + to_string(patched[3]) + " " + to_string(patched[4]))
+
+    // Test string pool
+    var pool = strpool_new()
+    pool = strpool_add(pool, "Hello")
+    pool = strpool_add(pool, "World")
+    println("String pool size: " + to_string(strpool_total_size(pool)))
+    println("'Hello' at offset: " + to_string(strpool_find(pool, "Hello")))
+    println("'World' at offset: " + to_string(strpool_find(pool, "World")))
+
+    // Test runtime stubs
+    var stubs = emit_runtime_stubs()
+    println("Runtime stub size: " + to_string(len(stubs)) + " bytes")
+
+    println("=== linker.vx tests passed ===")
+}

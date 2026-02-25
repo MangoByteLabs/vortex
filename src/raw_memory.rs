@@ -119,20 +119,28 @@ fn builtin_mem_realloc(_env: &mut Env, args: Vec<Value>) -> Result<Value, String
 macro_rules! read_builtin {
     ($name:ident, $ty:ty, Int) => {
         fn $name(_env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
-            if args.len() != 1 {
-                return Err(format!("{} expects 1 argument (ptr)", stringify!($name)));
+            if args.len() < 1 || args.len() > 2 {
+                return Err(format!("{} expects 1-2 arguments (ptr [, offset])", stringify!($name)));
             }
-            let addr = extract_ptr(&args[0])?;
+            let mut addr = extract_ptr(&args[0])?;
+            if args.len() == 2 {
+                let offset = match &args[1] { Value::Int(n) => *n as usize, Value::Pointer(p) => *p, _ => return Err(format!("{}: offset must be int", stringify!($name))) };
+                addr += offset;
+            }
             let val = unsafe { std::ptr::read_unaligned(addr as *const $ty) };
             Ok(Value::Int(val as i128))
         }
     };
     ($name:ident, $ty:ty, Float) => {
         fn $name(_env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
-            if args.len() != 1 {
-                return Err(format!("{} expects 1 argument (ptr)", stringify!($name)));
+            if args.len() < 1 || args.len() > 2 {
+                return Err(format!("{} expects 1-2 arguments (ptr [, offset])", stringify!($name)));
             }
-            let addr = extract_ptr(&args[0])?;
+            let mut addr = extract_ptr(&args[0])?;
+            if args.len() == 2 {
+                let offset = match &args[1] { Value::Int(n) => *n as usize, Value::Pointer(p) => *p, _ => return Err(format!("{}: offset must be int", stringify!($name))) };
+                addr += offset;
+            }
             let val = unsafe { std::ptr::read_unaligned(addr as *const $ty) };
             Ok(Value::Float(val as f64))
         }
@@ -157,22 +165,32 @@ read_builtin!(builtin_mem_read_f64, f64, Float);
 macro_rules! write_builtin {
     ($name:ident, $ty:ty, Int) => {
         fn $name(_env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
-            if args.len() != 2 {
-                return Err(format!("{} expects 2 arguments (ptr, val)", stringify!($name)));
+            if args.len() < 2 || args.len() > 3 {
+                return Err(format!("{} expects 2-3 arguments (ptr, val) or (ptr, offset, val)", stringify!($name)));
             }
-            let addr = extract_ptr(&args[0])?;
-            let val = extract_int(&args[1])? as $ty;
+            let mut addr = extract_ptr(&args[0])?;
+            let val_idx = if args.len() == 3 {
+                let offset = match &args[1] { Value::Int(n) => *n as usize, Value::Pointer(p) => *p, _ => return Err(format!("{}: offset must be int", stringify!($name))) };
+                addr += offset;
+                2
+            } else { 1 };
+            let val = extract_int(&args[val_idx])? as $ty;
             unsafe { std::ptr::write_unaligned(addr as *mut $ty, val) };
             Ok(Value::Void)
         }
     };
     ($name:ident, $ty:ty, Float) => {
         fn $name(_env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
-            if args.len() != 2 {
-                return Err(format!("{} expects 2 arguments (ptr, val)", stringify!($name)));
+            if args.len() < 2 || args.len() > 3 {
+                return Err(format!("{} expects 2-3 arguments (ptr, val) or (ptr, offset, val)", stringify!($name)));
             }
-            let addr = extract_ptr(&args[0])?;
-            let val = extract_float(&args[1])? as $ty;
+            let mut addr = extract_ptr(&args[0])?;
+            let val_idx = if args.len() == 3 {
+                let offset = match &args[1] { Value::Int(n) => *n as usize, Value::Pointer(p) => *p, _ => return Err(format!("{}: offset must be int", stringify!($name))) };
+                addr += offset;
+                2
+            } else { 1 };
+            let val = extract_float(&args[val_idx])? as $ty;
             unsafe { std::ptr::write_unaligned(addr as *mut $ty, val) };
             Ok(Value::Void)
         }

@@ -1,4 +1,4 @@
-// std/string.vx — String utilities
+// std/string.vx — String utilities for Vortex
 
 fn starts_with(s: String, prefix: String) -> bool {
     if len(prefix) > len(s) { return false }
@@ -11,37 +11,55 @@ fn ends_with(s: String, suffix: String) -> bool {
     return str_substr(s, start, len(suffix)) == suffix
 }
 
+fn contains(s: String, sub: String) -> bool {
+    let idx = unwrap_or(str_find(s, sub), -1)
+    return idx >= 0
+}
+
+fn trim_left(s: String) -> String {
+    var i = 0
+    let n = len(s)
+    while i < n {
+        let ch = str_char_at(s, i)
+        if str_is_ascii_whitespace(ch) {
+            i = i + 1
+        } else {
+            break
+        }
+    }
+    return str_substr(s, i, len(s) - i)
+}
+
+fn trim_right(s: String) -> String {
+    var j = len(s)
+    while j > 0 {
+        let ch = str_char_at(s, j - 1)
+        if str_is_ascii_whitespace(ch) {
+            j = j - 1
+        } else {
+            break
+        }
+    }
+    return str_substr(s, 0, j)
+}
+
 fn trim(s: String) -> String {
-    var start = 0
-    var end_idx = len(s)
-    let chars = str_to_chars(s)
-    while start < end_idx {
-        if str_is_ascii_whitespace(chars[start]) {
-            start = start + 1
-        } else {
-            break
-        }
-    }
-    while end_idx > start {
-        if str_is_ascii_whitespace(chars[end_idx - 1]) {
-            end_idx = end_idx - 1
-        } else {
-            break
-        }
-    }
-    return str_substr(s, start, end_idx - start)
+    return trim_right(trim_left(s))
 }
 
 fn to_upper(s: String) -> String {
     let bytes = str_bytes(s)
     var result = []
-    for i in range(0, len(bytes)) {
+    var i = 0
+    let n = len(bytes)
+    while i < n {
         let b = bytes[i]
         if b >= 97 && b <= 122 {
-            push(result, b - 32)
+            result = push(result, b - 32)
         } else {
-            push(result, b)
+            result = push(result, b)
         }
+        i = i + 1
     }
     return str_from_bytes(result)
 }
@@ -49,30 +67,173 @@ fn to_upper(s: String) -> String {
 fn to_lower(s: String) -> String {
     let bytes = str_bytes(s)
     var result = []
-    for i in range(0, len(bytes)) {
+    var i = 0
+    let n = len(bytes)
+    while i < n {
         let b = bytes[i]
         if b >= 65 && b <= 90 {
-            push(result, b + 32)
+            result = push(result, b + 32)
         } else {
-            push(result, b)
+            result = push(result, b)
         }
+        i = i + 1
     }
     return str_from_bytes(result)
 }
 
-fn join(arr: i64, sep: String) -> String {
+fn join_strings(arr: [String], sep: String) -> String {
     var result = ""
-    for i in range(0, len(arr)) {
-        if i > 0 { result = result + sep }
-        result = result + str(arr[i])
+    var i = 0
+    let n = len(arr)
+    while i < n {
+        if i > 0 {
+            result = result + sep
+        }
+        result = result + arr[i]
+        i = i + 1
     }
     return result
 }
 
-fn repeat(s: String, n: i64) -> String {
+fn split_string(s: String, delim: String) -> [String] {
+    var parts = []
+    var rest = s
+    let dlen = len(delim)
+    while true {
+        let idx = unwrap_or(str_find(rest, delim), -1)
+        if idx < 0 {
+            parts = push(parts, rest)
+            break
+        }
+        parts = push(parts, str_substr(rest, 0, idx))
+        rest = str_substr(rest, idx + dlen, len(rest) - idx - dlen)
+    }
+    return parts
+}
+
+fn replace_string(s: String, old: String, replacement: String) -> String {
     var result = ""
-    for i in range(0, n) {
-        result = result + s
+    var rest = s
+    let olen = len(old)
+    let rlen = len(replacement)
+    if olen == 0 {
+        return s
+    }
+    while true {
+        let idx = unwrap_or(str_find(rest, old), -1)
+        if idx < 0 {
+            result = result + rest
+            break
+        }
+        result = result + str_substr(rest, 0, idx) + replacement
+        rest = str_substr(rest, idx + olen, len(rest) - idx - olen)
     }
     return result
+}
+
+fn repeat_string(s: String, n: i64) -> String {
+    var result = ""
+    var i = 0
+    while i < n {
+        result = result + s
+        i = i + 1
+    }
+    return result
+}
+
+fn reverse_string(s: String) -> String {
+    let bytes = str_bytes(s)
+    var result = []
+    var i = len(bytes) - 1
+    while i >= 0 {
+        result = push(result, bytes[i])
+        i = i - 1
+    }
+    return str_from_bytes(result)
+}
+
+fn pad_left(s: String, width: i64, ch: String) -> String {
+    var result = s
+    while len(result) < width {
+        result = ch + result
+    }
+    return result
+}
+
+fn pad_right(s: String, width: i64, ch: String) -> String {
+    var result = s
+    while len(result) < width {
+        result = result + ch
+    }
+    return result
+}
+
+fn char_at(s: String, idx: i64) -> String {
+    return str_char_at(s, idx)
+}
+
+fn index_of(s: String, sub: String) -> i64 {
+    return unwrap_or(str_find(s, sub), -1)
+}
+
+fn main() {
+    let nl = str_from_bytes([10])
+
+    // starts_with / ends_with
+    println("=== starts_with / ends_with ===")
+    println(to_string(starts_with("hello world", "hello")))
+    println(to_string(starts_with("hello world", "world")))
+    println(to_string(ends_with("hello world", "world")))
+    println(to_string(ends_with("hello world", "hello")))
+
+    // contains
+    println("=== contains ===")
+    println(to_string(contains("hello world", "lo wo")))
+    println(to_string(contains("hello world", "xyz")))
+
+    // trim
+    println("=== trim ===")
+    println("[" + trim("  hello  ") + "]")
+    println("[" + trim_left("  hello  ") + "]")
+    println("[" + trim_right("  hello  ") + "]")
+
+    // to_upper / to_lower
+    println("=== to_upper / to_lower ===")
+    println(to_upper("hello World"))
+    println(to_lower("Hello WORLD"))
+
+    // join_strings
+    println("=== join_strings ===")
+    let parts = ["one", "two", "three"]
+    println(join_strings(parts, ", "))
+
+    // split_string
+    println("=== split_string ===")
+    let tokens = split_string("a,b,c,d", ",")
+    println(to_string(len(tokens)))
+    println(tokens[0])
+    println(tokens[3])
+
+    // replace_string
+    println("=== replace_string ===")
+    println(replace_string("foo bar foo", "foo", "baz"))
+
+    // repeat_string
+    println("=== repeat_string ===")
+    println(repeat_string("ab", 4))
+
+    // reverse_string
+    println("=== reverse_string ===")
+    println(reverse_string("hello"))
+
+    // pad_left / pad_right
+    println("=== pad ===")
+    println(pad_left("42", 6, "0"))
+    println(pad_right("hi", 6, "."))
+
+    // char_at / index_of
+    println("=== char_at / index_of ===")
+    println(char_at("hello", 1))
+    println(to_string(index_of("hello world", "world")))
+    println(to_string(index_of("hello world", "xyz")))
 }

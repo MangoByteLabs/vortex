@@ -1,0 +1,2395 @@
+// runtime.vx — Native runtime library for compiled Vortex binaries
+// Provides x86-64 machine code stubs that get embedded into every compiled binary.
+// All stubs follow System V AMD64 ABI: args in rdi, rsi, rdx, rcx, r8, r9; return in rax.
+
+// ============================================================================
+// Byte emission helpers (same pattern as vxc.vx)
+// ============================================================================
+
+fn emit_u8(code: [i64], b: i64) -> [i64] {
+    var val = b % 256
+    if val < 0 {
+        val = val + 256
+    }
+    return push(code, val)
+}
+
+fn emit_u32_le(code: [i64], val: i64) -> [i64] {
+    var v = val
+    if v < 0 {
+        v = v + 4294967296
+    }
+    code = push(code, v % 256)
+    v = v / 256
+    code = push(code, v % 256)
+    v = v / 256
+    code = push(code, v % 256)
+    v = v / 256
+    code = push(code, v % 256)
+    return code
+}
+
+fn emit_u64_le(code: [i64], val: i64) -> [i64] {
+    var v = val
+    if v < 0 {
+        v = v + 4294967296 * 4294967296
+    }
+    var i = 0
+    while i < 8 {
+        code = push(code, v % 256)
+        v = v / 256
+        i = i + 1
+    }
+    return code
+}
+
+// ============================================================================
+// 1. Memory Management (via mmap/munmap syscalls)
+// ============================================================================
+
+// _vx_malloc(size: i64) -> ptr
+// Allocates size+16 bytes via mmap, stores size at start, returns ptr+16
+// rdi = size
+// Returns: rax = usable pointer (past header)
+fn rt_malloc_stub() -> [i64] {
+    var out: [i64] = []
+    // push rbp
+    out = emit_u8(out, 85)
+    // mov rbp, rsp
+    out = emit_u8(out, 72)
+    out = emit_u8(out, 137)
+    out = emit_u8(out, 229)
+    // Save requested size in r12
+    // push r12
+    out = emit_u8(out, 65)
+    out = emit_u8(out, 84)
+    // mov r12, rdi (save original size)
+    out = emit_u8(out, 73)
+    out = emit_u8(out, 137)
+    out = emit_u8(out, 252)
+    // lea rsi, [rdi + 16] — total allocation = size + 16
+    out = emit_u8(out, 72)
+    out = emit_u8(out, 141)
+    out = emit_u8(out, 119)
+    out = emit_u8(out, 16)
+    // mov rax, 9 (SYS_MMAP)
+    out = emit_u8(out, 72)
+    out = emit_u8(out, 199)
+    out = emit_u8(out, 192)
+    out = emit_u32_le(out, 9)
+    // mov rdi, 0 (addr = NULL, let kernel choose)
+    out = emit_u8(out, 72)
+    out = emit_u8(out, 199)
+    out = emit_u8(out, 199)
+    out = emit_u32_le(out, 0)
+    // rsi already has size+16 (length)
+    // mov rdx, 3 (PROT_READ | PROT_WRITE)
+    out = emit_u8(out, 72)
+    out = emit_u8(out, 199)
+    out = emit_u8(out, 194)
+    out = emit_u32_le(out, 3)
+    // mov r10, 34 (MAP_PRIVATE | MAP_ANONYMOUS = 0x22)
+    out = emit_u8(out, 73)
+    out = emit_u8(out, 199)
+    out = emit_u8(out, 194)
+    out = emit_u32_le(out, 34)
+    // mov r8, -1 (fd = -1)
+    out = emit_u8(out, 73)
+    out = emit_u8(out, 199)
+    out = emit_u8(out, 192)
+    out = emit_u32_le(out, -1)
+    // mov r9, 0 (offset = 0)
+    out = emit_u8(out, 73)
+    out = emit_u8(out, 199)
+    out = emit_u8(out, 193)
+    out = emit_u32_le(out, 0)
+    // syscall
+    out = emit_u8(out, 15)
+    out = emit_u8(out, 5)
+    // Store original size at [rax] (header)
+    // mov [rax], r12
+    out = emit_u8(out, 76)
+    out = emit_u8(out, 137)
+    out = emit_u8(out, 32)
+    // Store total alloc size at [rax+8]
+    // lea rcx, [r12 + 16]
+    out = emit_u8(out, 73)
+    out = emit_u8(out, 141)
+    out = emit_u8(out, 76)
+    out = emit_u8(out, 36)
+    out = emit_u8(out, 16)
+    // mov [rax+8], rcx
+    out = emit_u8(out, 72)
+    out = emit_u8(out, 137)
+    out = emit_u8(out, 72)
+    out = emit_u8(out, 8)
+    // add rax, 16 — return usable pointer
+    out = emit_u8(out, 72)
+    out = emit_u8(out, 131)
+    out = emit_u8(out, 192)
+    out = emit_u8(out, 16)
+    // pop r12
+    out = emit_u8(out, 65)
+    out = emit_u8(out, 92)
+    // pop rbp
+    out = emit_u8(out, 93)
+    // ret
+    out = emit_u8(out, 195)
+    return out
+}
+
+// _vx_free(ptr) — reads size from ptr-16, calls munmap
+// rdi = usable pointer
+fn rt_free_stub() -> [i64] {
+    var out: [i64] = []
+    // push rbp
+    out = emit_u8(out, 85)
+    // mov rbp, rsp
+    out = emit_u8(out, 72)
+    out = emit_u8(out, 137)
+    out = emit_u8(out, 229)
+    // sub rdi, 16 — get real base
+    out = emit_u8(out, 72)
+    out = emit_u8(out, 131)
+    out = emit_u8(out, 239)
+    out = emit_u8(out, 16)
+    // mov rsi, [rdi+8] — total alloc size
+    out = emit_u8(out, 72)
+    out = emit_u8(out, 139)
+    out = emit_u8(out, 119)
+    out = emit_u8(out, 8)
+    // mov rax, 11 (SYS_MUNMAP)
+    out = emit_u8(out, 72)
+    out = emit_u8(out, 199)
+    out = emit_u8(out, 192)
+    out = emit_u32_le(out, 11)
+    // syscall
+    out = emit_u8(out, 15)
+    out = emit_u8(out, 5)
+    // pop rbp
+    out = emit_u8(out, 93)
+    // ret
+    out = emit_u8(out, 195)
+    return out
+}
+
+// _vx_realloc(ptr, new_size) -> new_ptr
+// rdi = old ptr, rsi = new_size
+// Strategy: malloc new, memcpy old data, free old
+fn rt_realloc_stub() -> [i64] {
+    var out: [i64] = []
+    // push rbp
+    out = emit_u8(out, 85)
+    // mov rbp, rsp
+    out = emit_u8(out, 72)
+    out = emit_u8(out, 137)
+    out = emit_u8(out, 229)
+    // push r12; push r13; push r14
+    out = emit_u8(out, 65)
+    out = emit_u8(out, 84)
+    out = emit_u8(out, 65)
+    out = emit_u8(out, 85)
+    out = emit_u8(out, 65)
+    out = emit_u8(out, 86)
+    // mov r12, rdi (old ptr)
+    out = emit_u8(out, 73)
+    out = emit_u8(out, 137)
+    out = emit_u8(out, 252)
+    // mov r13, rsi (new size)
+    out = emit_u8(out, 73)
+    out = emit_u8(out, 137)
+    out = emit_u8(out, 245)
+    // mov r14, [rdi - 16] (old size from header)
+    out = emit_u8(out, 77)
+    out = emit_u8(out, 139)
+    out = emit_u8(out, 119)
+    out = emit_u8(out, 240)  // -16 as signed byte
+
+    // --- Allocate new block: mmap(0, new_size+16, PROT_RW, MAP_PRIV|MAP_ANON, -1, 0) ---
+    // mov rax, 9 (SYS_MMAP)
+    out = emit_u8(out, 72)
+    out = emit_u8(out, 199)
+    out = emit_u8(out, 192)
+    out = emit_u32_le(out, 9)
+    // mov rdi, 0
+    out = emit_u8(out, 72)
+    out = emit_u8(out, 199)
+    out = emit_u8(out, 199)
+    out = emit_u32_le(out, 0)
+    // lea rsi, [r13 + 16]
+    out = emit_u8(out, 73)
+    out = emit_u8(out, 141)
+    out = emit_u8(out, 117)
+    out = emit_u8(out, 16)
+    // mov rdx, 3
+    out = emit_u8(out, 72)
+    out = emit_u8(out, 199)
+    out = emit_u8(out, 194)
+    out = emit_u32_le(out, 3)
+    // mov r10, 34
+    out = emit_u8(out, 73)
+    out = emit_u8(out, 199)
+    out = emit_u8(out, 194)
+    out = emit_u32_le(out, 34)
+    // mov r8, -1
+    out = emit_u8(out, 73)
+    out = emit_u8(out, 199)
+    out = emit_u8(out, 192)
+    out = emit_u32_le(out, -1)
+    // mov r9, 0
+    out = emit_u8(out, 73)
+    out = emit_u8(out, 199)
+    out = emit_u8(out, 193)
+    out = emit_u32_le(out, 0)
+    // syscall
+    out = emit_u8(out, 15)
+    out = emit_u8(out, 5)
+    // rax = new base pointer
+    // Store new size header at [rax]
+    // mov [rax], r13
+    out = emit_u8(out, 76)
+    out = emit_u8(out, 137)
+    out = emit_u8(out, 40)
+    // lea rcx, [r13 + 16]
+    out = emit_u8(out, 73)
+    out = emit_u8(out, 141)
+    out = emit_u8(out, 77)
+    out = emit_u8(out, 16)
+    // mov [rax+8], rcx
+    out = emit_u8(out, 72)
+    out = emit_u8(out, 137)
+    out = emit_u8(out, 72)
+    out = emit_u8(out, 8)
+    // Save new base in r15 for later (push r15 first)
+    // push rax (new base)
+    out = emit_u8(out, 80)
+
+    // --- memcpy: copy min(old_size, new_size) bytes from old to new+16 ---
+    // Destination: rdi = rax + 16
+    // lea rdi, [rax + 16]
+    out = emit_u8(out, 72)
+    out = emit_u8(out, 141)
+    out = emit_u8(out, 120)
+    out = emit_u8(out, 16)
+    // Source: rsi = r12 (old usable ptr)
+    // mov rsi, r12
+    out = emit_u8(out, 76)
+    out = emit_u8(out, 137)
+    out = emit_u8(out, 230)
+    // Count: rcx = min(r14, r13)
+    // mov rcx, r14
+    out = emit_u8(out, 76)
+    out = emit_u8(out, 137)
+    out = emit_u8(out, 241)
+    // cmp rcx, r13
+    out = emit_u8(out, 73)
+    out = emit_u8(out, 57)
+    out = emit_u8(out, 233)
+    // jbe +3 (skip if rcx <= r13)
+    out = emit_u8(out, 118)
+    out = emit_u8(out, 3)
+    // mov rcx, r13
+    out = emit_u8(out, 76)
+    out = emit_u8(out, 137)
+    out = emit_u8(out, 233)
+    // rep movsb
+    out = emit_u8(out, 243)
+    out = emit_u8(out, 164)
+
+    // --- Free old block: munmap(old_base, old_total) ---
+    // lea rdi, [r12 - 16]
+    out = emit_u8(out, 73)
+    out = emit_u8(out, 141)
+    out = emit_u8(out, 124)
+    out = emit_u8(out, 36)
+    out = emit_u8(out, 240) // -16
+    // mov rsi, [rdi + 8] (old total size)
+    out = emit_u8(out, 72)
+    out = emit_u8(out, 139)
+    out = emit_u8(out, 119)
+    out = emit_u8(out, 8)
+    // mov rax, 11 (SYS_MUNMAP)
+    out = emit_u8(out, 72)
+    out = emit_u8(out, 199)
+    out = emit_u8(out, 192)
+    out = emit_u32_le(out, 11)
+    // syscall
+    out = emit_u8(out, 15)
+    out = emit_u8(out, 5)
+
+    // pop rax (new base)
+    out = emit_u8(out, 88)
+    // add rax, 16 — return usable pointer
+    out = emit_u8(out, 72)
+    out = emit_u8(out, 131)
+    out = emit_u8(out, 192)
+    out = emit_u8(out, 16)
+    // pop r14; pop r13; pop r12
+    out = emit_u8(out, 65)
+    out = emit_u8(out, 94)
+    out = emit_u8(out, 65)
+    out = emit_u8(out, 93)
+    out = emit_u8(out, 65)
+    out = emit_u8(out, 92)
+    // pop rbp
+    out = emit_u8(out, 93)
+    // ret
+    out = emit_u8(out, 195)
+    return out
+}
+
+// ============================================================================
+// 2. String Runtime
+// Strings are (pointer, length) — rdi=ptr, rsi=len
+// ============================================================================
+
+// _vx_print_str(ptr, len) — write(1, ptr, len)
+// rdi = ptr, rsi = len
+fn rt_print_str_stub() -> [i64] {
+    var out: [i64] = []
+    // push rbp
+    out = emit_u8(out, 85)
+    // mov rbp, rsp
+    out = emit_u8(out, 72)
+    out = emit_u8(out, 137)
+    out = emit_u8(out, 229)
+    // mov rdx, rsi (count = len)
+    out = emit_u8(out, 72)
+    out = emit_u8(out, 137)
+    out = emit_u8(out, 242)
+    // mov rsi, rdi (buf = ptr)
+    out = emit_u8(out, 72)
+    out = emit_u8(out, 137)
+    out = emit_u8(out, 254)
+    // mov rdi, 1 (fd = stdout)
+    out = emit_u8(out, 72)
+    out = emit_u8(out, 199)
+    out = emit_u8(out, 199)
+    out = emit_u32_le(out, 1)
+    // mov rax, 1 (SYS_WRITE)
+    out = emit_u8(out, 72)
+    out = emit_u8(out, 199)
+    out = emit_u8(out, 192)
+    out = emit_u32_le(out, 1)
+    // syscall
+    out = emit_u8(out, 15)
+    out = emit_u8(out, 5)
+    // pop rbp
+    out = emit_u8(out, 93)
+    // ret
+    out = emit_u8(out, 195)
+    return out
+}
+
+// _vx_str_concat(ptr1, len1, ptr2, len2) -> (new_ptr, new_len)
+// rdi=ptr1, rsi=len1, rdx=ptr2, rcx=len2
+// Returns: rax=new_ptr, rdx=new_len
+fn rt_str_concat_stub() -> [i64] {
+    var out: [i64] = []
+    // push rbp
+    out = emit_u8(out, 85)
+    // mov rbp, rsp
+    out = emit_u8(out, 72)
+    out = emit_u8(out, 137)
+    out = emit_u8(out, 229)
+    // Save all args
+    // push r12; push r13; push r14; push r15
+    out = emit_u8(out, 65)
+    out = emit_u8(out, 84)
+    out = emit_u8(out, 65)
+    out = emit_u8(out, 85)
+    out = emit_u8(out, 65)
+    out = emit_u8(out, 86)
+    out = emit_u8(out, 65)
+    out = emit_u8(out, 87)
+    // mov r12, rdi (ptr1)
+    out = emit_u8(out, 73)
+    out = emit_u8(out, 137)
+    out = emit_u8(out, 252)
+    // mov r13, rsi (len1)
+    out = emit_u8(out, 73)
+    out = emit_u8(out, 137)
+    out = emit_u8(out, 245)
+    // mov r14, rdx (ptr2)
+    out = emit_u8(out, 73)
+    out = emit_u8(out, 137)
+    out = emit_u8(out, 214)
+    // mov r15, rcx (len2)
+    out = emit_u8(out, 73)
+    out = emit_u8(out, 137)
+    out = emit_u8(out, 207)
+
+    // total_len = len1 + len2
+    // lea rsi, [r13 + r15] — total for mmap
+    // We need total + 16 for mmap
+    // mov rsi, r13
+    out = emit_u8(out, 76)
+    out = emit_u8(out, 137)
+    out = emit_u8(out, 238)
+    // add rsi, r15
+    out = emit_u8(out, 76)
+    out = emit_u8(out, 1)
+    out = emit_u8(out, 254)
+    // push rsi (save total_len)
+    out = emit_u8(out, 86)
+    // add rsi, 16 (for header)
+    out = emit_u8(out, 72)
+    out = emit_u8(out, 131)
+    out = emit_u8(out, 198)
+    out = emit_u8(out, 16)
+
+    // mmap(0, rsi, 3, 34, -1, 0)
+    // mov rax, 9
+    out = emit_u8(out, 72)
+    out = emit_u8(out, 199)
+    out = emit_u8(out, 192)
+    out = emit_u32_le(out, 9)
+    // mov rdi, 0
+    out = emit_u8(out, 72)
+    out = emit_u8(out, 199)
+    out = emit_u8(out, 199)
+    out = emit_u32_le(out, 0)
+    // rsi already set
+    // mov rdx, 3
+    out = emit_u8(out, 72)
+    out = emit_u8(out, 199)
+    out = emit_u8(out, 194)
+    out = emit_u32_le(out, 3)
+    // mov r10, 34
+    out = emit_u8(out, 73)
+    out = emit_u8(out, 199)
+    out = emit_u8(out, 194)
+    out = emit_u32_le(out, 34)
+    // mov r8, -1
+    out = emit_u8(out, 73)
+    out = emit_u8(out, 199)
+    out = emit_u8(out, 192)
+    out = emit_u32_le(out, -1)
+    // mov r9, 0
+    out = emit_u8(out, 73)
+    out = emit_u8(out, 199)
+    out = emit_u8(out, 193)
+    out = emit_u32_le(out, 0)
+    // syscall
+    out = emit_u8(out, 15)
+    out = emit_u8(out, 5)
+    // rax = new base
+
+    // pop rcx (total_len)
+    out = emit_u8(out, 89)
+    // Store header
+    // mov [rax], rcx
+    out = emit_u8(out, 72)
+    out = emit_u8(out, 137)
+    out = emit_u8(out, 8)
+    // lea rcx2, [rcx + 16]
+    out = emit_u8(out, 72)
+    out = emit_u8(out, 141)
+    out = emit_u8(out, 73)
+    out = emit_u8(out, 16)
+    // mov [rax+8], rcx2
+    out = emit_u8(out, 72)
+    out = emit_u8(out, 137)
+    out = emit_u8(out, 72)
+    out = emit_u8(out, 8)
+
+    // push rax (save base)
+    out = emit_u8(out, 80)
+
+    // Copy first string: memcpy(base+16, ptr1, len1)
+    // lea rdi, [rax + 16]
+    out = emit_u8(out, 72)
+    out = emit_u8(out, 141)
+    out = emit_u8(out, 120)
+    out = emit_u8(out, 16)
+    // mov rsi, r12 (ptr1)
+    out = emit_u8(out, 76)
+    out = emit_u8(out, 137)
+    out = emit_u8(out, 230)
+    // mov rcx, r13 (len1)
+    out = emit_u8(out, 76)
+    out = emit_u8(out, 137)
+    out = emit_u8(out, 233)
+    // rep movsb
+    out = emit_u8(out, 243)
+    out = emit_u8(out, 164)
+
+    // Copy second string: rdi is now at base+16+len1
+    // mov rsi, r14 (ptr2)
+    out = emit_u8(out, 76)
+    out = emit_u8(out, 137)
+    out = emit_u8(out, 246)
+    // mov rcx, r15 (len2)
+    out = emit_u8(out, 76)
+    out = emit_u8(out, 137)
+    out = emit_u8(out, 249)
+    // rep movsb
+    out = emit_u8(out, 243)
+    out = emit_u8(out, 164)
+
+    // pop rax (base)
+    out = emit_u8(out, 88)
+    // Return: rax = base + 16 (usable ptr), rdx = total_len
+    // mov rdx, r13
+    out = emit_u8(out, 76)
+    out = emit_u8(out, 137)
+    out = emit_u8(out, 234)
+    // add rdx, r15
+    out = emit_u8(out, 76)
+    out = emit_u8(out, 1)
+    out = emit_u8(out, 250)
+    // add rax, 16
+    out = emit_u8(out, 72)
+    out = emit_u8(out, 131)
+    out = emit_u8(out, 192)
+    out = emit_u8(out, 16)
+
+    // pop r15; pop r14; pop r13; pop r12
+    out = emit_u8(out, 65)
+    out = emit_u8(out, 95)
+    out = emit_u8(out, 65)
+    out = emit_u8(out, 94)
+    out = emit_u8(out, 65)
+    out = emit_u8(out, 93)
+    out = emit_u8(out, 65)
+    out = emit_u8(out, 92)
+    // pop rbp
+    out = emit_u8(out, 93)
+    // ret
+    out = emit_u8(out, 195)
+    return out
+}
+
+// _vx_str_eq(ptr1, len1, ptr2, len2) -> 0 or 1
+// rdi=ptr1, rsi=len1, rdx=ptr2, rcx=len2
+fn rt_str_eq_stub() -> [i64] {
+    var out: [i64] = []
+    // push rbp
+    out = emit_u8(out, 85)
+    // mov rbp, rsp
+    out = emit_u8(out, 72)
+    out = emit_u8(out, 137)
+    out = emit_u8(out, 229)
+    // Compare lengths first
+    // cmp rsi, rcx
+    out = emit_u8(out, 72)
+    out = emit_u8(out, 57)
+    out = emit_u8(out, 206)
+    // jne .not_equal (jump forward)
+    out = emit_u8(out, 117)
+    var patch_ne = len(out)
+    out = emit_u8(out, 0)  // placeholder
+
+    // Lengths equal — compare bytes
+    // Save: rdi=ptr1, rdx=ptr2, rsi=len (== rcx)
+    // mov rcx, rsi (count)
+    out = emit_u8(out, 72)
+    out = emit_u8(out, 137)
+    out = emit_u8(out, 241)
+    // mov rsi, rdi (src1 = ptr1)
+    out = emit_u8(out, 72)
+    out = emit_u8(out, 137)
+    out = emit_u8(out, 254)
+    // mov rdi, rdx (src2 = ptr2)
+    out = emit_u8(out, 72)
+    out = emit_u8(out, 137)
+    out = emit_u8(out, 215)
+    // repe cmpsb
+    out = emit_u8(out, 243)
+    out = emit_u8(out, 166)
+    // jne .not_equal
+    out = emit_u8(out, 117)
+    var patch_ne2 = len(out)
+    out = emit_u8(out, 0)  // placeholder
+
+    // Equal: return 1
+    // mov rax, 1
+    out = emit_u8(out, 72)
+    out = emit_u8(out, 199)
+    out = emit_u8(out, 192)
+    out = emit_u32_le(out, 1)
+    // jmp .done
+    out = emit_u8(out, 235)
+    var patch_done = len(out)
+    out = emit_u8(out, 0)  // placeholder
+
+    // .not_equal:
+    var not_equal_off = len(out)
+    // mov rax, 0
+    out = emit_u8(out, 72)
+    out = emit_u8(out, 199)
+    out = emit_u8(out, 192)
+    out = emit_u32_le(out, 0)
+
+    // .done:
+    var done_off = len(out)
+    // pop rbp
+    out = emit_u8(out, 93)
+    // ret
+    out = emit_u8(out, 195)
+
+    // Patch jump targets
+    out[patch_ne] = not_equal_off - (patch_ne + 1)
+    out[patch_ne2] = not_equal_off - (patch_ne2 + 1)
+    out[patch_done] = done_off - (patch_done + 1)
+
+    return out
+}
+
+// _vx_str_char_at(ptr, len, index) -> byte as i64
+// rdi=ptr, rsi=len, rdx=index
+fn rt_str_char_at_stub() -> [i64] {
+    var out: [i64] = []
+    // push rbp
+    out = emit_u8(out, 85)
+    // mov rbp, rsp
+    out = emit_u8(out, 72)
+    out = emit_u8(out, 137)
+    out = emit_u8(out, 229)
+    // movzx rax, byte [rdi + rdx]
+    out = emit_u8(out, 72)
+    out = emit_u8(out, 15)
+    out = emit_u8(out, 182)
+    out = emit_u8(out, 4)
+    out = emit_u8(out, 23)  // SIB: [rdi + rdx*1]
+    // pop rbp
+    out = emit_u8(out, 93)
+    // ret
+    out = emit_u8(out, 195)
+    return out
+}
+
+// _vx_str_len(ptr, len) -> len
+// rdi=ptr, rsi=len
+fn rt_str_len_stub() -> [i64] {
+    var out: [i64] = []
+    // mov rax, rsi
+    out = emit_u8(out, 72)
+    out = emit_u8(out, 137)
+    out = emit_u8(out, 240)
+    // ret
+    out = emit_u8(out, 195)
+    return out
+}
+
+// _vx_str_substr(ptr, len, start, substr_len) -> (new_ptr, new_len)
+// rdi=ptr, rsi=len, rdx=start, rcx=substr_len
+fn rt_str_substr_stub() -> [i64] {
+    var out: [i64] = []
+    // push rbp
+    out = emit_u8(out, 85)
+    // mov rbp, rsp
+    out = emit_u8(out, 72)
+    out = emit_u8(out, 137)
+    out = emit_u8(out, 229)
+    // push r12; push r13
+    out = emit_u8(out, 65)
+    out = emit_u8(out, 84)
+    out = emit_u8(out, 65)
+    out = emit_u8(out, 85)
+    // lea r12, [rdi + rdx] (src = ptr + start)
+    out = emit_u8(out, 76)
+    out = emit_u8(out, 141)
+    out = emit_u8(out, 36)
+    out = emit_u8(out, 23)  // SIB: [rdi + rdx*1]
+    // mov r13, rcx (substr_len)
+    out = emit_u8(out, 73)
+    out = emit_u8(out, 137)
+    out = emit_u8(out, 205)
+
+    // mmap(0, substr_len+16, 3, 34, -1, 0)
+    // mov rax, 9
+    out = emit_u8(out, 72)
+    out = emit_u8(out, 199)
+    out = emit_u8(out, 192)
+    out = emit_u32_le(out, 9)
+    // mov rdi, 0
+    out = emit_u8(out, 72)
+    out = emit_u8(out, 199)
+    out = emit_u8(out, 199)
+    out = emit_u32_le(out, 0)
+    // lea rsi, [r13 + 16]
+    out = emit_u8(out, 73)
+    out = emit_u8(out, 141)
+    out = emit_u8(out, 117)
+    out = emit_u8(out, 16)
+    // mov rdx, 3
+    out = emit_u8(out, 72)
+    out = emit_u8(out, 199)
+    out = emit_u8(out, 194)
+    out = emit_u32_le(out, 3)
+    // mov r10, 34
+    out = emit_u8(out, 73)
+    out = emit_u8(out, 199)
+    out = emit_u8(out, 194)
+    out = emit_u32_le(out, 34)
+    // mov r8, -1
+    out = emit_u8(out, 73)
+    out = emit_u8(out, 199)
+    out = emit_u8(out, 192)
+    out = emit_u32_le(out, -1)
+    // mov r9, 0
+    out = emit_u8(out, 73)
+    out = emit_u8(out, 199)
+    out = emit_u8(out, 193)
+    out = emit_u32_le(out, 0)
+    // syscall
+    out = emit_u8(out, 15)
+    out = emit_u8(out, 5)
+
+    // Store header
+    // mov [rax], r13
+    out = emit_u8(out, 76)
+    out = emit_u8(out, 137)
+    out = emit_u8(out, 40)
+    // lea rcx, [r13 + 16]
+    out = emit_u8(out, 73)
+    out = emit_u8(out, 141)
+    out = emit_u8(out, 77)
+    out = emit_u8(out, 16)
+    // mov [rax+8], rcx
+    out = emit_u8(out, 72)
+    out = emit_u8(out, 137)
+    out = emit_u8(out, 72)
+    out = emit_u8(out, 8)
+
+    // push rax (save base)
+    out = emit_u8(out, 80)
+
+    // memcpy(base+16, r12, r13)
+    // lea rdi, [rax + 16]
+    out = emit_u8(out, 72)
+    out = emit_u8(out, 141)
+    out = emit_u8(out, 120)
+    out = emit_u8(out, 16)
+    // mov rsi, r12 (src)
+    out = emit_u8(out, 76)
+    out = emit_u8(out, 137)
+    out = emit_u8(out, 230)
+    // mov rcx, r13 (count)
+    out = emit_u8(out, 76)
+    out = emit_u8(out, 137)
+    out = emit_u8(out, 233)
+    // rep movsb
+    out = emit_u8(out, 243)
+    out = emit_u8(out, 164)
+
+    // pop rax (base)
+    out = emit_u8(out, 88)
+    // Return: rax = base+16 (ptr), rdx = substr_len
+    // mov rdx, r13
+    out = emit_u8(out, 76)
+    out = emit_u8(out, 137)
+    out = emit_u8(out, 234)
+    // add rax, 16
+    out = emit_u8(out, 72)
+    out = emit_u8(out, 131)
+    out = emit_u8(out, 192)
+    out = emit_u8(out, 16)
+
+    // pop r13; pop r12
+    out = emit_u8(out, 65)
+    out = emit_u8(out, 93)
+    out = emit_u8(out, 65)
+    out = emit_u8(out, 92)
+    // pop rbp
+    out = emit_u8(out, 93)
+    // ret
+    out = emit_u8(out, 195)
+    return out
+}
+
+// ============================================================================
+// 3. Array Runtime
+// Arrays: [capacity (8B), length (8B), elem0, elem1, ...]
+// All elements 8 bytes (i64/f64/ptr).
+// ============================================================================
+
+// _vx_array_new(initial_cap) -> ptr to array header
+// rdi = initial capacity
+fn rt_array_new_stub() -> [i64] {
+    var out: [i64] = []
+    // push rbp
+    out = emit_u8(out, 85)
+    // mov rbp, rsp
+    out = emit_u8(out, 72)
+    out = emit_u8(out, 137)
+    out = emit_u8(out, 229)
+    // push r12
+    out = emit_u8(out, 65)
+    out = emit_u8(out, 84)
+    // mov r12, rdi (save cap)
+    out = emit_u8(out, 73)
+    out = emit_u8(out, 137)
+    out = emit_u8(out, 252)
+
+    // Total bytes = (cap + 2) * 8 + 16 (mmap header)
+    // lea rsi, [rdi + 2]
+    out = emit_u8(out, 72)
+    out = emit_u8(out, 141)
+    out = emit_u8(out, 119)
+    out = emit_u8(out, 2)
+    // shl rsi, 3 (multiply by 8)
+    out = emit_u8(out, 72)
+    out = emit_u8(out, 193)
+    out = emit_u8(out, 230)
+    out = emit_u8(out, 3)
+    // add rsi, 16 (mmap header)
+    out = emit_u8(out, 72)
+    out = emit_u8(out, 131)
+    out = emit_u8(out, 198)
+    out = emit_u8(out, 16)
+
+    // mmap(0, rsi, 3, 34, -1, 0)
+    // mov rax, 9
+    out = emit_u8(out, 72)
+    out = emit_u8(out, 199)
+    out = emit_u8(out, 192)
+    out = emit_u32_le(out, 9)
+    // mov rdi, 0
+    out = emit_u8(out, 72)
+    out = emit_u8(out, 199)
+    out = emit_u8(out, 199)
+    out = emit_u32_le(out, 0)
+    // rsi already set
+    // mov rdx, 3
+    out = emit_u8(out, 72)
+    out = emit_u8(out, 199)
+    out = emit_u8(out, 194)
+    out = emit_u32_le(out, 3)
+    // mov r10, 34
+    out = emit_u8(out, 73)
+    out = emit_u8(out, 199)
+    out = emit_u8(out, 194)
+    out = emit_u32_le(out, 34)
+    // mov r8, -1
+    out = emit_u8(out, 73)
+    out = emit_u8(out, 199)
+    out = emit_u8(out, 192)
+    out = emit_u32_le(out, -1)
+    // mov r9, 0
+    out = emit_u8(out, 73)
+    out = emit_u8(out, 199)
+    out = emit_u8(out, 193)
+    out = emit_u32_le(out, 0)
+    // syscall
+    out = emit_u8(out, 15)
+    out = emit_u8(out, 5)
+
+    // rax = mmap base. Store mmap header.
+    // Save total alloc in header
+    // lea rcx, [r12 + 2]
+    out = emit_u8(out, 73)
+    out = emit_u8(out, 141)
+    out = emit_u8(out, 76)
+    out = emit_u8(out, 36)
+    out = emit_u8(out, 2)
+    // shl rcx, 3
+    out = emit_u8(out, 72)
+    out = emit_u8(out, 193)
+    out = emit_u8(out, 225)
+    out = emit_u8(out, 3)
+    // mov [rax], rcx (requested size)
+    out = emit_u8(out, 72)
+    out = emit_u8(out, 137)
+    out = emit_u8(out, 8)
+    // add rcx, 16
+    out = emit_u8(out, 72)
+    out = emit_u8(out, 131)
+    out = emit_u8(out, 193)
+    out = emit_u8(out, 16)
+    // mov [rax+8], rcx (total alloc)
+    out = emit_u8(out, 72)
+    out = emit_u8(out, 137)
+    out = emit_u8(out, 72)
+    out = emit_u8(out, 8)
+
+    // Array header starts at rax+16
+    // add rax, 16
+    out = emit_u8(out, 72)
+    out = emit_u8(out, 131)
+    out = emit_u8(out, 192)
+    out = emit_u8(out, 16)
+    // mov [rax], r12 (capacity)
+    out = emit_u8(out, 76)
+    out = emit_u8(out, 137)
+    out = emit_u8(out, 32)
+    // mov qword [rax+8], 0 (length = 0)
+    out = emit_u8(out, 72)
+    out = emit_u8(out, 199)
+    out = emit_u8(out, 64)
+    out = emit_u8(out, 8)
+    out = emit_u32_le(out, 0)
+
+    // pop r12
+    out = emit_u8(out, 65)
+    out = emit_u8(out, 92)
+    // pop rbp
+    out = emit_u8(out, 93)
+    // ret
+    out = emit_u8(out, 195)
+    return out
+}
+
+// _vx_array_get(arr_ptr, index) -> element value
+// rdi = array header ptr, rsi = index
+fn rt_array_get_stub() -> [i64] {
+    var out: [i64] = []
+    // Element at: arr_ptr + (index + 2) * 8
+    // lea rax, [rsi + 2]
+    out = emit_u8(out, 72)
+    out = emit_u8(out, 141)
+    out = emit_u8(out, 70)
+    out = emit_u8(out, 2)
+    // Actually: rax = [rdi + (rsi+2)*8]
+    // lea rcx, [rsi + 2]
+    out = emit_u8(out, 72)
+    out = emit_u8(out, 141)
+    out = emit_u8(out, 78)
+    out = emit_u8(out, 2)
+    // shl rcx, 3
+    out = emit_u8(out, 72)
+    out = emit_u8(out, 193)
+    out = emit_u8(out, 225)
+    out = emit_u8(out, 3)
+    // mov rax, [rdi + rcx]
+    out = emit_u8(out, 72)
+    out = emit_u8(out, 139)
+    out = emit_u8(out, 4)
+    out = emit_u8(out, 15)  // SIB: [rdi + rcx*1]
+    // ret
+    out = emit_u8(out, 195)
+    return out
+}
+
+// _vx_array_set(arr_ptr, index, value)
+// rdi = array header ptr, rsi = index, rdx = value
+fn rt_array_set_stub() -> [i64] {
+    var out: [i64] = []
+    // lea rcx, [rsi + 2]
+    out = emit_u8(out, 72)
+    out = emit_u8(out, 141)
+    out = emit_u8(out, 78)
+    out = emit_u8(out, 2)
+    // shl rcx, 3
+    out = emit_u8(out, 72)
+    out = emit_u8(out, 193)
+    out = emit_u8(out, 225)
+    out = emit_u8(out, 3)
+    // mov [rdi + rcx], rdx
+    out = emit_u8(out, 72)
+    out = emit_u8(out, 137)
+    out = emit_u8(out, 20)
+    out = emit_u8(out, 15)  // SIB: [rdi + rcx*1]
+    // ret
+    out = emit_u8(out, 195)
+    return out
+}
+
+// _vx_array_len(arr_ptr) -> length
+// rdi = array header ptr
+fn rt_array_len_stub() -> [i64] {
+    var out: [i64] = []
+    // mov rax, [rdi + 8]
+    out = emit_u8(out, 72)
+    out = emit_u8(out, 139)
+    out = emit_u8(out, 71)
+    out = emit_u8(out, 8)
+    // ret
+    out = emit_u8(out, 195)
+    return out
+}
+
+// _vx_array_push(arr_ptr, value) -> arr_ptr (possibly new if realloc needed)
+// rdi = array header ptr, rsi = value
+fn rt_array_push_stub() -> [i64] {
+    var out: [i64] = []
+    // push rbp
+    out = emit_u8(out, 85)
+    // mov rbp, rsp
+    out = emit_u8(out, 72)
+    out = emit_u8(out, 137)
+    out = emit_u8(out, 229)
+    // push r12; push r13
+    out = emit_u8(out, 65)
+    out = emit_u8(out, 84)
+    out = emit_u8(out, 65)
+    out = emit_u8(out, 85)
+    // mov r12, rdi (arr_ptr)
+    out = emit_u8(out, 73)
+    out = emit_u8(out, 137)
+    out = emit_u8(out, 252)
+    // mov r13, rsi (value)
+    out = emit_u8(out, 73)
+    out = emit_u8(out, 137)
+    out = emit_u8(out, 245)
+
+    // Load capacity and length
+    // mov rax, [rdi] (capacity)
+    out = emit_u8(out, 72)
+    out = emit_u8(out, 139)
+    out = emit_u8(out, 7)
+    // mov rcx, [rdi + 8] (length)
+    out = emit_u8(out, 72)
+    out = emit_u8(out, 139)
+    out = emit_u8(out, 79)
+    out = emit_u8(out, 8)
+
+    // cmp rcx, rax (len < cap?)
+    out = emit_u8(out, 72)
+    out = emit_u8(out, 57)
+    out = emit_u8(out, 193)
+    // jb .has_space
+    out = emit_u8(out, 114)
+    var patch_has_space = len(out)
+    out = emit_u8(out, 0)  // placeholder
+
+    // --- Need realloc: double capacity ---
+    // new_cap = cap * 2 (or 4 if cap==0)
+    // test rax, rax
+    out = emit_u8(out, 72)
+    out = emit_u8(out, 133)
+    out = emit_u8(out, 192)
+    // jnz .double
+    out = emit_u8(out, 117)
+    var patch_double = len(out)
+    out = emit_u8(out, 0)  // placeholder
+    // mov rax, 4 (default cap)
+    out = emit_u8(out, 72)
+    out = emit_u8(out, 199)
+    out = emit_u8(out, 192)
+    out = emit_u32_le(out, 4)
+    // jmp .do_realloc
+    out = emit_u8(out, 235)
+    var patch_do_realloc = len(out)
+    out = emit_u8(out, 0)
+
+    // .double:
+    var double_off = len(out)
+    // shl rax, 1 (cap *= 2)
+    out = emit_u8(out, 72)
+    out = emit_u8(out, 209)
+    out = emit_u8(out, 224)
+
+    // .do_realloc:
+    var do_realloc_off = len(out)
+    // rax = new capacity
+    // push rax (save new cap)
+    out = emit_u8(out, 80)
+    // Total mmap size: (new_cap + 2) * 8 + 16
+    // lea rsi, [rax + 2]
+    out = emit_u8(out, 72)
+    out = emit_u8(out, 141)
+    out = emit_u8(out, 112)
+    out = emit_u8(out, 2)
+    // shl rsi, 3
+    out = emit_u8(out, 72)
+    out = emit_u8(out, 193)
+    out = emit_u8(out, 230)
+    out = emit_u8(out, 3)
+    // add rsi, 16
+    out = emit_u8(out, 72)
+    out = emit_u8(out, 131)
+    out = emit_u8(out, 198)
+    out = emit_u8(out, 16)
+
+    // mmap(0, rsi, 3, 34, -1, 0)
+    out = emit_u8(out, 72)
+    out = emit_u8(out, 199)
+    out = emit_u8(out, 192)
+    out = emit_u32_le(out, 9)
+    out = emit_u8(out, 72)
+    out = emit_u8(out, 199)
+    out = emit_u8(out, 199)
+    out = emit_u32_le(out, 0)
+    out = emit_u8(out, 72)
+    out = emit_u8(out, 199)
+    out = emit_u8(out, 194)
+    out = emit_u32_le(out, 3)
+    out = emit_u8(out, 73)
+    out = emit_u8(out, 199)
+    out = emit_u8(out, 194)
+    out = emit_u32_le(out, 34)
+    out = emit_u8(out, 73)
+    out = emit_u8(out, 199)
+    out = emit_u8(out, 192)
+    out = emit_u32_le(out, -1)
+    out = emit_u8(out, 73)
+    out = emit_u8(out, 199)
+    out = emit_u8(out, 193)
+    out = emit_u32_le(out, 0)
+    out = emit_u8(out, 15)
+    out = emit_u8(out, 5)
+
+    // rax = new mmap base
+    // Store mmap header
+    // pop rcx (new cap)
+    out = emit_u8(out, 89)
+    // push rcx (keep for later)
+    out = emit_u8(out, 81)
+    // lea rdx, [rcx + 2]
+    out = emit_u8(out, 72)
+    out = emit_u8(out, 141)
+    out = emit_u8(out, 81)
+    out = emit_u8(out, 2)
+    // shl rdx, 3
+    out = emit_u8(out, 72)
+    out = emit_u8(out, 193)
+    out = emit_u8(out, 226)
+    out = emit_u8(out, 3)
+    // mov [rax], rdx
+    out = emit_u8(out, 72)
+    out = emit_u8(out, 137)
+    out = emit_u8(out, 16)
+    // add rdx, 16
+    out = emit_u8(out, 72)
+    out = emit_u8(out, 131)
+    out = emit_u8(out, 194)
+    out = emit_u8(out, 16)
+    // mov [rax+8], rdx
+    out = emit_u8(out, 72)
+    out = emit_u8(out, 137)
+    out = emit_u8(out, 80)
+    out = emit_u8(out, 8)
+
+    // New array header at rax+16
+    // push rax (save new mmap base)
+    out = emit_u8(out, 80)
+    // lea rdi, [rax + 16] (new arr header)
+    out = emit_u8(out, 72)
+    out = emit_u8(out, 141)
+    out = emit_u8(out, 120)
+    out = emit_u8(out, 16)
+
+    // Copy old data: (length+2)*8 bytes from r12
+    // mov rcx, [r12 + 8] (old length)
+    out = emit_u8(out, 73)
+    out = emit_u8(out, 139)
+    out = emit_u8(out, 76)
+    out = emit_u8(out, 36)
+    out = emit_u8(out, 8)
+    // lea rcx, [rcx + 2]
+    out = emit_u8(out, 72)
+    out = emit_u8(out, 141)
+    out = emit_u8(out, 73)
+    out = emit_u8(out, 2)
+    // shl rcx, 3
+    out = emit_u8(out, 72)
+    out = emit_u8(out, 193)
+    out = emit_u8(out, 225)
+    out = emit_u8(out, 3)
+    // mov rsi, r12 (old arr header = src)
+    out = emit_u8(out, 76)
+    out = emit_u8(out, 137)
+    out = emit_u8(out, 230)
+    // rep movsb
+    out = emit_u8(out, 243)
+    out = emit_u8(out, 164)
+
+    // Free old mmap: old base = r12 - 16
+    // lea rdi, [r12 - 16]
+    out = emit_u8(out, 73)
+    out = emit_u8(out, 141)
+    out = emit_u8(out, 124)
+    out = emit_u8(out, 36)
+    out = emit_u8(out, 240) // -16
+    // mov rsi, [rdi + 8]
+    out = emit_u8(out, 72)
+    out = emit_u8(out, 139)
+    out = emit_u8(out, 119)
+    out = emit_u8(out, 8)
+    // mov rax, 11 (SYS_MUNMAP)
+    out = emit_u8(out, 72)
+    out = emit_u8(out, 199)
+    out = emit_u8(out, 192)
+    out = emit_u32_le(out, 11)
+    // syscall
+    out = emit_u8(out, 15)
+    out = emit_u8(out, 5)
+
+    // pop rax (new mmap base)
+    out = emit_u8(out, 88)
+    // lea r12, [rax + 16] (new arr header)
+    out = emit_u8(out, 76)
+    out = emit_u8(out, 141)
+    out = emit_u8(out, 96)
+    out = emit_u8(out, 16)
+    // pop rcx (new cap)
+    out = emit_u8(out, 89)
+    // mov [r12], rcx (set new capacity)
+    out = emit_u8(out, 73)
+    out = emit_u8(out, 137)
+    out = emit_u8(out, 12)
+    out = emit_u8(out, 36)
+
+    // .has_space:
+    var has_space_off = len(out)
+    // r12 = arr_ptr, r13 = value
+    // mov rcx, [r12 + 8] (length)
+    out = emit_u8(out, 73)
+    out = emit_u8(out, 139)
+    out = emit_u8(out, 76)
+    out = emit_u8(out, 36)
+    out = emit_u8(out, 8)
+    // Store value at [r12 + (rcx+2)*8]
+    // lea rdx, [rcx + 2]
+    out = emit_u8(out, 72)
+    out = emit_u8(out, 141)
+    out = emit_u8(out, 81)
+    out = emit_u8(out, 2)
+    // shl rdx, 3
+    out = emit_u8(out, 72)
+    out = emit_u8(out, 193)
+    out = emit_u8(out, 226)
+    out = emit_u8(out, 3)
+    // mov [r12 + rdx], r13
+    out = emit_u8(out, 77)
+    out = emit_u8(out, 137)
+    out = emit_u8(out, 44)
+    out = emit_u8(out, 20) // SIB: [r12 + rdx*1]
+    // inc length: add qword [r12+8], 1
+    out = emit_u8(out, 73)
+    out = emit_u8(out, 131)
+    out = emit_u8(out, 68)
+    out = emit_u8(out, 36)
+    out = emit_u8(out, 8)
+    out = emit_u8(out, 1)
+    // mov rax, r12 (return arr_ptr)
+    out = emit_u8(out, 76)
+    out = emit_u8(out, 137)
+    out = emit_u8(out, 224)
+
+    // pop r13; pop r12
+    out = emit_u8(out, 65)
+    out = emit_u8(out, 93)
+    out = emit_u8(out, 65)
+    out = emit_u8(out, 92)
+    // pop rbp
+    out = emit_u8(out, 93)
+    // ret
+    out = emit_u8(out, 195)
+
+    // Patch jumps
+    out[patch_has_space] = has_space_off - (patch_has_space + 1)
+    out[patch_double] = double_off - (patch_double + 1)
+    out[patch_do_realloc] = do_realloc_off - (patch_do_realloc + 1)
+
+    return out
+}
+
+// ============================================================================
+// 4. I/O Runtime
+// ============================================================================
+
+// _vx_print_int(value: i64) — convert to decimal, print with newline
+// rdi = integer value
+fn rt_print_int_stub() -> [i64] {
+    var out: [i64] = []
+    // sub rsp, 32
+    out = emit_u8(out, 72)
+    out = emit_u8(out, 131)
+    out = emit_u8(out, 236)
+    out = emit_u8(out, 32)
+    // mov rax, rdi
+    out = emit_u8(out, 72)
+    out = emit_u8(out, 137)
+    out = emit_u8(out, 248)
+    // lea rsi, [rsp+31]
+    out = emit_u8(out, 72)
+    out = emit_u8(out, 141)
+    out = emit_u8(out, 116)
+    out = emit_u8(out, 36)
+    out = emit_u8(out, 31)
+    // mov byte [rsi], 0x0a (newline)
+    out = emit_u8(out, 198)
+    out = emit_u8(out, 6)
+    out = emit_u8(out, 10)
+    // xor rcx, rcx (digit counter)
+    out = emit_u8(out, 72)
+    out = emit_u8(out, 49)
+    out = emit_u8(out, 201)
+    // mov r8, 10
+    out = emit_u8(out, 73)
+    out = emit_u8(out, 199)
+    out = emit_u8(out, 192)
+    out = emit_u8(out, 10)
+    out = emit_u8(out, 0)
+    out = emit_u8(out, 0)
+    out = emit_u8(out, 0)
+    // test rax, rax
+    out = emit_u8(out, 72)
+    out = emit_u8(out, 133)
+    out = emit_u8(out, 192)
+    // jns +3 (skip neg)
+    out = emit_u8(out, 121)
+    out = emit_u8(out, 3)
+    // neg rax
+    out = emit_u8(out, 72)
+    out = emit_u8(out, 247)
+    out = emit_u8(out, 216)
+    // .digit_loop:
+    // xor rdx, rdx
+    out = emit_u8(out, 72)
+    out = emit_u8(out, 49)
+    out = emit_u8(out, 210)
+    // div r8
+    out = emit_u8(out, 73)
+    out = emit_u8(out, 247)
+    out = emit_u8(out, 240)
+    // add dl, 0x30
+    out = emit_u8(out, 128)
+    out = emit_u8(out, 194)
+    out = emit_u8(out, 48)
+    // dec rsi
+    out = emit_u8(out, 72)
+    out = emit_u8(out, 255)
+    out = emit_u8(out, 206)
+    // mov [rsi], dl
+    out = emit_u8(out, 136)
+    out = emit_u8(out, 22)
+    // inc rcx
+    out = emit_u8(out, 72)
+    out = emit_u8(out, 255)
+    out = emit_u8(out, 193)
+    // test rax, rax
+    out = emit_u8(out, 72)
+    out = emit_u8(out, 133)
+    out = emit_u8(out, 192)
+    // jnz .digit_loop (-22 = 0xea)
+    out = emit_u8(out, 117)
+    out = emit_u8(out, 234)
+    // test rdi, rdi
+    out = emit_u8(out, 72)
+    out = emit_u8(out, 133)
+    out = emit_u8(out, 255)
+    // jns +9
+    out = emit_u8(out, 121)
+    out = emit_u8(out, 9)
+    // dec rsi
+    out = emit_u8(out, 72)
+    out = emit_u8(out, 255)
+    out = emit_u8(out, 206)
+    // mov byte [rsi], 0x2d (minus)
+    out = emit_u8(out, 198)
+    out = emit_u8(out, 6)
+    out = emit_u8(out, 45)
+    // inc rcx
+    out = emit_u8(out, 72)
+    out = emit_u8(out, 255)
+    out = emit_u8(out, 193)
+    // lea rdx, [rcx+1] (include newline)
+    out = emit_u8(out, 72)
+    out = emit_u8(out, 141)
+    out = emit_u8(out, 81)
+    out = emit_u8(out, 1)
+    // mov rax, 1 (SYS_WRITE)
+    out = emit_u8(out, 72)
+    out = emit_u8(out, 199)
+    out = emit_u8(out, 192)
+    out = emit_u8(out, 1)
+    out = emit_u8(out, 0)
+    out = emit_u8(out, 0)
+    out = emit_u8(out, 0)
+    // mov rdi, 1 (stdout)
+    out = emit_u8(out, 72)
+    out = emit_u8(out, 199)
+    out = emit_u8(out, 199)
+    out = emit_u8(out, 1)
+    out = emit_u8(out, 0)
+    out = emit_u8(out, 0)
+    out = emit_u8(out, 0)
+    // syscall
+    out = emit_u8(out, 15)
+    out = emit_u8(out, 5)
+    // add rsp, 32
+    out = emit_u8(out, 72)
+    out = emit_u8(out, 131)
+    out = emit_u8(out, 196)
+    out = emit_u8(out, 32)
+    // ret
+    out = emit_u8(out, 195)
+    return out
+}
+
+// _vx_print_newline() — write "\n" to stdout
+fn rt_print_newline_stub() -> [i64] {
+    var out: [i64] = []
+    // sub rsp, 8
+    out = emit_u8(out, 72)
+    out = emit_u8(out, 131)
+    out = emit_u8(out, 236)
+    out = emit_u8(out, 8)
+    // mov byte [rsp], 10
+    out = emit_u8(out, 198)
+    out = emit_u8(out, 4)
+    out = emit_u8(out, 36)
+    out = emit_u8(out, 10)
+    // mov rax, 1 (SYS_WRITE)
+    out = emit_u8(out, 72)
+    out = emit_u8(out, 199)
+    out = emit_u8(out, 192)
+    out = emit_u32_le(out, 1)
+    // mov rdi, 1 (stdout)
+    out = emit_u8(out, 72)
+    out = emit_u8(out, 199)
+    out = emit_u8(out, 199)
+    out = emit_u32_le(out, 1)
+    // mov rsi, rsp (buf)
+    out = emit_u8(out, 72)
+    out = emit_u8(out, 137)
+    out = emit_u8(out, 230)
+    // mov rdx, 1 (count)
+    out = emit_u8(out, 72)
+    out = emit_u8(out, 199)
+    out = emit_u8(out, 194)
+    out = emit_u32_le(out, 1)
+    // syscall
+    out = emit_u8(out, 15)
+    out = emit_u8(out, 5)
+    // add rsp, 8
+    out = emit_u8(out, 72)
+    out = emit_u8(out, 131)
+    out = emit_u8(out, 196)
+    out = emit_u8(out, 8)
+    // ret
+    out = emit_u8(out, 195)
+    return out
+}
+
+// _vx_read_file(path_ptr, path_len) -> (data_ptr, data_len)
+// rdi = path ptr (null-terminated), rsi = path len
+// Strategy: open, fstat (to get size), mmap the file, close fd
+// Returns: rax = data ptr, rdx = data len
+fn rt_read_file_stub() -> [i64] {
+    var out: [i64] = []
+    // push rbp
+    out = emit_u8(out, 85)
+    // mov rbp, rsp
+    out = emit_u8(out, 72)
+    out = emit_u8(out, 137)
+    out = emit_u8(out, 229)
+    // sub rsp, 144 (space for stat buf — struct stat is 144 bytes on x86-64)
+    out = emit_u8(out, 72)
+    out = emit_u8(out, 129)
+    out = emit_u8(out, 236)
+    out = emit_u32_le(out, 144)
+    // push r12; push r13
+    out = emit_u8(out, 65)
+    out = emit_u8(out, 84)
+    out = emit_u8(out, 65)
+    out = emit_u8(out, 85)
+
+    // open(path, O_RDONLY=0, 0)
+    // rdi already = path_ptr
+    // mov rax, 2 (SYS_OPEN)
+    out = emit_u8(out, 72)
+    out = emit_u8(out, 199)
+    out = emit_u8(out, 192)
+    out = emit_u32_le(out, 2)
+    // mov rsi, 0 (O_RDONLY)
+    out = emit_u8(out, 72)
+    out = emit_u8(out, 199)
+    out = emit_u8(out, 198)
+    out = emit_u32_le(out, 0)
+    // mov rdx, 0 (mode)
+    out = emit_u8(out, 72)
+    out = emit_u8(out, 199)
+    out = emit_u8(out, 194)
+    out = emit_u32_le(out, 0)
+    // syscall
+    out = emit_u8(out, 15)
+    out = emit_u8(out, 5)
+    // mov r12, rax (fd)
+    out = emit_u8(out, 73)
+    out = emit_u8(out, 137)
+    out = emit_u8(out, 196)
+
+    // fstat(fd, stat_buf)
+    // mov rax, 5 (SYS_FSTAT)
+    out = emit_u8(out, 72)
+    out = emit_u8(out, 199)
+    out = emit_u8(out, 192)
+    out = emit_u32_le(out, 5)
+    // mov rdi, r12 (fd)
+    out = emit_u8(out, 76)
+    out = emit_u8(out, 137)
+    out = emit_u8(out, 231)
+    // lea rsi, [rbp - 144]
+    out = emit_u8(out, 72)
+    out = emit_u8(out, 141)
+    out = emit_u8(out, 181)
+    out = emit_u32_le(out, -144)
+    // syscall
+    out = emit_u8(out, 15)
+    out = emit_u8(out, 5)
+
+    // Get file size from stat: st_size is at offset 48
+    // mov r13, [rbp - 144 + 48] = [rbp - 96]
+    out = emit_u8(out, 76)
+    out = emit_u8(out, 139)
+    out = emit_u8(out, 173)
+    out = emit_u32_le(out, -96)
+
+    // mmap(NULL, file_size, PROT_READ=1, MAP_PRIVATE=2, fd, 0)
+    // mov rax, 9
+    out = emit_u8(out, 72)
+    out = emit_u8(out, 199)
+    out = emit_u8(out, 192)
+    out = emit_u32_le(out, 9)
+    // mov rdi, 0
+    out = emit_u8(out, 72)
+    out = emit_u8(out, 199)
+    out = emit_u8(out, 199)
+    out = emit_u32_le(out, 0)
+    // mov rsi, r13 (size)
+    out = emit_u8(out, 76)
+    out = emit_u8(out, 137)
+    out = emit_u8(out, 238)
+    // mov rdx, 1 (PROT_READ)
+    out = emit_u8(out, 72)
+    out = emit_u8(out, 199)
+    out = emit_u8(out, 194)
+    out = emit_u32_le(out, 1)
+    // mov r10, 2 (MAP_PRIVATE)
+    out = emit_u8(out, 73)
+    out = emit_u8(out, 199)
+    out = emit_u8(out, 194)
+    out = emit_u32_le(out, 2)
+    // mov r8, r12 (fd)
+    out = emit_u8(out, 77)
+    out = emit_u8(out, 137)
+    out = emit_u8(out, 224)
+    // mov r9, 0 (offset)
+    out = emit_u8(out, 73)
+    out = emit_u8(out, 199)
+    out = emit_u8(out, 193)
+    out = emit_u32_le(out, 0)
+    // syscall
+    out = emit_u8(out, 15)
+    out = emit_u8(out, 5)
+    // rax = mapped ptr, save it
+    // push rax
+    out = emit_u8(out, 80)
+
+    // close(fd)
+    // mov rax, 3 (SYS_CLOSE)
+    out = emit_u8(out, 72)
+    out = emit_u8(out, 199)
+    out = emit_u8(out, 192)
+    out = emit_u32_le(out, 3)
+    // mov rdi, r12
+    out = emit_u8(out, 76)
+    out = emit_u8(out, 137)
+    out = emit_u8(out, 231)
+    // syscall
+    out = emit_u8(out, 15)
+    out = emit_u8(out, 5)
+
+    // pop rax (mapped ptr)
+    out = emit_u8(out, 88)
+    // mov rdx, r13 (file size)
+    out = emit_u8(out, 76)
+    out = emit_u8(out, 137)
+    out = emit_u8(out, 234)
+
+    // pop r13; pop r12
+    out = emit_u8(out, 65)
+    out = emit_u8(out, 93)
+    out = emit_u8(out, 65)
+    out = emit_u8(out, 92)
+    // add rsp, 144
+    out = emit_u8(out, 72)
+    out = emit_u8(out, 129)
+    out = emit_u8(out, 196)
+    out = emit_u32_le(out, 144)
+    // pop rbp
+    out = emit_u8(out, 93)
+    // ret
+    out = emit_u8(out, 195)
+    return out
+}
+
+// _vx_write_file(path_ptr, path_len, data_ptr, data_len) -> bytes_written
+// rdi = path ptr (null-terminated), rsi = path len, rdx = data ptr, rcx = data len
+fn rt_write_file_stub() -> [i64] {
+    var out: [i64] = []
+    // push rbp
+    out = emit_u8(out, 85)
+    // mov rbp, rsp
+    out = emit_u8(out, 72)
+    out = emit_u8(out, 137)
+    out = emit_u8(out, 229)
+    // push r12; push r13
+    out = emit_u8(out, 65)
+    out = emit_u8(out, 84)
+    out = emit_u8(out, 65)
+    out = emit_u8(out, 85)
+    // Save data args
+    // mov r12, rdx (data_ptr)
+    out = emit_u8(out, 73)
+    out = emit_u8(out, 137)
+    out = emit_u8(out, 212)
+    // mov r13, rcx (data_len)
+    out = emit_u8(out, 73)
+    out = emit_u8(out, 137)
+    out = emit_u8(out, 205)
+
+    // open(path, O_WRONLY|O_CREAT|O_TRUNC = 0x241, 0644 = 420)
+    // rdi already = path_ptr
+    // mov rax, 2 (SYS_OPEN)
+    out = emit_u8(out, 72)
+    out = emit_u8(out, 199)
+    out = emit_u8(out, 192)
+    out = emit_u32_le(out, 2)
+    // mov rsi, 0x241 (577)
+    out = emit_u8(out, 72)
+    out = emit_u8(out, 199)
+    out = emit_u8(out, 198)
+    out = emit_u32_le(out, 577)
+    // mov rdx, 420 (0644 octal)
+    out = emit_u8(out, 72)
+    out = emit_u8(out, 199)
+    out = emit_u8(out, 194)
+    out = emit_u32_le(out, 420)
+    // syscall
+    out = emit_u8(out, 15)
+    out = emit_u8(out, 5)
+    // push rax (fd)
+    out = emit_u8(out, 80)
+
+    // write(fd, data_ptr, data_len)
+    // mov rdi, rax (fd)
+    out = emit_u8(out, 72)
+    out = emit_u8(out, 137)
+    out = emit_u8(out, 199)
+    // mov rsi, r12 (data_ptr)
+    out = emit_u8(out, 76)
+    out = emit_u8(out, 137)
+    out = emit_u8(out, 230)
+    // mov rdx, r13 (data_len)
+    out = emit_u8(out, 76)
+    out = emit_u8(out, 137)
+    out = emit_u8(out, 234)
+    // mov rax, 1 (SYS_WRITE)
+    out = emit_u8(out, 72)
+    out = emit_u8(out, 199)
+    out = emit_u8(out, 192)
+    out = emit_u32_le(out, 1)
+    // syscall
+    out = emit_u8(out, 15)
+    out = emit_u8(out, 5)
+    // push rax (bytes written)
+    out = emit_u8(out, 80)
+
+    // close(fd)
+    // pop rdx (bytes written — save)
+    // Actually let's reorder: save write result in r12
+    // mov r12, rax
+    out = emit_u8(out, 73)
+    out = emit_u8(out, 137)
+    out = emit_u8(out, 196)
+    // pop rdi (fd)
+    out = emit_u8(out, 95)
+    // mov rax, 3 (SYS_CLOSE)
+    out = emit_u8(out, 72)
+    out = emit_u8(out, 199)
+    out = emit_u8(out, 192)
+    out = emit_u32_le(out, 3)
+    // syscall
+    out = emit_u8(out, 15)
+    out = emit_u8(out, 5)
+
+    // mov rax, r12 (bytes written)
+    out = emit_u8(out, 76)
+    out = emit_u8(out, 137)
+    out = emit_u8(out, 224)
+
+    // pop r13; pop r12
+    out = emit_u8(out, 65)
+    out = emit_u8(out, 93)
+    out = emit_u8(out, 65)
+    out = emit_u8(out, 92)
+    // pop rbp
+    out = emit_u8(out, 93)
+    // ret
+    out = emit_u8(out, 195)
+    return out
+}
+
+// ============================================================================
+// 5. Math Runtime (float operations via SSE2)
+// ============================================================================
+
+// _vx_int_to_float(i: i64) -> f64 (as i64 bits)
+// cvtsi2sd xmm0, rdi; movq rax, xmm0
+fn rt_int_to_float_stub() -> [i64] {
+    var out: [i64] = []
+    // cvtsi2sd xmm0, rdi: F2 48 0F 2A C7
+    out = emit_u8(out, 242)
+    out = emit_u8(out, 72)
+    out = emit_u8(out, 15)
+    out = emit_u8(out, 42)
+    out = emit_u8(out, 199)
+    // movq rax, xmm0: 66 48 0F 7E C0
+    out = emit_u8(out, 102)
+    out = emit_u8(out, 72)
+    out = emit_u8(out, 15)
+    out = emit_u8(out, 126)
+    out = emit_u8(out, 192)
+    // ret
+    out = emit_u8(out, 195)
+    return out
+}
+
+// _vx_float_to_int(f: f64 as i64 bits) -> i64
+// movq xmm0, rdi; cvttsd2si rax, xmm0
+fn rt_float_to_int_stub() -> [i64] {
+    var out: [i64] = []
+    // movq xmm0, rdi: 66 48 0F 6E C7
+    out = emit_u8(out, 102)
+    out = emit_u8(out, 72)
+    out = emit_u8(out, 15)
+    out = emit_u8(out, 110)
+    out = emit_u8(out, 199)
+    // cvttsd2si rax, xmm0: F2 48 0F 2C C0
+    out = emit_u8(out, 242)
+    out = emit_u8(out, 72)
+    out = emit_u8(out, 15)
+    out = emit_u8(out, 44)
+    out = emit_u8(out, 192)
+    // ret
+    out = emit_u8(out, 195)
+    return out
+}
+
+// _vx_float_add(a, b) -> a + b (all as i64 bit patterns)
+// movq xmm0, rdi; movq xmm1, rsi; addsd xmm0, xmm1; movq rax, xmm0
+fn rt_float_add_stub() -> [i64] {
+    var out: [i64] = []
+    // movq xmm0, rdi: 66 48 0F 6E C7
+    out = emit_u8(out, 102)
+    out = emit_u8(out, 72)
+    out = emit_u8(out, 15)
+    out = emit_u8(out, 110)
+    out = emit_u8(out, 199)
+    // movq xmm1, rsi: 66 48 0F 6E CE
+    out = emit_u8(out, 102)
+    out = emit_u8(out, 72)
+    out = emit_u8(out, 15)
+    out = emit_u8(out, 110)
+    out = emit_u8(out, 206)
+    // addsd xmm0, xmm1: F2 0F 58 C1
+    out = emit_u8(out, 242)
+    out = emit_u8(out, 15)
+    out = emit_u8(out, 88)
+    out = emit_u8(out, 193)
+    // movq rax, xmm0: 66 48 0F 7E C0
+    out = emit_u8(out, 102)
+    out = emit_u8(out, 72)
+    out = emit_u8(out, 15)
+    out = emit_u8(out, 126)
+    out = emit_u8(out, 192)
+    // ret
+    out = emit_u8(out, 195)
+    return out
+}
+
+// _vx_float_sub(a, b) -> a - b
+fn rt_float_sub_stub() -> [i64] {
+    var out: [i64] = []
+    // movq xmm0, rdi
+    out = emit_u8(out, 102)
+    out = emit_u8(out, 72)
+    out = emit_u8(out, 15)
+    out = emit_u8(out, 110)
+    out = emit_u8(out, 199)
+    // movq xmm1, rsi
+    out = emit_u8(out, 102)
+    out = emit_u8(out, 72)
+    out = emit_u8(out, 15)
+    out = emit_u8(out, 110)
+    out = emit_u8(out, 206)
+    // subsd xmm0, xmm1: F2 0F 5C C1
+    out = emit_u8(out, 242)
+    out = emit_u8(out, 15)
+    out = emit_u8(out, 92)
+    out = emit_u8(out, 193)
+    // movq rax, xmm0
+    out = emit_u8(out, 102)
+    out = emit_u8(out, 72)
+    out = emit_u8(out, 15)
+    out = emit_u8(out, 126)
+    out = emit_u8(out, 192)
+    // ret
+    out = emit_u8(out, 195)
+    return out
+}
+
+// _vx_float_mul(a, b) -> a * b
+fn rt_float_mul_stub() -> [i64] {
+    var out: [i64] = []
+    // movq xmm0, rdi
+    out = emit_u8(out, 102)
+    out = emit_u8(out, 72)
+    out = emit_u8(out, 15)
+    out = emit_u8(out, 110)
+    out = emit_u8(out, 199)
+    // movq xmm1, rsi
+    out = emit_u8(out, 102)
+    out = emit_u8(out, 72)
+    out = emit_u8(out, 15)
+    out = emit_u8(out, 110)
+    out = emit_u8(out, 206)
+    // mulsd xmm0, xmm1: F2 0F 59 C1
+    out = emit_u8(out, 242)
+    out = emit_u8(out, 15)
+    out = emit_u8(out, 89)
+    out = emit_u8(out, 193)
+    // movq rax, xmm0
+    out = emit_u8(out, 102)
+    out = emit_u8(out, 72)
+    out = emit_u8(out, 15)
+    out = emit_u8(out, 126)
+    out = emit_u8(out, 192)
+    // ret
+    out = emit_u8(out, 195)
+    return out
+}
+
+// _vx_float_div(a, b) -> a / b
+fn rt_float_div_stub() -> [i64] {
+    var out: [i64] = []
+    // movq xmm0, rdi
+    out = emit_u8(out, 102)
+    out = emit_u8(out, 72)
+    out = emit_u8(out, 15)
+    out = emit_u8(out, 110)
+    out = emit_u8(out, 199)
+    // movq xmm1, rsi
+    out = emit_u8(out, 102)
+    out = emit_u8(out, 72)
+    out = emit_u8(out, 15)
+    out = emit_u8(out, 110)
+    out = emit_u8(out, 206)
+    // divsd xmm0, xmm1: F2 0F 5E C1
+    out = emit_u8(out, 242)
+    out = emit_u8(out, 15)
+    out = emit_u8(out, 94)
+    out = emit_u8(out, 193)
+    // movq rax, xmm0
+    out = emit_u8(out, 102)
+    out = emit_u8(out, 72)
+    out = emit_u8(out, 15)
+    out = emit_u8(out, 126)
+    out = emit_u8(out, 192)
+    // ret
+    out = emit_u8(out, 195)
+    return out
+}
+
+// ============================================================================
+// 6. Full Runtime Assembly
+// ============================================================================
+
+// Symbol table entry: name and offset into the combined code blob
+fn make_symbol(name: String, offset: i64) -> (String, i64) {
+    return (name, offset)
+}
+
+// Assembles all stubs into a single byte array.
+// Returns a tuple of (code_bytes, symbol_names, symbol_offsets)
+fn build_runtime() -> ([i64], [String], [i64]) {
+    var code: [i64] = []
+    var names: [String] = []
+    var offsets: [i64] = []
+
+    // Helper: append a stub and register its symbol
+    var stub: [i64] = []
+    var i = 0
+
+    // --- Memory Management ---
+    names = push(names, "_vx_malloc")
+    offsets = push(offsets, len(code))
+    stub = rt_malloc_stub()
+    i = 0
+    while i < len(stub) {
+        code = push(code, stub[i])
+        i = i + 1
+    }
+
+    names = push(names, "_vx_free")
+    offsets = push(offsets, len(code))
+    stub = rt_free_stub()
+    i = 0
+    while i < len(stub) {
+        code = push(code, stub[i])
+        i = i + 1
+    }
+
+    names = push(names, "_vx_realloc")
+    offsets = push(offsets, len(code))
+    stub = rt_realloc_stub()
+    i = 0
+    while i < len(stub) {
+        code = push(code, stub[i])
+        i = i + 1
+    }
+
+    // --- String Runtime ---
+    names = push(names, "_vx_print_str")
+    offsets = push(offsets, len(code))
+    stub = rt_print_str_stub()
+    i = 0
+    while i < len(stub) {
+        code = push(code, stub[i])
+        i = i + 1
+    }
+
+    names = push(names, "_vx_str_concat")
+    offsets = push(offsets, len(code))
+    stub = rt_str_concat_stub()
+    i = 0
+    while i < len(stub) {
+        code = push(code, stub[i])
+        i = i + 1
+    }
+
+    names = push(names, "_vx_str_eq")
+    offsets = push(offsets, len(code))
+    stub = rt_str_eq_stub()
+    i = 0
+    while i < len(stub) {
+        code = push(code, stub[i])
+        i = i + 1
+    }
+
+    names = push(names, "_vx_str_char_at")
+    offsets = push(offsets, len(code))
+    stub = rt_str_char_at_stub()
+    i = 0
+    while i < len(stub) {
+        code = push(code, stub[i])
+        i = i + 1
+    }
+
+    names = push(names, "_vx_str_len")
+    offsets = push(offsets, len(code))
+    stub = rt_str_len_stub()
+    i = 0
+    while i < len(stub) {
+        code = push(code, stub[i])
+        i = i + 1
+    }
+
+    names = push(names, "_vx_str_substr")
+    offsets = push(offsets, len(code))
+    stub = rt_str_substr_stub()
+    i = 0
+    while i < len(stub) {
+        code = push(code, stub[i])
+        i = i + 1
+    }
+
+    // --- Array Runtime ---
+    names = push(names, "_vx_array_new")
+    offsets = push(offsets, len(code))
+    stub = rt_array_new_stub()
+    i = 0
+    while i < len(stub) {
+        code = push(code, stub[i])
+        i = i + 1
+    }
+
+    names = push(names, "_vx_array_get")
+    offsets = push(offsets, len(code))
+    stub = rt_array_get_stub()
+    i = 0
+    while i < len(stub) {
+        code = push(code, stub[i])
+        i = i + 1
+    }
+
+    names = push(names, "_vx_array_set")
+    offsets = push(offsets, len(code))
+    stub = rt_array_set_stub()
+    i = 0
+    while i < len(stub) {
+        code = push(code, stub[i])
+        i = i + 1
+    }
+
+    names = push(names, "_vx_array_len")
+    offsets = push(offsets, len(code))
+    stub = rt_array_len_stub()
+    i = 0
+    while i < len(stub) {
+        code = push(code, stub[i])
+        i = i + 1
+    }
+
+    names = push(names, "_vx_array_push")
+    offsets = push(offsets, len(code))
+    stub = rt_array_push_stub()
+    i = 0
+    while i < len(stub) {
+        code = push(code, stub[i])
+        i = i + 1
+    }
+
+    // --- I/O Runtime ---
+    names = push(names, "_vx_print_int")
+    offsets = push(offsets, len(code))
+    stub = rt_print_int_stub()
+    i = 0
+    while i < len(stub) {
+        code = push(code, stub[i])
+        i = i + 1
+    }
+
+    names = push(names, "_vx_print_newline")
+    offsets = push(offsets, len(code))
+    stub = rt_print_newline_stub()
+    i = 0
+    while i < len(stub) {
+        code = push(code, stub[i])
+        i = i + 1
+    }
+
+    names = push(names, "_vx_read_file")
+    offsets = push(offsets, len(code))
+    stub = rt_read_file_stub()
+    i = 0
+    while i < len(stub) {
+        code = push(code, stub[i])
+        i = i + 1
+    }
+
+    names = push(names, "_vx_write_file")
+    offsets = push(offsets, len(code))
+    stub = rt_write_file_stub()
+    i = 0
+    while i < len(stub) {
+        code = push(code, stub[i])
+        i = i + 1
+    }
+
+    // --- Math Runtime ---
+    names = push(names, "_vx_int_to_float")
+    offsets = push(offsets, len(code))
+    stub = rt_int_to_float_stub()
+    i = 0
+    while i < len(stub) {
+        code = push(code, stub[i])
+        i = i + 1
+    }
+
+    names = push(names, "_vx_float_to_int")
+    offsets = push(offsets, len(code))
+    stub = rt_float_to_int_stub()
+    i = 0
+    while i < len(stub) {
+        code = push(code, stub[i])
+        i = i + 1
+    }
+
+    names = push(names, "_vx_float_add")
+    offsets = push(offsets, len(code))
+    stub = rt_float_add_stub()
+    i = 0
+    while i < len(stub) {
+        code = push(code, stub[i])
+        i = i + 1
+    }
+
+    names = push(names, "_vx_float_sub")
+    offsets = push(offsets, len(code))
+    stub = rt_float_sub_stub()
+    i = 0
+    while i < len(stub) {
+        code = push(code, stub[i])
+        i = i + 1
+    }
+
+    names = push(names, "_vx_float_mul")
+    offsets = push(offsets, len(code))
+    stub = rt_float_mul_stub()
+    i = 0
+    while i < len(stub) {
+        code = push(code, stub[i])
+        i = i + 1
+    }
+
+    names = push(names, "_vx_float_div")
+    offsets = push(offsets, len(code))
+    stub = rt_float_div_stub()
+    i = 0
+    while i < len(stub) {
+        code = push(code, stub[i])
+        i = i + 1
+    }
+
+    return (code, names, offsets)
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+fn test_stub(name: String, stub: [i64], min_len: i64, expected_first: i64) -> bool {
+    let ok_len = len(stub) >= min_len
+    let ok_first = stub[0] == expected_first
+    if ok_len && ok_first {
+        println("PASS: " + name + " (" + to_string(len(stub)) + " bytes)")
+        return true
+    }
+    if !ok_len {
+        println("FAIL: " + name + " — too short: " + to_string(len(stub)) + " < " + to_string(min_len))
+    }
+    if !ok_first {
+        println("FAIL: " + name + " — first byte: " + to_string(stub[0]) + " != " + to_string(expected_first))
+    }
+    return false
+}
+
+fn test_stub_ret(name: String, stub: [i64]) -> bool {
+    // Verify last byte is 0xC3 (ret)
+    let last = stub[len(stub) - 1]
+    if last == 195 {
+        return true
+    }
+    println("FAIL: " + name + " — last byte is " + to_string(last) + ", expected 195 (ret)")
+    return false
+}
+
+fn main() {
+    var passed = 0
+    var failed = 0
+    var total = 0
+
+    // --- Memory Management ---
+    let malloc_code = rt_malloc_stub()
+    total = total + 1
+    if test_stub("rt_malloc_stub", malloc_code, 20, 85) && test_stub_ret("rt_malloc_stub", malloc_code) {
+        passed = passed + 1
+    } else {
+        failed = failed + 1
+    }
+
+    let free_code = rt_free_stub()
+    total = total + 1
+    if test_stub("rt_free_stub", free_code, 10, 85) && test_stub_ret("rt_free_stub", free_code) {
+        passed = passed + 1
+    } else {
+        failed = failed + 1
+    }
+
+    let realloc_code = rt_realloc_stub()
+    total = total + 1
+    if test_stub("rt_realloc_stub", realloc_code, 40, 85) && test_stub_ret("rt_realloc_stub", realloc_code) {
+        passed = passed + 1
+    } else {
+        failed = failed + 1
+    }
+
+    // --- String Runtime ---
+    let print_str_code = rt_print_str_stub()
+    total = total + 1
+    if test_stub("rt_print_str_stub", print_str_code, 15, 85) && test_stub_ret("rt_print_str_stub", print_str_code) {
+        passed = passed + 1
+    } else {
+        failed = failed + 1
+    }
+
+    let str_concat_code = rt_str_concat_stub()
+    total = total + 1
+    if test_stub("rt_str_concat_stub", str_concat_code, 40, 85) && test_stub_ret("rt_str_concat_stub", str_concat_code) {
+        passed = passed + 1
+    } else {
+        failed = failed + 1
+    }
+
+    let str_eq_code = rt_str_eq_stub()
+    total = total + 1
+    if test_stub("rt_str_eq_stub", str_eq_code, 15, 85) && test_stub_ret("rt_str_eq_stub", str_eq_code) {
+        passed = passed + 1
+    } else {
+        failed = failed + 1
+    }
+
+    let str_char_at_code = rt_str_char_at_stub()
+    total = total + 1
+    if test_stub("rt_str_char_at_stub", str_char_at_code, 5, 85) && test_stub_ret("rt_str_char_at_stub", str_char_at_code) {
+        passed = passed + 1
+    } else {
+        failed = failed + 1
+    }
+
+    let str_len_code = rt_str_len_stub()
+    total = total + 1
+    if test_stub("rt_str_len_stub", str_len_code, 3, 72) && test_stub_ret("rt_str_len_stub", str_len_code) {
+        passed = passed + 1
+    } else {
+        failed = failed + 1
+    }
+
+    let str_substr_code = rt_str_substr_stub()
+    total = total + 1
+    if test_stub("rt_str_substr_stub", str_substr_code, 30, 85) && test_stub_ret("rt_str_substr_stub", str_substr_code) {
+        passed = passed + 1
+    } else {
+        failed = failed + 1
+    }
+
+    // --- Array Runtime ---
+    let array_new_code = rt_array_new_stub()
+    total = total + 1
+    if test_stub("rt_array_new_stub", array_new_code, 30, 85) && test_stub_ret("rt_array_new_stub", array_new_code) {
+        passed = passed + 1
+    } else {
+        failed = failed + 1
+    }
+
+    let array_get_code = rt_array_get_stub()
+    total = total + 1
+    if test_stub("rt_array_get_stub", array_get_code, 5, 72) && test_stub_ret("rt_array_get_stub", array_get_code) {
+        passed = passed + 1
+    } else {
+        failed = failed + 1
+    }
+
+    let array_set_code = rt_array_set_stub()
+    total = total + 1
+    if test_stub("rt_array_set_stub", array_set_code, 5, 72) && test_stub_ret("rt_array_set_stub", array_set_code) {
+        passed = passed + 1
+    } else {
+        failed = failed + 1
+    }
+
+    let array_len_code = rt_array_len_stub()
+    total = total + 1
+    if test_stub("rt_array_len_stub", array_len_code, 4, 72) && test_stub_ret("rt_array_len_stub", array_len_code) {
+        passed = passed + 1
+    } else {
+        failed = failed + 1
+    }
+
+    let array_push_code = rt_array_push_stub()
+    total = total + 1
+    if test_stub("rt_array_push_stub", array_push_code, 40, 85) && test_stub_ret("rt_array_push_stub", array_push_code) {
+        passed = passed + 1
+    } else {
+        failed = failed + 1
+    }
+
+    // --- I/O Runtime ---
+    let print_int_code = rt_print_int_stub()
+    total = total + 1
+    if test_stub("rt_print_int_stub", print_int_code, 40, 72) && test_stub_ret("rt_print_int_stub", print_int_code) {
+        passed = passed + 1
+    } else {
+        failed = failed + 1
+    }
+
+    let print_nl_code = rt_print_newline_stub()
+    total = total + 1
+    if test_stub("rt_print_newline_stub", print_nl_code, 15, 72) && test_stub_ret("rt_print_newline_stub", print_nl_code) {
+        passed = passed + 1
+    } else {
+        failed = failed + 1
+    }
+
+    let read_file_code = rt_read_file_stub()
+    total = total + 1
+    if test_stub("rt_read_file_stub", read_file_code, 40, 85) && test_stub_ret("rt_read_file_stub", read_file_code) {
+        passed = passed + 1
+    } else {
+        failed = failed + 1
+    }
+
+    let write_file_code = rt_write_file_stub()
+    total = total + 1
+    if test_stub("rt_write_file_stub", write_file_code, 30, 85) && test_stub_ret("rt_write_file_stub", write_file_code) {
+        passed = passed + 1
+    } else {
+        failed = failed + 1
+    }
+
+    // --- Math Runtime ---
+    let i2f_code = rt_int_to_float_stub()
+    total = total + 1
+    if test_stub("rt_int_to_float_stub", i2f_code, 10, 242) && test_stub_ret("rt_int_to_float_stub", i2f_code) {
+        passed = passed + 1
+    } else {
+        failed = failed + 1
+    }
+
+    let f2i_code = rt_float_to_int_stub()
+    total = total + 1
+    if test_stub("rt_float_to_int_stub", f2i_code, 10, 102) && test_stub_ret("rt_float_to_int_stub", f2i_code) {
+        passed = passed + 1
+    } else {
+        failed = failed + 1
+    }
+
+    let fadd_code = rt_float_add_stub()
+    total = total + 1
+    if test_stub("rt_float_add_stub", fadd_code, 15, 102) && test_stub_ret("rt_float_add_stub", fadd_code) {
+        passed = passed + 1
+    } else {
+        failed = failed + 1
+    }
+
+    let fsub_code = rt_float_sub_stub()
+    total = total + 1
+    if test_stub("rt_float_sub_stub", fsub_code, 15, 102) && test_stub_ret("rt_float_sub_stub", fsub_code) {
+        passed = passed + 1
+    } else {
+        failed = failed + 1
+    }
+
+    let fmul_code = rt_float_mul_stub()
+    total = total + 1
+    if test_stub("rt_float_mul_stub", fmul_code, 15, 102) && test_stub_ret("rt_float_mul_stub", fmul_code) {
+        passed = passed + 1
+    } else {
+        failed = failed + 1
+    }
+
+    let fdiv_code = rt_float_div_stub()
+    total = total + 1
+    if test_stub("rt_float_div_stub", fdiv_code, 15, 102) && test_stub_ret("rt_float_div_stub", fdiv_code) {
+        passed = passed + 1
+    } else {
+        failed = failed + 1
+    }
+
+    // --- build_runtime integration test ---
+    println("")
+    println("--- build_runtime integration ---")
+    let result = build_runtime()
+    let all_code = result.0
+    let all_names = result.1
+    let all_offsets = result.2
+
+    println("Total runtime code: " + to_string(len(all_code)) + " bytes")
+    println("Total symbols: " + to_string(len(all_names)))
+
+    total = total + 1
+    if len(all_code) > 200 && len(all_names) == 23 && len(all_offsets) == 23 {
+        println("PASS: build_runtime produces valid output")
+        passed = passed + 1
+    } else {
+        println("FAIL: build_runtime — code=" + to_string(len(all_code)) + " names=" + to_string(len(all_names)) + " offsets=" + to_string(len(all_offsets)))
+        failed = failed + 1
+    }
+
+    // Print symbol table
+    var s = 0
+    while s < len(all_names) {
+        println("  " + all_names[s] + " @ offset " + to_string(all_offsets[s]))
+        s = s + 1
+    }
+
+    println("")
+    println("=== Results: " + to_string(passed) + "/" + to_string(total) + " passed, " + to_string(failed) + " failed ===")
+}

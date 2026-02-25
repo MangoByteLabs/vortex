@@ -1,0 +1,337 @@
+// std/random.vx — Pseudo-random number generation for Vortex
+// Uses a Linear Congruential Generator (LCG) — no external dependencies.
+//
+// LCG formula:  new_state = (state * A + C) % M
+//   A = 6364136223846793005  (Knuth multiplier)
+//   C = 1442695040888963407
+//   M = 9223372036854775807  (2^63 - 1, largest i64 prime-like modulus)
+//
+// All generator functions return arrays so callers can thread state through:
+//   rng_int_range   -> [i64]    where [0]=value,      [1]=new_state
+//   rng_float01     -> [String] where [0]=float_str,  [1]=new_state_str
+//   rng_normal      -> [String] where [0]=float_str,  [1]=new_state_str
+//   rng_shuffle     -> [String] (shuffled elements; last element is state_str)
+//   rng_choice      -> [String] where [0]=element,    [1]=new_state_str
+//   rng_sample      -> [String] (n elements; last element is state_str)
+
+// ─── SYS_CLOCK_GETTIME constant ──────────────────────────────────────────────
+
+fn _RNG_SYS_CLOCK_GETTIME() -> i64 { return 228 }
+fn _RNG_CLOCK_REALTIME()    -> i64 { return 0   }
+
+// ─── LCG core ─────────────────────────────────────────────────────────────────
+
+// LCG multiplier and addend (standard Knuth / glibc-compatible values).
+fn _lcg_a() -> i64 { return 6364136223846793005 }
+fn _lcg_c() -> i64 { return 1442695040888963407 }
+
+// _lcg_mod: modular reduction keeping result positive in [1, M-1].
+// We use M = 2^31 - 1 = 2147483647 for portability (avoids i64 overflow
+// in the intermediate multiply on all interpreter backends).
+fn _lcg_mod() -> i64 { return 2147483647 }
+
+// rng_new: create a new RNG state from a seed.
+// Seed 0 is remapped to 1 to avoid the degenerate all-zero case.
+fn rng_new(seed: i64) -> i64 {
+    if seed == 0 {
+        return 1
+    }
+    // Ensure positive initial state inside modulus
+    var s = seed
+    if s < 0 {
+        s = 0 - s
+    }
+    return s % _lcg_mod() + 1
+}
+
+// rng_next: advance LCG state by one step and return new state.
+// The returned value IS the raw random state; use rng_int_range / rng_float01
+// to map it to useful ranges.
+fn rng_next(state: i64) -> i64 {
+    // new = (state * A + C) % M  — using Schrage's method to avoid overflow:
+    //   M = 2147483647, A = 48271, C = 0  (MINSTD style, safe under i64)
+    // We keep it simple: multiply under i64 range since M < 2^31.
+    let a = 48271
+    let m = _lcg_mod()
+    let new_state = (state * a) % m
+    if new_state <= 0 {
+        return 1
+    }
+    return new_state
+}
+
+// rng_int_range: return a random integer in [min, max).
+// Result: [value, new_state]
+fn rng_int_range(state: i64, min: i64, max: i64) -> [i64] {
+    let ns = rng_next(state)
+    if max <= min {
+        return [min, ns]
+    }
+    let span = max - min
+    let value = min + (ns % span)
+    return [value, ns]
+}
+
+// rng_float01: return a random float in [0.0, 1.0) as a string.
+// Result: [float_str, new_state_str]
+fn rng_float01(state: i64) -> [String] {
+    let ns = rng_next(state)
+    let m = _lcg_mod()
+    // value = ns / (m - 1) as float
+    let fns = float(ns)
+    let fm = float(m)
+    let value = fns / fm
+    return [str(value), str(ns)]
+}
+
+// rng_float_range: return a random float in [lo, hi) as a string.
+// Result: [float_str, new_state_str]
+fn rng_float_range(state: i64, lo: f64, hi: f64) -> [String] {
+    let pair = rng_float01(state)
+    let raw = float(pair[0])
+    let span = hi - lo
+    let value = lo + raw * span
+    return [str(value), pair[1]]
+}
+
+// ─── Normal distribution (Box-Muller approximation) ───────────────────────────
+
+// rng_normal: sample from N(0,1) using a 12-uniform central-limit approximation.
+// Sums 12 uniform [0,1) values and subtracts 6 — mean=0, variance=1 approx.
+// Result: [float_str, new_state_str]
+fn rng_normal(state: i64) -> [String] {
+    var s = state
+    var sum = 0.0
+    var i = 0
+    while i < 12 {
+        let pair = rng_float01(s)
+        sum = sum + float(pair[0])
+        s = int(pair[1])
+        i = i + 1
+    }
+    let value = sum - 6.0
+    return [str(value), str(s)]
+}
+
+// ─── Array operations ─────────────────────────────────────────────────────────
+
+// rng_shuffle: Fisher-Yates shuffle of a [String] array.
+// Returns the shuffled array with the new RNG state appended as the last element.
+// Callers must pop the last element to recover the state.
+fn rng_shuffle(arr: [String], state: i64) -> [String] {
+    let n = len(arr)
+    if n <= 1 {
+        return push(arr, str(state))
+    }
+    // Copy arr into a mutable working array
+    var work = []
+    var i = 0
+    while i < n {
+        work = push(work, arr[i])
+        i = i + 1
+    }
+    var s = state
+    var j = n - 1
+    while j > 0 {
+        let pair = rng_int_range(s, 0, j + 1)
+        let k = pair[0]
+        s = pair[1]
+        // Swap work[j] and work[k]
+        let tmp = work[j]
+        var new_work = []
+        var idx = 0
+        while idx < n {
+            if idx == j {
+                new_work = push(new_work, work[k])
+            } else if idx == k {
+                new_work = push(new_work, tmp)
+            } else {
+                new_work = push(new_work, work[idx])
+            }
+            idx = idx + 1
+        }
+        work = new_work
+        j = j - 1
+    }
+    // Append new state as final element
+    work = push(work, str(s))
+    return work
+}
+
+// rng_choice: pick one random element from arr.
+// Returns [chosen_element, new_state_str].
+fn rng_choice(arr: [String], state: i64) -> [String] {
+    let n = len(arr)
+    if n == 0 {
+        return ["", str(state)]
+    }
+    let pair = rng_int_range(state, 0, n)
+    let idx = pair[0]
+    let ns = pair[1]
+    return [arr[idx], str(ns)]
+}
+
+// rng_sample: draw n elements from arr without replacement.
+// Returns sampled elements + new state appended as the last String element.
+// If n >= len(arr), returns a shuffle of the full array.
+fn rng_sample(arr: [String], n: i64, state: i64) -> [String] {
+    let total = len(arr)
+    var actual_n = n
+    if actual_n > total {
+        actual_n = total
+    }
+    // Shuffle a copy, then take first actual_n elements
+    let shuffled_with_state = rng_shuffle(arr, state)
+    // Last element is state, preceding elements are the shuffled array
+    let shuffled_len = len(shuffled_with_state)
+    let final_state = shuffled_with_state[shuffled_len - 1]
+    var result = []
+    var i = 0
+    while i < actual_n {
+        result = push(result, shuffled_with_state[i])
+        i = i + 1
+    }
+    // Append state
+    result = push(result, final_state)
+    return result
+}
+
+// ─── Seeding from system time ─────────────────────────────────────────────────
+
+// rng_seed_from_time: use SYS_CLOCK_GETTIME to obtain nanoseconds as a seed.
+// Reads struct timespec { i64 tv_sec; i64 tv_nsec } from a 16-byte buffer.
+fn rng_seed_from_time() -> i64 {
+    let ts = mem_alloc(16)
+    let ret = syscall2(_RNG_SYS_CLOCK_GETTIME(), _RNG_CLOCK_REALTIME(), ts)
+    if ret < 0 {
+        mem_free(ts)
+        return 12345
+    }
+    // Read tv_sec (bytes 0-7) little-endian
+    let b0 = mem_read_u8(ts, 0)
+    let b1 = mem_read_u8(ts, 1)
+    let b2 = mem_read_u8(ts, 2)
+    let b3 = mem_read_u8(ts, 3)
+    let b4 = mem_read_u8(ts, 4)
+    let b5 = mem_read_u8(ts, 5)
+    let b6 = mem_read_u8(ts, 6)
+    let b7 = mem_read_u8(ts, 7)
+    let sec = b0 + b1 * 256 + b2 * 65536 + b3 * 16777216 +
+              b4 * 4294967296 + b5 * 1099511627776 +
+              b6 * 281474976710656 + b7 * 72057594037927936
+    // Read tv_nsec (bytes 8-15) little-endian
+    let n0 = mem_read_u8(ts, 8)
+    let n1 = mem_read_u8(ts, 9)
+    let n2 = mem_read_u8(ts, 10)
+    let n3 = mem_read_u8(ts, 11)
+    let nsec = n0 + n1 * 256 + n2 * 65536 + n3 * 16777216
+    mem_free(ts)
+    let seed = sec * 1000000000 + nsec
+    return rng_new(seed)
+}
+
+// ─── Convenience: generate a list of N random integers ───────────────────────
+
+// rng_generate_ints: produce n random integers in [min, max), threading state.
+// Returns the values as [i64]; pass the final state element separately if needed.
+fn rng_generate_ints(n: i64, min: i64, max: i64, state: i64) -> [i64] {
+    var result = []
+    var s = state
+    var i = 0
+    while i < n {
+        let pair = rng_int_range(s, min, max)
+        result = push(result, pair[0])
+        s = pair[1]
+        i = i + 1
+    }
+    return result
+}
+
+// rng_generate_floats: produce n random floats in [0,1) as strings.
+fn rng_generate_floats(n: i64, state: i64) -> [String] {
+    var result = []
+    var s = state
+    var i = 0
+    while i < n {
+        let pair = rng_float01(s)
+        result = push(result, pair[0])
+        s = int(pair[1])
+        i = i + 1
+    }
+    return result
+}
+
+// ─── Demo ─────────────────────────────────────────────────────────────────────
+
+fn main() {
+    println("=== random.vx demo ===")
+    let newline = str_from_bytes([10])
+
+    // Seed from time
+    let seed = rng_seed_from_time()
+    println("seed from time: " + str(seed))
+
+    // Generate 10 random ints in [0, 100)
+    println(newline + "10 random ints in [0, 100):")
+    let ints = rng_generate_ints(10, 0, 100, seed)
+    var i = 0
+    while i < len(ints) {
+        print(str(ints[i]) + " ")
+        i = i + 1
+    }
+    println("")
+
+    // Generate 5 floats in [0,1)
+    println(newline + "5 random floats in [0, 1):")
+    let floats = rng_generate_floats(5, seed)
+    var j = 0
+    while j < len(floats) {
+        print(floats[j] + " ")
+        j = j + 1
+    }
+    println("")
+
+    // Shuffle a string array
+    println(newline + "shuffle [a, b, c, d, e]:")
+    let orig = ["a", "b", "c", "d", "e"]
+    let shuffled_with_s = rng_shuffle(orig, seed)
+    let slen = len(shuffled_with_s)
+    var k = 0
+    while k < slen - 1 {
+        print(shuffled_with_s[k] + " ")
+        k = k + 1
+    }
+    println("")
+    println("state after shuffle: " + shuffled_with_s[slen - 1])
+
+    // rng_choice
+    println(newline + "random choice from [alpha, beta, gamma, delta]:")
+    let choices = ["alpha", "beta", "gamma", "delta"]
+    let chosen = rng_choice(choices, seed)
+    println("chosen: " + chosen[0])
+
+    // rng_sample
+    println(newline + "sample 3 from [1, 2, 3, 4, 5, 6, 7, 8]:")
+    let pool = ["1", "2", "3", "4", "5", "6", "7", "8"]
+    let sampled = rng_sample(pool, 3, seed)
+    var m = 0
+    while m < len(sampled) - 1 {
+        print(sampled[m] + " ")
+        m = m + 1
+    }
+    println("")
+
+    // Normal distribution samples
+    println(newline + "5 samples from N(0,1) approximation:")
+    var s2 = seed
+    var ni = 0
+    while ni < 5 {
+        let norm = rng_normal(s2)
+        print(norm[0] + " ")
+        s2 = int(norm[1])
+        ni = ni + 1
+    }
+    println("")
+
+    println(newline + "=== random.vx done ===")
+}

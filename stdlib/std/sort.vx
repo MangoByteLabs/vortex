@@ -1,0 +1,631 @@
+// std/sort.vx — Sorting algorithms for Vortex
+// Provides quicksort (iterative, stack-based), binary search, merge, topk, argsort.
+// No external dependencies.
+//
+// Supported array types:
+//   [i64]    — integer arrays
+//   [f64]    — float arrays
+//   [String] — lexicographic string arrays
+
+// ─── Internal stack helpers ───────────────────────────────────────────────────
+// An explicit (lo, hi) pair stack is stored as a flat [i64] array:
+//   [lo0, hi0, lo1, hi1, ...]
+// _stack_push / _stack_pop operate on this representation.
+
+fn _stack_empty(stack: [i64]) -> bool {
+    return len(stack) == 0
+}
+
+fn _stack_push_pair(stack: [i64], lo: i64, hi: i64) -> [i64] {
+    let s2 = push(stack, lo)
+    return push(s2, hi)
+}
+
+// Returns [lo, hi, rest...] — caller uses [0] and [1], then rebuilds tail.
+// To "pop", call _stack_pop_pair and use the returned tail as new stack.
+fn _stack_top_lo(stack: [i64]) -> i64 {
+    return stack[len(stack) - 2]
+}
+
+fn _stack_top_hi(stack: [i64]) -> i64 {
+    return stack[len(stack) - 1]
+}
+
+fn _stack_pop(stack: [i64]) -> [i64] {
+    let n = len(stack)
+    var result = []
+    var i = 0
+    while i < n - 2 {
+        result = push(result, stack[i])
+        i = i + 1
+    }
+    return result
+}
+
+// ─── Integer array utilities ──────────────────────────────────────────────────
+
+// _swap_ints: swap elements at positions i and j in arr, return new array.
+fn _swap_ints(arr: [i64], i: i64, j: i64) -> [i64] {
+    let n = len(arr)
+    let tmp_i = arr[i]
+    let tmp_j = arr[j]
+    var result = []
+    var k = 0
+    while k < n {
+        if k == i {
+            result = push(result, tmp_j)
+        } else if k == j {
+            result = push(result, tmp_i)
+        } else {
+            result = push(result, arr[k])
+        }
+        k = k + 1
+    }
+    return result
+}
+
+// _partition_ints: Lomuto partition around pivot at hi. Returns [new_arr..., pivot_idx].
+// The pivot index is appended as the last element of the returned array.
+fn _partition_ints(arr: [i64], lo: i64, hi: i64) -> [i64] {
+    let pivot = arr[hi]
+    var i = lo - 1
+    var work = arr
+    var j = lo
+    while j < hi {
+        if work[j] <= pivot {
+            i = i + 1
+            work = _swap_ints(work, i, j)
+        }
+        j = j + 1
+    }
+    work = _swap_ints(work, i + 1, hi)
+    return push(work, i + 1)
+}
+
+// sort_ints: iterative quicksort for [i64]. Returns sorted array (ascending).
+fn sort_ints(arr: [i64]) -> [i64] {
+    let n = len(arr)
+    if n <= 1 {
+        return arr
+    }
+    var work = arr
+    var stack = []
+    stack = _stack_push_pair(stack, 0, n - 1)
+    while len(stack) > 0 {
+        let lo = _stack_top_lo(stack)
+        let hi = _stack_top_hi(stack)
+        stack = _stack_pop(stack)
+        if lo < hi {
+            let res = _partition_ints(work, lo, hi)
+            let plen = len(res)
+            let pivot_idx = res[plen - 1]
+            // Rebuild work array without the appended pivot index
+            var new_work = []
+            var k = 0
+            while k < plen - 1 {
+                new_work = push(new_work, res[k])
+                k = k + 1
+            }
+            work = new_work
+            // Push sub-ranges onto the stack
+            if pivot_idx - 1 > lo {
+                stack = _stack_push_pair(stack, lo, pivot_idx - 1)
+            }
+            if pivot_idx + 1 < hi {
+                stack = _stack_push_pair(stack, pivot_idx + 1, hi)
+            }
+        }
+    }
+    return work
+}
+
+// ─── Float array utilities ────────────────────────────────────────────────────
+
+fn _swap_floats(arr: [f64], i: i64, j: i64) -> [f64] {
+    let n = len(arr)
+    let tmp_i = arr[i]
+    let tmp_j = arr[j]
+    var result = []
+    var k = 0
+    while k < n {
+        if k == i {
+            result = push(result, tmp_j)
+        } else if k == j {
+            result = push(result, tmp_i)
+        } else {
+            result = push(result, arr[k])
+        }
+        k = k + 1
+    }
+    return result
+}
+
+// _partition_floats: Lomuto partition. Returns [new_arr..., pivot_idx_as_float].
+// We encode the integer pivot index as a float appended at the end.
+fn _partition_floats(arr: [f64], lo: i64, hi: i64) -> [f64] {
+    let pivot = arr[hi]
+    var i = lo - 1
+    var work = arr
+    var j = lo
+    while j < hi {
+        if work[j] <= pivot {
+            i = i + 1
+            work = _swap_floats(work, i, j)
+        }
+        j = j + 1
+    }
+    work = _swap_floats(work, i + 1, hi)
+    return push(work, float(i + 1))
+}
+
+// sort_floats: iterative quicksort for [f64]. Returns sorted array (ascending).
+fn sort_floats(arr: [f64]) -> [f64] {
+    let n = len(arr)
+    if n <= 1 {
+        return arr
+    }
+    var work = arr
+    var stack = []
+    stack = _stack_push_pair(stack, 0, n - 1)
+    while len(stack) > 0 {
+        let lo = _stack_top_lo(stack)
+        let hi = _stack_top_hi(stack)
+        stack = _stack_pop(stack)
+        if lo < hi {
+            let res = _partition_floats(work, lo, hi)
+            let plen = len(res)
+            let pivot_idx = int(res[plen - 1])
+            var new_work = []
+            var k = 0
+            while k < plen - 1 {
+                new_work = push(new_work, res[k])
+                k = k + 1
+            }
+            work = new_work
+            if pivot_idx - 1 > lo {
+                stack = _stack_push_pair(stack, lo, pivot_idx - 1)
+            }
+            if pivot_idx + 1 < hi {
+                stack = _stack_push_pair(stack, pivot_idx + 1, hi)
+            }
+        }
+    }
+    return work
+}
+
+// ─── String array utilities ───────────────────────────────────────────────────
+
+// _str_lt: return true if a < b lexicographically.
+fn _str_lt(a: String, b: String) -> bool {
+    let la = len(a)
+    let lb = len(b)
+    let ab = str_bytes(a)
+    let bb = str_bytes(b)
+    var min_len = la
+    if lb < la {
+        min_len = lb
+    }
+    var i = 0
+    while i < min_len {
+        let ca = int(ab[i])
+        let cb = int(bb[i])
+        if ca < cb {
+            return true
+        }
+        if ca > cb {
+            return false
+        }
+        i = i + 1
+    }
+    return la < lb
+}
+
+fn _swap_strings(arr: [String], i: i64, j: i64) -> [String] {
+    let n = len(arr)
+    let tmp_i = arr[i]
+    let tmp_j = arr[j]
+    var result = []
+    var k = 0
+    while k < n {
+        if k == i {
+            result = push(result, tmp_j)
+        } else if k == j {
+            result = push(result, tmp_i)
+        } else {
+            result = push(result, arr[k])
+        }
+        k = k + 1
+    }
+    return result
+}
+
+// _partition_strings: Lomuto partition. Pivot index appended as last element.
+fn _partition_strings(arr: [String], lo: i64, hi: i64) -> [String] {
+    let pivot = arr[hi]
+    var i = lo - 1
+    var work = arr
+    var j = lo
+    while j < hi {
+        if _str_lt(work[j], pivot) || work[j] == pivot {
+            i = i + 1
+            work = _swap_strings(work, i, j)
+        }
+        j = j + 1
+    }
+    work = _swap_strings(work, i + 1, hi)
+    return push(work, str(i + 1))
+}
+
+// sort_strings: iterative quicksort for [String] (lexicographic ascending).
+fn sort_strings(arr: [String]) -> [String] {
+    let n = len(arr)
+    if n <= 1 {
+        return arr
+    }
+    var work = arr
+    var stack = []
+    stack = _stack_push_pair(stack, 0, n - 1)
+    while len(stack) > 0 {
+        let lo = _stack_top_lo(stack)
+        let hi = _stack_top_hi(stack)
+        stack = _stack_pop(stack)
+        if lo < hi {
+            let res = _partition_strings(work, lo, hi)
+            let plen = len(res)
+            let pivot_idx = int(res[plen - 1])
+            var new_work = []
+            var k = 0
+            while k < plen - 1 {
+                new_work = push(new_work, res[k])
+                k = k + 1
+            }
+            work = new_work
+            if pivot_idx - 1 > lo {
+                stack = _stack_push_pair(stack, lo, pivot_idx - 1)
+            }
+            if pivot_idx + 1 < hi {
+                stack = _stack_push_pair(stack, pivot_idx + 1, hi)
+            }
+        }
+    }
+    return work
+}
+
+// ─── Sort by key ──────────────────────────────────────────────────────────────
+
+// sort_by_key: reorder arr so elements are sorted by their corresponding float key.
+// arr and keys must be the same length.
+fn sort_by_key(arr: [String], keys: [f64]) -> [String] {
+    let n = len(arr)
+    if n <= 1 {
+        return arr
+    }
+    // Build index array, sort indices by key, reorder arr
+    let sorted_idx = argsort_floats(keys)
+    var result = []
+    var i = 0
+    while i < n {
+        result = push(result, arr[sorted_idx[i]])
+        i = i + 1
+    }
+    return result
+}
+
+// ─── Binary search ────────────────────────────────────────────────────────────
+
+// binary_search_int: search sorted [i64] for target. Returns index or -1.
+fn binary_search_int(arr: [i64], target: i64) -> i64 {
+    var lo = 0
+    var hi = len(arr) - 1
+    while lo <= hi {
+        let mid = lo + (hi - lo) / 2
+        if arr[mid] == target {
+            return mid
+        }
+        if arr[mid] < target {
+            lo = mid + 1
+        } else {
+            hi = mid - 1
+        }
+    }
+    return -1
+}
+
+// binary_search_str: search sorted [String] for target. Returns index or -1.
+fn binary_search_str(arr: [String], target: String) -> i64 {
+    var lo = 0
+    var hi = len(arr) - 1
+    while lo <= hi {
+        let mid = lo + (hi - lo) / 2
+        if arr[mid] == target {
+            return mid
+        }
+        if _str_lt(arr[mid], target) {
+            lo = mid + 1
+        } else {
+            hi = mid - 1
+        }
+    }
+    return -1
+}
+
+// ─── Deduplication ───────────────────────────────────────────────────────────
+
+// unique_ints: sort arr and remove duplicate values.
+fn unique_ints(arr: [i64]) -> [i64] {
+    let n = len(arr)
+    if n == 0 {
+        return arr
+    }
+    let sorted = sort_ints(arr)
+    var result = [sorted[0]]
+    var i = 1
+    while i < n {
+        if sorted[i] != sorted[i - 1] {
+            result = push(result, sorted[i])
+        }
+        i = i + 1
+    }
+    return result
+}
+
+// unique_strings: sort arr and remove duplicate values.
+fn unique_strings(arr: [String]) -> [String] {
+    let n = len(arr)
+    if n == 0 {
+        return arr
+    }
+    let sorted = sort_strings(arr)
+    var result = [sorted[0]]
+    var i = 1
+    while i < n {
+        if sorted[i] != sorted[i - 1] {
+            result = push(result, sorted[i])
+        }
+        i = i + 1
+    }
+    return result
+}
+
+// ─── Merge sorted arrays ──────────────────────────────────────────────────────
+
+// merge_sorted_ints: merge two sorted [i64] arrays into one sorted [i64] array.
+fn merge_sorted_ints(a: [i64], b: [i64]) -> [i64] {
+    let na = len(a)
+    let nb = len(b)
+    var result = []
+    var i = 0
+    var j = 0
+    while i < na && j < nb {
+        if a[i] <= b[j] {
+            result = push(result, a[i])
+            i = i + 1
+        } else {
+            result = push(result, b[j])
+            j = j + 1
+        }
+    }
+    while i < na {
+        result = push(result, a[i])
+        i = i + 1
+    }
+    while j < nb {
+        result = push(result, b[j])
+        j = j + 1
+    }
+    return result
+}
+
+// ─── Top-K ────────────────────────────────────────────────────────────────────
+
+// topk_floats: return the k largest values from arr (unsorted input OK).
+// The returned array has at most k elements, in descending order.
+fn topk_floats(arr: [f64], k: i64) -> [f64] {
+    let n = len(arr)
+    if k <= 0 {
+        return []
+    }
+    var actual_k = k
+    if actual_k > n {
+        actual_k = n
+    }
+    let sorted = sort_floats(arr)
+    // sorted is ascending; take last actual_k elements in reverse
+    var result = []
+    var i = n - 1
+    var count = 0
+    while count < actual_k {
+        result = push(result, sorted[i])
+        i = i - 1
+        count = count + 1
+    }
+    return result
+}
+
+// ─── Argsort ─────────────────────────────────────────────────────────────────
+
+// argsort_floats: return indices that would sort arr in ascending order.
+// Uses insertion sort on an index array for simplicity and correctness.
+// For large arrays a quicksort variant would be faster; this is O(n^2) worst case.
+fn argsort_floats(arr: [f64]) -> [i64] {
+    let n = len(arr)
+    // Build initial index array [0, 1, 2, ..., n-1]
+    var idx = []
+    var i = 0
+    while i < n {
+        idx = push(idx, i)
+        i = i + 1
+    }
+    // Insertion sort by arr[idx[j]]
+    var outer = 1
+    while outer < n {
+        let key_idx = idx[outer]
+        let key_val = arr[key_idx]
+        var inner = outer - 1
+        var shifting = true
+        while shifting {
+            if inner < 0 {
+                shifting = false
+            } else if arr[idx[inner]] > key_val {
+                // Shift idx[inner] right to idx[inner+1]
+                var new_idx = []
+                var k = 0
+                while k < n {
+                    if k == inner + 1 {
+                        new_idx = push(new_idx, idx[inner])
+                    } else {
+                        new_idx = push(new_idx, idx[k])
+                    }
+                    k = k + 1
+                }
+                idx = new_idx
+                inner = inner - 1
+            } else {
+                shifting = false
+            }
+        }
+        // Place key_idx at inner+1
+        var new_idx2 = []
+        var k2 = 0
+        while k2 < n {
+            if k2 == inner + 1 {
+                new_idx2 = push(new_idx2, key_idx)
+            } else {
+                new_idx2 = push(new_idx2, idx[k2])
+            }
+            k2 = k2 + 1
+        }
+        idx = new_idx2
+        outer = outer + 1
+    }
+    return idx
+}
+
+// ─── Demo ─────────────────────────────────────────────────────────────────────
+
+fn main() {
+    println("=== sort.vx demo ===")
+    let newline = str_from_bytes([10])
+
+    // sort_ints
+    let ints = [42, 7, 99, 1, 55, 23, 8, 16, 4, 88]
+    let sorted_ints = sort_ints(ints)
+    print("sort_ints: ")
+    var i = 0
+    while i < len(sorted_ints) {
+        print(str(sorted_ints[i]) + " ")
+        i = i + 1
+    }
+    println("")
+
+    // sort_floats
+    let floats = [3.14, 1.41, 2.71, 0.57, 1.73, 2.23]
+    let sorted_floats = sort_floats(floats)
+    print("sort_floats: ")
+    var j = 0
+    while j < len(sorted_floats) {
+        print(str(sorted_floats[j]) + " ")
+        j = j + 1
+    }
+    println("")
+
+    // sort_strings
+    let words = ["banana", "apple", "cherry", "date", "elderberry", "fig"]
+    let sorted_words = sort_strings(words)
+    print("sort_strings: ")
+    var k = 0
+    while k < len(sorted_words) {
+        print(sorted_words[k] + " ")
+        k = k + 1
+    }
+    println("")
+
+    // sort_by_key
+    println(newline + "sort_by_key (labels sorted by score):")
+    let labels = ["low", "high", "medium", "critical"]
+    let scores = [1.5, 9.9, 5.0, 7.3]
+    let by_key = sort_by_key(labels, scores)
+    var l = 0
+    while l < len(by_key) {
+        print(by_key[l] + " ")
+        l = l + 1
+    }
+    println("")
+
+    // binary_search_int
+    let sorted_for_bs = sort_ints(ints)
+    let idx_42 = binary_search_int(sorted_for_bs, 42)
+    let idx_99 = binary_search_int(sorted_for_bs, 99)
+    let idx_50 = binary_search_int(sorted_for_bs, 50)
+    println(newline + "binary_search_int:")
+    println("  42 -> index " + str(idx_42))
+    println("  99 -> index " + str(idx_99))
+    println("  50 -> index " + str(idx_50) + " (not found)")
+
+    // binary_search_str
+    let sorted_words2 = sort_strings(words)
+    let idx_cherry = binary_search_str(sorted_words2, "cherry")
+    let idx_kiwi = binary_search_str(sorted_words2, "kiwi")
+    println(newline + "binary_search_str:")
+    println("  cherry -> index " + str(idx_cherry))
+    println("  kiwi   -> index " + str(idx_kiwi) + " (not found)")
+
+    // unique_ints
+    let dupes = [3, 1, 4, 1, 5, 9, 2, 6, 5, 3, 5]
+    let uniqs = unique_ints(dupes)
+    print(newline + "unique_ints: ")
+    var m = 0
+    while m < len(uniqs) {
+        print(str(uniqs[m]) + " ")
+        m = m + 1
+    }
+    println("")
+
+    // unique_strings
+    let dup_words = ["b", "a", "c", "a", "b", "d"]
+    let uniq_words = unique_strings(dup_words)
+    print("unique_strings: ")
+    var n2 = 0
+    while n2 < len(uniq_words) {
+        print(uniq_words[n2] + " ")
+        n2 = n2 + 1
+    }
+    println("")
+
+    // merge_sorted_ints
+    let ma = [1, 3, 5, 7, 9]
+    let mb = [2, 4, 6, 8, 10]
+    let merged = merge_sorted_ints(ma, mb)
+    print(newline + "merge_sorted_ints: ")
+    var p = 0
+    while p < len(merged) {
+        print(str(merged[p]) + " ")
+        p = p + 1
+    }
+    println("")
+
+    // topk_floats
+    let fvals = [1.1, 5.5, 3.3, 9.9, 2.2, 8.8, 4.4, 7.7, 6.6]
+    let topk = topk_floats(fvals, 3)
+    print(newline + "topk_floats (k=3): ")
+    var q = 0
+    while q < len(topk) {
+        print(str(topk[q]) + " ")
+        q = q + 1
+    }
+    println("")
+
+    // argsort_floats
+    let fsmall = [3.3, 1.1, 4.4, 2.2, 5.5]
+    let argsorted = argsort_floats(fsmall)
+    print(newline + "argsort_floats [3.3, 1.1, 4.4, 2.2, 5.5]: ")
+    var r = 0
+    while r < len(argsorted) {
+        print(str(argsorted[r]) + " ")
+        r = r + 1
+    }
+    println("")
+    println("(expected: 1 3 0 2 4)")
+
+    println(newline + "=== sort.vx done ===")
+}

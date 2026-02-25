@@ -1,0 +1,460 @@
+// std/string_native.vx — Native string operations for self-hosted Vortex
+// Pure Vortex implementations using only bootstrap string primitives:
+//   str_char_at, len, str_substr, str_bytes, str_from_bytes,
+//   str_is_ascii_alpha, str_is_ascii_digit, str_is_ascii_whitespace,
+//   str_find, unwrap_or, to_string, int, float, push
+
+// ─── String Builder ─────────────────────────────────────────────────────────
+
+fn sb_new() -> [String] {
+    let empty: [String] = []
+    return empty
+}
+
+fn sb_append(sb: [String], s: String) -> [String] {
+    return push(sb, s)
+}
+
+fn sb_to_string(sb: [String]) -> String {
+    var result = ""
+    var i = 0
+    let n = len(sb)
+    while i < n {
+        result = result + sb[i]
+        i = i + 1
+    }
+    return result
+}
+
+// ─── String Utilities ───────────────────────────────────────────────────────
+
+fn str_repeat(s: String, n: i64) -> String {
+    var result = ""
+    var i = 0
+    while i < n {
+        result = result + s
+        i = i + 1
+    }
+    return result
+}
+
+fn str_pad_left(s: String, width: i64, pad: String) -> String {
+    var result = s
+    while len(result) < width {
+        result = pad + result
+    }
+    return result
+}
+
+fn str_pad_right(s: String, width: i64, pad: String) -> String {
+    var result = s
+    while len(result) < width {
+        result = result + pad
+    }
+    return result
+}
+
+fn str_trim_left(s: String) -> String {
+    var i = 0
+    let n = len(s)
+    while i < n {
+        let ch = str_char_at(s, i)
+        if str_is_ascii_whitespace(ch) {
+            i = i + 1
+        } else {
+            break
+        }
+    }
+    return str_substr(s, i, n - i)
+}
+
+fn str_trim_right(s: String) -> String {
+    var j = len(s)
+    while j > 0 {
+        let ch = str_char_at(s, j - 1)
+        if str_is_ascii_whitespace(ch) {
+            j = j - 1
+        } else {
+            break
+        }
+    }
+    return str_substr(s, 0, j)
+}
+
+fn str_trim(s: String) -> String {
+    return str_trim_right(str_trim_left(s))
+}
+
+fn str_starts_with(s: String, prefix: String) -> bool {
+    if len(prefix) > len(s) { return false }
+    return str_substr(s, 0, len(prefix)) == prefix
+}
+
+fn str_ends_with(s: String, suffix: String) -> bool {
+    if len(suffix) > len(s) { return false }
+    let start = len(s) - len(suffix)
+    return str_substr(s, start, len(suffix)) == suffix
+}
+
+fn str_contains(s: String, needle: String) -> bool {
+    let idx = unwrap_or(str_find(s, needle), -1)
+    return idx >= 0
+}
+
+fn str_index_of(s: String, needle: String) -> i64 {
+    return unwrap_or(str_find(s, needle), -1)
+}
+
+fn str_replace(s: String, old: String, new_str: String) -> String {
+    if len(old) == 0 { return s }
+    let idx = unwrap_or(str_find(s, old), -1)
+    if idx < 0 { return s }
+    let before = str_substr(s, 0, idx)
+    let after_start = idx + len(old)
+    let after = str_substr(s, after_start, len(s) - after_start)
+    return before + new_str + after
+}
+
+fn str_replace_all(s: String, old: String, new_str: String) -> String {
+    if len(old) == 0 { return s }
+    var result = ""
+    var rest = s
+    let olen = len(old)
+    while true {
+        let idx = unwrap_or(str_find(rest, old), -1)
+        if idx < 0 {
+            result = result + rest
+            break
+        }
+        result = result + str_substr(rest, 0, idx) + new_str
+        rest = str_substr(rest, idx + olen, len(rest) - idx - olen)
+    }
+    return result
+}
+
+fn str_split(s: String, delimiter: String) -> [String] {
+    var parts: [String] = []
+    var rest = s
+    let dlen = len(delimiter)
+    while true {
+        let idx = unwrap_or(str_find(rest, delimiter), -1)
+        if idx < 0 {
+            parts = push(parts, rest)
+            break
+        }
+        parts = push(parts, str_substr(rest, 0, idx))
+        rest = str_substr(rest, idx + dlen, len(rest) - idx - dlen)
+    }
+    return parts
+}
+
+fn str_join(parts: [String], sep: String) -> String {
+    var result = ""
+    var i = 0
+    let n = len(parts)
+    while i < n {
+        if i > 0 {
+            result = result + sep
+        }
+        result = result + parts[i]
+        i = i + 1
+    }
+    return result
+}
+
+fn str_to_upper(s: String) -> String {
+    let bytes = str_bytes(s)
+    var result: [i64] = []
+    var i = 0
+    let n = len(bytes)
+    while i < n {
+        let b = bytes[i]
+        if b >= 97 && b <= 122 {
+            result = push(result, b - 32)
+        } else {
+            result = push(result, b)
+        }
+        i = i + 1
+    }
+    return str_from_bytes(result)
+}
+
+fn str_to_lower(s: String) -> String {
+    let bytes = str_bytes(s)
+    var result: [i64] = []
+    var i = 0
+    let n = len(bytes)
+    while i < n {
+        let b = bytes[i]
+        if b >= 65 && b <= 90 {
+            result = push(result, b + 32)
+        } else {
+            result = push(result, b)
+        }
+        i = i + 1
+    }
+    return str_from_bytes(result)
+}
+
+fn str_reverse(s: String) -> String {
+    let bytes = str_bytes(s)
+    var result: [i64] = []
+    var i = len(bytes) - 1
+    while i >= 0 {
+        result = push(result, bytes[i])
+        i = i - 1
+    }
+    return str_from_bytes(result)
+}
+
+// ─── Number Formatting ──────────────────────────────────────────────────────
+
+fn format_int(n: i64, base: i64) -> String {
+    if n == 0 { return "0" }
+    let digits = "0123456789abcdef"
+    var is_neg = false
+    var val = n
+    if val < 0 {
+        is_neg = true
+        val = 0 - val
+    }
+    var chars: [String] = []
+    while val > 0 {
+        let remainder = val % base
+        chars = push(chars, str_char_at(digits, remainder))
+        val = val / base
+    }
+    // reverse
+    var result = ""
+    var i = len(chars) - 1
+    while i >= 0 {
+        result = result + chars[i]
+        i = i - 1
+    }
+    if is_neg {
+        result = "-" + result
+    }
+    return result
+}
+
+fn int_to_hex(n: i64) -> String {
+    if n == 0 { return "0x0" }
+    return "0x" + format_int(n, 16)
+}
+
+fn int_to_binary(n: i64) -> String {
+    if n == 0 { return "0b0" }
+    return "0b" + format_int(n, 2)
+}
+
+// ─── Parsing ────────────────────────────────────────────────────────────────
+
+fn parse_int(s: String) -> i64 {
+    return int(s)
+}
+
+fn parse_float(s: String) -> f64 {
+    return float(s)
+}
+
+fn is_numeric(s: String) -> bool {
+    if len(s) == 0 { return false }
+    var i = 0
+    let n = len(s)
+    while i < n {
+        let ch = str_char_at(s, i)
+        if !str_is_ascii_digit(ch) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+fn is_alpha(s: String) -> bool {
+    if len(s) == 0 { return false }
+    var i = 0
+    let n = len(s)
+    while i < n {
+        let ch = str_char_at(s, i)
+        if !str_is_ascii_alpha(ch) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+fn is_alphanumeric(s: String) -> bool {
+    if len(s) == 0 { return false }
+    var i = 0
+    let n = len(s)
+    while i < n {
+        let ch = str_char_at(s, i)
+        if !str_is_ascii_alpha(ch) && !str_is_ascii_digit(ch) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+// ─── Tests ──────────────────────────────────────────────────────────────────
+
+fn assert_eq_str(label: String, got: String, expected: String) {
+    if got == expected {
+        println("PASS: " + label)
+    } else {
+        println("FAIL: " + label + " | expected [" + expected + "] got [" + got + "]")
+    }
+}
+
+fn assert_eq_int(label: String, got: i64, expected: i64) {
+    if got == expected {
+        println("PASS: " + label)
+    } else {
+        println("FAIL: " + label + " | expected " + to_string(expected) + " got " + to_string(got))
+    }
+}
+
+fn assert_eq_bool(label: String, got: bool, expected: bool) {
+    if got == expected {
+        println("PASS: " + label)
+    } else {
+        println("FAIL: " + label + " | expected " + to_string(expected) + " got " + to_string(got))
+    }
+}
+
+fn main() {
+    var pass_count = 0
+    var fail_count = 0
+
+    // ── String Builder ──
+    println("=== String Builder ===")
+    let sb0 = sb_new()
+    assert_eq_int("sb_new length", len(sb0), 0)
+    let sb1 = sb_append(sb_append(sb_append(sb0, "hello"), " "), "world")
+    assert_eq_str("sb_to_string", sb_to_string(sb1), "hello world")
+
+    // ── str_repeat ──
+    println("=== str_repeat ===")
+    assert_eq_str("repeat ab*3", str_repeat("ab", 3), "ababab")
+    assert_eq_str("repeat x*0", str_repeat("x", 0), "")
+    assert_eq_str("repeat empty*5", str_repeat("", 5), "")
+
+    // ── str_pad_left / str_pad_right ──
+    println("=== str_pad ===")
+    assert_eq_str("pad_left 42", str_pad_left("42", 6, "0"), "000042")
+    assert_eq_str("pad_left already wide", str_pad_left("abcdef", 4, "0"), "abcdef")
+    assert_eq_str("pad_right hi", str_pad_right("hi", 6, "."), "hi....")
+    assert_eq_str("pad_right already wide", str_pad_right("abcdef", 4, "."), "abcdef")
+
+    // ── str_trim ──
+    println("=== str_trim ===")
+    assert_eq_str("trim both", str_trim("  hello  "), "hello")
+    assert_eq_str("trim_left", str_trim_left("  hello  "), "hello  ")
+    assert_eq_str("trim_right", str_trim_right("  hello  "), "  hello")
+    assert_eq_str("trim empty", str_trim(""), "")
+    assert_eq_str("trim all spaces", str_trim("   "), "")
+
+    // ── str_starts_with / str_ends_with ──
+    println("=== starts_with / ends_with ===")
+    assert_eq_bool("starts_with hello", str_starts_with("hello world", "hello"), true)
+    assert_eq_bool("starts_with world", str_starts_with("hello world", "world"), false)
+    assert_eq_bool("ends_with world", str_ends_with("hello world", "world"), true)
+    assert_eq_bool("ends_with hello", str_ends_with("hello world", "hello"), false)
+    assert_eq_bool("starts_with empty", str_starts_with("hello", ""), true)
+    assert_eq_bool("ends_with empty", str_ends_with("hello", ""), true)
+
+    // ── str_contains ──
+    println("=== str_contains ===")
+    assert_eq_bool("contains lo wo", str_contains("hello world", "lo wo"), true)
+    assert_eq_bool("contains xyz", str_contains("hello world", "xyz"), false)
+    assert_eq_bool("contains empty", str_contains("hello", ""), true)
+
+    // ── str_index_of ──
+    println("=== str_index_of ===")
+    assert_eq_int("index_of world", str_index_of("hello world", "world"), 6)
+    assert_eq_int("index_of xyz", str_index_of("hello world", "xyz"), -1)
+    assert_eq_int("index_of empty", str_index_of("hello", ""), 0)
+
+    // ── str_replace ──
+    println("=== str_replace ===")
+    assert_eq_str("replace first foo", str_replace("foo bar foo", "foo", "baz"), "baz bar foo")
+    assert_eq_str("replace not found", str_replace("hello", "xyz", "abc"), "hello")
+
+    // ── str_replace_all ──
+    println("=== str_replace_all ===")
+    assert_eq_str("replace_all foo", str_replace_all("foo bar foo", "foo", "baz"), "baz bar baz")
+    assert_eq_str("replace_all not found", str_replace_all("hello", "xyz", "abc"), "hello")
+    assert_eq_str("replace_all adjacent", str_replace_all("aaa", "a", "bb"), "bbbbbb")
+
+    // ── str_split ──
+    println("=== str_split ===")
+    let parts = str_split("a,b,c,d", ",")
+    assert_eq_int("split count", len(parts), 4)
+    assert_eq_str("split[0]", parts[0], "a")
+    assert_eq_str("split[1]", parts[1], "b")
+    assert_eq_str("split[3]", parts[3], "d")
+    let parts2 = str_split("hello", ",")
+    assert_eq_int("split no delim", len(parts2), 1)
+    assert_eq_str("split no delim[0]", parts2[0], "hello")
+
+    // ── str_join ──
+    println("=== str_join ===")
+    assert_eq_str("join comma", str_join(["one", "two", "three"], ", "), "one, two, three")
+    assert_eq_str("join empty sep", str_join(["a", "b", "c"], ""), "abc")
+    let empty_arr: [String] = []
+    assert_eq_str("join empty arr", str_join(empty_arr, ","), "")
+
+    // ── str_to_upper / str_to_lower ──
+    println("=== to_upper / to_lower ===")
+    assert_eq_str("to_upper", str_to_upper("hello World"), "HELLO WORLD")
+    assert_eq_str("to_lower", str_to_lower("Hello WORLD"), "hello world")
+    assert_eq_str("to_upper empty", str_to_upper(""), "")
+    assert_eq_str("to_lower nums", str_to_lower("ABC123"), "abc123")
+
+    // ── str_reverse ──
+    println("=== str_reverse ===")
+    assert_eq_str("reverse hello", str_reverse("hello"), "olleh")
+    assert_eq_str("reverse empty", str_reverse(""), "")
+    assert_eq_str("reverse single", str_reverse("x"), "x")
+    assert_eq_str("reverse palindrome", str_reverse("racecar"), "racecar")
+
+    // ── Number Formatting ──
+    println("=== Number Formatting ===")
+    assert_eq_str("int_to_hex 255", int_to_hex(255), "0xff")
+    assert_eq_str("int_to_hex 0", int_to_hex(0), "0x0")
+    assert_eq_str("int_to_hex 16", int_to_hex(16), "0x10")
+    assert_eq_str("int_to_binary 10", int_to_binary(10), "0b1010")
+    assert_eq_str("int_to_binary 0", int_to_binary(0), "0b0")
+    assert_eq_str("format_int 42 base10", format_int(42, 10), "42")
+    assert_eq_str("format_int 8 base8", format_int(8, 8), "10")
+    assert_eq_str("format_int neg", format_int(-42, 10), "-42")
+
+    // ── Parsing ──
+    println("=== Parsing ===")
+    assert_eq_int("parse_int 42", parse_int("42"), 42)
+    assert_eq_int("parse_int neg", parse_int("-7"), -7)
+    // parse_float tested via comparison
+    let f = parse_float("3.14")
+    if f > 3.13 && f < 3.15 {
+        println("PASS: parse_float 3.14")
+    } else {
+        println("FAIL: parse_float 3.14")
+    }
+
+    // ── is_numeric / is_alpha / is_alphanumeric ──
+    println("=== Character Classification ===")
+    assert_eq_bool("is_numeric 123", is_numeric("123"), true)
+    assert_eq_bool("is_numeric 12a", is_numeric("12a"), false)
+    assert_eq_bool("is_numeric empty", is_numeric(""), false)
+    assert_eq_bool("is_alpha hello", is_alpha("hello"), true)
+    assert_eq_bool("is_alpha h3llo", is_alpha("h3llo"), false)
+    assert_eq_bool("is_alpha empty", is_alpha(""), false)
+    assert_eq_bool("is_alphanumeric abc123", is_alphanumeric("abc123"), true)
+    assert_eq_bool("is_alphanumeric abc!", is_alphanumeric("abc!"), false)
+    assert_eq_bool("is_alphanumeric empty", is_alphanumeric(""), false)
+
+    println("=== All tests complete ===")
+}

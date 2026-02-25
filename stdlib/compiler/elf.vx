@@ -1,0 +1,391 @@
+// Vortex ELF64 Binary Emitter
+// Generates valid Linux ELF64 executables from raw x86-64 machine code.
+// Pure Vortex — no Rust, no external tools.
+//
+// Usage:
+//   var code = make_exit_program(42)
+//   write_elf("/tmp/my_program", code)
+//   // then run: /tmp/my_program; echo $?
+
+// ============================================================
+// Constants
+// ============================================================
+
+fn elf_base_addr() -> i64 { return 4194304 }       // 0x400000
+fn elf_header_size() -> i64 { return 64 }
+fn phdr_size() -> i64 { return 56 }
+fn total_header_size() -> i64 { return 120 }        // 64 + 56
+fn entry_point_default() -> i64 { return 4194424 }  // 0x400078 = 0x400000 + 120
+
+// Syscall numbers
+fn sys_write() -> i64 { return 1 }
+fn sys_open() -> i64 { return 2 }
+fn sys_close() -> i64 { return 3 }
+
+// open flags: O_WRONLY | O_CREAT | O_TRUNC = 1 | 64 | 512 = 577
+fn open_flags() -> i64 { return 577 }
+// mode 0o755 = 493
+fn open_mode() -> i64 { return 493 }
+
+// ============================================================
+// Byte Helpers
+// ============================================================
+
+// Push one byte (masked to 0-255) onto the buffer
+fn emit_byte(buf: [i64], b: i64) -> [i64] {
+    let masked = b % 256
+    var val = masked
+    if val < 0 {
+        val = val + 256
+    }
+    buf = push(buf, val)
+    return buf
+}
+
+// Emit a 16-bit value in little-endian order
+fn emit_u16_le(buf: [i64], val: i64) -> [i64] {
+    buf = emit_byte(buf, val % 256)
+    buf = emit_byte(buf, (val / 256) % 256)
+    return buf
+}
+
+// Emit a 32-bit value in little-endian order
+fn emit_u32_le(buf: [i64], val: i64) -> [i64] {
+    buf = emit_byte(buf, val % 256)
+    buf = emit_byte(buf, (val / 256) % 256)
+    buf = emit_byte(buf, (val / 65536) % 256)
+    buf = emit_byte(buf, (val / 16777216) % 256)
+    return buf
+}
+
+// Emit a 64-bit value in little-endian order
+fn emit_u64_le(buf: [i64], val: i64) -> [i64] {
+    buf = emit_byte(buf, val % 256)
+    buf = emit_byte(buf, (val / 256) % 256)
+    buf = emit_byte(buf, (val / 65536) % 256)
+    buf = emit_byte(buf, (val / 16777216) % 256)
+    buf = emit_byte(buf, (val / 4294967296) % 256)
+    buf = emit_byte(buf, (val / 1099511627776) % 256)
+    buf = emit_byte(buf, (val / 281474976710656) % 256)
+    buf = emit_byte(buf, (val / 72057594037927936) % 256)
+    return buf
+}
+
+// Emit N zero bytes
+fn emit_zeros(buf: [i64], n: i64) -> [i64] {
+    var i = 0
+    while i < n {
+        buf = emit_byte(buf, 0)
+        i = i + 1
+    }
+    return buf
+}
+
+// ============================================================
+// ELF Header (64 bytes)
+// ============================================================
+
+fn elf_header(entry_point: i64, phoff: i64) -> [i64] {
+    var buf = []
+
+    // e_ident: magic number
+    buf = emit_byte(buf, 127)   // 0x7F
+    buf = emit_byte(buf, 69)    // 'E'
+    buf = emit_byte(buf, 76)    // 'L'
+    buf = emit_byte(buf, 70)    // 'F'
+
+    // EI_CLASS = 2 (64-bit)
+    buf = emit_byte(buf, 2)
+    // EI_DATA = 1 (little-endian)
+    buf = emit_byte(buf, 1)
+    // EI_VERSION = 1
+    buf = emit_byte(buf, 1)
+    // EI_OSABI = 0 (System V)
+    buf = emit_byte(buf, 0)
+    // EI_ABIVERSION + 7 bytes padding = 8 zero bytes
+    buf = emit_zeros(buf, 8)
+
+    // e_type = 2 (ET_EXEC)
+    buf = emit_u16_le(buf, 2)
+    // e_machine = 0x3E (x86-64)
+    buf = emit_u16_le(buf, 62)
+    // e_version = 1
+    buf = emit_u32_le(buf, 1)
+    // e_entry (8 bytes)
+    buf = emit_u64_le(buf, entry_point)
+    // e_phoff (8 bytes) — program header offset
+    buf = emit_u64_le(buf, phoff)
+    // e_shoff (8 bytes) — no section headers
+    buf = emit_u64_le(buf, 0)
+    // e_flags (4 bytes)
+    buf = emit_u32_le(buf, 0)
+    // e_ehsize (2 bytes)
+    buf = emit_u16_le(buf, 64)
+    // e_phentsize (2 bytes)
+    buf = emit_u16_le(buf, 56)
+    // e_phnum (2 bytes)
+    buf = emit_u16_le(buf, 1)
+    // e_shentsize (2 bytes)
+    buf = emit_u16_le(buf, 0)
+    // e_shnum (2 bytes)
+    buf = emit_u16_le(buf, 0)
+    // e_shstrndx (2 bytes)
+    buf = emit_u16_le(buf, 0)
+
+    return buf
+}
+
+// ============================================================
+// Program Header (56 bytes) — single PT_LOAD segment
+// ============================================================
+
+fn program_header(total_size: i64) -> [i64] {
+    var buf = []
+
+    // p_type = 1 (PT_LOAD)
+    buf = emit_u32_le(buf, 1)
+    // p_flags = 5 (PF_R | PF_X)
+    buf = emit_u32_le(buf, 5)
+    // p_offset = 0
+    buf = emit_u64_le(buf, 0)
+    // p_vaddr = 0x400000
+    buf = emit_u64_le(buf, elf_base_addr())
+    // p_paddr = 0x400000
+    buf = emit_u64_le(buf, elf_base_addr())
+    // p_filesz = total_size
+    buf = emit_u64_le(buf, total_size)
+    // p_memsz = total_size
+    buf = emit_u64_le(buf, total_size)
+    // p_align = 0x1000
+    buf = emit_u64_le(buf, 4096)
+
+    return buf
+}
+
+// ============================================================
+// Combine ELF header + program header + machine code
+// ============================================================
+
+fn make_elf(code: [i64]) -> [i64] {
+    let code_len = len(code)
+    let total_size = total_header_size() + code_len
+    let entry = elf_base_addr() + total_header_size()
+
+    var elf = elf_header(entry, elf_header_size())
+    let phdr = program_header(total_size)
+
+    // Append program header
+    var i = 0
+    while i < len(phdr) {
+        elf = push(elf, phdr[i])
+        i = i + 1
+    }
+
+    // Append machine code
+    i = 0
+    while i < code_len {
+        elf = push(elf, code[i])
+        i = i + 1
+    }
+
+    return elf
+}
+
+// ============================================================
+// File writing via syscalls
+// ============================================================
+
+fn write_elf(filename: String, code: [i64]) -> i64 {
+    let elf = make_elf(code)
+    let total_size = len(elf)
+
+    // Convert filename to bytes and write to memory for syscall
+    let name_bytes = str_bytes(filename)
+    let name_len = len(name_bytes)
+    // Need null-terminated string for open syscall
+    let name_buf = mem_alloc(name_len + 1)
+    var i = 0
+    while i < name_len {
+        mem_write_u8(name_buf, i, name_bytes[i])
+        i = i + 1
+    }
+    mem_write_u8(name_buf, name_len, 0)
+
+    // Open file: syscall3(SYS_OPEN, path_ptr, flags, mode)
+    let fd = syscall3(sys_open(), ptr_to_int(name_buf), open_flags(), open_mode())
+    mem_free(name_buf)
+
+    if fd < 0 {
+        println("Error: could not open file " + filename + " (fd=" + to_string(fd) + ")")
+        return fd
+    }
+
+    // Allocate buffer and write ELF bytes
+    let data_buf = mem_alloc(total_size)
+    i = 0
+    while i < total_size {
+        mem_write_u8(data_buf, i, elf[i])
+        i = i + 1
+    }
+
+    // Write: syscall3(SYS_WRITE, fd, buf_ptr, size)
+    let written = syscall3(sys_write(), fd, ptr_to_int(data_buf), total_size)
+
+    // Close: syscall1(SYS_CLOSE, fd)
+    syscall1(sys_close(), fd)
+
+    // Free buffer
+    mem_free(data_buf)
+
+    return written
+}
+
+// ============================================================
+// Machine Code Generators
+// ============================================================
+
+// Generate a minimal program that calls exit(N).
+// x86-64 instructions:
+//   48 C7 C7 <N as 4 bytes LE>   mov rdi, N
+//   48 C7 C0 3C 00 00 00         mov rax, 60 (SYS_EXIT)
+//   0F 05                         syscall
+fn make_exit_program(exit_code: i64) -> [i64] {
+    var code = []
+
+    // mov rdi, exit_code  (48 C7 C7 xx xx xx xx)
+    code = emit_byte(code, 72)    // 0x48
+    code = emit_byte(code, 199)   // 0xC7
+    code = emit_byte(code, 199)   // 0xC7
+    code = emit_u32_le(code, exit_code)
+
+    // mov rax, 60  (48 C7 C0 3C 00 00 00)
+    code = emit_byte(code, 72)    // 0x48
+    code = emit_byte(code, 199)   // 0xC7
+    code = emit_byte(code, 192)   // 0xC0
+    code = emit_u32_le(code, 60)
+
+    // syscall  (0F 05)
+    code = emit_byte(code, 15)    // 0x0F
+    code = emit_byte(code, 5)     // 0x05
+
+    return code
+}
+
+// Generate a program that writes "Hello from Vortex!\n" to stdout, then exits.
+// Strategy: code runs first, data (the message) is placed after the exit syscall.
+// We compute the absolute address of the message as entry_point + offset.
+//
+// Layout of the code:
+//   [0..6]   mov rax, 1           ; SYS_WRITE     (7 bytes: 48 C7 C0 01 00 00 00)
+//   [7..13]  mov rdi, 1           ; stdout fd      (7 bytes: 48 C7 C7 01 00 00 00)
+//   [14..23] mov rsi, msg_addr    ; message ptr    (10 bytes: 48 BE <8 bytes>)
+//   [24..30] mov rdx, 19          ; message len    (7 bytes: 48 C7 C2 13 00 00 00)
+//   [31..32] syscall                               (2 bytes: 0F 05)
+//   [33..39] mov rax, 60          ; SYS_EXIT       (7 bytes: 48 C7 C0 3C 00 00 00)
+//   [40..46] mov rdi, 0           ; exit code 0    (7 bytes: 48 C7 C7 00 00 00 00)
+//   [47..48] syscall                               (2 bytes: 0F 05)
+//   [49..67] "Hello from Vortex!\n"               (19 bytes)
+//
+// Total code: 68 bytes
+// Message at code offset 49, absolute address = entry_point + 49
+
+fn make_hello_program() -> [i64] {
+    var code = []
+    let entry = entry_point_default()
+    let msg_offset = 49
+    let msg_addr = entry + msg_offset
+    let msg_len = 19
+
+    // mov rax, 1  (SYS_WRITE)
+    code = emit_byte(code, 72)    // 0x48
+    code = emit_byte(code, 199)   // 0xC7
+    code = emit_byte(code, 192)   // 0xC0
+    code = emit_u32_le(code, 1)
+
+    // mov rdi, 1  (stdout)
+    code = emit_byte(code, 72)    // 0x48
+    code = emit_byte(code, 199)   // 0xC7
+    code = emit_byte(code, 199)   // 0xC7
+    code = emit_u32_le(code, 1)
+
+    // movabs rsi, msg_addr  (48 BE <8 bytes LE>)
+    code = emit_byte(code, 72)    // 0x48
+    code = emit_byte(code, 190)   // 0xBE
+    code = emit_u64_le(code, msg_addr)
+
+    // mov rdx, 19  (message length)
+    code = emit_byte(code, 72)    // 0x48
+    code = emit_byte(code, 199)   // 0xC7
+    code = emit_byte(code, 194)   // 0xC2
+    code = emit_u32_le(code, msg_len)
+
+    // syscall
+    code = emit_byte(code, 15)    // 0x0F
+    code = emit_byte(code, 5)     // 0x05
+
+    // mov rax, 60  (SYS_EXIT)
+    code = emit_byte(code, 72)    // 0x48
+    code = emit_byte(code, 199)   // 0xC7
+    code = emit_byte(code, 192)   // 0xC0
+    code = emit_u32_le(code, 60)
+
+    // mov rdi, 0  (exit code 0)
+    code = emit_byte(code, 72)    // 0x48
+    code = emit_byte(code, 199)   // 0xC7
+    code = emit_byte(code, 199)   // 0xC7
+    code = emit_u32_le(code, 0)
+
+    // syscall
+    code = emit_byte(code, 15)    // 0x0F
+    code = emit_byte(code, 5)     // 0x05
+
+    // Message data: "Hello from Vortex!\n"
+    // H=72 e=101 l=108 l=108 o=111 ' '=32 f=102 r=114 o=111 m=109
+    // ' '=32 V=86 o=111 r=114 t=116 e=101 x=120 !=33 \n=10
+    code = emit_byte(code, 72)    // H
+    code = emit_byte(code, 101)   // e
+    code = emit_byte(code, 108)   // l
+    code = emit_byte(code, 108)   // l
+    code = emit_byte(code, 111)   // o
+    code = emit_byte(code, 32)    // ' '
+    code = emit_byte(code, 102)   // f
+    code = emit_byte(code, 114)   // r
+    code = emit_byte(code, 111)   // o
+    code = emit_byte(code, 109)   // m
+    code = emit_byte(code, 32)    // ' '
+    code = emit_byte(code, 86)    // V
+    code = emit_byte(code, 111)   // o
+    code = emit_byte(code, 114)   // r
+    code = emit_byte(code, 116)   // t
+    code = emit_byte(code, 101)   // e
+    code = emit_byte(code, 120)   // x
+    code = emit_byte(code, 33)    // !
+    code = emit_byte(code, 10)    // \n
+
+    return code
+}
+
+// ============================================================
+// Main — generate test binaries
+// ============================================================
+
+fn main() {
+    // Test 1: Generate minimal exit(42) program
+    var code = make_exit_program(42)
+    var elf = make_elf(code)
+    println("ELF size: " + to_string(len(elf)) + " bytes")
+    println("Code size: " + to_string(len(code)) + " bytes")
+
+    // Write to /tmp/test_vortex_exit
+    write_elf("/tmp/test_vortex_exit", code)
+    println("Written /tmp/test_vortex_exit")
+
+    // Test 2: Generate hello world program
+    var hello_code = make_hello_program()
+    write_elf("/tmp/test_vortex_hello", hello_code)
+    println("Written /tmp/test_vortex_hello")
+
+    println("Run with:")
+    println("  /tmp/test_vortex_exit; echo $?   # should print 42")
+    println("  /tmp/test_vortex_hello            # should print Hello from Vortex!")
+}

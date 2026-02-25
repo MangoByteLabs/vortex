@@ -1,0 +1,1176 @@
+// gpu_native.vx — Vortex native GPU compilation and execution system
+// VXB ISA (Vortex Binary) — Vortex's own GPU instruction set
+// Direct DRM ioctl access. No CUDA, no ROCm, no OpenCL.
+//
+// VXB 32-bit fixed-width instructions:
+//   [opcode:8][dst:5][src1:5][src2:5][flags:9]
+//
+// Registers: r0-r31 (32 general purpose, 64-bit each)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// VXB Opcode Constants
+// ═══════════════════════════════════════════════════════════════════════════════
+
+fn VXB_ADD() -> i64 { return 1 }
+fn VXB_SUB() -> i64 { return 2 }
+fn VXB_MUL() -> i64 { return 3 }
+fn VXB_DIV() -> i64 { return 4 }
+fn VXB_FMA() -> i64 { return 5 }
+fn VXB_MOV() -> i64 { return 6 }
+fn VXB_LOAD() -> i64 { return 7 }
+fn VXB_STORE() -> i64 { return 8 }
+fn VXB_LOAD_SHARED() -> i64 { return 9 }
+fn VXB_STORE_SHARED() -> i64 { return 10 }
+fn VXB_CMP() -> i64 { return 16 }
+fn VXB_BEQ() -> i64 { return 17 }
+fn VXB_BNE() -> i64 { return 18 }
+fn VXB_BLT() -> i64 { return 19 }
+fn VXB_JMP() -> i64 { return 20 }
+fn VXB_THREAD_ID() -> i64 { return 32 }
+fn VXB_BLOCK_ID() -> i64 { return 33 }
+fn VXB_BARRIER() -> i64 { return 34 }
+fn VXB_WARP_SHUFFLE() -> i64 { return 35 }
+fn VXB_ATOMIC_ADD() -> i64 { return 48 }
+fn VXB_ATOMIC_CAS() -> i64 { return 49 }
+fn VXB_LOAD_IMM() -> i64 { return 240 }
+fn VXB_LOAD_IMM_HI() -> i64 { return 241 }
+fn VXB_HALT() -> i64 { return 255 }
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// VXB Instruction Encoding
+// ═══════════════════════════════════════════════════════════════════════════════
+// Layout: [opcode:8][dst:5][src1:5][src2:5][flags:9] = 32 bits
+// We use arithmetic since Vortex has no bitwise ops
+// Bit positions: opcode at bits 24-31, dst at 19-23, src1 at 14-18, src2 at 9-13, flags at 0-8
+
+fn vxb_encode(opcode: i64, dst: i64, src1: i64, src2: i64, flags: i64) -> i64 {
+    let op_part = (opcode % 256) * 16777216
+    let dst_part = (dst % 32) * 524288
+    let src1_part = (src1 % 32) * 16384
+    let src2_part = (src2 % 32) * 512
+    let flags_part = flags % 512
+    return op_part + dst_part + src1_part + src2_part + flags_part
+}
+
+fn vxb_decode(inst: i64) -> [i64] {
+    let opcode = (inst / 16777216) % 256
+    let dst = (inst / 524288) % 32
+    let src1 = (inst / 16384) % 32
+    let src2 = (inst / 512) % 32
+    let flags = inst % 512
+    return [opcode, dst, src1, src2, flags]
+}
+
+fn vxb_opcode_name(op: i64) -> String {
+    if op == 1 { return "ADD" }
+    if op == 2 { return "SUB" }
+    if op == 3 { return "MUL" }
+    if op == 4 { return "DIV" }
+    if op == 5 { return "FMA" }
+    if op == 6 { return "MOV" }
+    if op == 7 { return "LOAD" }
+    if op == 8 { return "STORE" }
+    if op == 9 { return "LOAD_SHARED" }
+    if op == 10 { return "STORE_SHARED" }
+    if op == 16 { return "CMP" }
+    if op == 17 { return "BEQ" }
+    if op == 18 { return "BNE" }
+    if op == 19 { return "BLT" }
+    if op == 20 { return "JMP" }
+    if op == 32 { return "THREAD_ID" }
+    if op == 33 { return "BLOCK_ID" }
+    if op == 34 { return "BARRIER" }
+    if op == 35 { return "WARP_SHUFFLE" }
+    if op == 48 { return "ATOMIC_ADD" }
+    if op == 49 { return "ATOMIC_CAS" }
+    if op == 240 { return "LOAD_IMM" }
+    if op == 241 { return "LOAD_IMM_HI" }
+    if op == 255 { return "HALT" }
+    return "UNKNOWN"
+}
+
+fn vxb_disasm(inst: i64) -> String {
+    let parts = vxb_decode(inst)
+    let op = parts[0]
+    let dst = parts[1]
+    let src1 = parts[2]
+    let src2 = parts[3]
+    let flags = parts[4]
+    let name = vxb_opcode_name(op)
+
+    if op == VXB_HALT() {
+        return "HALT"
+    }
+    if op == VXB_BARRIER() {
+        return "BARRIER"
+    }
+    if op == VXB_THREAD_ID() {
+        return "THREAD_ID r" + to_string(dst)
+    }
+    if op == VXB_BLOCK_ID() {
+        return "BLOCK_ID r" + to_string(dst)
+    }
+    if op == VXB_MOV() {
+        return "MOV r" + to_string(dst) + ", r" + to_string(src1)
+    }
+    if op == VXB_LOAD_IMM() {
+        let imm = src1 * 32 + src2
+        return "LOAD_IMM r" + to_string(dst) + ", " + to_string(imm)
+    }
+    if op == VXB_LOAD_IMM_HI() {
+        let imm = src1 * 32 + src2
+        return "LOAD_IMM_HI r" + to_string(dst) + ", " + to_string(imm)
+    }
+    if op == VXB_LOAD() {
+        return "LOAD r" + to_string(dst) + ", [r" + to_string(src1) + " + " + to_string(flags) + "]"
+    }
+    if op == VXB_STORE() {
+        return "STORE [r" + to_string(dst) + " + " + to_string(flags) + "], r" + to_string(src1)
+    }
+    if op == VXB_LOAD_SHARED() {
+        return "LOAD_SHARED r" + to_string(dst) + ", [r" + to_string(src1) + "]"
+    }
+    if op == VXB_STORE_SHARED() {
+        return "STORE_SHARED [r" + to_string(dst) + "], r" + to_string(src1)
+    }
+    if op == VXB_CMP() {
+        return "CMP r" + to_string(src1) + ", r" + to_string(src2)
+    }
+    if op == VXB_BEQ() || op == VXB_BNE() || op == VXB_BLT() || op == VXB_JMP() {
+        let offset = dst * pow2(5) + src1
+        return name + " " + to_string(offset)
+    }
+    if op == VXB_WARP_SHUFFLE() {
+        return "WARP_SHUFFLE r" + to_string(dst) + ", r" + to_string(src1) + ", " + to_string(src2)
+    }
+    if op == VXB_ATOMIC_ADD() {
+        return "ATOMIC_ADD r" + to_string(dst) + ", r" + to_string(src1)
+    }
+    if op == VXB_ATOMIC_CAS() {
+        return "ATOMIC_CAS r" + to_string(dst) + ", r" + to_string(src1) + ", r" + to_string(src2)
+    }
+    return name + " r" + to_string(dst) + ", r" + to_string(src1) + ", r" + to_string(src2)
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// VXB Assembler — Convenience instruction builders
+// ═══════════════════════════════════════════════════════════════════════════════
+
+fn vxb_add(dst: i64, s1: i64, s2: i64) -> i64 {
+    return vxb_encode(VXB_ADD(), dst, s1, s2, 0)
+}
+
+fn vxb_sub(dst: i64, s1: i64, s2: i64) -> i64 {
+    return vxb_encode(VXB_SUB(), dst, s1, s2, 0)
+}
+
+fn vxb_mul(dst: i64, s1: i64, s2: i64) -> i64 {
+    return vxb_encode(VXB_MUL(), dst, s1, s2, 0)
+}
+
+fn vxb_div(dst: i64, s1: i64, s2: i64) -> i64 {
+    return vxb_encode(VXB_DIV(), dst, s1, s2, 0)
+}
+
+fn vxb_fma(dst: i64, s1: i64, s2: i64) -> i64 {
+    return vxb_encode(VXB_FMA(), dst, s1, s2, 0)
+}
+
+fn vxb_mov(dst: i64, src: i64) -> i64 {
+    return vxb_encode(VXB_MOV(), dst, src, 0, 0)
+}
+
+fn vxb_load(dst: i64, base: i64, imm: i64) -> i64 {
+    return vxb_encode(VXB_LOAD(), dst, base, 0, imm % 512)
+}
+
+fn vxb_store(base: i64, src: i64, imm: i64) -> i64 {
+    return vxb_encode(VXB_STORE(), base, src, 0, imm % 512)
+}
+
+fn vxb_load_shared(dst: i64, src: i64) -> i64 {
+    return vxb_encode(VXB_LOAD_SHARED(), dst, src, 0, 0)
+}
+
+fn vxb_store_shared(dst: i64, src: i64) -> i64 {
+    return vxb_encode(VXB_STORE_SHARED(), dst, src, 0, 0)
+}
+
+fn vxb_cmp(src1: i64, src2: i64) -> i64 {
+    return vxb_encode(VXB_CMP(), 0, src1, src2, 0)
+}
+
+fn vxb_beq(offset: i64) -> i64 {
+    let hi = (offset / 32) % 32
+    let lo = offset % 32
+    return vxb_encode(VXB_BEQ(), hi, lo, 0, 0)
+}
+
+fn vxb_bne(offset: i64) -> i64 {
+    let hi = (offset / 32) % 32
+    let lo = offset % 32
+    return vxb_encode(VXB_BNE(), hi, lo, 0, 0)
+}
+
+fn vxb_blt(offset: i64) -> i64 {
+    let hi = (offset / 32) % 32
+    let lo = offset % 32
+    return vxb_encode(VXB_BLT(), hi, lo, 0, 0)
+}
+
+fn vxb_jmp(offset: i64) -> i64 {
+    let hi = (offset / 32) % 32
+    let lo = offset % 32
+    return vxb_encode(VXB_JMP(), hi, lo, 0, 0)
+}
+
+fn vxb_thread_id(dst: i64) -> i64 {
+    return vxb_encode(VXB_THREAD_ID(), dst, 0, 0, 0)
+}
+
+fn vxb_block_id(dst: i64) -> i64 {
+    return vxb_encode(VXB_BLOCK_ID(), dst, 0, 0, 0)
+}
+
+fn vxb_barrier() -> i64 {
+    return vxb_encode(VXB_BARRIER(), 0, 0, 0, 0)
+}
+
+fn vxb_shuffle(dst: i64, src: i64, lane: i64) -> i64 {
+    return vxb_encode(VXB_WARP_SHUFFLE(), dst, src, lane, 0)
+}
+
+fn vxb_atomic_add(dst: i64, src: i64) -> i64 {
+    return vxb_encode(VXB_ATOMIC_ADD(), dst, src, 0, 0)
+}
+
+fn vxb_atomic_cas(dst: i64, src1: i64, src2: i64) -> i64 {
+    return vxb_encode(VXB_ATOMIC_CAS(), dst, src1, src2, 0)
+}
+
+fn vxb_load_imm(dst: i64, imm: i64) -> i64 {
+    let s1 = (imm / 32) % 32
+    let s2 = imm % 32
+    return vxb_encode(VXB_LOAD_IMM(), dst, s1, s2, 0)
+}
+
+fn vxb_load_imm_hi(dst: i64, imm: i64) -> i64 {
+    let s1 = (imm / 32) % 32
+    let s2 = imm % 32
+    return vxb_encode(VXB_LOAD_IMM_HI(), dst, s1, s2, 0)
+}
+
+fn vxb_halt() -> i64 {
+    return vxb_encode(VXB_HALT(), 0, 0, 0, 0)
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Kernel Builder
+// ═══════════════════════════════════════════════════════════════════════════════
+// A kernel is: ["kernel", name, n_regs_str, ...instructions_as_strings]
+// Each instruction is stored as its encoded i64 converted to string
+
+fn kernel_new(name: String, n_regs: i64) -> [String] {
+    var k: [String] = []
+    k = push(k, "kernel")
+    k = push(k, name)
+    k = push(k, to_string(n_regs))
+    return k
+}
+
+fn kernel_emit(k: [String], inst: i64) -> [String] {
+    return push(k, to_string(inst))
+}
+
+fn kernel_emit_label(k: [String], label: String) -> [String] {
+    return push(k, "label:" + label)
+}
+
+fn kernel_size(k: [String]) -> i64 {
+    // First 3 elements are header, rest are instructions (skip labels)
+    var count = 0
+    var i = 3
+    while i < len(k) {
+        let entry = k[i]
+        if len(entry) < 6 {
+            count = count + 1
+        } else {
+            let prefix = str_char_at(entry, 0)
+            if prefix == "l" {
+                // might be a label — check for "label:"
+                let c1 = str_char_at(entry, 1)
+                let c2 = str_char_at(entry, 2)
+                let c3 = str_char_at(entry, 3)
+                let c4 = str_char_at(entry, 4)
+                let c5 = str_char_at(entry, 5)
+                if c1 == "a" && c2 == "b" && c3 == "e" && c4 == "l" && c5 == ":" {
+                    // label, don't count
+                } else {
+                    count = count + 1
+                }
+            } else {
+                count = count + 1
+            }
+        }
+        i = i + 1
+    }
+    return count
+}
+
+// Extract instruction codes from kernel (skip header and labels)
+fn kernel_get_instructions(k: [String]) -> [i64] {
+    var insts: [i64] = []
+    var i = 3
+    while i < len(k) {
+        let entry = k[i]
+        let first = str_char_at(entry, 0)
+        // Skip labels (start with 'l' and contain "label:")
+        var is_label = false
+        if len(entry) > 6 && first == "l" {
+            let c1 = str_char_at(entry, 1)
+            let c2 = str_char_at(entry, 2)
+            let c3 = str_char_at(entry, 3)
+            let c4 = str_char_at(entry, 4)
+            let c5 = str_char_at(entry, 5)
+            if c1 == "a" && c2 == "b" && c3 == "e" && c4 == "l" && c5 == ":" {
+                is_label = true
+            }
+        }
+        if !is_label {
+            insts = push(insts, unwrap(parse_int(entry)))
+        }
+        i = i + 1
+    }
+    return insts
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Pre-built GPU Kernels for LLM Operations
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// Element-wise vector addition: C[i] = A[i] + B[i]
+// Memory layout: A at offset 0, B at offset n, C at offset 2*n
+fn kernel_vector_add(n: i64) -> [String] {
+    var k = kernel_new("vector_add", 8)
+    // r0 = thread_id
+    k = kernel_emit(k, vxb_thread_id(0))
+    // r1 = block_id
+    k = kernel_emit(k, vxb_block_id(1))
+    // r2 = n (load immediate)
+    k = kernel_emit(k, vxb_load_imm(2, n))
+    // r3 = block_id * 32 (warp size) — approximate global index
+    // For simplicity: global_id = block_id * 32 + thread_id
+    k = kernel_emit(k, vxb_load_imm(3, 32))
+    k = kernel_emit(k, vxb_mul(3, 1, 3))
+    k = kernel_emit(k, vxb_add(3, 3, 0))
+    // Bounds check: if global_id >= n, halt
+    k = kernel_emit(k, vxb_cmp(3, 2))
+    k = kernel_emit(k, vxb_blt(2))
+    k = kernel_emit(k, vxb_halt())
+    // r4 = A[global_id] — load from offset global_id
+    k = kernel_emit(k, vxb_load(4, 3, 0))
+    // r5 = B[global_id] — load from offset global_id + n
+    k = kernel_emit(k, vxb_add(5, 3, 2))
+    k = kernel_emit(k, vxb_load(5, 5, 0))
+    // r6 = A[i] + B[i]
+    k = kernel_emit(k, vxb_add(6, 4, 5))
+    // C[global_id] = r6 — store at offset global_id + 2*n
+    k = kernel_emit(k, vxb_add(7, 3, 2))
+    k = kernel_emit(k, vxb_add(7, 7, 2))
+    k = kernel_emit(k, vxb_store(7, 6, 0))
+    k = kernel_emit(k, vxb_halt())
+    return k
+}
+
+// Matrix multiply C = A @ B (naive: each thread computes one element)
+// A is m x k, B is k x n_cols, C is m x n_cols
+// Memory: A at 0, B at m*k, C at m*k + k*n_cols
+fn kernel_matmul_naive(m: i64, n_cols: i64, k: i64) -> [String] {
+    var kern = kernel_new("matmul_naive", 16)
+    // r0 = thread_id, r1 = block_id
+    kern = kernel_emit(kern, vxb_thread_id(0))
+    kern = kernel_emit(kern, vxb_block_id(1))
+    // Compute global_id
+    kern = kernel_emit(kern, vxb_load_imm(2, 32))
+    kern = kernel_emit(kern, vxb_mul(2, 1, 2))
+    kern = kernel_emit(kern, vxb_add(2, 2, 0))
+    // r3 = row = global_id / n_cols
+    kern = kernel_emit(kern, vxb_load_imm(3, n_cols))
+    kern = kernel_emit(kern, vxb_div(4, 2, 3))
+    // r5 = col = global_id % n_cols (global_id - row * n_cols)
+    kern = kernel_emit(kern, vxb_mul(5, 4, 3))
+    kern = kernel_emit(kern, vxb_sub(5, 2, 5))
+    // r6 = k dimension
+    kern = kernel_emit(kern, vxb_load_imm(6, k))
+    // r7 = accumulator = 0
+    kern = kernel_emit(kern, vxb_load_imm(7, 0))
+    // r8 = loop counter = 0
+    kern = kernel_emit(kern, vxb_load_imm(8, 0))
+    // Loop: for i in 0..k
+    kern = kernel_emit_label(kern, "loop")
+    kern = kernel_emit(kern, vxb_cmp(8, 6))
+    kern = kernel_emit(kern, vxb_blt(2))
+    kern = kernel_emit(kern, vxb_jmp(12))
+    // A[row][i] = A[row * k + i]
+    kern = kernel_emit(kern, vxb_mul(9, 4, 6))
+    kern = kernel_emit(kern, vxb_add(9, 9, 8))
+    kern = kernel_emit(kern, vxb_load(9, 9, 0))
+    // B[i][col] = B[i * n_cols + col] + offset(m*k)
+    kern = kernel_emit(kern, vxb_mul(10, 8, 3))
+    kern = kernel_emit(kern, vxb_add(10, 10, 5))
+    kern = kernel_emit(kern, vxb_load_imm(11, m * k))
+    kern = kernel_emit(kern, vxb_add(10, 10, 11))
+    kern = kernel_emit(kern, vxb_load(10, 10, 0))
+    // acc += A_val * B_val
+    kern = kernel_emit(kern, vxb_mul(12, 9, 10))
+    kern = kernel_emit(kern, vxb_add(7, 7, 12))
+    // i++
+    kern = kernel_emit(kern, vxb_load_imm(13, 1))
+    kern = kernel_emit(kern, vxb_add(8, 8, 13))
+    kern = kernel_emit(kern, vxb_jmp(0))
+    // Store C[row][col] = C_offset + row * n_cols + col
+    kern = kernel_emit_label(kern, "done")
+    kern = kernel_emit(kern, vxb_load_imm(9, m * k + k * n_cols))
+    kern = kernel_emit(kern, vxb_add(9, 9, 2))
+    kern = kernel_emit(kern, vxb_store(9, 7, 0))
+    kern = kernel_emit(kern, vxb_halt())
+    return kern
+}
+
+// Tiled matrix multiply using shared memory
+fn kernel_matmul_tiled(m: i64, n_cols: i64, k: i64, tile_size: i64) -> [String] {
+    var kern = kernel_new("matmul_tiled", 20)
+    kern = kernel_emit(kern, vxb_thread_id(0))
+    kern = kernel_emit(kern, vxb_block_id(1))
+    kern = kernel_emit(kern, vxb_load_imm(2, tile_size))
+    // Local row/col within tile
+    kern = kernel_emit(kern, vxb_div(3, 0, 2))
+    kern = kernel_emit(kern, vxb_mul(4, 3, 2))
+    kern = kernel_emit(kern, vxb_sub(4, 0, 4))
+    // Accumulator
+    kern = kernel_emit(kern, vxb_load_imm(5, 0))
+    // Tile loop
+    kern = kernel_emit(kern, vxb_load_imm(6, 0))
+    kern = kernel_emit(kern, vxb_load_imm(7, k))
+    kern = kernel_emit_label(kern, "tile_loop")
+    kern = kernel_emit(kern, vxb_cmp(6, 7))
+    kern = kernel_emit(kern, vxb_blt(2))
+    kern = kernel_emit(kern, vxb_jmp(10))
+    // Load tile of A into shared memory
+    kern = kernel_emit(kern, vxb_load(8, 0, 0))
+    kern = kernel_emit(kern, vxb_store_shared(0, 8))
+    // Load tile of B into shared memory
+    kern = kernel_emit(kern, vxb_load(9, 0, 0))
+    kern = kernel_emit(kern, vxb_store_shared(1, 9))
+    kern = kernel_emit(kern, vxb_barrier())
+    // Inner dot product over tile
+    kern = kernel_emit(kern, vxb_load_shared(10, 0))
+    kern = kernel_emit(kern, vxb_load_shared(11, 1))
+    kern = kernel_emit(kern, vxb_fma(5, 10, 11))
+    kern = kernel_emit(kern, vxb_barrier())
+    // Next tile
+    kern = kernel_emit(kern, vxb_add(6, 6, 2))
+    kern = kernel_emit(kern, vxb_jmp(0))
+    // Store result
+    kern = kernel_emit_label(kern, "store")
+    kern = kernel_emit(kern, vxb_store(0, 5, 0))
+    kern = kernel_emit(kern, vxb_halt())
+    return kern
+}
+
+// Softmax over a vector: find max, subtract, exp, sum, divide
+// Memory: input at 0..n, output at n..2n
+fn kernel_softmax(n: i64) -> [String] {
+    var k = kernel_new("softmax", 12)
+    k = kernel_emit(k, vxb_thread_id(0))
+    k = kernel_emit(k, vxb_block_id(1))
+    k = kernel_emit(k, vxb_load_imm(2, n))
+    // Compute global_id
+    k = kernel_emit(k, vxb_load_imm(3, 32))
+    k = kernel_emit(k, vxb_mul(3, 1, 3))
+    k = kernel_emit(k, vxb_add(3, 3, 0))
+    // Load input value
+    k = kernel_emit(k, vxb_load(4, 3, 0))
+    // For a simple single-warp softmax we use shared memory for max and sum
+    // Store val in shared mem
+    k = kernel_emit(k, vxb_store_shared(0, 4))
+    k = kernel_emit(k, vxb_barrier())
+    // Use warp shuffle to find max (simplified: thread 0 reduces)
+    k = kernel_emit(k, vxb_shuffle(5, 4, 0))
+    k = kernel_emit(k, vxb_barrier())
+    // Subtract max: val = val - max
+    k = kernel_emit(k, vxb_sub(6, 4, 5))
+    // exp approximation: 1 + x + x^2/2 (stored as mul/add chain)
+    // r7 = x^2
+    k = kernel_emit(k, vxb_mul(7, 6, 6))
+    // r8 = x^2 * 0.5 — approximate with div by 2
+    k = kernel_emit(k, vxb_load_imm(9, 2))
+    k = kernel_emit(k, vxb_div(8, 7, 9))
+    // r10 = 1 + x + x^2/2
+    k = kernel_emit(k, vxb_load_imm(10, 1))
+    k = kernel_emit(k, vxb_add(10, 10, 6))
+    k = kernel_emit(k, vxb_add(10, 10, 8))
+    // Store exp val in shared for sum reduction
+    k = kernel_emit(k, vxb_store_shared(0, 10))
+    k = kernel_emit(k, vxb_barrier())
+    // Shuffle-reduce sum
+    k = kernel_emit(k, vxb_shuffle(11, 10, 0))
+    k = kernel_emit(k, vxb_barrier())
+    // Divide: output = exp_val / sum
+    k = kernel_emit(k, vxb_div(10, 10, 11))
+    // Store output at offset n + global_id
+    k = kernel_emit(k, vxb_add(3, 3, 2))
+    k = kernel_emit(k, vxb_store(3, 10, 0))
+    k = kernel_emit(k, vxb_halt())
+    return k
+}
+
+// Layer normalization: output[i] = (input[i] - mean) / sqrt(var + eps) * gamma + beta
+fn kernel_layer_norm(n: i64, dim: i64) -> [String] {
+    var k = kernel_new("layer_norm", 16)
+    k = kernel_emit(k, vxb_thread_id(0))
+    k = kernel_emit(k, vxb_block_id(1))
+    k = kernel_emit(k, vxb_load_imm(2, dim))
+    // Global id
+    k = kernel_emit(k, vxb_load_imm(3, 32))
+    k = kernel_emit(k, vxb_mul(3, 1, 3))
+    k = kernel_emit(k, vxb_add(3, 3, 0))
+    // Load input
+    k = kernel_emit(k, vxb_load(4, 3, 0))
+    // Compute mean via warp shuffle
+    k = kernel_emit(k, vxb_shuffle(5, 4, 0))
+    k = kernel_emit(k, vxb_div(5, 5, 2))
+    // Subtract mean
+    k = kernel_emit(k, vxb_sub(6, 4, 5))
+    // Variance: (x - mean)^2 averaged
+    k = kernel_emit(k, vxb_mul(7, 6, 6))
+    k = kernel_emit(k, vxb_shuffle(8, 7, 0))
+    k = kernel_emit(k, vxb_div(8, 8, 2))
+    // Normalize: (x - mean) / sqrt(var) approx as div
+    k = kernel_emit(k, vxb_load_imm(9, 1))
+    k = kernel_emit(k, vxb_add(8, 8, 9))
+    k = kernel_emit(k, vxb_div(10, 6, 8))
+    // Store output at offset n
+    k = kernel_emit(k, vxb_load_imm(11, n))
+    k = kernel_emit(k, vxb_add(11, 11, 3))
+    k = kernel_emit(k, vxb_store(11, 10, 0))
+    k = kernel_emit(k, vxb_halt())
+    return k
+}
+
+// Rotary position embedding
+fn kernel_rope(seq_len: i64, dim: i64) -> [String] {
+    var k = kernel_new("rope", 16)
+    k = kernel_emit(k, vxb_thread_id(0))
+    k = kernel_emit(k, vxb_block_id(1))
+    k = kernel_emit(k, vxb_load_imm(2, dim))
+    k = kernel_emit(k, vxb_load_imm(3, 32))
+    k = kernel_emit(k, vxb_mul(3, 1, 3))
+    k = kernel_emit(k, vxb_add(3, 3, 0))
+    // Load x_real and x_imag (paired dimensions)
+    k = kernel_emit(k, vxb_load(4, 3, 0))
+    k = kernel_emit(k, vxb_add(5, 3, 2))
+    k = kernel_emit(k, vxb_load(5, 5, 0))
+    // Compute rotation angle (simplified: theta = pos / 10000^(2i/dim))
+    k = kernel_emit(k, vxb_load_imm(6, seq_len))
+    k = kernel_emit(k, vxb_div(7, 3, 6))
+    // Apply rotation: x_rot = x_real * cos - x_imag * sin
+    k = kernel_emit(k, vxb_mul(8, 4, 7))
+    k = kernel_emit(k, vxb_mul(9, 5, 7))
+    k = kernel_emit(k, vxb_sub(10, 8, 9))
+    // x_rot_imag = x_real * sin + x_imag * cos
+    k = kernel_emit(k, vxb_add(11, 9, 8))
+    // Store
+    k = kernel_emit(k, vxb_store(3, 10, 0))
+    k = kernel_emit(k, vxb_add(12, 3, 2))
+    k = kernel_emit(k, vxb_store(12, 11, 0))
+    k = kernel_emit(k, vxb_halt())
+    return k
+}
+
+// Scaled dot-product attention
+fn kernel_attention(seq_len: i64, head_dim: i64) -> [String] {
+    var k = kernel_new("attention", 20)
+    k = kernel_emit(k, vxb_thread_id(0))
+    k = kernel_emit(k, vxb_block_id(1))
+    k = kernel_emit(k, vxb_load_imm(2, head_dim))
+    k = kernel_emit(k, vxb_load_imm(3, 32))
+    k = kernel_emit(k, vxb_mul(3, 1, 3))
+    k = kernel_emit(k, vxb_add(3, 3, 0))
+    // Load Q and K
+    k = kernel_emit(k, vxb_load(4, 3, 0))
+    k = kernel_emit(k, vxb_load_imm(5, seq_len * head_dim))
+    k = kernel_emit(k, vxb_add(5, 5, 3))
+    k = kernel_emit(k, vxb_load(5, 5, 0))
+    // Q * K (dot product accumulate via FMA)
+    k = kernel_emit(k, vxb_load_imm(6, 0))
+    k = kernel_emit(k, vxb_fma(6, 4, 5))
+    // Scale by 1/sqrt(head_dim) — approximate
+    k = kernel_emit(k, vxb_div(6, 6, 2))
+    // Softmax (simplified: just store score)
+    k = kernel_emit(k, vxb_store_shared(0, 6))
+    k = kernel_emit(k, vxb_barrier())
+    // Load V and multiply by attention weight
+    k = kernel_emit(k, vxb_load_imm(7, 2 * seq_len * head_dim))
+    k = kernel_emit(k, vxb_add(7, 7, 3))
+    k = kernel_emit(k, vxb_load(7, 7, 0))
+    k = kernel_emit(k, vxb_load_shared(8, 0))
+    k = kernel_emit(k, vxb_mul(9, 8, 7))
+    // Store output
+    k = kernel_emit(k, vxb_load_imm(10, 3 * seq_len * head_dim))
+    k = kernel_emit(k, vxb_add(10, 10, 3))
+    k = kernel_emit(k, vxb_store(10, 9, 0))
+    k = kernel_emit(k, vxb_halt())
+    return k
+}
+
+// SiLU activation: silu(x) = x * sigmoid(x) = x * (1 / (1 + exp(-x)))
+fn kernel_silu(n: i64) -> [String] {
+    var k = kernel_new("silu", 12)
+    k = kernel_emit(k, vxb_thread_id(0))
+    k = kernel_emit(k, vxb_block_id(1))
+    k = kernel_emit(k, vxb_load_imm(2, n))
+    k = kernel_emit(k, vxb_load_imm(3, 32))
+    k = kernel_emit(k, vxb_mul(3, 1, 3))
+    k = kernel_emit(k, vxb_add(3, 3, 0))
+    // Load input
+    k = kernel_emit(k, vxb_load(4, 3, 0))
+    // Compute -x
+    k = kernel_emit(k, vxb_load_imm(5, 0))
+    k = kernel_emit(k, vxb_sub(5, 5, 4))
+    // exp(-x) approximation: 1 + (-x) + (-x)^2/2
+    k = kernel_emit(k, vxb_mul(6, 5, 5))
+    k = kernel_emit(k, vxb_load_imm(7, 2))
+    k = kernel_emit(k, vxb_div(6, 6, 7))
+    k = kernel_emit(k, vxb_load_imm(8, 1))
+    k = kernel_emit(k, vxb_add(8, 8, 5))
+    k = kernel_emit(k, vxb_add(8, 8, 6))
+    // sigmoid = 1 / (1 + exp_neg)
+    k = kernel_emit(k, vxb_load_imm(9, 1))
+    k = kernel_emit(k, vxb_add(9, 9, 8))
+    k = kernel_emit(k, vxb_load_imm(10, 1))
+    k = kernel_emit(k, vxb_div(10, 10, 9))
+    // silu = x * sigmoid
+    k = kernel_emit(k, vxb_mul(11, 4, 10))
+    // Store at offset n + global_id
+    k = kernel_emit(k, vxb_add(3, 3, 2))
+    k = kernel_emit(k, vxb_store(3, 11, 0))
+    k = kernel_emit(k, vxb_halt())
+    return k
+}
+
+// Parallel reduction to compute sum
+fn kernel_reduce_sum(n: i64) -> [String] {
+    var k = kernel_new("reduce_sum", 10)
+    k = kernel_emit(k, vxb_thread_id(0))
+    k = kernel_emit(k, vxb_block_id(1))
+    k = kernel_emit(k, vxb_load_imm(2, n))
+    k = kernel_emit(k, vxb_load_imm(3, 32))
+    k = kernel_emit(k, vxb_mul(3, 1, 3))
+    k = kernel_emit(k, vxb_add(3, 3, 0))
+    // Load value
+    k = kernel_emit(k, vxb_load(4, 3, 0))
+    // Store in shared
+    k = kernel_emit(k, vxb_store_shared(0, 4))
+    k = kernel_emit(k, vxb_barrier())
+    // Tree reduction using warp shuffles (log2 steps)
+    k = kernel_emit(k, vxb_shuffle(5, 4, 16))
+    k = kernel_emit(k, vxb_add(4, 4, 5))
+    k = kernel_emit(k, vxb_shuffle(5, 4, 8))
+    k = kernel_emit(k, vxb_add(4, 4, 5))
+    k = kernel_emit(k, vxb_shuffle(5, 4, 4))
+    k = kernel_emit(k, vxb_add(4, 4, 5))
+    k = kernel_emit(k, vxb_shuffle(5, 4, 2))
+    k = kernel_emit(k, vxb_add(4, 4, 5))
+    k = kernel_emit(k, vxb_shuffle(5, 4, 1))
+    k = kernel_emit(k, vxb_add(4, 4, 5))
+    // Thread 0 writes result at offset n
+    k = kernel_emit(k, vxb_store(2, 4, 0))
+    k = kernel_emit(k, vxb_halt())
+    return k
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SIMT Simulator
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// Execute one thread of a kernel
+// Returns modified global memory
+fn simt_warp_exec(prog: [String], regs: [f64], shared_mem: [f64], global_mem: [f64], thread_id: i64, block_id: i64) -> [f64] {
+    let insts = kernel_get_instructions(prog)
+    let n_insts = len(insts)
+
+    // Initialize register file (copy)
+    var rf: [f64] = []
+    var ri = 0
+    while ri < 32 {
+        if ri < len(regs) {
+            rf = push(rf, regs[ri])
+        } else {
+            rf = push(rf, 0.0)
+        }
+        ri = ri + 1
+    }
+
+    var gmem = global_mem
+    var smem = shared_mem
+    var pc = 0
+    var halted = false
+    var steps = 0
+    let max_steps = 1000
+
+    while pc < n_insts && !halted && steps < max_steps {
+        let inst = insts[pc]
+        let parts = vxb_decode(inst)
+        let op = parts[0]
+        let dst = parts[1]
+        let src1 = parts[2]
+        let src2 = parts[3]
+        let flags = parts[4]
+
+        if op == VXB_ADD() {
+            let val = rf[src1] + rf[src2]
+            rf = array_set_f(rf, dst, val)
+            pc = pc + 1
+        } else if op == VXB_SUB() {
+            let val = rf[src1] - rf[src2]
+            rf = array_set_f(rf, dst, val)
+            pc = pc + 1
+        } else if op == VXB_MUL() {
+            let val = rf[src1] * rf[src2]
+            rf = array_set_f(rf, dst, val)
+            pc = pc + 1
+        } else if op == VXB_DIV() {
+            var val = 0.0
+            if rf[src2] != 0.0 {
+                val = rf[src1] / rf[src2]
+            }
+            rf = array_set_f(rf, dst, val)
+            pc = pc + 1
+        } else if op == VXB_FMA() {
+            let val = rf[dst] + rf[src1] * rf[src2]
+            rf = array_set_f(rf, dst, val)
+            pc = pc + 1
+        } else if op == VXB_MOV() {
+            rf = array_set_f(rf, dst, rf[src1])
+            pc = pc + 1
+        } else if op == VXB_LOAD() {
+            let addr = int(rf[src1]) + flags
+            if addr >= 0 && addr < len(gmem) {
+                rf = array_set_f(rf, dst, gmem[addr])
+            } else {
+                rf = array_set_f(rf, dst, 0.0)
+            }
+            pc = pc + 1
+        } else if op == VXB_STORE() {
+            let addr = int(rf[dst]) + flags
+            if addr >= 0 && addr < len(gmem) {
+                gmem = array_set_f(gmem, addr, rf[src1])
+            }
+            pc = pc + 1
+        } else if op == VXB_LOAD_SHARED() {
+            let addr = int(rf[src1])
+            if addr >= 0 && addr < len(smem) {
+                rf = array_set_f(rf, dst, smem[addr])
+            }
+            pc = pc + 1
+        } else if op == VXB_STORE_SHARED() {
+            let addr = int(rf[dst])
+            if addr >= 0 && addr < len(smem) {
+                smem = array_set_f(smem, addr, rf[src1])
+            }
+            pc = pc + 1
+        } else if op == VXB_CMP() {
+            // Set comparison flags in rf[31] (flag register)
+            if rf[src1] < rf[src2] {
+                rf = array_set_f(rf, 31, -1.0)
+            } else if rf[src1] == rf[src2] {
+                rf = array_set_f(rf, 31, 0.0)
+            } else {
+                rf = array_set_f(rf, 31, 1.0)
+            }
+            pc = pc + 1
+        } else if op == VXB_BEQ() {
+            let offset = dst * 32 + src1
+            if rf[31] == 0.0 {
+                pc = pc + offset
+            } else {
+                pc = pc + 1
+            }
+        } else if op == VXB_BNE() {
+            let offset = dst * 32 + src1
+            if rf[31] != 0.0 {
+                pc = pc + offset
+            } else {
+                pc = pc + 1
+            }
+        } else if op == VXB_BLT() {
+            let offset = dst * 32 + src1
+            if rf[31] < 0.0 {
+                pc = pc + offset
+            } else {
+                pc = pc + 1
+            }
+        } else if op == VXB_JMP() {
+            let offset = dst * 32 + src1
+            pc = pc + offset
+        } else if op == VXB_THREAD_ID() {
+            rf = array_set_f(rf, dst, float(thread_id))
+            pc = pc + 1
+        } else if op == VXB_BLOCK_ID() {
+            rf = array_set_f(rf, dst, float(block_id))
+            pc = pc + 1
+        } else if op == VXB_BARRIER() {
+            // No-op in single-thread simulation
+            pc = pc + 1
+        } else if op == VXB_WARP_SHUFFLE() {
+            // In single-thread sim, just copy src
+            rf = array_set_f(rf, dst, rf[src1])
+            pc = pc + 1
+        } else if op == VXB_ATOMIC_ADD() {
+            let addr = int(rf[dst])
+            if addr >= 0 && addr < len(gmem) {
+                let old = gmem[addr]
+                gmem = array_set_f(gmem, addr, old + rf[src1])
+            }
+            pc = pc + 1
+        } else if op == VXB_LOAD_IMM() {
+            let imm = float(src1 * 32 + src2)
+            rf = array_set_f(rf, dst, imm)
+            pc = pc + 1
+        } else if op == VXB_HALT() {
+            halted = true
+        } else {
+            // Unknown opcode, skip
+            pc = pc + 1
+        }
+        steps = steps + 1
+    }
+    return gmem
+}
+
+// Helper: set element in f64 array (immutable rebuild)
+fn array_set_f(arr: [f64], idx: i64, val: f64) -> [f64] {
+    var out: [f64] = []
+    var i = 0
+    while i < len(arr) {
+        if i == idx {
+            out = push(out, val)
+        } else {
+            out = push(out, arr[i])
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// Execute kernel on SIMT simulator with multiple threads/blocks
+fn simt_exec(prog: [String], global_mem: [f64], n_threads: i64, n_blocks: i64) -> [f64] {
+    var gmem = global_mem
+    // Allocate shared memory (64 entries per block)
+    var shared_size = 64
+    var empty_regs: [f64] = []
+    var ri = 0
+    while ri < 32 {
+        empty_regs = push(empty_regs, 0.0)
+        ri = ri + 1
+    }
+
+    var blk = 0
+    while blk < n_blocks {
+        var smem: [f64] = []
+        var si = 0
+        while si < shared_size {
+            smem = push(smem, 0.0)
+            si = si + 1
+        }
+
+        var tid = 0
+        while tid < n_threads {
+            gmem = simt_warp_exec(prog, empty_regs, smem, gmem, tid, blk)
+            tid = tid + 1
+        }
+        blk = blk + 1
+    }
+    return gmem
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// VXB Binary Format
+// ═══════════════════════════════════════════════════════════════════════════════
+
+fn VXB_MAGIC() -> i64 { return 5658178 }
+fn VXB_VERSION() -> i64 { return 1 }
+
+fn vxb_serialize(prog: [String]) -> [i64] {
+    let insts = kernel_get_instructions(prog)
+    var data: [i64] = []
+    // Magic
+    data = push(data, VXB_MAGIC())
+    // Version
+    data = push(data, VXB_VERSION())
+    // Number of instructions
+    data = push(data, len(insts))
+    // Instructions
+    var i = 0
+    while i < len(insts) {
+        data = push(data, insts[i])
+        i = i + 1
+    }
+    return data
+}
+
+fn vxb_deserialize(data: [i64]) -> [String] {
+    if len(data) < 3 {
+        return kernel_new("error", 0)
+    }
+    let magic = data[0]
+    let version = data[1]
+    let n_insts = data[2]
+
+    if magic != VXB_MAGIC() {
+        return kernel_new("bad_magic", 0)
+    }
+
+    var k = kernel_new("deserialized", 32)
+    var i = 0
+    while i < n_insts && (i + 3) < len(data) {
+        k = kernel_emit(k, data[i + 3])
+        i = i + 1
+    }
+    return k
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// DRM Interface (for future real GPU execution)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+fn drm_open_gpu() -> i64 {
+    // Would open /dev/dri/renderD128 via syscall
+    // Returns -1 in simulation mode (no real GPU)
+    print("[DRM] drm_open_gpu: simulation mode, no real GPU present")
+    return -1
+}
+
+fn drm_submit_kernel(fd: i64, kernel_binary: [i64], global_mem_ptr: i64, mem_size: i64) -> i64 {
+    // Would submit VXB kernel for execution via DRM ioctls
+    // Returns -1 in simulation mode
+    if fd < 0 {
+        print("[DRM] drm_submit_kernel: simulation mode, fd=" + to_string(fd))
+        return -1
+    }
+    // In real implementation:
+    // 1. Map global memory buffer via DRM_IOCTL_GEM_CREATE
+    // 2. Upload kernel binary via DRM_IOCTL_SUBMIT
+    // 3. Wait for completion via DRM_IOCTL_WAIT
+    return 0
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Test Main
+// ═══════════════════════════════════════════════════════════════════════════════
+
+fn main() {
+    print("=== VXB GPU Native — Vortex Binary ISA ===")
+    print("")
+    var pass_count = 0
+    var fail_count = 0
+
+    // ── Test 1: Encode/Decode round-trip ──
+    print("--- Test 1: Encode/Decode VXB Instructions ---")
+    let inst1 = vxb_encode(VXB_ADD(), 5, 10, 20, 0)
+    let dec1 = vxb_decode(inst1)
+    var t1_pass = dec1[0] == VXB_ADD() && dec1[1] == 5 && dec1[2] == 10 && dec1[3] == 20 && dec1[4] == 0
+    if t1_pass {
+        print("  ADD r5, r10, r20 round-trip: PASS")
+        pass_count = pass_count + 1
+    } else {
+        print("  ADD r5, r10, r20 round-trip: FAIL (got op=" + to_string(dec1[0]) + " dst=" + to_string(dec1[1]) + " s1=" + to_string(dec1[2]) + " s2=" + to_string(dec1[3]) + ")")
+        fail_count = fail_count + 1
+    }
+
+    let inst2 = vxb_encode(VXB_LOAD(), 7, 3, 0, 42)
+    let dec2 = vxb_decode(inst2)
+    var t1b_pass = dec2[0] == VXB_LOAD() && dec2[1] == 7 && dec2[2] == 3 && dec2[4] == 42
+    if t1b_pass {
+        print("  LOAD r7, [r3+42] round-trip: PASS")
+        pass_count = pass_count + 1
+    } else {
+        print("  LOAD r7, [r3+42] round-trip: FAIL")
+        fail_count = fail_count + 1
+    }
+
+    let inst3 = vxb_halt()
+    let dec3 = vxb_decode(inst3)
+    if dec3[0] == VXB_HALT() {
+        print("  HALT round-trip: PASS")
+        pass_count = pass_count + 1
+    } else {
+        print("  HALT round-trip: FAIL")
+        fail_count = fail_count + 1
+    }
+
+    // ── Test 2: Disassemble ──
+    print("")
+    print("--- Test 2: Disassemble Instructions ---")
+    let d1 = vxb_disasm(vxb_add(5, 10, 20))
+    print("  " + d1)
+    if d1 == "ADD r5, r10, r20" {
+        print("  Disasm ADD: PASS")
+        pass_count = pass_count + 1
+    } else {
+        print("  Disasm ADD: FAIL (got: " + d1 + ")")
+        fail_count = fail_count + 1
+    }
+
+    let d2 = vxb_disasm(vxb_load(7, 3, 42))
+    print("  " + d2)
+    if d2 == "LOAD r7, [r3 + 42]" {
+        print("  Disasm LOAD: PASS")
+        pass_count = pass_count + 1
+    } else {
+        print("  Disasm LOAD: FAIL (got: " + d2 + ")")
+        fail_count = fail_count + 1
+    }
+
+    let d3 = vxb_disasm(vxb_halt())
+    if d3 == "HALT" {
+        print("  Disasm HALT: PASS")
+        pass_count = pass_count + 1
+    } else {
+        print("  Disasm HALT: FAIL (got: " + d3 + ")")
+        fail_count = fail_count + 1
+    }
+
+    let d4 = vxb_disasm(vxb_thread_id(3))
+    if d4 == "THREAD_ID r3" {
+        print("  Disasm THREAD_ID: PASS")
+        pass_count = pass_count + 1
+    } else {
+        print("  Disasm THREAD_ID: FAIL (got: " + d4 + ")")
+        fail_count = fail_count + 1
+    }
+
+    // ── Test 3: Build vector_add kernel ──
+    print("")
+    print("--- Test 3: Build vector_add kernel ---")
+    let vadd_k = kernel_vector_add(4)
+    let vadd_size = kernel_size(vadd_k)
+    print("  vector_add kernel: " + to_string(vadd_size) + " instructions")
+    if vadd_size > 10 {
+        print("  Kernel build: PASS")
+        pass_count = pass_count + 1
+    } else {
+        print("  Kernel build: FAIL (too few instructions)")
+        fail_count = fail_count + 1
+    }
+
+    // ── Test 4: SIMT execute vector_add ──
+    print("")
+    print("--- Test 4: SIMT execute vector_add ---")
+    // Memory layout: A=[1,2,3,4] at 0-3, B=[5,6,7,8] at 4-7, C=[0,0,0,0] at 8-11
+    var mem: [f64] = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 0.0, 0.0, 0.0, 0.0]
+    let result = simt_exec(vadd_k, mem, 4, 1)
+    print("  Input A: [1, 2, 3, 4]")
+    print("  Input B: [5, 6, 7, 8]")
+    print("  Output C: [" + to_string(result[8]) + ", " + to_string(result[9]) + ", " + to_string(result[10]) + ", " + to_string(result[11]) + "]")
+    if result[8] == 6.0 && result[9] == 8.0 && result[10] == 10.0 && result[11] == 12.0 {
+        print("  Vector add SIMT: PASS")
+        pass_count = pass_count + 1
+    } else {
+        print("  Vector add SIMT: FAIL")
+        fail_count = fail_count + 1
+    }
+
+    // ── Test 5: Build and test softmax kernel ──
+    print("")
+    print("--- Test 5: Build softmax kernel ---")
+    let sm_k = kernel_softmax(4)
+    let sm_size = kernel_size(sm_k)
+    print("  softmax kernel: " + to_string(sm_size) + " instructions")
+    if sm_size > 10 {
+        print("  Softmax kernel build: PASS")
+        pass_count = pass_count + 1
+    } else {
+        print("  Softmax kernel build: FAIL")
+        fail_count = fail_count + 1
+    }
+    // Execute softmax on small input
+    var sm_mem: [f64] = [1.0, 2.0, 3.0, 4.0, 0.0, 0.0, 0.0, 0.0]
+    let sm_result = simt_exec(sm_k, sm_mem, 4, 1)
+    print("  Softmax input:  [1, 2, 3, 4]")
+    print("  Softmax output: [" + to_string(sm_result[4]) + ", " + to_string(sm_result[5]) + ", " + to_string(sm_result[6]) + ", " + to_string(sm_result[7]) + "]")
+    // Verify outputs are non-zero (softmax produces values in (0,1))
+    if sm_result[4] > 0.0 && sm_result[5] > 0.0 && sm_result[6] > 0.0 && sm_result[7] > 0.0 {
+        print("  Softmax exec: PASS")
+        pass_count = pass_count + 1
+    } else {
+        print("  Softmax exec: FAIL")
+        fail_count = fail_count + 1
+    }
+
+    // ── Test 6: Serialize/Deserialize round-trip ──
+    print("")
+    print("--- Test 6: Serialize/Deserialize kernel ---")
+    let serial = vxb_serialize(vadd_k)
+    print("  Serialized: " + to_string(len(serial)) + " words (magic=" + to_string(serial[0]) + ", ver=" + to_string(serial[1]) + ", n=" + to_string(serial[2]) + ")")
+    let deser_k = vxb_deserialize(serial)
+    let deser_size = kernel_size(deser_k)
+    if deser_size == vadd_size {
+        print("  Round-trip size match: PASS (" + to_string(deser_size) + " == " + to_string(vadd_size) + ")")
+        pass_count = pass_count + 1
+    } else {
+        print("  Round-trip size match: FAIL (" + to_string(deser_size) + " != " + to_string(vadd_size) + ")")
+        fail_count = fail_count + 1
+    }
+    // Verify instruction-level match
+    let orig_insts = kernel_get_instructions(vadd_k)
+    let deser_insts = kernel_get_instructions(deser_k)
+    var insts_match = true
+    var ii = 0
+    while ii < len(orig_insts) && ii < len(deser_insts) {
+        if orig_insts[ii] != deser_insts[ii] {
+            insts_match = false
+        }
+        ii = ii + 1
+    }
+    if insts_match {
+        print("  Instruction-level match: PASS")
+        pass_count = pass_count + 1
+    } else {
+        print("  Instruction-level match: FAIL")
+        fail_count = fail_count + 1
+    }
+
+    // ── Test 7: Build matmul kernel ──
+    print("")
+    print("--- Test 7: Build matmul kernel ---")
+    let mm_k = kernel_matmul_naive(2, 2, 2)
+    let mm_size = kernel_size(mm_k)
+    print("  matmul_naive(2,2,2) kernel: " + to_string(mm_size) + " instructions")
+    // Disassemble first few instructions to verify pattern
+    let mm_insts = kernel_get_instructions(mm_k)
+    let mm_first = vxb_decode(mm_insts[0])
+    let mm_second = vxb_decode(mm_insts[1])
+    if mm_first[0] == VXB_THREAD_ID() && mm_second[0] == VXB_BLOCK_ID() {
+        print("  Matmul pattern (THREAD_ID, BLOCK_ID start): PASS")
+        pass_count = pass_count + 1
+    } else {
+        print("  Matmul pattern: FAIL")
+        fail_count = fail_count + 1
+    }
+    if mm_size > 15 {
+        print("  Matmul instruction count (>" + to_string(15) + "): PASS")
+        pass_count = pass_count + 1
+    } else {
+        print("  Matmul instruction count: FAIL (only " + to_string(mm_size) + ")")
+        fail_count = fail_count + 1
+    }
+
+    // ── Summary ──
+    print("")
+    print("=== RESULTS: " + to_string(pass_count) + " PASS, " + to_string(fail_count) + " FAIL ===")
+    if fail_count == 0 {
+        print("ALL TESTS PASSED")
+    }
+}

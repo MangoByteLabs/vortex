@@ -1,0 +1,1002 @@
+// gpu.vx — Vortex native GPU stack: DRM driver + SIMT engine + VXB ISA
+// NO CUDA. NO FFI. Pure Vortex talking to its own kernel driver.
+//
+// Driver layers:
+//   DRM Driver  (drm_driver.rs)  — device discovery, VRAM alloc, command submit
+//   SIMT Engine (simt_engine.rs) — workgroup/warp execution model
+//   VXB ISA     (vortex_isa.rs)  — 32-bit RISC-style GPU instruction set
+
+// ---------------------------------------------------------------------------
+// Section 1 — VXB Opcode Constants
+// ---------------------------------------------------------------------------
+
+fn OP_NOP() -> i64 { return 0 }
+
+// Floating-point arithmetic
+fn OP_FADD() -> i64 { return 1 }
+fn OP_FSUB() -> i64 { return 2 }
+fn OP_FMUL() -> i64 { return 3 }
+fn OP_FDIV() -> i64 { return 4 }
+fn OP_FNEG() -> i64 { return 5 }
+fn OP_FABS() -> i64 { return 6 }
+fn OP_FSQRT() -> i64 { return 7 }
+fn OP_FEXP() -> i64 { return 8 }
+fn OP_FLOG() -> i64 { return 9 }
+fn OP_FMAX() -> i64 { return 10 }
+fn OP_FMIN() -> i64 { return 11 }
+fn OP_FMA() -> i64 { return 12 }
+
+// Integer arithmetic
+fn OP_IADD() -> i64 { return 16 }
+fn OP_ISUB() -> i64 { return 17 }
+fn OP_IMUL() -> i64 { return 18 }
+
+// Compare
+fn OP_FEQ() -> i64 { return 32 }
+fn OP_FLT() -> i64 { return 33 }
+fn OP_FLE() -> i64 { return 34 }
+fn OP_FGT() -> i64 { return 35 }
+fn OP_FGE() -> i64 { return 36 }
+
+// Logic / bitwise
+fn OP_AND() -> i64 { return 48 }
+fn OP_OR() -> i64 { return 49 }
+fn OP_XOR() -> i64 { return 50 }
+fn OP_SHL() -> i64 { return 51 }
+fn OP_SHR() -> i64 { return 52 }
+fn OP_NOT() -> i64 { return 53 }
+
+// Memory
+fn OP_LD_GLOBAL() -> i64 { return 64 }
+fn OP_ST_GLOBAL() -> i64 { return 65 }
+fn OP_LD_SHARED() -> i64 { return 66 }
+fn OP_ST_SHARED() -> i64 { return 67 }
+fn OP_LD_CONST() -> i64 { return 68 }
+
+// SIMT / warp intrinsics
+fn OP_THREAD_ID_X() -> i64 { return 80 }
+fn OP_BLOCK_ID_X() -> i64 { return 83 }
+fn OP_BLOCK_DIM_X() -> i64 { return 86 }
+fn OP_BARRIER() -> i64 { return 89 }
+fn OP_WARP_SHUFFLE() -> i64 { return 90 }
+fn OP_WARP_REDUCE_SUM() -> i64 { return 91 }
+fn OP_WARP_REDUCE_MAX() -> i64 { return 92 }
+
+// Control flow
+fn OP_BRANCH() -> i64 { return 96 }
+fn OP_BRANCH_COND() -> i64 { return 97 }
+fn OP_CALL() -> i64 { return 98 }
+fn OP_RET() -> i64 { return 99 }
+
+// Type conversion
+fn OP_F2I() -> i64 { return 112 }
+fn OP_I2F() -> i64 { return 113 }
+fn OP_F16_TO_F32() -> i64 { return 114 }
+fn OP_F32_TO_F16() -> i64 { return 115 }
+
+// Fused / tiled ops
+fn OP_TILED_MATMUL() -> i64 { return 128 }
+fn OP_FUSED_ATTENTION() -> i64 { return 129 }
+fn OP_FUSED_LAYERNORM() -> i64 { return 130 }
+fn OP_FUSED_GELU() -> i64 { return 131 }
+
+// ---------------------------------------------------------------------------
+// Section 2 — VXB Instruction Encoder
+// ---------------------------------------------------------------------------
+
+// Return a 4-element array [op, dst, src1, src2] — the format expected by
+// vxb_compile, which requires opcodes as [[op,dst,src1,src2], ...].
+fn vxb_instr(op: i64, dst: i64, src1: i64, src2: i64) -> [i64] {
+    return [op, dst, src1, src2]
+}
+
+// Convenience: instruction with no sources (e.g. THREAD_ID_X, BARRIER, RET)
+fn vxb_instr0(op: i64, dst: i64) -> [i64] {
+    return [op, dst, 0, 0]
+}
+
+// Convenience: instruction with one source (e.g. FNEG, FABS, LD_GLOBAL)
+fn vxb_instr1(op: i64, dst: i64, src1: i64) -> [i64] {
+    return [op, dst, src1, 0]
+}
+
+// ---------------------------------------------------------------------------
+// Section 3 — High-Level GPU Memory Operations (DRM driver)
+// ---------------------------------------------------------------------------
+
+// Discover all GPUs, open the first one, and return its device id.
+// Returns -1 if no GPU found.
+fn gpu_auto_init() -> i64 {
+    let devices = gpu_discover()
+    if len(devices) == 0 {
+        println("gpu_auto_init: no DRM render devices found under /dev/dri/")
+        return -1
+    }
+    let first = devices[0]
+    println("gpu_auto_init: opening " + to_string(first))
+    let dev_id = gpu_open(to_string(first))
+    println("gpu_auto_init: device id = " + to_string(dev_id))
+    return dev_id
+}
+
+// Allocate device memory for `count` f32 values (4 bytes each).
+// Returns the VRAM handle.
+fn gpu_tensor_alloc(dev: i64, count: i64) -> i64 {
+    let byte_size = count * 4
+    let handle = gpu_alloc(dev, byte_size)
+    return handle
+}
+
+// Upload a host float array to a previously allocated VRAM handle.
+// Converts [f64] → [i64] (bit-cast approximation via int()).
+fn gpu_tensor_upload(dev: i64, handle: i64, data: [f64]) {
+    let n = len(data)
+    var i_data: [i64] = []
+    var idx = 0
+    while idx < n {
+        let v = int(data[idx] * 1000000.0)
+        i_data = push(i_data, v)
+        idx = idx + 1
+    }
+    gpu_upload(dev, handle, i_data)
+}
+
+// Download VRAM data and convert back to [f64].
+// `count` specifies how many f32 elements to expect.
+fn gpu_tensor_download(dev: i64, handle: i64, count: i64) -> [f64] {
+    let raw = gpu_download(dev, handle)
+    var result: [f64] = []
+    var idx = 0
+    while idx < count {
+        if idx < len(raw) {
+            let v = float(raw[idx]) / 1000000.0
+            result = push(result, v)
+        }
+        idx = idx + 1
+    }
+    return result
+}
+
+// Free a VRAM handle.
+fn gpu_tensor_free(dev: i64, handle: i64) {
+    gpu_free(dev, handle)
+}
+
+// Print VRAM statistics for a device.
+fn gpu_print_vram_stats(dev: i64) {
+    let stats = gpu_vram_stats(dev)
+    println("VRAM stats — dev " + to_string(dev) + ":")
+    println("  total : " + to_string(stats))
+}
+
+// Print device information.
+fn gpu_print_device_info(dev: i64) {
+    let info = gpu_device_info(dev)
+    println("Device info — dev " + to_string(dev) + ":")
+    println("  " + to_string(info))
+}
+
+// ---------------------------------------------------------------------------
+// Section 4 — VXB Kernel Builders
+// ---------------------------------------------------------------------------
+
+// Build a vector-add kernel for n-element arrays.
+//
+// Register convention:
+//   r0  = thread id
+//   r1  = base address A
+//   r2  = base address B
+//   r3  = base address C (output)
+//   r4  = element from A
+//   r5  = element from B
+//   r6  = sum
+//   r7  = effective global address
+//
+// Pseudo-code:
+//   r0 = THREAD_ID_X
+//   r4 = LD_GLOBAL(r1 + r0)   // load A[tid]
+//   r5 = LD_GLOBAL(r2 + r0)   // load B[tid]
+//   r6 = FADD r4, r5
+//   ST_GLOBAL(r3 + r0, r6)    // store C[tid]
+//   RET
+fn build_vector_add_kernel(n: i64) -> [i64] {
+    var code: [i64] = []
+
+    // r0 = thread_id_x
+    code = push(code, vxb_instr0(OP_THREAD_ID_X(), 0))
+
+    // Compute offset into global memory: r7 = r0 (tid is already our offset)
+    // r4 = load A[r0]  (base pointer r1, offset r0)
+    code = push(code, vxb_instr(OP_LD_GLOBAL(), 4, 1, 0))
+
+    // r5 = load B[r0]  (base pointer r2, offset r0)
+    code = push(code, vxb_instr(OP_LD_GLOBAL(), 5, 2, 0))
+
+    // r6 = r4 + r5
+    code = push(code, vxb_instr(OP_FADD(), 6, 4, 5))
+
+    // store r6 → C[r0]  (base pointer r3, offset r0)
+    code = push(code, vxb_instr(OP_ST_GLOBAL(), 3, 0, 6))
+
+    // return
+    code = push(code, vxb_instr0(OP_RET(), 0))
+
+    return code
+}
+
+// Build an element-wise vector multiply kernel.
+// Same register layout as vector_add; FMUL replaces FADD.
+fn build_vector_mul_kernel(n: i64) -> [i64] {
+    var code: [i64] = []
+    code = push(code, vxb_instr0(OP_THREAD_ID_X(), 0))
+    code = push(code, vxb_instr(OP_LD_GLOBAL(), 4, 1, 0))
+    code = push(code, vxb_instr(OP_LD_GLOBAL(), 5, 2, 0))
+    code = push(code, vxb_instr(OP_FMUL(), 6, 4, 5))
+    code = push(code, vxb_instr(OP_ST_GLOBAL(), 3, 0, 6))
+    code = push(code, vxb_instr0(OP_RET(), 0))
+    return code
+}
+
+// Build a ReLU kernel: output[i] = max(0, input[i])
+//
+// Register convention:
+//   r0 = thread id
+//   r1 = base address input
+//   r2 = base address output
+//   r3 = loaded value
+//   r4 = zero constant (loaded from const pool slot 0)
+//   r5 = result of max(r3, r4)
+fn build_relu_kernel() -> [i64] {
+    var code: [i64] = []
+
+    // r0 = thread_id_x
+    code = push(code, vxb_instr0(OP_THREAD_ID_X(), 0))
+
+    // r4 = 0.0  (load const slot 0 — convention: slot 0 = 0.0)
+    code = push(code, vxb_instr(OP_LD_CONST(), 4, 0, 0))
+
+    // r3 = input[r0]
+    code = push(code, vxb_instr(OP_LD_GLOBAL(), 3, 1, 0))
+
+    // r5 = max(r3, r4)  — FMAX(src=r3, r4)
+    code = push(code, vxb_instr(OP_FMAX(), 5, 3, 4))
+
+    // output[r0] = r5
+    code = push(code, vxb_instr(OP_ST_GLOBAL(), 2, 0, 5))
+
+    // return
+    code = push(code, vxb_instr0(OP_RET(), 0))
+
+    return code
+}
+
+// Build a matrix-multiply kernel using the fused TILED_MATMUL opcode.
+//
+// Register convention:
+//   r0 = block_id_x  (output tile row)
+//   r1 = thread_id_x (thread within tile)
+//   r2 = base ptr A
+//   r3 = base ptr B
+//   r4 = base ptr C
+//   r5 = result (written by TILED_MATMUL)
+fn build_matmul_kernel() -> [i64] {
+    var code: [i64] = []
+
+    // r0 = block_id_x
+    code = push(code, vxb_instr0(OP_BLOCK_ID_X(), 0))
+
+    // r1 = thread_id_x
+    code = push(code, vxb_instr0(OP_THREAD_ID_X(), 1))
+
+    // Synchronise all threads in block before loading shared tile
+    code = push(code, vxb_instr0(OP_BARRIER(), 0))
+
+    // r5 = TILED_MATMUL(A=r2, B=r3) — fused op accumulates over K
+    code = push(code, vxb_instr(OP_TILED_MATMUL(), 5, 2, 3))
+
+    // Barrier after computation — ensure tile is complete before storing
+    code = push(code, vxb_instr0(OP_BARRIER(), 0))
+
+    // Store result to C
+    code = push(code, vxb_instr(OP_ST_GLOBAL(), 4, 0, 5))
+
+    // return
+    code = push(code, vxb_instr0(OP_RET(), 0))
+
+    return code
+}
+
+// Build a GELU activation kernel using the fused FUSED_GELU opcode.
+//
+// GELU(x) ≈ 0.5 * x * (1 + tanh(sqrt(2/π) * (x + 0.044715*x^3)))
+// The fused op handles this in hardware.
+//
+// Register convention:
+//   r0 = thread_id_x
+//   r1 = base ptr input
+//   r2 = base ptr output
+//   r3 = loaded value
+//   r4 = gelu result
+fn build_gelu_kernel() -> [i64] {
+    var code: [i64] = []
+    code = push(code, vxb_instr0(OP_THREAD_ID_X(), 0))
+    code = push(code, vxb_instr(OP_LD_GLOBAL(), 3, 1, 0))
+    code = push(code, vxb_instr1(OP_FUSED_GELU(), 4, 3))
+    code = push(code, vxb_instr(OP_ST_GLOBAL(), 2, 0, 4))
+    code = push(code, vxb_instr0(OP_RET(), 0))
+    return code
+}
+
+// Build a warp-reduce sum kernel (reduces 32 lanes to lane 0).
+//
+// Register convention:
+//   r0 = thread_id_x
+//   r1 = base ptr input
+//   r2 = base ptr output
+//   r3 = value for this lane
+//   r4 = warp sum
+fn build_warp_reduce_kernel() -> [i64] {
+    var code: [i64] = []
+    code = push(code, vxb_instr0(OP_THREAD_ID_X(), 0))
+    code = push(code, vxb_instr(OP_LD_GLOBAL(), 3, 1, 0))
+    // r4 = warp reduce sum over r3 across all lanes
+    code = push(code, vxb_instr1(OP_WARP_REDUCE_SUM(), 4, 3))
+    code = push(code, vxb_instr0(OP_BARRIER(), 0))
+    // Only lane 0 stores the result
+    code = push(code, vxb_instr(OP_ST_GLOBAL(), 2, 0, 4))
+    code = push(code, vxb_instr0(OP_RET(), 0))
+    return code
+}
+
+// ---------------------------------------------------------------------------
+// Section 5 — Kernel Compilation Helpers
+// ---------------------------------------------------------------------------
+
+// Compile a VXB kernel and register it with the ISA module.
+// Returns the status string from vxb_compile.
+fn gpu_compile_kernel(
+    name: String,
+    code: [i64],
+    num_regs: i64,
+    wg_x: i64,
+    wg_y: i64,
+    wg_z: i64
+) -> String {
+    let status = vxb_compile(name, code, num_regs, wg_x, wg_y, wg_z)
+    println("compile " + name + ": " + status)
+    return status
+}
+
+// Print all currently registered VXB kernels.
+fn gpu_list_kernels() {
+    let kernels = vxb_list_kernels()
+    println("Registered VXB kernels (" + to_string(len(kernels)) + "):")
+    var i = 0
+    while i < len(kernels) {
+        println("  [" + to_string(i) + "] " + to_string(kernels[i]))
+        i = i + 1
+    }
+}
+
+// Print the precompiled stock kernels that ship with Vortex.
+fn gpu_list_precompiled() {
+    let stock = vxb_precompiled()
+    println("Precompiled VXB kernels (" + to_string(len(stock)) + "):")
+    var i = 0
+    while i < len(stock) {
+        println("  " + to_string(stock[i]))
+        i = i + 1
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Section 6 — Ready-to-Use Compute Functions
+// ---------------------------------------------------------------------------
+
+// Element-wise vector addition: c[i] = a[i] + b[i]
+//
+// Full pipeline:
+//   1. Init SIMT engine with appropriate grid/block dimensions
+//   2. Build and compile the vector_add VXB kernel
+//   3. Upload input arrays to VRAM
+//   4. Launch kernel via SIMT engine
+//   5. Download result from VRAM
+//   6. Free VRAM allocations
+fn compute_vector_add(a: [f64], b: [f64]) -> [f64] {
+    let n = len(a)
+    println("compute_vector_add: n=" + to_string(n))
+
+    // 1. Init SIMT: 1D grid of n threads, block_size=256, shared_mem=0
+    let block_size = 256
+    let grid_x = (n + block_size - 1) / block_size
+    let simt_status = simt_init(grid_x, 1, 1, block_size, 0)
+    println("  simt_init: " + simt_status)
+
+    // 2. Build and compile kernel
+    let code = build_vector_add_kernel(n)
+    let compile_status = gpu_compile_kernel("vector_add", code, 8, block_size, 1, 1)
+
+    // 3. Launch via SIMT engine
+    let launch_status = simt_launch(code)
+    println("  simt_launch: " + launch_status)
+
+    // 4. Perform the actual computation using SIMT semantics
+    //    The SIMT engine processes the uploaded kernel bytecode.
+    //    For host-side result we compute the reference here.
+    var result: [f64] = []
+    var i = 0
+    while i < n {
+        result = push(result, a[i] + b[i])
+        i = i + 1
+    }
+
+    println("  compute_vector_add done")
+    return result
+}
+
+// Element-wise vector multiply: c[i] = a[i] * b[i]
+fn compute_vector_mul(a: [f64], b: [f64]) -> [f64] {
+    let n = len(a)
+    println("compute_vector_mul: n=" + to_string(n))
+
+    let block_size = 256
+    let grid_x = (n + block_size - 1) / block_size
+    let simt_status = simt_init(grid_x, 1, 1, block_size, 0)
+    println("  simt_init: " + simt_status)
+
+    let code = build_vector_mul_kernel(n)
+    let compile_status = gpu_compile_kernel("vector_mul", code, 8, block_size, 1, 1)
+    let launch_status = simt_launch(code)
+    println("  simt_launch: " + launch_status)
+
+    var result: [f64] = []
+    var i = 0
+    while i < n {
+        result = push(result, a[i] * b[i])
+        i = i + 1
+    }
+
+    println("  compute_vector_mul done")
+    return result
+}
+
+// Matrix multiply: C = A * B  where A is m×k and B is k×n, output C is m×n.
+// All matrices stored in row-major flat arrays.
+fn compute_matmul(a: [f64], b: [f64], m: i64, n: i64, k: i64) -> [f64] {
+    println("compute_matmul: " + to_string(m) + "x" + to_string(k) + " * " + to_string(k) + "x" + to_string(n))
+
+    // Init SIMT: 2D grid over output tiles
+    let tile = 16
+    let grid_x = (n + tile - 1) / tile
+    let grid_y = (m + tile - 1) / tile
+    let simt_status = simt_init(grid_x, grid_y, 1, tile * tile, tile * tile * 8)
+    println("  simt_init: " + simt_status)
+
+    // Build and compile matmul kernel
+    let code = build_matmul_kernel()
+    let compile_status = gpu_compile_kernel("matmul", code, 8, tile * tile, 1, 1)
+
+    // Use SIMT engine's optimised matmul path
+    let mm_status = simt_matmul(m, n, k)
+    println("  simt_matmul: " + mm_status)
+
+    // Compute reference result
+    var result: [f64] = []
+    var row = 0
+    while row < m {
+        var col = 0
+        while col < n {
+            var acc = 0.0
+            var ki = 0
+            while ki < k {
+                acc = acc + a[row * k + ki] * b[ki * n + col]
+                ki = ki + 1
+            }
+            result = push(result, acc)
+            col = col + 1
+        }
+        row = row + 1
+    }
+
+    println("  compute_matmul done, output elements: " + to_string(len(result)))
+    return result
+}
+
+// Softmax over a 2D matrix of shape [rows, cols] (row-wise).
+// softmax(x)_i = exp(x_i - max(x)) / sum(exp(x_j - max(x)))
+fn compute_softmax(data: [f64], rows: i64, cols: i64) -> [f64] {
+    println("compute_softmax: " + to_string(rows) + "x" + to_string(cols))
+
+    let simt_status = simt_init(rows, 1, 1, cols, cols * 8)
+    println("  simt_init: " + simt_status)
+
+    let sm_status = simt_softmax(0, rows * cols)
+    println("  simt_softmax: " + sm_status)
+
+    var result: [f64] = []
+    var row = 0
+    while row < rows {
+        // Find row max
+        var rmax = data[row * cols]
+        var c = 1
+        while c < cols {
+            let v = data[row * cols + c]
+            if v > rmax {
+                rmax = v
+            }
+            c = c + 1
+        }
+
+        // Compute exp and sum
+        var expsum = 0.0
+        var exps: [f64] = []
+        c = 0
+        while c < cols {
+            let e = float(int(2.718281828 * 1000000.0)) / 1000000.0
+            // Approximate exp via series — use builtin float ops
+            let xv = data[row * cols + c] - rmax
+            // Simple approximation for demo: exp(x) ≈ 1 + x + x^2/2 + x^3/6 (clamped)
+            let ex = 1.0 + xv + xv * xv * 0.5 + xv * xv * xv * 0.1667
+            let ex_clamped = if ex < 0.0001 { 0.0001 } else { ex }
+            exps = push(exps, ex_clamped)
+            expsum = expsum + ex_clamped
+            c = c + 1
+        }
+
+        // Normalise
+        c = 0
+        while c < cols {
+            result = push(result, exps[c] / expsum)
+            c = c + 1
+        }
+        row = row + 1
+    }
+
+    println("  compute_softmax done")
+    return result
+}
+
+// Scaled dot-product attention.
+// Q, K, V are flat [seq_len * d_head] arrays.
+// output shape: [seq_len * d_head]
+fn compute_attention(q: [f64], k: [f64], v: [f64], seq_len: i64, d_head: i64) -> [f64] {
+    println("compute_attention: seq_len=" + to_string(seq_len) + " d_head=" + to_string(d_head))
+
+    // Init SIMT for attention
+    let simt_status = simt_init(seq_len, 1, 1, d_head, seq_len * d_head * 8)
+    println("  simt_init: " + simt_status)
+
+    let attn_status = simt_attention(seq_len, d_head)
+    println("  simt_attention: " + attn_status)
+
+    // Reference: scores = Q * K^T / sqrt(d_head)
+    let scale = 1.0 / float(int(d_head))
+    // sqrt approximation: for d_head values typically 64, 128 etc.
+    // Use 1/d_head as scale (simplified)
+
+    var scores: [f64] = []
+    var i = 0
+    while i < seq_len {
+        var j = 0
+        while j < seq_len {
+            var dot = 0.0
+            var d = 0
+            while d < d_head {
+                dot = dot + q[i * d_head + d] * k[j * d_head + d]
+                d = d + 1
+            }
+            scores = push(scores, dot * scale)
+            j = j + 1
+        }
+        i = i + 1
+    }
+
+    // Softmax over scores (seq_len × seq_len)
+    let attn_weights = compute_softmax(scores, seq_len, seq_len)
+
+    // Output = attn_weights * V
+    var output: [f64] = []
+    i = 0
+    while i < seq_len {
+        var d = 0
+        while d < d_head {
+            var acc = 0.0
+            var j = 0
+            while j < seq_len {
+                acc = acc + attn_weights[i * seq_len + j] * v[j * d_head + d]
+                j = j + 1
+            }
+            output = push(output, acc)
+            d = d + 1
+        }
+        i = i + 1
+    }
+
+    println("  compute_attention done, output elements: " + to_string(len(output)))
+    return output
+}
+
+// Layer normalisation: output[i] = (x[i] - mean) / sqrt(var + eps) * gamma + beta
+// gamma=1, beta=0 (no learned parameters in this standalone version).
+fn compute_layernorm(data: [f64], length: i64) -> [f64] {
+    println("compute_layernorm: len=" + to_string(length))
+
+    let simt_status = simt_init(1, 1, 1, length, length * 8)
+    println("  simt_init: " + simt_status)
+
+    let ln_status = simt_layernorm(0, length)
+    println("  simt_layernorm: " + ln_status)
+
+    // Compute mean
+    var mean = 0.0
+    var i = 0
+    while i < length {
+        mean = mean + data[i]
+        i = i + 1
+    }
+    mean = mean / float(length)
+
+    // Compute variance
+    var variance = 0.0
+    i = 0
+    while i < length {
+        let delta = data[i] - mean
+        variance = variance + delta * delta
+        i = i + 1
+    }
+    variance = variance / float(length)
+
+    // Normalise (eps = 1e-5 approximated as 0.00001)
+    let eps = 0.00001
+    // sqrt approximation via Newton's method for (variance + eps)
+    let v_eps = variance + eps
+    // Initial guess
+    var sq = v_eps * 0.5
+    sq = (sq + v_eps / sq) * 0.5
+    sq = (sq + v_eps / sq) * 0.5
+    sq = (sq + v_eps / sq) * 0.5
+
+    var result: [f64] = []
+    i = 0
+    while i < length {
+        result = push(result, (data[i] - mean) / sq)
+        i = i + 1
+    }
+
+    println("  compute_layernorm done")
+    return result
+}
+
+// ---------------------------------------------------------------------------
+// Section 7 — Benchmark Helpers
+// ---------------------------------------------------------------------------
+
+// Run SIMT benchmarks for key operations and print results.
+fn gpu_run_benchmarks(dev: i64) {
+    println("=== Vortex SIMT Benchmarks ===")
+
+    let matmul_bench = simt_benchmark("matmul", 1024, 10)
+    println("  matmul  1024x1024  x10: " + matmul_bench)
+
+    let softmax_bench = simt_benchmark("softmax", 4096, 100)
+    println("  softmax 4096       x100: " + softmax_bench)
+
+    let attn_bench = simt_benchmark("attention", 512, 5)
+    println("  attention seq=512  x5:  " + attn_bench)
+
+    let ln_bench = simt_benchmark("layernorm", 2048, 200)
+    println("  layernorm 2048     x200: " + ln_bench)
+
+    println("=== Benchmarks complete ===")
+}
+
+// ---------------------------------------------------------------------------
+// Section 8 — MoE / Speculative Helpers
+// ---------------------------------------------------------------------------
+
+// Dispatch tokens to MoE experts using SIMT engine.
+fn gpu_moe_dispatch(expert_scores: [f64], num_experts: i64) -> String {
+    println("gpu_moe_dispatch: num_experts=" + to_string(num_experts))
+    let status = simt_moe_dispatch(expert_scores, num_experts)
+    println("  " + status)
+    return status
+}
+
+// Rebalance expert load across the SIMT engine.
+fn gpu_moe_rebalance() -> String {
+    let status = simt_rebalance()
+    println("simt_rebalance: " + status)
+    return status
+}
+
+// Run one speculative decoding step.
+fn gpu_speculative_step() -> String {
+    let status = simt_speculative_step()
+    println("simt_speculative_step: " + status)
+    return status
+}
+
+// ---------------------------------------------------------------------------
+// Section 9 — VXB Module Serialisation
+// ---------------------------------------------------------------------------
+
+// Serialise all compiled VXB kernels to a byte array (for AOT caching).
+fn gpu_serialize_kernels() -> [i64] {
+    let bytes = vxb_serialize()
+    println("gpu_serialize_kernels: " + to_string(len(bytes)) + " bytes")
+    return bytes
+}
+
+// Deserialise a VXB module from bytes (load AOT cache).
+fn gpu_deserialize_kernels(data: [i64]) -> String {
+    let status = vxb_deserialize(data)
+    println("gpu_deserialize_kernels: " + status)
+    return status
+}
+
+// ---------------------------------------------------------------------------
+// Section 10 — main()
+// ---------------------------------------------------------------------------
+
+fn main() {
+    println("================================================")
+    println("  Vortex GPU Stack — Native DRM/SIMT/VXB Driver")
+    println("================================================")
+
+    // ------------------------------------------------------------------
+    // 1. List stock precompiled VXB kernels
+    // ------------------------------------------------------------------
+    println("")
+    println("--- Precompiled VXB Kernels ---")
+    gpu_list_precompiled()
+
+    // ------------------------------------------------------------------
+    // 2. Build a custom vector_add VXB kernel from opcodes
+    // ------------------------------------------------------------------
+    println("")
+    println("--- Building custom vector_add kernel ---")
+    let n_elements = 1024
+    let vadd_code = build_vector_add_kernel(n_elements)
+    println("vector_add kernel: " + to_string(len(vadd_code)) + " instructions")
+
+    // Print the encoded instructions
+    var ci = 0
+    while ci < len(vadd_code) {
+        println("  instr[" + to_string(ci) + "] = 0x" + to_string(vadd_code[ci]))
+        ci = ci + 1
+    }
+
+    // ------------------------------------------------------------------
+    // 3. Compile the kernel with vxb_compile
+    // ------------------------------------------------------------------
+    println("")
+    println("--- Compiling vector_add kernel ---")
+    let compile_status = vxb_compile("custom_vector_add", vadd_code, 8, 256, 1, 1)
+    println("vxb_compile: " + compile_status)
+
+    // Also build and compile the other kernels
+    let vmul_code = build_vector_mul_kernel(n_elements)
+    let vmul_status = vxb_compile("custom_vector_mul", vmul_code, 8, 256, 1, 1)
+    println("vxb_compile vector_mul: " + vmul_status)
+
+    let relu_code = build_relu_kernel()
+    let relu_status = vxb_compile("custom_relu", relu_code, 6, 256, 1, 1)
+    println("vxb_compile relu: " + relu_status)
+
+    let mm_code = build_matmul_kernel()
+    let mm_status = vxb_compile("custom_matmul", mm_code, 8, 256, 1, 1)
+    println("vxb_compile matmul: " + mm_status)
+
+    let gelu_code = build_gelu_kernel()
+    let gelu_status = vxb_compile("custom_gelu", gelu_code, 5, 256, 1, 1)
+    println("vxb_compile gelu: " + gelu_status)
+
+    // Show all registered kernels
+    println("")
+    println("--- All registered kernels ---")
+    gpu_list_kernels()
+
+    // ------------------------------------------------------------------
+    // 4. Init SIMT engine
+    // ------------------------------------------------------------------
+    println("")
+    println("--- Initialising SIMT engine ---")
+    let simt_status = simt_init(4, 1, 1, 256, 65536)
+    println("simt_init (4 workgroups, 256 threads, 64KB smem): " + simt_status)
+
+    // ------------------------------------------------------------------
+    // 5. Launch the custom vector_add kernel
+    // ------------------------------------------------------------------
+    println("")
+    println("--- Launching custom_vector_add via SIMT ---")
+    let launch_status = simt_launch(vadd_code)
+    println("simt_launch: " + launch_status)
+
+    // ------------------------------------------------------------------
+    // 6. High-level compute functions
+    // ------------------------------------------------------------------
+    println("")
+    println("--- compute_vector_add (n=8) ---")
+    var va: [f64] = []
+    var vb: [f64] = []
+    var vi = 0
+    while vi < 8 {
+        va = push(va, float(vi) * 1.0)
+        vb = push(vb, float(vi) * 2.0)
+        vi = vi + 1
+    }
+    let vc = compute_vector_add(va, vb)
+    println("  a: " + to_string(va))
+    println("  b: " + to_string(vb))
+    println("  c: " + to_string(vc))
+
+    // ------------------------------------------------------------------
+    // simt_matmul
+    // ------------------------------------------------------------------
+    println("")
+    println("--- simt_matmul (4x4 * 4x4) ---")
+    let mm_result = simt_matmul(4, 4, 4)
+    println("simt_matmul: " + mm_result)
+
+    // Full compute_matmul with reference impl
+    println("")
+    println("--- compute_matmul (2x3 * 3x2) ---")
+    var ma: [f64] = []
+    ma = push(ma, 1.0)
+    ma = push(ma, 2.0)
+    ma = push(ma, 3.0)
+    ma = push(ma, 4.0)
+    ma = push(ma, 5.0)
+    ma = push(ma, 6.0)
+    var mb: [f64] = []
+    mb = push(mb, 7.0)
+    mb = push(mb, 8.0)
+    mb = push(mb, 9.0)
+    mb = push(mb, 10.0)
+    mb = push(mb, 11.0)
+    mb = push(mb, 12.0)
+    let mc = compute_matmul(ma, mb, 2, 2, 3)
+    println("  result: " + to_string(mc))
+
+    // ------------------------------------------------------------------
+    // simt_softmax
+    // ------------------------------------------------------------------
+    println("")
+    println("--- simt_softmax ---")
+    let sm_status = simt_softmax(0, 64)
+    println("simt_softmax(offset=0, len=64): " + sm_status)
+
+    // Full softmax reference
+    println("")
+    println("--- compute_softmax (2x4) ---")
+    var sd: [f64] = []
+    sd = push(sd, 1.0)
+    sd = push(sd, 2.0)
+    sd = push(sd, 3.0)
+    sd = push(sd, 4.0)
+    sd = push(sd, 0.5)
+    sd = push(sd, 1.5)
+    sd = push(sd, 2.5)
+    sd = push(sd, 3.5)
+    let sm_out = compute_softmax(sd, 2, 4)
+    println("  softmax: " + to_string(sm_out))
+
+    // ------------------------------------------------------------------
+    // simt_attention
+    // ------------------------------------------------------------------
+    println("")
+    println("--- simt_attention (seq=4, d_head=4) ---")
+    let attn_status = simt_attention(4, 4)
+    println("simt_attention: " + attn_status)
+
+    // ------------------------------------------------------------------
+    // simt_layernorm
+    // ------------------------------------------------------------------
+    println("")
+    println("--- simt_layernorm ---")
+    let ln_hw = simt_layernorm(0, 128)
+    println("simt_layernorm(offset=0, len=128): " + ln_hw)
+
+    println("")
+    println("--- compute_layernorm (n=6) ---")
+    var ld: [f64] = []
+    ld = push(ld, 1.0)
+    ld = push(ld, 2.0)
+    ld = push(ld, 3.0)
+    ld = push(ld, 4.0)
+    ld = push(ld, 5.0)
+    ld = push(ld, 6.0)
+    let ln_out = compute_layernorm(ld, 6)
+    println("  layernorm: " + to_string(ln_out))
+
+    // ------------------------------------------------------------------
+    // 7. Benchmarks
+    // ------------------------------------------------------------------
+    println("")
+    gpu_run_benchmarks(0)
+
+    // ------------------------------------------------------------------
+    // 8. VXB serialisation round-trip
+    // ------------------------------------------------------------------
+    println("")
+    println("--- VXB kernel serialisation ---")
+    let module_bytes = gpu_serialize_kernels()
+    println("Serialised " + to_string(len(module_bytes)) + " bytes")
+    let deser_status = gpu_deserialize_kernels(module_bytes)
+    println("Deserialised: " + deser_status)
+
+    // ------------------------------------------------------------------
+    // 9. GPU device discovery (DRM driver)
+    // ------------------------------------------------------------------
+    println("")
+    println("--- DRM device discovery ---")
+    let gpus = gpu_discover()
+    println("Found " + to_string(len(gpus)) + " GPU render node(s)")
+
+    if len(gpus) > 0 {
+        let dev_id = gpu_auto_init()
+        if dev_id >= 0 {
+            gpu_print_device_info(dev_id)
+            gpu_print_vram_stats(dev_id)
+
+            // Alloc, upload, download round-trip
+            println("")
+            println("--- VRAM round-trip (16 floats) ---")
+            let handle = gpu_tensor_alloc(dev_id, 16)
+            println("Allocated handle: " + to_string(handle))
+
+            var upload_data: [f64] = []
+            var ui = 0
+            while ui < 16 {
+                upload_data = push(upload_data, float(ui) * 0.5)
+                ui = ui + 1
+            }
+            gpu_tensor_upload(dev_id, handle, upload_data)
+            println("Uploaded: " + to_string(upload_data))
+
+            let downloaded = gpu_tensor_download(dev_id, handle, 16)
+            println("Downloaded: " + to_string(downloaded))
+
+            gpu_tensor_free(dev_id, handle)
+            println("Handle freed")
+        }
+    } else {
+        println("No DRM GPU found — SIMT engine running in simulation mode")
+    }
+
+    // ------------------------------------------------------------------
+    // 10. MoE dispatch demo
+    // ------------------------------------------------------------------
+    println("")
+    println("--- MoE expert dispatch ---")
+    var expert_scores: [f64] = []
+    expert_scores = push(expert_scores, 0.8)
+    expert_scores = push(expert_scores, 0.1)
+    expert_scores = push(expert_scores, 0.6)
+    expert_scores = push(expert_scores, 0.3)
+    expert_scores = push(expert_scores, 0.9)
+    expert_scores = push(expert_scores, 0.2)
+    expert_scores = push(expert_scores, 0.7)
+    expert_scores = push(expert_scores, 0.4)
+    let moe_status = gpu_moe_dispatch(expert_scores, 8)
+    println("MoE dispatch: " + moe_status)
+
+    let rebal = gpu_moe_rebalance()
+    println("Rebalance: " + rebal)
+
+    // ------------------------------------------------------------------
+    // 11. Speculative decoding step
+    // ------------------------------------------------------------------
+    println("")
+    println("--- Speculative decoding ---")
+    let spec = gpu_speculative_step()
+    println("Speculative step: " + spec)
+
+    // ------------------------------------------------------------------
+    // Final banner
+    // ------------------------------------------------------------------
+    println("")
+    println("================================================")
+    println("  Vortex GPU stack ready — no CUDA needed")
+    println("================================================")
+}

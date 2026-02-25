@@ -1,0 +1,695 @@
+// spike_ssm.vx — Hybrid Spike-SSM-Attention
+//
+// Combines three ideas that are each possible individually in PyTorch,
+// but whose *dynamic interaction* is impossible in a static graph:
+//
+//   1. Spike encoding: continuous values → binary events (0/1)
+//   2. State Space Model (SSM): recurrent dynamics, O(N) per sequence
+//   3. Sparse attention: attend only between positions that fired spikes
+//
+// The key novelty: a spike at position t DYNAMICALLY decides whether:
+//   (a) the SSM state gets updated at all (saving compute)
+//   (b) position t participates in attention (reducing attention from O(N²) to O(S²))
+//
+// In PyTorch you must pad/mask to full length — the computation always happens.
+// In Vortex the conditional computation is structural, not a multiply-by-zero.
+//
+// State encodings (all use [String] to pass heterogeneous data):
+//   ssm_result  : [output_0..output_{dim-1}, new_state_0..new_state_{dim-1}]
+//   seq_entry   : space-separated f64 of length dim (same as adaptive_depth)
+//   ssm_params  : [A_flat..., B_flat..., C_flat...]  (3 * dim*dim floats as strings)
+//   attn_params : [Wq_flat..., Wk_flat..., Wv_flat...] (3 * dim*dim floats as strings)
+
+// ─────────────────────────────────────────────────────────────
+// Section 1: Math helpers
+// ─────────────────────────────────────────────────────────────
+
+fn abs_f(x: f64) -> f64 {
+    if x < 0.0 { 0.0 - x } else { x }
+}
+
+fn exp_approx(x: f64) -> f64 {
+    var cx = x
+    if cx > 6.0  { cx = 6.0 }
+    if cx < 0.0 - 6.0 { cx = 0.0 - 6.0 }
+    var num = 1.0 + cx + cx * cx * 0.5 + cx * cx * cx * 0.16666667
+    var den = 1.0 - cx + cx * cx * 0.5 - cx * cx * cx * 0.16666667
+    if den < 0.0001 { den = 0.0001 }
+    num / den
+}
+
+fn softmax_vec(v: [f64]) -> [f64] {
+    var n = len(v)
+    // find max for numerical stability
+    var mx = v[0]
+    var i = 1
+    while i < n {
+        if v[i] > mx { mx = v[i] }
+        i = i + 1
+    }
+    var exps = []
+    var total = 0.0
+    i = 0
+    while i < n {
+        var e = exp_approx(v[i] - mx)
+        exps = push(exps, e)
+        total = total + e
+        i = i + 1
+    }
+    var result = []
+    i = 0
+    while i < n {
+        result = push(result, exps[i] / total)
+        i = i + 1
+    }
+    result
+}
+
+fn sqrt_approx(x: f64) -> f64 {
+    if x <= 0.0 { return 1.0 }
+    var g = x * 0.5
+    var i = 0
+    while i < 15 {
+        g = (g + x / g) * 0.5
+        i = i + 1
+    }
+    g
+}
+
+// ─────────────────────────────────────────────────────────────
+// Section 2: Sequence encoding helpers
+// ─────────────────────────────────────────────────────────────
+
+fn encode_vec(v: [f64]) -> String {
+    var n = len(v)
+    if n == 0 { return "" }
+    var s = to_string(v[0])
+    var i = 1
+    while i < n {
+        s = s + " " + to_string(v[i])
+        i = i + 1
+    }
+    s
+}
+
+fn decode_vec(s: String, dim: i64) -> [f64] {
+    var result = []
+    var current = ""
+    var idx = 0
+    var slen = len(s)
+    while idx < slen {
+        var ch = str_char_at(s, idx)
+        if ch == " " {
+            if len(current) > 0 {
+                result = push(result, float(current))
+                current = ""
+            }
+        } else {
+            current = current + ch
+        }
+        idx = idx + 1
+    }
+    if len(current) > 0 {
+        result = push(result, float(current))
+    }
+    while len(result) < dim {
+        result = push(result, 0.0)
+    }
+    result
+}
+
+fn encode_int_vec(v: [i64]) -> String {
+    var n = len(v)
+    if n == 0 { return "" }
+    var s = to_string(v[0])
+    var i = 1
+    while i < n {
+        s = s + " " + to_string(v[i])
+        i = i + 1
+    }
+    s
+}
+
+fn decode_int_vec(s: String, dim: i64) -> [i64] {
+    var result = []
+    var current = ""
+    var idx = 0
+    var slen = len(s)
+    while idx < slen {
+        var ch = str_char_at(s, idx)
+        if ch == " " {
+            if len(current) > 0 {
+                result = push(result, int(current))
+                current = ""
+            }
+        } else {
+            current = current + ch
+        }
+        idx = idx + 1
+    }
+    if len(current) > 0 {
+        result = push(result, int(current))
+    }
+    while len(result) < dim {
+        result = push(result, 0)
+    }
+    result
+}
+
+// ─────────────────────────────────────────────────────────────
+// Section 3: Spike encoding / decoding
+// ─────────────────────────────────────────────────────────────
+
+// spike_encode — convert continuous values to binary spike events.
+// A spike fires (value = 1) whenever input[i] > threshold.
+// This is NOT differentiable — it is a discrete event, like a neuron firing.
+// PyTorch requires a surrogate gradient trick; Vortex treats it natively.
+fn spike_encode(input: [f64], threshold: f64) -> [i64] {
+    var spikes = []
+    var n = len(input)
+    var i = 0
+    while i < n {
+        if input[i] > threshold {
+            spikes = push(spikes, 1)
+        } else {
+            spikes = push(spikes, 0)
+        }
+        i = i + 1
+    }
+    spikes
+}
+
+// spike_decode — reconstruct approximate continuous signal from spikes.
+// scale controls the amplitude of reconstructed spikes.
+fn spike_decode(spikes: [i64], scale: f64) -> [f64] {
+    var result = []
+    var n = len(spikes)
+    var i = 0
+    while i < n {
+        result = push(result, float(spikes[i]) * scale)
+        i = i + 1
+    }
+    result
+}
+
+// spike_rate — fraction of positions that fired
+fn spike_rate(spikes: [i64]) -> f64 {
+    var n = len(spikes)
+    if n == 0 { return 0.0 }
+    var total = 0
+    var i = 0
+    while i < n {
+        total = total + spikes[i]
+        i = i + 1
+    }
+    float(total) / float(n)
+}
+
+// ─────────────────────────────────────────────────────────────
+// Section 4: State Space Model (SSM)
+// ─────────────────────────────────────────────────────────────
+
+// ssm_state_new — zero initial state vector of length dim
+fn ssm_state_new(dim: i64) -> [f64] {
+    var s = []
+    var i = 0
+    while i < dim {
+        s = push(s, 0.0)
+        i = i + 1
+    }
+    s
+}
+
+// mat_vec_mul — multiply dim×dim matrix (row-major flat) by vector of length dim
+fn mat_vec_mul(mat: [f64], vec: [f64], dim: i64) -> [f64] {
+    var out = []
+    var row = 0
+    while row < dim {
+        var acc = 0.0
+        var col = 0
+        while col < dim {
+            acc = acc + mat[row * dim + col] * vec[col]
+            col = col + 1
+        }
+        out = push(out, acc)
+        row = row + 1
+    }
+    out
+}
+
+// vec_add — element-wise addition of two vectors
+fn vec_add(a: [f64], b: [f64]) -> [f64] {
+    var n = len(a)
+    var result = []
+    var i = 0
+    while i < n {
+        result = push(result, a[i] + b[i])
+        i = i + 1
+    }
+    result
+}
+
+// ssm_step — one discrete SSM step.
+//   new_state = A * state + B * input
+//   output    = C * new_state
+//
+// Returns [String]: first dim entries = output, next dim entries = new_state
+// This layout lets callers extract both cheaply without two passes.
+fn ssm_step(state: [f64], input: [f64], A: [f64], B: [f64], C: [f64], dim: i64) -> [String] {
+    var As = mat_vec_mul(A, state, dim)
+    var Bx = mat_vec_mul(B, input, dim)
+    var new_state = vec_add(As, Bx)
+    var output = mat_vec_mul(C, new_state, dim)
+
+    var result = []
+    var i = 0
+    while i < dim {
+        result = push(result, to_string(output[i]))
+        i = i + 1
+    }
+    i = 0
+    while i < dim {
+        result = push(result, to_string(new_state[i]))
+        i = i + 1
+    }
+    result
+}
+
+// ─────────────────────────────────────────────────────────────
+// Section 5: Spike-gated SSM forward pass
+// ─────────────────────────────────────────────────────────────
+
+// spike_ssm_forward — process a sequence through a spike-gated SSM.
+//
+// For each time step t:
+//   - decode input_seq[t] to a float vector
+//   - compute spikes from the first element's magnitude as a proxy
+//   - ONLY run the SSM step if ANY spike fired at this time step
+//   - this skips the matrix multiplications entirely (not a masked zero)
+//
+// Returns [String]:
+//   Entries 0..seq_len-1 : encoded output vectors (or "skipped" if no spike)
+//   Entry seq_len         : "steps_computed:<n>"
+//   Entry seq_len+1       : "steps_skipped:<n>"
+//   Entry seq_len+2       : "compute_savings:<pct>%"
+fn spike_ssm_forward(input_seq: [String], A: [f64], B: [f64], C: [f64], dim: i64, threshold: f64) -> [String] {
+    var seq_len = len(input_seq)
+    var state = ssm_state_new(dim)
+    var outputs = []
+    var steps_computed = 0
+    var steps_skipped = 0
+
+    var t = 0
+    while t < seq_len {
+        var x = decode_vec(input_seq[t], dim)
+
+        // spike decision: use the full input vector's L1 norm as spike signal
+        var norm = 0.0
+        var k = 0
+        while k < dim {
+            if x[k] > 0.0 { norm = norm + x[k] }
+            else { norm = norm + (0.0 - x[k]) }
+            k = k + 1
+        }
+        var mean_norm = norm / float(dim)
+
+        if mean_norm > threshold {
+            // spike fired: run SSM
+            var step_result = ssm_step(state, x, A, B, C, dim)
+            // extract new_state from positions dim..2*dim-1
+            var new_state = []
+            var si = dim
+            while si < dim + dim {
+                new_state = push(new_state, float(step_result[si]))
+                si = si + 1
+            }
+            state = new_state
+            // extract output from positions 0..dim-1
+            var out_vec = []
+            si = 0
+            while si < dim {
+                out_vec = push(out_vec, float(step_result[si]))
+                si = si + 1
+            }
+            outputs = push(outputs, encode_vec(out_vec))
+            steps_computed = steps_computed + 1
+        } else {
+            // no spike: skip computation entirely, carry state forward
+            outputs = push(outputs, "skipped")
+            steps_skipped = steps_skipped + 1
+        }
+        t = t + 1
+    }
+
+    var total = steps_computed + steps_skipped
+    var savings_pct = 0.0
+    if total > 0 {
+        savings_pct = float(steps_skipped) / float(total) * 100.0
+    }
+
+    var result = outputs
+    result = push(result, "steps_computed:" + to_string(steps_computed))
+    result = push(result, "steps_skipped:" + to_string(steps_skipped))
+    result = push(result, "compute_savings:" + to_string(savings_pct) + "%")
+    result
+}
+
+// ─────────────────────────────────────────────────────────────
+// Section 6: Sparse attention (O(S²) not O(N²))
+// ─────────────────────────────────────────────────────────────
+
+// sparse_attention — multi-head-free dot-product attention restricted to
+// positions where spike_mask[i] == 1.
+//
+// queries, keys, values : flat [f64] of seq_len * dim (row-major)
+// spike_mask            : [i64] of length seq_len
+//
+// Returns [f64] of seq_len * dim — non-spiking positions get zeros.
+fn sparse_attention(queries: [f64], keys: [f64], values: [f64], spike_mask: [i64], dim: i64, seq_len: i64) -> [f64] {
+    var scale = 1.0 / sqrt_approx(float(dim))
+
+    // collect spike indices
+    var spike_indices = []
+    var i = 0
+    while i < seq_len {
+        if spike_mask[i] == 1 {
+            spike_indices = push(spike_indices, i)
+        }
+        i = i + 1
+    }
+    var S = len(spike_indices)
+
+    // output buffer: all zeros initially
+    var output = []
+    var k = 0
+    while k < seq_len * dim {
+        output = push(output, 0.0)
+        k = k + 1
+    }
+
+    if S == 0 {
+        return output
+    }
+
+    // for each spiking query position, attend only to spiking key positions
+    var qi = 0
+    while qi < S {
+        var q_pos = spike_indices[qi]
+
+        // compute attention scores vs all spiking keys
+        var scores = []
+        var ki = 0
+        while ki < S {
+            var k_pos = spike_indices[ki]
+            var dot = 0.0
+            var d = 0
+            while d < dim {
+                dot = dot + queries[q_pos * dim + d] * keys[k_pos * dim + d]
+                d = d + 1
+            }
+            scores = push(scores, dot * scale)
+            ki = ki + 1
+        }
+
+        // softmax over spiking positions only
+        var attn_weights = softmax_vec(scores)
+
+        // weighted sum of values at spiking positions
+        var out_vec = []
+        var d = 0
+        while d < dim {
+            out_vec = push(out_vec, 0.0)
+            d = d + 1
+        }
+
+        var wi = 0
+        while wi < S {
+            var v_pos = spike_indices[wi]
+            d = 0
+            while d < dim {
+                var cur = out_vec[d] + attn_weights[wi] * values[v_pos * dim + d]
+                // rebuild out_vec with updated value at d
+                var new_out = []
+                var dd = 0
+                while dd < dim {
+                    if dd == d { new_out = push(new_out, cur) }
+                    else        { new_out = push(new_out, out_vec[dd]) }
+                    dd = dd + 1
+                }
+                out_vec = new_out
+                d = d + 1
+            }
+            wi = wi + 1
+        }
+
+        // write to output at q_pos
+        d = 0
+        while d < dim {
+            var flat_idx = q_pos * dim + d
+            var new_output = []
+            var oi = 0
+            while oi < seq_len * dim {
+                if oi == flat_idx { new_output = push(new_output, out_vec[d]) }
+                else               { new_output = push(new_output, output[oi]) }
+                oi = oi + 1
+            }
+            output = new_output
+            d = d + 1
+        }
+        qi = qi + 1
+    }
+    output
+}
+
+// ─────────────────────────────────────────────────────────────
+// Section 7: Hybrid SSM + Sparse Attention forward
+// ─────────────────────────────────────────────────────────────
+
+// rand_mat — simple pseudo-random dim×dim matrix scaled by scale
+fn rand_mat(dim: i64, seed: i64, scale: f64) -> [f64] {
+    var n = dim * dim
+    var m = []
+    var s = seed
+    var i = 0
+    while i < n {
+        s = s * 1664525 + 1013904223
+        var v = float(s % 100000) / 100000.0 - 0.5
+        m = push(m, v * scale)
+        i = i + 1
+    }
+    m
+}
+
+// hybrid_forward — SSM handles local temporal dynamics; sparse attention
+// handles long-range relationships between positions that fired spikes.
+//
+// ssm_params  : [String] where entries are encoded A, B, C matrices (each dim*dim floats)
+// attn_params : [String] where entries are encoded Wq, Wk, Wv matrices
+//
+// Returns [String]:
+//   [0..seq_len-1] : encoded output for each position
+//   [seq_len]      : "ssm_savings:<pct>%"
+//   [seq_len+1]    : "attn_sparsity:<pct>%"
+//   [seq_len+2]    : "total_spike_rate:<rate>"
+fn hybrid_forward(input_seq: [String], ssm_params: [String], attn_params: [String], dim: i64, threshold: f64) -> [String] {
+    var seq_len = len(input_seq)
+
+    // decode SSM matrices
+    var A = decode_vec(ssm_params[0], dim * dim)
+    var B = decode_vec(ssm_params[1], dim * dim)
+    var C = decode_vec(ssm_params[2], dim * dim)
+
+    // decode attention projection matrices
+    var Wq = decode_vec(attn_params[0], dim * dim)
+    var Wk = decode_vec(attn_params[1], dim * dim)
+    var Wv = decode_vec(attn_params[2], dim * dim)
+
+    // Pass 1: spike-gated SSM for local dynamics
+    var ssm_result = spike_ssm_forward(input_seq, A, B, C, dim, threshold)
+    var ssm_savings_s = ssm_result[seq_len + 2]  // "compute_savings:XX%"
+
+    // Collect SSM outputs and build spike mask for attention
+    var ssm_outputs = []
+    var spike_mask = []
+    var t = 0
+    while t < seq_len {
+        var entry = ssm_result[t]
+        if entry == "skipped" {
+            // no spike — use original input for attention but mark as 0
+            ssm_outputs = push(ssm_outputs, decode_vec(input_seq[t], dim))
+            spike_mask = push(spike_mask, 0)
+        } else {
+            ssm_outputs = push(ssm_outputs, decode_vec(entry, dim))
+            spike_mask = push(spike_mask, 1)
+        }
+        t = t + 1
+    }
+
+    // Pass 2: project SSM outputs into Q, K, V spaces
+    var queries = []
+    var keys = []
+    var values = []
+    t = 0
+    while t < seq_len {
+        var q = mat_vec_mul(Wq, ssm_outputs[t], dim)
+        var k = mat_vec_mul(Wk, ssm_outputs[t], dim)
+        var v = mat_vec_mul(Wv, ssm_outputs[t], dim)
+        var d = 0
+        while d < dim {
+            queries = push(queries, q[d])
+            keys    = push(keys,    k[d])
+            values  = push(values,  v[d])
+            d = d + 1
+        }
+        t = t + 1
+    }
+
+    // Pass 3: sparse attention (O(S²))
+    var attn_output = sparse_attention(queries, keys, values, spike_mask, dim, seq_len)
+
+    // Fuse SSM and attention outputs: element-wise add
+    var final_outputs = []
+    t = 0
+    while t < seq_len {
+        var fused = []
+        var d = 0
+        while d < dim {
+            fused = push(fused, ssm_outputs[t][d] + attn_output[t * dim + d])
+            d = d + 1
+        }
+        final_outputs = push(final_outputs, encode_vec(fused))
+        t = t + 1
+    }
+
+    // compute sparsity stats
+    var spike_count = 0
+    var si = 0
+    while si < seq_len {
+        spike_count = spike_count + spike_mask[si]
+        si = si + 1
+    }
+    var spike_rate_val = float(spike_count) / float(seq_len)
+    var attn_sparsity = (1.0 - spike_rate_val * spike_rate_val) * 100.0
+
+    var result = final_outputs
+    result = push(result, "ssm_savings:" + ssm_savings_s)
+    result = push(result, "attn_sparsity:" + to_string(attn_sparsity) + "%")
+    result = push(result, "total_spike_rate:" + to_string(spike_rate_val))
+    result
+}
+
+// ─────────────────────────────────────────────────────────────
+// Section 8: Demo
+// ─────────────────────────────────────────────────────────────
+
+fn main() {
+    var nl = str_from_bytes([10])
+    var tab = str_from_bytes([9])
+
+    println("=== Spike-SSM-Attention Hybrid Demo ===" + nl)
+    println("Dynamic sparse computation impossible in static graphs." + nl)
+
+    var dim = 4
+    var seq_len = 8
+    var threshold = 0.4
+
+    println("Sequence length = " + to_string(seq_len) + ",  dim = " + to_string(dim))
+    println("Spike threshold = " + to_string(threshold) + nl)
+
+    // Build a sequence with mixed activity levels
+    // Positions 0,1,6,7 are quiet; positions 2,3,4,5 are active
+    var input_seq = []
+    var t = 0
+    while t < seq_len {
+        var v = []
+        var d = 0
+        if t >= 2 {
+            if t <= 5 {
+                // active region
+                while d < dim {
+                    v = push(v, 0.6 + float(d) * 0.15 + float(t) * 0.05)
+                    d = d + 1
+                }
+            } else {
+                while d < dim {
+                    v = push(v, 0.1 + float(d) * 0.02)
+                    d = d + 1
+                }
+            }
+        } else {
+            while d < dim {
+                v = push(v, 0.1 + float(d) * 0.02)
+                d = d + 1
+            }
+        }
+        input_seq = push(input_seq, encode_vec(v))
+        t = t + 1
+    }
+
+    // Show what spikes fire at each position
+    println("--- Spike pattern per time step ---" + nl)
+    t = 0
+    while t < seq_len {
+        var x = decode_vec(input_seq[t], dim)
+        var spikes = spike_encode(x, threshold)
+        var rate = spike_rate(spikes)
+        var fired = ""
+        if rate > 0.0 { fired = " <<< SPIKE" } else { fired = " (silent)" }
+        println(tab + "t=" + to_string(t) + "  spike_rate=" + to_string(rate) + fired)
+        t = t + 1
+    }
+
+    // Build SSM matrices
+    var A = rand_mat(dim, 42,    0.3)
+    var B = rand_mat(dim, 137,   0.5)
+    var C = rand_mat(dim, 999,   0.4)
+
+    println(nl + "--- Spike-gated SSM (skips steps where no spike fires) ---" + nl)
+    var ssm_out = spike_ssm_forward(input_seq, A, B, C, dim, threshold)
+    t = 0
+    while t < seq_len {
+        println(tab + "t=" + to_string(t) + ": " + ssm_out[t])
+        t = t + 1
+    }
+    println(nl + tab + ssm_out[seq_len])
+    println(tab + ssm_out[seq_len + 1])
+    println(tab + ssm_out[seq_len + 2])
+
+    // Build attention matrices
+    var Wq = rand_mat(dim, 31,  0.4)
+    var Wk = rand_mat(dim, 71,  0.4)
+    var Wv = rand_mat(dim, 113, 0.4)
+
+    var ssm_params = []
+    ssm_params = push(ssm_params, encode_vec(A))
+    ssm_params = push(ssm_params, encode_vec(B))
+    ssm_params = push(ssm_params, encode_vec(C))
+
+    var attn_params = []
+    attn_params = push(attn_params, encode_vec(Wq))
+    attn_params = push(attn_params, encode_vec(Wk))
+    attn_params = push(attn_params, encode_vec(Wv))
+
+    println(nl + "--- Hybrid SSM + Sparse Attention ---" + nl)
+    var hybrid_out = hybrid_forward(input_seq, ssm_params, attn_params, dim, threshold)
+    t = 0
+    while t < seq_len {
+        var label = ""
+        if t >= 2 {
+            if t <= 5 { label = " (spiking)" } else { label = " (silent)" }
+        } else {
+            label = " (silent)"
+        }
+        println(tab + "t=" + to_string(t) + label + ": " + hybrid_out[t])
+        t = t + 1
+    }
+    println(nl + tab + hybrid_out[seq_len])
+    println(tab + hybrid_out[seq_len + 1])
+    println(tab + hybrid_out[seq_len + 2])
+
+    println(nl + "Key insight:")
+    println(tab + "SSM skips matrix multiplications at silent positions entirely.")
+    println(tab + "Attention is O(S^2) not O(N^2) where S = spiking positions.")
+    println(tab + "Both savings are structural (no computation), not masked zeros.")
+    println(tab + "PyTorch must always run all N^2 attention pairs and all N SSM steps.")
+}

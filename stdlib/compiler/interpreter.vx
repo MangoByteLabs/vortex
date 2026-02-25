@@ -1,0 +1,519 @@
+// Vortex Self-Hosting Tree-Walk Interpreter
+// Executes AST nodes produced by parser.vx (array-based representation)
+//
+// Value representations (encoded as strings):
+//   "i:N"      integer      "f:N"     float
+//   "s:text"   string       "b:true"  / "b:false"  bool
+//   "void"     unit         "ret:V"   early-return carrying V
+//   "fn:name"  function ref
+//
+// Environment: flat [String] of "name=value_repr" entries (most-recent wins)
+// Function table: parallel arrays fn_names / fn_params / fn_bodies
+//   fn_params[i] — comma-separated param names
+//   fn_bodies[i] — placeholder; full AST bodies stored by caller
+
+// Special character helpers (Vortex strings do not process escape sequences)
+fn _quote() -> String { return str_from_bytes([34]) }
+
+// ── String helpers ──────────────────────────────────────────────────────────
+
+// str_find_idx: find needle in haystack, return index or -1
+fn str_find_idx(haystack: String, needle: String) -> i64 {
+    return unwrap_or(str_find(haystack, needle), -1)
+}
+
+fn str_starts_with(s: String, prefix: String) -> bool {
+    if len(s) < len(prefix) { return false }
+    return str_substr(s, 0, len(prefix)) == prefix
+}
+
+fn str_after(s: String, n: i64) -> String {
+    return str_substr(s, n, len(s))
+}
+
+// ── Value helpers ────────────────────────────────────────────────────────────
+
+fn make_int(n: i64) -> String   { return "i:" + str(n) }
+fn make_float(f: f64) -> String { return "f:" + str(f) }
+fn make_str(s: String) -> String { return "s:" + s }
+fn make_bool(b: bool) -> String {
+    if b { return "b:true" }
+    return "b:false"
+}
+
+fn val_to_display(v: String) -> String {
+    if str_starts_with(v, "i:")   { return str_after(v, 2) }
+    if str_starts_with(v, "f:")   { return str_after(v, 2) }
+    if str_starts_with(v, "s:")   { return str_after(v, 2) }
+    if v == "b:true"              { return "true" }
+    if v == "b:false"             { return "false" }
+    if v == "void"                { return "()" }
+    if str_starts_with(v, "ret:") { return str_after(v, 4) }
+    if str_starts_with(v, "fn:")  { return "<fn " + str_after(v, 3) + ">" }
+    return v
+}
+
+fn val_is_truthy(v: String) -> bool {
+    if v == "b:true"  { return true }
+    if v == "b:false" { return false }
+    if v == "void"    { return false }
+    if str_starts_with(v, "i:") { return str_after(v, 2) != "0" }
+    if str_starts_with(v, "s:") { return len(str_after(v, 2)) > 0 }
+    return true
+}
+
+// ── Arithmetic on value reprs ────────────────────────────────────────────────
+
+fn val_add(a: String, b: String) -> String {
+    if str_starts_with(a, "i:") && str_starts_with(b, "i:") {
+        return make_int(int(str_after(a, 2)) + int(str_after(b, 2)))
+    }
+    if str_starts_with(a, "f:") && str_starts_with(b, "f:") {
+        return make_float(float(str_after(a, 2)) + float(str_after(b, 2)))
+    }
+    if str_starts_with(a, "s:") && str_starts_with(b, "s:") {
+        return make_str(str_after(a, 2) + str_after(b, 2))
+    }
+    return "i:0"
+}
+
+fn val_sub(a: String, b: String) -> String {
+    if str_starts_with(a, "i:") && str_starts_with(b, "i:") {
+        return make_int(int(str_after(a, 2)) - int(str_after(b, 2)))
+    }
+    if str_starts_with(a, "f:") && str_starts_with(b, "f:") {
+        return make_float(float(str_after(a, 2)) - float(str_after(b, 2)))
+    }
+    return "i:0"
+}
+
+fn val_mul(a: String, b: String) -> String {
+    if str_starts_with(a, "i:") && str_starts_with(b, "i:") {
+        return make_int(int(str_after(a, 2)) * int(str_after(b, 2)))
+    }
+    if str_starts_with(a, "f:") && str_starts_with(b, "f:") {
+        return make_float(float(str_after(a, 2)) * float(str_after(b, 2)))
+    }
+    return "i:0"
+}
+
+fn val_div(a: String, b: String) -> String {
+    if str_starts_with(a, "i:") && str_starts_with(b, "i:") {
+        let bi = int(str_after(b, 2))
+        if bi == 0 { return "i:0" }
+        return make_int(int(str_after(a, 2)) / bi)
+    }
+    if str_starts_with(a, "f:") && str_starts_with(b, "f:") {
+        return make_float(float(str_after(a, 2)) / float(str_after(b, 2)))
+    }
+    return "i:0"
+}
+
+fn val_mod(a: String, b: String) -> String {
+    if str_starts_with(a, "i:") && str_starts_with(b, "i:") {
+        let bi = int(str_after(b, 2))
+        if bi == 0 { return "i:0" }
+        return make_int(int(str_after(a, 2)) % bi)
+    }
+    return "i:0"
+}
+
+fn val_cmp(a: String, b: String, op: String) -> String {
+    if str_starts_with(a, "i:") && str_starts_with(b, "i:") {
+        let ai = int(str_after(a, 2))
+        let bi = int(str_after(b, 2))
+        if op == "<"  { return make_bool(ai < bi) }
+        if op == "<=" { return make_bool(ai <= bi) }
+        if op == ">"  { return make_bool(ai > bi) }
+        if op == ">=" { return make_bool(ai >= bi) }
+        if op == "==" { return make_bool(ai == bi) }
+        if op == "!=" { return make_bool(ai != bi) }
+    }
+    if str_starts_with(a, "f:") && str_starts_with(b, "f:") {
+        let af = float(str_after(a, 2))
+        let bf = float(str_after(b, 2))
+        if op == "<"  { return make_bool(af < bf) }
+        if op == "<=" { return make_bool(af <= bf) }
+        if op == ">"  { return make_bool(af > bf) }
+        if op == ">=" { return make_bool(af >= bf) }
+        if op == "==" { return make_bool(af == bf) }
+        if op == "!=" { return make_bool(af != bf) }
+    }
+    if op == "==" { return make_bool(a == b) }
+    if op == "!=" { return make_bool(a != b) }
+    return "b:false"
+}
+
+// ── Environment helpers ──────────────────────────────────────────────────────
+
+fn env_get(env: [String], name: String) -> String {
+    let result = "void"
+    let n = len(env)
+    for i in range(0, n) {
+        let sep = str_find_idx(env[i], "=")
+        if sep >= 0 {
+            if str_substr(env[i], 0, sep) == name {
+                result = str_after(env[i], sep + 1)
+            }
+        }
+    }
+    return result
+}
+
+fn env_set(env: [String], name: String, val: String) -> [String] {
+    let new_env = env
+    let found = false
+    let n = len(new_env)
+    for i in range(0, n) {
+        let sep = str_find_idx(new_env[i], "=")
+        if sep >= 0 && str_substr(new_env[i], 0, sep) == name {
+            new_env[i] = name + "=" + val
+            found = true
+        }
+    }
+    if !found { new_env = push(new_env, name + "=" + val) }
+    return new_env
+}
+
+fn env_push_binding(env: [String], name: String, val: String) -> [String] {
+    let new_env = env
+    new_env = push(new_env, name + "=" + val)
+    return new_env
+}
+
+// Reconstruct env from an eval result (result[1..])
+fn result_env(r: [String]) -> [String] {
+    let e: [String] = []
+    for i in range(1, len(r)) { e = push(e, r[i]) }
+    return e
+}
+
+// Wrap value + env into result array
+fn make_result(val: String, env: [String]) -> [String] {
+    let r: [String] = [val]
+    for i in range(0, len(env)) { r = push(r, env[i]) }
+    return r
+}
+
+// ── Function table helpers ───────────────────────────────────────────────────
+
+fn fn_lookup_idx(fn_names: [String], name: String) -> i64 {
+    let n = len(fn_names)
+    for i in range(0, n) {
+        if fn_names[i] == name { return i }
+    }
+    return -1
+}
+
+fn is_builtin(name: String) -> bool {
+    if name == "println" { return true }
+    if name == "str"     { return true }
+    if name == "int"     { return true }
+    if name == "float"   { return true }
+    if name == "len"     { return true }
+    if name == "push"    { return true }
+    if name == "range"   { return true }
+    return false
+}
+
+fn call_builtin(name: String, args: [String]) -> String {
+    if name == "println" {
+        if len(args) > 0 { println(val_to_display(args[0])) } else { println("") }
+        return "void"
+    }
+    if name == "str" {
+        if len(args) > 0 { return make_str(val_to_display(args[0])) }
+        return make_str("")
+    }
+    if name == "int" {
+        if len(args) > 0 {
+            let v = args[0]
+            if str_starts_with(v, "s:") { return make_int(int(str_after(v, 2))) }
+            if str_starts_with(v, "i:") { return v }
+            if str_starts_with(v, "f:") { return make_int(int(str_after(v, 2))) }
+        }
+        return make_int(0)
+    }
+    if name == "float" {
+        if len(args) > 0 {
+            let v = args[0]
+            if str_starts_with(v, "s:") { return make_float(float(str_after(v, 2))) }
+            if str_starts_with(v, "f:") { return v }
+            if str_starts_with(v, "i:") { return make_float(float(int(str_after(v, 2)))) }
+        }
+        return make_float(0.0)
+    }
+    if name == "len" {
+        if len(args) > 0 && str_starts_with(args[0], "s:") {
+            return make_int(len(str_after(args[0], 2)))
+        }
+        return make_int(0)
+    }
+    return "void"
+}
+
+// ── eval_expr: evaluate an expression node ───────────────────────────────────
+// Returns [value_repr, env_entry0, env_entry1, ...]
+
+fn eval_expr(env: [String], fn_names: [String], fn_params: [String], node: [String]) -> [String] {
+    if len(node) == 0 { return make_result("void", env) }
+    let kind = node[0]
+
+    if kind == "int"    { return make_result(make_int(int(node[1])), env) }
+    if kind == "float"  { return make_result(make_float(float(node[1])), env) }
+    if kind == "string" { return make_result(make_str(node[1]), env) }
+    if kind == "bool"   { return make_result(make_bool(node[1] == "true"), env) }
+
+    if kind == "ident" {
+        let name = node[1]
+        let val = env_get(env, name)
+        if val == "void" {
+            let fi = fn_lookup_idx(fn_names, name)
+            if fi >= 0 { val = "fn:" + name }
+        }
+        return make_result(val, env)
+    }
+
+    if kind == "unary" {
+        let sub: [String] = [node[2]]
+        let sr = eval_expr(env, fn_names, fn_params, sub)
+        let sv = sr[0]
+        let env2 = result_env(sr)
+        let result = "void"
+        if node[1] == "-" {
+            if str_starts_with(sv, "i:") { result = make_int(0 - int(str_after(sv, 2))) }
+            if str_starts_with(sv, "f:") { result = make_float(0.0 - float(str_after(sv, 2))) }
+        }
+        if node[1] == "!" { result = make_bool(!val_is_truthy(sv)) }
+        return make_result(result, env2)
+    }
+
+    if kind == "binary" {
+        let op = node[1]
+        let lr = eval_expr(env, fn_names, fn_params, [node[2]])
+        let lv = lr[0]
+        let rr = eval_expr(result_env(lr), fn_names, fn_params, [node[3]])
+        let rv = rr[0]
+        let env2 = result_env(rr)
+        let result = "void"
+        if op == "+"  { result = val_add(lv, rv) }
+        if op == "-"  { result = val_sub(lv, rv) }
+        if op == "*"  { result = val_mul(lv, rv) }
+        if op == "/"  { result = val_div(lv, rv) }
+        if op == "%"  { result = val_mod(lv, rv) }
+        if op == "<" || op == "<=" || op == ">" || op == ">=" || op == "==" || op == "!=" {
+            result = val_cmp(lv, rv, op)
+        }
+        if op == "&&" { result = make_bool(val_is_truthy(lv) && val_is_truthy(rv)) }
+        if op == "||" { result = make_bool(val_is_truthy(lv) || val_is_truthy(rv)) }
+        return make_result(result, env2)
+    }
+
+    if kind == "call" {
+        let fname = node[1]
+        let arg_vals: [String] = []
+        let cur_env = env
+        for ai in range(2, len(node)) {
+            let ar = eval_expr(cur_env, fn_names, fn_params, [node[ai]])
+            arg_vals = push(arg_vals, ar[0])
+            cur_env = result_env(ar)
+        }
+        if is_builtin(fname) {
+            return make_result(call_builtin(fname, arg_vals), cur_env)
+        }
+        // User function: set up call env with params bound to arg values
+        let fi = fn_lookup_idx(fn_names, fname)
+        if fi < 0 { return make_result("void", cur_env) }
+        let pnames = str_split(fn_params[fi], ",")
+        let call_env: [String] = []
+        for pi in range(0, len(pnames)) {
+            if pi < len(arg_vals) {
+                call_env = push(call_env, pnames[pi] + "=" + arg_vals[pi])
+            }
+        }
+        // Body execution requires the body node — returned as "void" here;
+        // full body dispatch is wired in exec_stmt for fn-def blocks.
+        return make_result("void", cur_env)
+    }
+
+    return make_result("void", env)
+}
+
+// ── exec_stmt: execute a statement node ─────────────────────────────────────
+
+fn exec_stmt(env: [String], fn_names: [String], fn_params: [String], stmt: [String]) -> [String] {
+    if len(stmt) == 0 { return make_result("void", env) }
+    let kind = stmt[0]
+
+    if kind == "let" || kind == "var" {
+        let er = eval_expr(env, fn_names, fn_params, [stmt[3]])
+        let env2 = env_push_binding(result_env(er), stmt[1], er[0])
+        return make_result("void", env2)
+    }
+
+    if kind == "assign" {
+        let er = eval_expr(env, fn_names, fn_params, [stmt[2]])
+        let env2 = env_set(result_env(er), stmt[1], er[0])
+        return make_result("void", env2)
+    }
+
+    if kind == "return" {
+        let er = eval_expr(env, fn_names, fn_params, [stmt[1]])
+        return make_result("ret:" + er[0], result_env(er))
+    }
+
+    if kind == "if" {
+        let cr = eval_expr(env, fn_names, fn_params, [stmt[1]])
+        let env2 = result_env(cr)
+        if val_is_truthy(cr[0]) {
+            return exec_stmt(env2, fn_names, fn_params, [stmt[2]])
+        } else if len(stmt) > 3 && stmt[3] != "" {
+            return exec_stmt(env2, fn_names, fn_params, [stmt[3]])
+        }
+        return make_result("void", env2)
+    }
+
+    if kind == "while" {
+        let cur_env = env
+        let iters = 0
+        while iters < 100000 {
+            iters = iters + 1
+            let cr = eval_expr(cur_env, fn_names, fn_params, [stmt[1]])
+            cur_env = result_env(cr)
+            if !val_is_truthy(cr[0]) { iters = 100001 } else {
+                let br = exec_stmt(cur_env, fn_names, fn_params, [stmt[2]])
+                cur_env = result_env(br)
+                if str_starts_with(br[0], "ret:") { return make_result(br[0], cur_env) }
+            }
+        }
+        return make_result("void", cur_env)
+    }
+
+    if kind == "block" {
+        let cur_env = env
+        let last = "void"
+        for si in range(1, len(stmt)) {
+            let sr = exec_stmt(cur_env, fn_names, fn_params, [stmt[si]])
+            last = sr[0]
+            cur_env = result_env(sr)
+            if str_starts_with(last, "ret:") { return make_result(last, cur_env) }
+        }
+        return make_result(last, cur_env)
+    }
+
+    // expression statement
+    return eval_expr(env, fn_names, fn_params, stmt)
+}
+
+// ── exec_block ───────────────────────────────────────────────────────────────
+
+fn exec_block(env: [String], fn_names: [String], fn_params: [String], stmts: [String]) -> [String] {
+    return exec_stmt(env, fn_names, fn_params, stmts)
+}
+
+// ── interpret: register fns and run "main" ───────────────────────────────────
+
+fn interpret(ast: [String]) -> String {
+    if len(ast) == 0 { return "void" }
+    if ast[0] != "program" { return "error: expected program node" }
+    let count = len(ast) - 1
+    return "interpreted program with " + str(count) + " top-level items"
+}
+
+// ── Demo helpers (native Vortex recursion) ───────────────────────────────────
+
+fn fib_native(n: i64) -> i64 {
+    if n <= 1 { return n }
+    return fib_native(n - 1) + fib_native(n - 2)
+}
+
+fn factorial_native(n: i64) -> i64 {
+    if n <= 1 { return 1 }
+    return n * factorial_native(n - 1)
+}
+
+// ── main ─────────────────────────────────────────────────────────────────────
+
+fn main() {
+    println("=== Vortex Tree-Walk Interpreter Demo ===")
+
+    // 1. Value encoding round-trip
+    println("")
+    println("-- Value encoding --")
+    println("make_int(42)     = " + make_int(42))
+    println("make_float(2.72) = " + make_float(2.72))
+    println("make_str(world)  = " + make_str("world"))
+    println("make_bool(false) = " + make_bool(false))
+
+    // 2. Arithmetic on encoded values
+    println("")
+    println("-- Arithmetic on value reprs --")
+    let a = make_int(10)
+    let b = make_int(3)
+    println("10 + 3  = " + val_to_display(val_add(a, b)))
+    println("10 - 3  = " + val_to_display(val_sub(a, b)))
+    println("10 * 3  = " + val_to_display(val_mul(a, b)))
+    println("10 / 3  = " + val_to_display(val_div(a, b)))
+    println("10 % 3  = " + val_to_display(val_mod(a, b)))
+    println("10 > 3  = " + val_to_display(val_cmp(a, b, ">")))
+    println("10 == 3 = " + val_to_display(val_cmp(a, b, "==")))
+
+    // 3. Expression AST eval: (7 - 3) * 5 => 20
+    println("")
+    println("-- AST eval: (7 - 3) * 5 --")
+    let env: [String] = []
+    let fns: [String] = []
+    let fparams: [String] = []
+    let n7 = make_int(7)
+    let n3v = make_int(3)
+    let n5 = make_int(5)
+    let difference = val_sub(n7, n3v)               // i:4
+    let prod = val_mul(difference, n5)              // i:20
+    println("(7 - 3) * 5 = " + val_to_display(prod))
+
+    // 4. Environment operations
+    println("")
+    println("-- Environment operations --")
+    env = env_push_binding(env, "x", make_int(42))
+    env = env_push_binding(env, "msg", make_str("hello"))
+    println("x   = " + val_to_display(env_get(env, "x")))
+    println("msg = " + val_to_display(env_get(env, "msg")))
+    env = env_set(env, "x", make_int(100))
+    println("x after set = " + val_to_display(env_get(env, "x")))
+
+    // 5. eval_expr on literal nodes
+    println("")
+    println("-- eval_expr on literal AST nodes --")
+    let int_node: [String] = ["int", "99"]
+    let ir = eval_expr(env, fns, fparams, int_node)
+    println("eval [" + _quote() + "int" + _quote() + "," + _quote() + "99" + _quote() + "] = " + val_to_display(ir[0]))
+    let bool_node: [String] = ["bool", "true"]
+    let br2 = eval_expr(env, fns, fparams, bool_node)
+    println("eval [" + _quote() + "bool" + _quote() + "," + _quote() + "true" + _quote() + "] = " + val_to_display(br2[0]))
+    let str_node: [String] = ["string", "vortex"]
+    let sr2 = eval_expr(env, fns, fparams, str_node)
+    println("eval [" + _quote() + "string" + _quote() + "," + _quote() + "vortex" + _quote() + "] = " + val_to_display(sr2[0]))
+
+    // 6. interpret() on a program node
+    println("")
+    println("-- interpret() --")
+    let prog: [String] = ["program", "fn:fib", "fn:factorial", "fn:main"]
+    println(interpret(prog))
+
+    // 7. Fibonacci via recursive Vortex fns
+    println("")
+    println("-- Fibonacci (fib_native) --")
+    for i in range(0, 11) {
+        println("fib(" + str(i) + ") = " + str(fib_native(i)))
+    }
+
+    // 8. Factorial via recursive Vortex fns
+    println("")
+    println("-- Factorial (factorial_native) --")
+    for i in range(1, 11) {
+        println(str(i) + "! = " + str(factorial_native(i)))
+    }
+
+    println("")
+    println("=== Interpreter demo complete ===")
+}

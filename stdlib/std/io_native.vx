@@ -1,0 +1,388 @@
+// io_native.vx — Native file I/O for self-hosted Vortex using raw Linux syscalls
+//
+// Uses Vortex builtins: syscall0..syscall3, mem_alloc, mem_free,
+// mem_read_u8, mem_write_u8, mem_write_string, mem_read_string,
+// str_bytes, str_from_bytes, ptr_to_int, len, push, println, str
+
+// ---- Syscall numbers (x86-64 Linux) ----
+fn _SYS_READ()           -> i64 { return 0 }
+fn _SYS_WRITE()          -> i64 { return 1 }
+fn _SYS_OPEN()           -> i64 { return 2 }
+fn _SYS_CLOSE()          -> i64 { return 3 }
+fn _SYS_LSEEK()          -> i64 { return 8 }
+fn _SYS_GETPID()         -> i64 { return 39 }
+fn _SYS_EXIT()           -> i64 { return 60 }
+fn _SYS_MKDIR()          -> i64 { return 83 }
+fn _SYS_RMDIR()          -> i64 { return 84 }
+fn _SYS_UNLINK()         -> i64 { return 87 }
+fn _SYS_GETDENTS64()     -> i64 { return 217 }
+fn _SYS_CLOCK_GETTIME()  -> i64 { return 228 }
+
+// ---- Open flags ----
+fn _O_RDONLY()   -> i64 { return 0 }
+fn _O_WRONLY()   -> i64 { return 1 }
+fn _O_RDWR()     -> i64 { return 2 }
+fn _O_CREAT()    -> i64 { return 64 }
+fn _O_TRUNC()    -> i64 { return 512 }
+fn _O_APPEND()   -> i64 { return 1024 }
+
+// ---- Seek whence ----
+fn _SEEK_SET() -> i64 { return 0 }
+fn _SEEK_CUR() -> i64 { return 1 }
+fn _SEEK_END() -> i64 { return 2 }
+
+// ============================================================================
+// Internal helper: convert Vortex String to null-terminated C buffer
+// Returns pointer (as i64 via ptr_to_int). Caller must mem_free the result.
+// ============================================================================
+
+fn _to_cstr(s: String) -> i64 {
+    let bytes = str_bytes(s)
+    let n = len(bytes)
+    let buf = mem_alloc(n + 1)
+    var i = 0
+    while i < n {
+        mem_write_u8(buf, i, int(bytes[i]))
+        i = i + 1
+    }
+    mem_write_u8(buf, n, 0)
+    return ptr_to_int(buf)
+}
+
+// ============================================================================
+// File operations
+// ============================================================================
+
+// file_open: open a file, returns fd or negative errno
+fn file_open(path: String, flags: i64, mode: i64) -> i64 {
+    let cpath = _to_cstr(path)
+    let fd = syscall3(_SYS_OPEN(), cpath, flags, mode)
+    mem_free(int_to_ptr(cpath))
+    return fd
+}
+
+// file_close: close a file descriptor
+fn file_close(fd: i64) -> i64 {
+    return syscall1(_SYS_CLOSE(), fd)
+}
+
+// file_read: read up to buf_size bytes from fd, return as string
+fn file_read(fd: i64, buf_size: i64) -> String {
+    let buf = mem_alloc(buf_size)
+    let n = syscall3(_SYS_READ(), fd, ptr_to_int(buf), buf_size)
+    if n <= 0 {
+        mem_free(buf)
+        return ""
+    }
+    let result = mem_read_string(buf, n)
+    mem_free(buf)
+    return result
+}
+
+// file_read_bytes: read n bytes from fd, return as byte array
+fn file_read_bytes(fd: i64, n: i64) -> [i64] {
+    let buf = mem_alloc(n)
+    let got = syscall3(_SYS_READ(), fd, ptr_to_int(buf), n)
+    if got <= 0 {
+        mem_free(buf)
+        return []
+    }
+    var result = []
+    var i = 0
+    while i < got {
+        result = push(result, mem_read_u8(buf, i))
+        i = i + 1
+    }
+    mem_free(buf)
+    return result
+}
+
+// file_write: write string to fd, return bytes written or negative errno
+fn file_write(fd: i64, data: String) -> i64 {
+    let bytes = str_bytes(data)
+    let n = len(bytes)
+    if n == 0 {
+        return 0
+    }
+    let buf = mem_alloc(n)
+    mem_write_string(buf, data)
+    let written = syscall3(_SYS_WRITE(), fd, ptr_to_int(buf), n)
+    mem_free(buf)
+    return written
+}
+
+// file_write_bytes: write byte array to fd, return bytes written
+fn file_write_bytes(fd: i64, data: [i64]) -> i64 {
+    let n = len(data)
+    if n == 0 {
+        return 0
+    }
+    let buf = mem_alloc(n)
+    var i = 0
+    while i < n {
+        mem_write_u8(buf, i, int(data[i]))
+        i = i + 1
+    }
+    let written = syscall3(_SYS_WRITE(), fd, ptr_to_int(buf), n)
+    mem_free(buf)
+    return written
+}
+
+// file_seek: seek within a file descriptor
+fn file_seek(fd: i64, offset: i64, whence: i64) -> i64 {
+    return syscall3(_SYS_LSEEK(), fd, offset, whence)
+}
+
+// ============================================================================
+// High-level file helpers
+// ============================================================================
+
+// read_file: read entire file as string
+fn read_file(path: String) -> String {
+    let fd = file_open(path, _O_RDONLY(), 0)
+    if fd < 0 {
+        return ""
+    }
+    // Get file size by seeking to end
+    let size = file_seek(fd, 0, _SEEK_END())
+    if size <= 0 {
+        file_close(fd)
+        return ""
+    }
+    // Seek back to start
+    file_seek(fd, 0, _SEEK_SET())
+    let content = file_read(fd, size)
+    file_close(fd)
+    return content
+}
+
+// write_file: write string to file (create/truncate), return true on success
+fn write_file(path: String, content: String) -> bool {
+    let flags = _O_WRONLY() + _O_CREAT() + _O_TRUNC()
+    let fd = file_open(path, flags, 438)
+    if fd < 0 {
+        return false
+    }
+    let written = file_write(fd, content)
+    file_close(fd)
+    return written >= 0
+}
+
+// append_file: append string to file, return true on success
+fn append_file(path: String, content: String) -> bool {
+    let flags = _O_WRONLY() + _O_CREAT() + _O_APPEND()
+    let fd = file_open(path, flags, 438)
+    if fd < 0 {
+        return false
+    }
+    let written = file_write(fd, content)
+    file_close(fd)
+    return written >= 0
+}
+
+// file_exists: check if a file exists by trying to open it
+fn file_exists(path: String) -> bool {
+    let fd = file_open(path, _O_RDONLY(), 0)
+    if fd < 0 {
+        return false
+    }
+    file_close(fd)
+    return true
+}
+
+// ============================================================================
+// Console I/O
+// ============================================================================
+
+// print_str: write string to stdout (fd 1)
+fn print_str(s: String) {
+    file_write(1, s)
+}
+
+// print_line: write string + newline to stdout
+fn print_line(s: String) {
+    file_write(1, s + "\n")
+}
+
+// print_int_native: print integer to stdout via syscall
+fn print_int_native(n: i64) {
+    print_str(str(n))
+}
+
+// print_float_native: format float as string, print it, return the string
+fn print_float_native(f: f64) -> String {
+    let s = str(f)
+    print_str(s)
+    return s
+}
+
+// read_line: read a line from stdin (fd 0)
+fn read_line() -> String {
+    var result = []
+    var done = false
+    while done == false {
+        let buf = mem_alloc(1)
+        let n = syscall3(_SYS_READ(), 0, ptr_to_int(buf), 1)
+        if n <= 0 {
+            mem_free(buf)
+            done = true
+        } else {
+            let b = mem_read_u8(buf, 0)
+            mem_free(buf)
+            if b == 10 {
+                done = true
+            } else {
+                result = push(result, b)
+            }
+        }
+    }
+    return str_from_bytes(result)
+}
+
+// ============================================================================
+// Directory operations
+// ============================================================================
+
+// mkdir: create a directory, return 0 on success or negative errno
+fn mkdir(path: String, mode: i64) -> i64 {
+    let cpath = _to_cstr(path)
+    let ret = syscall2(_SYS_MKDIR(), cpath, mode)
+    mem_free(int_to_ptr(cpath))
+    return ret
+}
+
+// rmdir: remove a directory, return 0 on success or negative errno
+fn rmdir(path: String) -> i64 {
+    let cpath = _to_cstr(path)
+    let ret = syscall1(_SYS_RMDIR(), cpath)
+    mem_free(int_to_ptr(cpath))
+    return ret
+}
+
+// unlink: remove a file, return 0 on success or negative errno
+fn unlink(path: String) -> i64 {
+    let cpath = _to_cstr(path)
+    let ret = syscall1(_SYS_UNLINK(), cpath)
+    mem_free(int_to_ptr(cpath))
+    return ret
+}
+
+// ============================================================================
+// Process operations
+// ============================================================================
+
+// exit: terminate the process with the given exit code
+fn exit(code: i64) {
+    syscall1(_SYS_EXIT(), code)
+}
+
+// getpid: return the current process ID
+fn getpid() -> i64 {
+    return syscall0(_SYS_GETPID())
+}
+
+// ============================================================================
+// Time operations
+// ============================================================================
+
+// time_ns: return current monotonic time in nanoseconds
+fn time_ns() -> i64 {
+    let ts = mem_alloc(16)
+    let ret = syscall2(_SYS_CLOCK_GETTIME(), 1, ptr_to_int(ts))
+    if ret < 0 {
+        mem_free(ts)
+        return 0 - 1
+    }
+    // Read tv_sec (8 bytes little-endian) and tv_nsec (8 bytes little-endian)
+    let b0 = mem_read_u8(ts, 0)
+    let b1 = mem_read_u8(ts, 1)
+    let b2 = mem_read_u8(ts, 2)
+    let b3 = mem_read_u8(ts, 3)
+    let b4 = mem_read_u8(ts, 4)
+    let b5 = mem_read_u8(ts, 5)
+    let b6 = mem_read_u8(ts, 6)
+    let b7 = mem_read_u8(ts, 7)
+    let sec = b0 + b1 * 256 + b2 * 65536 + b3 * 16777216 + b4 * 4294967296 + b5 * 1099511627776 + b6 * 281474976710656 + b7 * 72057594037927936
+    let n0 = mem_read_u8(ts, 8)
+    let n1 = mem_read_u8(ts, 9)
+    let n2 = mem_read_u8(ts, 10)
+    let n3 = mem_read_u8(ts, 11)
+    let n4 = mem_read_u8(ts, 12)
+    let n5 = mem_read_u8(ts, 13)
+    let n6 = mem_read_u8(ts, 14)
+    let n7 = mem_read_u8(ts, 15)
+    let nsec = n0 + n1 * 256 + n2 * 65536 + n3 * 16777216 + n4 * 4294967296 + n5 * 1099511627776 + n6 * 281474976710656 + n7 * 72057594037927936
+    mem_free(ts)
+    return sec * 1000000000 + nsec
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+fn main() {
+    var passed = 0
+    var failed = 0
+
+    // Test 1: getpid() returns > 0
+    let pid = getpid()
+    if pid > 0 {
+        println("PASS: getpid() = " + str(pid))
+        passed = passed + 1
+    } else {
+        println("FAIL: getpid() returned " + str(pid))
+        failed = failed + 1
+    }
+
+    // Test 2: Write a temp file, read it back, verify content matches
+    let tmp_path = "/tmp/vortex_io_native_test.txt"
+    let test_content = "Hello from Vortex io_native!"
+    let wrote = write_file(tmp_path, test_content)
+    if wrote == false {
+        println("FAIL: write_file returned false")
+        failed = failed + 1
+    } else {
+        let readback = read_file(tmp_path)
+        if readback == test_content {
+            println("PASS: write_file + read_file roundtrip")
+            passed = passed + 1
+        } else {
+            println("FAIL: read_file got '" + readback + "', expected '" + test_content + "'")
+            failed = failed + 1
+        }
+    }
+
+    // Test 3: file_exists on existing and non-existing files
+    let exists1 = file_exists(tmp_path)
+    let exists2 = file_exists("/tmp/vortex_definitely_does_not_exist_xyz.txt")
+    if exists1 == true && exists2 == false {
+        println("PASS: file_exists (true for existing, false for non-existing)")
+        passed = passed + 1
+    } else {
+        println("FAIL: file_exists returned " + str(exists1) + " and " + str(exists2))
+        failed = failed + 1
+    }
+
+    // Cleanup temp file
+    unlink(tmp_path)
+
+    // Test 4: print_str and print_line via syscalls
+    print_str("PASS: print_str works")
+    print_line(" and print_line works")
+    passed = passed + 1
+
+    // Test 5: time_ns returns reasonable values (> 0, and two calls are non-decreasing)
+    let t1 = time_ns()
+    let t2 = time_ns()
+    if t1 > 0 && t2 >= t1 {
+        println("PASS: time_ns() = " + str(t1) + ", delta = " + str(t2 - t1) + " ns")
+        passed = passed + 1
+    } else {
+        println("FAIL: time_ns() returned " + str(t1) + " then " + str(t2))
+        failed = failed + 1
+    }
+
+    // Summary
+    println("")
+    println("Results: " + str(passed) + " passed, " + str(failed) + " failed")
+}

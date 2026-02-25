@@ -1,77 +1,83 @@
 // Vortex Self-Hosting Parser
-// Takes tokens from lexer.vx and produces an AST (HashMap-based nodes)
+// Takes tokens from lexer.vx and produces an AST (array-based nodes)
 // Recursive descent with precedence climbing for expressions
+//
+// AST nodes are arrays: ["kind", field1, field2, ...]
+// Tokens are arrays: [type, value, line, col]
+// Parser state is a mutable array: [tokens, pos]
 
 // --- AST Node Constructors ---
 
-fn ast_int(val) { return {"kind": "Int", "value": val} }
-fn ast_float(val) { return {"kind": "Float", "value": val} }
-fn ast_string(val) { return {"kind": "String", "value": val} }
-fn ast_bool(val) { return {"kind": "Bool", "value": val} }
-fn ast_ident(name) { return {"kind": "Ident", "name": name} }
-fn ast_binop(op, left, right) { return {"kind": "BinOp", "op": op, "left": left, "right": right} }
-fn ast_unary(op, expr) { return {"kind": "Unary", "op": op, "expr": expr} }
-fn ast_call(func, args) { return {"kind": "Call", "func": func, "args": args} }
-fn ast_index(obj, idx) { return {"kind": "Index", "obj": obj, "index": idx} }
-fn ast_field(obj, name) { return {"kind": "Field", "obj": obj, "name": name} }
-fn ast_array(elems) { return {"kind": "Array", "elems": elems} }
-fn ast_hash(pairs) { return {"kind": "HashMap", "pairs": pairs} }
-fn ast_if(cond, then_b, else_b) { return {"kind": "If", "cond": cond, "then": then_b, "else": else_b} }
-fn ast_let(name, value) { return {"kind": "Let", "name": name, "value": value} }
-fn ast_var(name, value) { return {"kind": "Var", "name": name, "value": value} }
-fn ast_assign(target, value) { return {"kind": "Assign", "target": target, "value": value} }
-fn ast_return(value) { return {"kind": "Return", "value": value} }
-fn ast_fn(name, params, body) { return {"kind": "Fn", "name": name, "params": params, "body": body} }
-fn ast_block(stmts) { return {"kind": "Block", "stmts": stmts} }
-fn ast_for(var_name, iter, body) { return {"kind": "For", "var": var_name, "iter": iter, "body": body} }
-fn ast_while(cond, body) { return {"kind": "While", "cond": cond, "body": body} }
-fn ast_closure(params, body) { return {"kind": "Closure", "params": params, "body": body} }
-fn ast_struct(name, fields) { return {"kind": "Struct", "name": name, "fields": fields} }
-fn ast_program(items) { return {"kind": "Program", "items": items} }
+fn ast_int(val: String) -> [i64] { return ["Int", val] }
+fn ast_float(val: String) -> [i64] { return ["Float", val] }
+fn ast_string(val: String) -> [i64] { return ["String", val] }
+fn ast_bool(val: bool) -> [i64] { return ["Bool", val] }
+fn ast_ident(name: String) -> [i64] { return ["Ident", name] }
+fn ast_binop(op: String, left: [i64], right: [i64]) -> [i64] { return ["BinOp", op, left, right] }
+fn ast_unary(op: String, expr: [i64]) -> [i64] { return ["Unary", op, expr] }
+fn ast_call(func: [i64], args: [i64]) -> [i64] { return ["Call", func, args] }
+fn ast_index(obj: [i64], idx: [i64]) -> [i64] { return ["Index", obj, idx] }
+fn ast_field(obj: [i64], name: String) -> [i64] { return ["Field", obj, name] }
+fn ast_array(elems: [i64]) -> [i64] { return ["Array", elems] }
+fn ast_hash(pairs: [i64]) -> [i64] { return ["HashMap", pairs] }
+fn ast_if(cond: [i64], then_b: [i64], else_b: [i64]) -> [i64] { return ["If", cond, then_b, else_b] }
+fn ast_let(name: String, value: [i64]) -> [i64] { return ["Let", name, value] }
+fn ast_var(name: String, value: [i64]) -> [i64] { return ["Var", name, value] }
+fn ast_assign(target: [i64], value: [i64]) -> [i64] { return ["Assign", target, value] }
+fn ast_return(value: [i64]) -> [i64] { return ["Return", value] }
+fn ast_fn(name: String, params: [i64], body: [i64]) -> [i64] { return ["Fn", name, params, body] }
+fn ast_block(stmts: [i64]) -> [i64] { return ["Block", stmts] }
+fn ast_for(var_name: String, iter: [i64], body: [i64]) -> [i64] { return ["For", var_name, iter, body] }
+fn ast_while(cond: [i64], body: [i64]) -> [i64] { return ["While", cond, body] }
+fn ast_closure(params: [i64], body: [i64]) -> [i64] { return ["Closure", params, body] }
+fn ast_struct(name: String, fields: [i64]) -> [i64] { return ["Struct", name, fields] }
+fn ast_program(items: [i64]) -> [i64] { return ["Program", items] }
+
+fn ast_kind(node: [i64]) -> String { return node[0] }
 
 // --- Parser State Helpers ---
 
-fn peek(state) {
-    let pos = state["pos"]
-    let tokens = state["tokens"]
+fn peek(state: [i64]) -> [i64] {
+    let pos = state[1]
+    let tokens = state[0]
     if pos >= len(tokens) {
-        return {"type": "EOF", "value": "", "line": 0, "col": 0}
+        return ["EOF", "", "0", "0"]
     }
     return tokens[pos]
 }
 
-fn advance(state) {
-    let pos = state["pos"]
-    let tok = state["tokens"][pos]
-    state["pos"] = pos + 1
+fn advance(state: [i64]) -> [i64] {
+    let pos = state[1]
+    let tok = state[0][pos]
+    state[1] = pos + 1
     return tok
 }
 
-fn at(state, token_type) {
+fn at(state: [i64], token_type: String) -> bool {
     let tok = peek(state)
-    return tok["type"] == token_type
+    return tok[0] == token_type
 }
 
-fn at_keyword(state, kw) {
+fn at_keyword(state: [i64], kw: String) -> bool {
     let tok = peek(state)
-    return tok["type"] == "KEYWORD" and tok["value"] == kw
+    return tok[0] == "KEYWORD" && tok[1] == kw
 }
 
-fn expect(state, token_type) {
+fn expect(state: [i64], token_type: String) -> [i64] {
     let tok = peek(state)
-    if tok["type"] != token_type {
-        let msg = "Expected " + token_type + " but got " + tok["type"]
-        let msg = msg + " ('" + tok["value"] + "') at line " + str(tok["line"])
+    if tok[0] != token_type {
+        let msg = "Expected " + token_type + " but got " + tok[0]
+        let msg = msg + " ('" + tok[1] + "') at line " + str(tok[2])
         println("Parse error: " + msg)
         return tok
     }
     return advance(state)
 }
 
-fn expect_keyword(state, kw) {
+fn expect_keyword(state: [i64], kw: String) -> [i64] {
     let tok = peek(state)
-    if tok["type"] != "KEYWORD" or tok["value"] != kw {
-        println("Parse error: expected keyword '" + kw + "' but got '" + tok["value"] + "'")
+    if tok[0] != "KEYWORD" || tok[1] != kw {
+        println("Parse error: expected keyword '" + kw + "' but got '" + tok[1] + "'")
         return tok
     }
     return advance(state)
@@ -79,11 +85,11 @@ fn expect_keyword(state, kw) {
 
 // --- Expression Parsing (precedence climbing) ---
 
-fn parse_expr(state) {
+fn parse_expr(state: [i64]) -> [i64] {
     return parse_or(state)
 }
 
-fn parse_or(state) {
+fn parse_or(state: [i64]) -> [i64] {
     var left = parse_and(state)
     while at(state, "OR") {
         advance(state)
@@ -93,7 +99,7 @@ fn parse_or(state) {
     return left
 }
 
-fn parse_and(state) {
+fn parse_and(state: [i64]) -> [i64] {
     var left = parse_equality(state)
     while at(state, "AND") {
         advance(state)
@@ -103,47 +109,47 @@ fn parse_and(state) {
     return left
 }
 
-fn parse_equality(state) {
+fn parse_equality(state: [i64]) -> [i64] {
     var left = parse_comparison(state)
-    while at(state, "EQEQ") or at(state, "NEQ") {
+    while at(state, "EQEQ") || at(state, "NEQ") {
         let op_tok = advance(state)
         let right = parse_comparison(state)
-        left = ast_binop(op_tok["value"], left, right)
+        left = ast_binop(op_tok[1], left, right)
     }
     return left
 }
 
-fn parse_comparison(state) {
+fn parse_comparison(state: [i64]) -> [i64] {
     var left = parse_addition(state)
-    while at(state, "LT") or at(state, "GT") or at(state, "LTEQ") or at(state, "GTEQ") {
+    while at(state, "LT") || at(state, "GT") || at(state, "LTEQ") || at(state, "GTEQ") {
         let op_tok = advance(state)
         let right = parse_addition(state)
-        left = ast_binop(op_tok["value"], left, right)
+        left = ast_binop(op_tok[1], left, right)
     }
     return left
 }
 
-fn parse_addition(state) {
+fn parse_addition(state: [i64]) -> [i64] {
     var left = parse_multiplication(state)
-    while at(state, "PLUS") or at(state, "MINUS") {
+    while at(state, "PLUS") || at(state, "MINUS") {
         let op_tok = advance(state)
         let right = parse_multiplication(state)
-        left = ast_binop(op_tok["value"], left, right)
+        left = ast_binop(op_tok[1], left, right)
     }
     return left
 }
 
-fn parse_multiplication(state) {
+fn parse_multiplication(state: [i64]) -> [i64] {
     var left = parse_unary(state)
-    while at(state, "STAR") or at(state, "SLASH") or at(state, "PERCENT") {
+    while at(state, "STAR") || at(state, "SLASH") || at(state, "PERCENT") {
         let op_tok = advance(state)
         let right = parse_unary(state)
-        left = ast_binop(op_tok["value"], left, right)
+        left = ast_binop(op_tok[1], left, right)
     }
     return left
 }
 
-fn parse_unary(state) {
+fn parse_unary(state: [i64]) -> [i64] {
     if at(state, "NOT") {
         advance(state)
         let expr = parse_unary(state)
@@ -157,7 +163,7 @@ fn parse_unary(state) {
     return parse_postfix(state)
 }
 
-fn parse_postfix(state) {
+fn parse_postfix(state: [i64]) -> [i64] {
     var expr = parse_primary(state)
     while true {
         if at(state, "LPAREN") {
@@ -165,10 +171,10 @@ fn parse_postfix(state) {
             advance(state)
             var args = []
             if !at(state, "RPAREN") {
-                push(args, parse_expr(state))
+                args = push(args, parse_expr(state))
                 while at(state, "COMMA") {
                     advance(state)
-                    push(args, parse_expr(state))
+                    args = push(args, parse_expr(state))
                 }
             }
             expect(state, "RPAREN")
@@ -183,7 +189,7 @@ fn parse_postfix(state) {
             // Field access
             advance(state)
             let name_tok = expect(state, "IDENT")
-            expr = ast_field(expr, name_tok["value"])
+            expr = ast_field(expr, name_tok[1])
         } else {
             return expr
         }
@@ -191,45 +197,45 @@ fn parse_postfix(state) {
     return expr
 }
 
-fn parse_primary(state) {
+fn parse_primary(state: [i64]) -> [i64] {
     let tok = peek(state)
 
     // Integer literal
-    if tok["type"] == "INT" {
+    if tok[0] == "INT" {
         advance(state)
-        return ast_int(tok["value"])
+        return ast_int(tok[1])
     }
 
     // Float literal
-    if tok["type"] == "FLOAT" {
+    if tok[0] == "FLOAT" {
         advance(state)
-        return ast_float(tok["value"])
+        return ast_float(tok[1])
     }
 
     // String literal
-    if tok["type"] == "STRING" {
+    if tok[0] == "STRING" {
         advance(state)
-        return ast_string(tok["value"])
+        return ast_string(tok[1])
     }
 
     // Bool literals
-    if tok["type"] == "KEYWORD" and tok["value"] == "true" {
+    if tok[0] == "KEYWORD" && tok[1] == "true" {
         advance(state)
         return ast_bool(true)
     }
-    if tok["type"] == "KEYWORD" and tok["value"] == "false" {
+    if tok[0] == "KEYWORD" && tok[1] == "false" {
         advance(state)
         return ast_bool(false)
     }
 
     // Identifier
-    if tok["type"] == "IDENT" {
+    if tok[0] == "IDENT" {
         advance(state)
-        return ast_ident(tok["value"])
+        return ast_ident(tok[1])
     }
 
     // Parenthesized expression
-    if tok["type"] == "LPAREN" {
+    if tok[0] == "LPAREN" {
         advance(state)
         let expr = parse_expr(state)
         expect(state, "RPAREN")
@@ -237,17 +243,17 @@ fn parse_primary(state) {
     }
 
     // Array literal
-    if tok["type"] == "LBRACKET" {
+    if tok[0] == "LBRACKET" {
         advance(state)
         var elems = []
         if !at(state, "RBRACKET") {
-            push(elems, parse_expr(state))
+            elems = push(elems, parse_expr(state))
             while at(state, "COMMA") {
                 advance(state)
                 if at(state, "RBRACKET") {
                     // trailing comma
                 } else {
-                    push(elems, parse_expr(state))
+                    elems = push(elems, parse_expr(state))
                 }
             }
         }
@@ -256,14 +262,14 @@ fn parse_primary(state) {
     }
 
     // HashMap literal
-    if tok["type"] == "LBRACE" {
+    if tok[0] == "LBRACE" {
         advance(state)
         var pairs = []
         if !at(state, "RBRACE") {
             let key = parse_expr(state)
             expect(state, "COLON")
             let val = parse_expr(state)
-            push(pairs, {"key": key, "value": val})
+            pairs = push(pairs, [key, val])
             while at(state, "COMMA") {
                 advance(state)
                 if at(state, "RBRACE") {
@@ -272,7 +278,7 @@ fn parse_primary(state) {
                     let k = parse_expr(state)
                     expect(state, "COLON")
                     let v = parse_expr(state)
-                    push(pairs, {"key": k, "value": v})
+                    pairs = push(pairs, [k, v])
                 }
             }
         }
@@ -281,32 +287,32 @@ fn parse_primary(state) {
     }
 
     // Closure: |params| expr  or  |params| { block }
-    if tok["type"] == "PIPE" {
+    if tok[0] == "PIPE" {
         return parse_closure(state)
     }
 
     // If expression
-    if tok["type"] == "KEYWORD" and tok["value"] == "if" {
+    if tok[0] == "KEYWORD" && tok[1] == "if" {
         return parse_if(state)
     }
 
-    println("Parse error: unexpected token '" + tok["value"] + "' (" + tok["type"] + ") at line " + str(tok["line"]))
+    println("Parse error: unexpected token '" + tok[1] + "' (" + tok[0] + ") at line " + str(tok[2]))
     advance(state)
     return ast_ident("__error__")
 }
 
 // --- Closure ---
 
-fn parse_closure(state) {
+fn parse_closure(state: [i64]) -> [i64] {
     expect(state, "PIPE")
     var params = []
     if !at(state, "PIPE") {
         let p = expect(state, "IDENT")
-        push(params, p["value"])
+        params = push(params, p[1])
         while at(state, "COMMA") {
             advance(state)
             let p2 = expect(state, "IDENT")
-            push(params, p2["value"])
+            params = push(params, p2[1])
         }
     }
     expect(state, "PIPE")
@@ -315,38 +321,38 @@ fn parse_closure(state) {
         body = parse_block(state)
     } else {
         let expr = parse_expr(state)
-        push(body, ast_return(expr))
+        body = push(body, ast_return(expr))
     }
     return ast_closure(params, body)
 }
 
 // --- Statements ---
 
-fn parse_statement(state) {
+fn parse_statement(state: [i64]) -> [i64] {
     let tok = peek(state)
 
     // let binding
-    if tok["type"] == "KEYWORD" and tok["value"] == "let" {
+    if tok[0] == "KEYWORD" && tok[1] == "let" {
         advance(state)
         let name_tok = expect(state, "IDENT")
         expect(state, "EQ")
         let val = parse_expr(state)
-        return ast_let(name_tok["value"], val)
+        return ast_let(name_tok[1], val)
     }
 
     // var binding
-    if tok["type"] == "KEYWORD" and tok["value"] == "var" {
+    if tok[0] == "KEYWORD" && tok[1] == "var" {
         advance(state)
         let name_tok = expect(state, "IDENT")
         expect(state, "EQ")
         let val = parse_expr(state)
-        return ast_var(name_tok["value"], val)
+        return ast_var(name_tok[1], val)
     }
 
     // return
-    if tok["type"] == "KEYWORD" and tok["value"] == "return" {
+    if tok[0] == "KEYWORD" && tok[1] == "return" {
         advance(state)
-        if at(state, "RBRACE") or at(state, "EOF") {
+        if at(state, "RBRACE") || at(state, "EOF") {
             return ast_return(ast_ident("nil"))
         }
         let val = parse_expr(state)
@@ -354,27 +360,27 @@ fn parse_statement(state) {
     }
 
     // for loop
-    if tok["type"] == "KEYWORD" and tok["value"] == "for" {
+    if tok[0] == "KEYWORD" && tok[1] == "for" {
         return parse_for(state)
     }
 
     // while loop
-    if tok["type"] == "KEYWORD" and tok["value"] == "while" {
+    if tok[0] == "KEYWORD" && tok[1] == "while" {
         return parse_while(state)
     }
 
     // if statement
-    if tok["type"] == "KEYWORD" and tok["value"] == "if" {
+    if tok[0] == "KEYWORD" && tok[1] == "if" {
         return parse_if(state)
     }
 
     // fn definition (nested)
-    if tok["type"] == "KEYWORD" and tok["value"] == "fn" {
+    if tok[0] == "KEYWORD" && tok[1] == "fn" {
         return parse_fn(state)
     }
 
     // struct definition
-    if tok["type"] == "KEYWORD" and tok["value"] == "struct" {
+    if tok[0] == "KEYWORD" && tok[1] == "struct" {
         return parse_struct(state)
     }
 
@@ -388,12 +394,12 @@ fn parse_statement(state) {
     return expr
 }
 
-fn parse_block(state) {
+fn parse_block(state: [i64]) -> [i64] {
     expect(state, "LBRACE")
     var stmts = []
-    while !at(state, "RBRACE") and !at(state, "EOF") {
+    while !at(state, "RBRACE") && !at(state, "EOF") {
         let s = parse_statement(state)
-        push(stmts, s)
+        stmts = push(stmts, s)
     }
     expect(state, "RBRACE")
     return stmts
@@ -401,7 +407,7 @@ fn parse_block(state) {
 
 // --- Control Flow ---
 
-fn parse_if(state) {
+fn parse_if(state: [i64]) -> [i64] {
     expect_keyword(state, "if")
     let cond = parse_expr(state)
     let then_stmts = parse_block(state)
@@ -411,7 +417,7 @@ fn parse_if(state) {
         if at_keyword(state, "if") {
             // else if chain
             let elif = parse_if(state)
-            push(else_stmts, elif)
+            else_stmts = push(else_stmts, elif)
         } else {
             else_stmts = parse_block(state)
         }
@@ -419,16 +425,16 @@ fn parse_if(state) {
     return ast_if(cond, then_stmts, else_stmts)
 }
 
-fn parse_for(state) {
+fn parse_for(state: [i64]) -> [i64] {
     expect_keyword(state, "for")
     let var_tok = expect(state, "IDENT")
     expect_keyword(state, "in")
     let iter = parse_expr(state)
     let body = parse_block(state)
-    return ast_for(var_tok["value"], iter, body)
+    return ast_for(var_tok[1], iter, body)
 }
 
-fn parse_while(state) {
+fn parse_while(state: [i64]) -> [i64] {
     expect_keyword(state, "while")
     let cond = parse_expr(state)
     let body = parse_block(state)
@@ -437,58 +443,58 @@ fn parse_while(state) {
 
 // --- Definitions ---
 
-fn parse_fn(state) {
+fn parse_fn(state: [i64]) -> [i64] {
     expect_keyword(state, "fn")
     let name_tok = expect(state, "IDENT")
     expect(state, "LPAREN")
     var params = []
     if !at(state, "RPAREN") {
         let p = expect(state, "IDENT")
-        push(params, p["value"])
+        params = push(params, p[1])
         while at(state, "COMMA") {
             advance(state)
             let p2 = expect(state, "IDENT")
-            push(params, p2["value"])
+            params = push(params, p2[1])
         }
     }
     expect(state, "RPAREN")
     let body = parse_block(state)
-    return ast_fn(name_tok["value"], params, body)
+    return ast_fn(name_tok[1], params, body)
 }
 
-fn parse_struct(state) {
+fn parse_struct(state: [i64]) -> [i64] {
     expect_keyword(state, "struct")
     let name_tok = expect(state, "IDENT")
     expect(state, "LBRACE")
     var fields = []
-    while !at(state, "RBRACE") and !at(state, "EOF") {
+    while !at(state, "RBRACE") && !at(state, "EOF") {
         let f = expect(state, "IDENT")
-        push(fields, f["value"])
+        fields = push(fields, f[1])
         if at(state, "COMMA") {
             advance(state)
         }
     }
     expect(state, "RBRACE")
-    return ast_struct(name_tok["value"], fields)
+    return ast_struct(name_tok[1], fields)
 }
 
 // --- Top-Level Program ---
 
-fn parse_program(state) {
+fn parse_program(state: [i64]) -> [i64] {
     var items = []
     while !at(state, "EOF") {
         let tok = peek(state)
-        if tok["type"] == "KEYWORD" and tok["value"] == "fn" {
-            push(items, parse_fn(state))
-        } else if tok["type"] == "KEYWORD" and tok["value"] == "struct" {
-            push(items, parse_struct(state))
-        } else if tok["type"] == "KEYWORD" and tok["value"] == "let" {
-            push(items, parse_statement(state))
-        } else if tok["type"] == "KEYWORD" and tok["value"] == "var" {
-            push(items, parse_statement(state))
+        if tok[0] == "KEYWORD" && tok[1] == "fn" {
+            items = push(items, parse_fn(state))
+        } else if tok[0] == "KEYWORD" && tok[1] == "struct" {
+            items = push(items, parse_struct(state))
+        } else if tok[0] == "KEYWORD" && tok[1] == "let" {
+            items = push(items, parse_statement(state))
+        } else if tok[0] == "KEYWORD" && tok[1] == "var" {
+            items = push(items, parse_statement(state))
         } else {
             // expression or other statement at top level
-            push(items, parse_statement(state))
+            items = push(items, parse_statement(state))
         }
     }
     return ast_program(items)
@@ -499,26 +505,26 @@ fn parse_program(state) {
 fn main() {
     // Test with hand-built tokens for: fn add(a, b) { return a + b }
     let tokens = [
-        {"type": "KEYWORD", "value": "fn", "line": 1, "col": 1},
-        {"type": "IDENT", "value": "add", "line": 1, "col": 4},
-        {"type": "LPAREN", "value": "(", "line": 1, "col": 7},
-        {"type": "IDENT", "value": "a", "line": 1, "col": 8},
-        {"type": "COMMA", "value": ",", "line": 1, "col": 9},
-        {"type": "IDENT", "value": "b", "line": 1, "col": 11},
-        {"type": "RPAREN", "value": ")", "line": 1, "col": 12},
-        {"type": "LBRACE", "value": "{", "line": 1, "col": 14},
-        {"type": "KEYWORD", "value": "return", "line": 1, "col": 16},
-        {"type": "IDENT", "value": "a", "line": 1, "col": 23},
-        {"type": "PLUS", "value": "+", "line": 1, "col": 25},
-        {"type": "IDENT", "value": "b", "line": 1, "col": 27},
-        {"type": "RBRACE", "value": "}", "line": 1, "col": 29},
-        {"type": "EOF", "value": "", "line": 1, "col": 30}
+        ["KEYWORD", "fn", "1", "1"],
+        ["IDENT", "add", "1", "4"],
+        ["LPAREN", "(", "1", "7"],
+        ["IDENT", "a", "1", "8"],
+        ["COMMA", ",", "1", "9"],
+        ["IDENT", "b", "1", "11"],
+        ["RPAREN", ")", "1", "12"],
+        ["LBRACE", "{", "1", "14"],
+        ["KEYWORD", "return", "1", "16"],
+        ["IDENT", "a", "1", "23"],
+        ["PLUS", "+", "1", "25"],
+        ["IDENT", "b", "1", "27"],
+        ["RBRACE", "}", "1", "29"],
+        ["EOF", "", "1", "30"]
     ]
-    let state = {"tokens": tokens, "pos": 0}
+    let state = [tokens, 0]
     let ast = parse_program(state)
-    println("Parsed: " + str(ast["kind"]))
-    println("Items: " + str(len(ast["items"])))
-    let f = ast["items"][0]
-    println("Function: " + f["name"])
-    println("Params: " + str(f["params"]))
+    println("Parsed: " + ast_kind(ast))
+    println("Items: " + str(len(ast[1])))
+    let f = ast[1][0]
+    println("Function: " + f[1])
+    println("Params: " + str(f[2]))
 }

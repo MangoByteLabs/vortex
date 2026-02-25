@@ -1,56 +1,212 @@
 // std/io.vx — File I/O for Vortex
-// Uses raw syscalls and memory builtins
+// Uses raw Linux x86-64 syscalls and memory builtins.
+// No dependencies on other stdlib modules.
 
-fn file_open(path: String, mode: String) -> i64 {
-    let path_ptr = mem_alloc(len(path) + 1)
-    mem_write_string(path_ptr, path)
+// ─── Syscall constants ────────────────────────────────────────────────────────
 
-    var flags = 0
-    if mode == "r" {
-        flags = O_RDONLY
-    } else if mode == "w" {
-        flags = O_WRONLY + O_CREAT + O_TRUNC
-    } else if mode == "a" {
-        flags = O_WRONLY + O_CREAT + O_APPEND
-    } else if mode == "rw" {
-        flags = O_RDWR + O_CREAT
+fn _SYS_READ()  -> i64 { return 0 }
+fn _SYS_WRITE() -> i64 { return 1 }
+fn _SYS_OPEN()  -> i64 { return 2 }
+fn _SYS_CLOSE() -> i64 { return 3 }
+fn _SYS_STAT()  -> i64 { return 4 }
+fn _SYS_FSTAT() -> i64 { return 5 }
+fn _SYS_LSEEK() -> i64 { return 8 }
+
+// ─── File open flags ─────────────────────────────────────────────────────────
+
+fn _O_RDONLY() -> i64 { return 0 }
+fn _O_WRONLY() -> i64 { return 1 }
+fn _O_RDWR()   -> i64 { return 2 }
+fn _O_CREAT()  -> i64 { return 64 }
+fn _O_TRUNC()  -> i64 { return 512 }
+fn _O_APPEND() -> i64 { return 1024 }
+
+// ─── Internal helpers ─────────────────────────────────────────────────────────
+
+// _null_terminate: allocate a buffer, write string bytes + null terminator.
+// Returns the memory pointer as i64. Caller must mem_free it.
+fn _null_terminate(s: String) -> i64 {
+    let bytes = str_bytes(s)
+    let n = len(bytes)
+    let buf = mem_alloc(n + 1)
+    var i = 0
+    while i < n {
+        mem_write_u8(buf, i, int(bytes[i]))
+        i = i + 1
     }
+    mem_write_u8(buf, n, 0)
+    return buf
+}
 
-    let fd = syscall3(SYS_OPEN, ptr_to_int(path_ptr), flags, 420)
+// ─── Core file operations ─────────────────────────────────────────────────────
+
+// file_open: open a file by path using a mode string.
+//   "r"  -> read-only
+//   "w"  -> write-only, create/truncate
+//   "a"  -> write-only, create/append
+//   "rw" -> read-write, create
+// Returns a file descriptor (>= 0) on success, negative on error.
+fn file_open(path: String, mode: String) -> i64 {
+    let path_ptr = _null_terminate(path)
+    var flags = _O_RDONLY()
+    if mode == "r" {
+        flags = _O_RDONLY()
+    } else {
+        if mode == "w" {
+            flags = _O_WRONLY() + _O_CREAT() + _O_TRUNC()
+        } else {
+            if mode == "a" {
+                flags = _O_WRONLY() + _O_CREAT() + _O_APPEND()
+            } else {
+                if mode == "rw" {
+                    flags = _O_RDWR() + _O_CREAT()
+                }
+            }
+        }
+    }
+    let fd = syscall3(_SYS_OPEN(), path_ptr, flags, 420)
     mem_free(path_ptr)
     return fd
 }
 
+// file_read: read up to max_bytes from an open file descriptor.
+// Returns the data as a String (may be shorter than max_bytes at EOF).
 fn file_read(fd: i64, max_bytes: i64) -> String {
     let buf = mem_alloc(max_bytes)
-    let n = syscall3(SYS_READ, fd, ptr_to_int(buf), max_bytes)
-    let content = mem_read_string(buf, n)
+    let n = syscall3(_SYS_READ(), fd, buf, max_bytes)
+    if n <= 0 {
+        mem_free(buf)
+        return ""
+    }
+    var byte_arr = []
+    var i = 0
+    while i < n {
+        byte_arr = push(byte_arr, mem_read_u8(buf, i))
+        i = i + 1
+    }
     mem_free(buf)
-    return content
+    return str_from_bytes(byte_arr)
 }
 
+// file_write: write a string to an open file descriptor.
+// Returns the number of bytes written, or negative on error.
 fn file_write(fd: i64, data: String) -> i64 {
-    let buf = mem_alloc(len(data))
-    mem_write_string(buf, data)
-    let n = syscall3(SYS_WRITE, fd, ptr_to_int(buf), len(data))
+    let bytes = str_bytes(data)
+    let n = len(bytes)
+    if n == 0 {
+        return 0
+    }
+    let buf = mem_alloc(n)
+    var i = 0
+    while i < n {
+        mem_write_u8(buf, i, int(bytes[i]))
+        i = i + 1
+    }
+    let written = syscall3(_SYS_WRITE(), fd, buf, n)
     mem_free(buf)
-    return n
+    return written
 }
 
+// file_close: close an open file descriptor.
+// Returns 0 on success, negative on error.
 fn file_close(fd: i64) -> i64 {
-    return syscall1(SYS_CLOSE, fd)
+    return syscall1(_SYS_CLOSE(), fd)
 }
 
+// ─── Convenience functions ────────────────────────────────────────────────────
+
+// read_file: open a file and return its entire contents as a String.
+// Returns "" on error. Reads up to 8 MB.
 fn read_file(path: String) -> String {
     let fd = file_open(path, "r")
-    let content = file_read(fd, 1048576)
+    if fd < 0 {
+        return ""
+    }
+    let content = file_read(fd, 8388608)
     file_close(fd)
     return content
 }
 
-fn write_file(path: String, content: String) -> i64 {
+// write_file: create/truncate a file and write content to it.
+// Returns true on success, false on error.
+fn write_file(path: String, content: String) -> bool {
     let fd = file_open(path, "w")
-    let result = file_write(fd, content)
+    if fd < 0 {
+        return false
+    }
+    let bytes = str_bytes(content)
+    let n = len(bytes)
+    if n == 0 {
+        file_close(fd)
+        return true
+    }
+    let written = file_write(fd, content)
     file_close(fd)
-    return result
+    return written == n
+}
+
+// append_file: open a file for appending and write content.
+// Returns true on success, false on error.
+fn append_file(path: String, content: String) -> bool {
+    let fd = file_open(path, "a")
+    if fd < 0 {
+        return false
+    }
+    let bytes = str_bytes(content)
+    let n = len(bytes)
+    if n == 0 {
+        file_close(fd)
+        return true
+    }
+    let written = file_write(fd, content)
+    file_close(fd)
+    return written == n
+}
+
+// file_exists: return true if the file can be opened for reading.
+fn file_exists(path: String) -> bool {
+    let fd = file_open(path, "r")
+    if fd < 0 {
+        return false
+    }
+    file_close(fd)
+    return true
+}
+
+// ─── Demo / self-test ─────────────────────────────────────────────────────────
+
+fn main() {
+    let nl = str_from_bytes([10])
+    println("=== io.vx self-test ===")
+
+    // write_file round-trip
+    let tmp = "/tmp/io_vx_test.txt"
+    let content = "hello from io.vx" + nl + "second line" + nl
+    let ok = write_file(tmp, content)
+    println("write_file ok: " + str(ok))
+
+    // read_file
+    let back = read_file(tmp)
+    println("read_file bytes: " + str(len(back)))
+    println("content: " + back)
+
+    // file_exists
+    println("file_exists(/tmp/io_vx_test.txt): " + str(file_exists(tmp)))
+    println("file_exists(/no/such/file): " + str(file_exists("/no/such/file")))
+
+    // append_file
+    let ok2 = append_file(tmp, "appended line" + nl)
+    println("append_file ok: " + str(ok2))
+    let after_append = read_file(tmp)
+    println("after append bytes: " + str(len(after_append)))
+    println("after append: " + after_append)
+
+    // file_open / file_read / file_write / file_close directly
+    let fd = file_open(tmp, "r")
+    println("file_open fd: " + str(fd))
+    let chunk = file_read(fd, 16)
+    println("file_read 16 bytes: " + chunk)
+    file_close(fd)
+
+    println("=== io.vx done ===")
 }

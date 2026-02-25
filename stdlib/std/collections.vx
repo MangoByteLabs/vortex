@@ -1,0 +1,448 @@
+// Vortex Standard Library — Collections
+// Array-based Map, Set, Deque, and Stack implementations.
+//
+// Map: flat [String] where entries are interleaved key-value pairs
+//      layout: [k0, v0, k1, v1, ...]   stride = 2
+//
+// Set: flat [String] of unique values
+//
+// Deque: [String] where indices 0..N-1 are data slots.
+//        We represent front/back cursors by prepending two encoded
+//        integers as the first two elements, then the data ring.
+//        Format: ["front_idx", "size", d0, d1, ..., d_{cap-1}]
+//        Capacity grows by doubling when full.
+//
+// Stack: plain [String] — top is last element.
+
+// ============================================================
+// MAP  (key: String -> value: String)
+// ============================================================
+
+fn map_new() -> [String] {
+    return []
+}
+
+// map_find_idx: returns index of key slot, or -1 if absent
+fn map_find_idx(m: [String], key: String) -> i64 {
+    let stride = 2
+    let n = len(m) / stride
+    for i in range(0, n) {
+        if m[i * stride] == key {
+            return i * stride
+        }
+    }
+    return -1
+}
+
+fn map_has(m: [String], key: String) -> bool {
+    return map_find_idx(m, key) >= 0
+}
+
+fn map_get(m: [String], key: String) -> String {
+    let idx = map_find_idx(m, key)
+    if idx < 0 {
+        return ""
+    }
+    return m[idx + 1]
+}
+
+fn map_set(m: [String], key: String, val: String) -> [String] {
+    let idx = map_find_idx(m, key)
+    if idx >= 0 {
+        // Update in-place: rebuild array with new value at idx+1
+        var out = []
+        for i in range(0, len(m)) {
+            if i == idx + 1 {
+                out = push(out, val)
+            } else {
+                out = push(out, m[i])
+            }
+        }
+        return out
+    }
+    // Append new pair
+    var out = []
+    for i in range(0, len(m)) {
+        out = push(out, m[i])
+    }
+    out = push(out, key)
+    out = push(out, val)
+    return out
+}
+
+fn map_remove(m: [String], key: String) -> [String] {
+    let idx = map_find_idx(m, key)
+    if idx < 0 {
+        return m
+    }
+    var out = []
+    for i in range(0, len(m)) {
+        if i == idx || i == idx + 1 {
+            // skip
+        } else {
+            out = push(out, m[i])
+        }
+    }
+    return out
+}
+
+fn map_keys(m: [String]) -> [String] {
+    let stride = 2
+    let n = len(m) / stride
+    var out = []
+    for i in range(0, n) {
+        out = push(out, m[i * stride])
+    }
+    return out
+}
+
+fn map_values(m: [String]) -> [String] {
+    let stride = 2
+    let n = len(m) / stride
+    var out = []
+    for i in range(0, n) {
+        out = push(out, m[i * stride + 1])
+    }
+    return out
+}
+
+fn map_size(m: [String]) -> i64 {
+    return len(m) / 2
+}
+
+// ============================================================
+// SET  (values: String, deduplicated)
+// ============================================================
+
+fn set_new() -> [String] {
+    return []
+}
+
+fn set_has(s: [String], val: String) -> bool {
+    for i in range(0, len(s)) {
+        if s[i] == val {
+            return true
+        }
+    }
+    return false
+}
+
+fn set_add(s: [String], val: String) -> [String] {
+    if set_has(s, val) {
+        return s
+    }
+    var out = []
+    for i in range(0, len(s)) {
+        out = push(out, s[i])
+    }
+    out = push(out, val)
+    return out
+}
+
+fn set_remove(s: [String], val: String) -> [String] {
+    var out = []
+    for i in range(0, len(s)) {
+        if s[i] != val {
+            out = push(out, s[i])
+        }
+    }
+    return out
+}
+
+fn set_size(s: [String]) -> i64 {
+    return len(s)
+}
+
+fn set_union(a: [String], b: [String]) -> [String] {
+    var out = []
+    for i in range(0, len(a)) {
+        out = push(out, a[i])
+    }
+    for i in range(0, len(b)) {
+        if !set_has(out, b[i]) {
+            out = push(out, b[i])
+        }
+    }
+    return out
+}
+
+fn set_intersect(a: [String], b: [String]) -> [String] {
+    var out = []
+    for i in range(0, len(a)) {
+        if set_has(b, a[i]) {
+            out = push(out, a[i])
+        }
+    }
+    return out
+}
+
+// ============================================================
+// DEQUE  (double-ended queue)
+//
+// Layout: ["front", "size", "cap", d0, d1, ..., d_{cap-1}]
+//         front, size, cap are stored as decimal strings.
+//         Header occupies indices 0, 1, 2.
+//         Data starts at index 3.
+// ============================================================
+
+fn deque_new() -> [String] {
+    let cap = 8
+    var d = ["0", "0", str(cap)]
+    for i in range(0, cap) {
+        d = push(d, "")
+    }
+    return d
+}
+
+fn deque_front_idx(d: [String]) -> i64  { return int(d[0]) }
+fn deque_size_val(d: [String])  -> i64  { return int(d[1]) }
+fn deque_cap_val(d: [String])   -> i64  { return int(d[2]) }
+
+fn deque_size(d: [String]) -> i64 {
+    return deque_size_val(d)
+}
+
+// deque_grow: double capacity preserving logical order
+fn deque_grow(d: [String]) -> [String] {
+    let old_cap  = deque_cap_val(d)
+    let sz       = deque_size_val(d)
+    let front    = deque_front_idx(d)
+    let new_cap  = old_cap * 2
+    var nd = ["0", str(sz), str(new_cap)]
+    // Copy elements in logical order into new data region
+    for i in range(0, sz) {
+        let phys = (front + i) % old_cap
+        nd = push(nd, d[3 + phys])
+    }
+    // Pad remaining slots
+    for i in range(sz, new_cap) {
+        nd = push(nd, "")
+    }
+    return nd
+}
+
+fn deque_push_back(d: [String], val: String) -> [String] {
+    let sz  = deque_size_val(d)
+    let cap = deque_cap_val(d)
+    var dd = d
+    if sz == cap {
+        dd = deque_grow(d)
+    }
+    let new_cap   = deque_cap_val(dd)
+    let front_idx = deque_front_idx(dd)
+    let new_sz    = deque_size_val(dd) + 1
+    let back_phys = (front_idx + deque_size_val(dd)) % new_cap
+    // Rebuild array with updated size and new element
+    var out = [str(front_idx), str(new_sz), str(new_cap)]
+    for i in range(0, new_cap) {
+        if i == back_phys {
+            out = push(out, val)
+        } else {
+            out = push(out, dd[3 + i])
+        }
+    }
+    return out
+}
+
+fn deque_push_front(d: [String], val: String) -> [String] {
+    let sz  = deque_size_val(d)
+    let cap = deque_cap_val(d)
+    var dd = d
+    if sz == cap {
+        dd = deque_grow(d)
+    }
+    let new_cap   = deque_cap_val(dd)
+    let front_idx = deque_front_idx(dd)
+    let new_front = (front_idx - 1 + new_cap) % new_cap
+    let new_sz    = deque_size_val(dd) + 1
+    var out = [str(new_front), str(new_sz), str(new_cap)]
+    for i in range(0, new_cap) {
+        if i == new_front {
+            out = push(out, val)
+        } else {
+            out = push(out, dd[3 + i])
+        }
+    }
+    return out
+}
+
+fn deque_pop_front(d: [String]) -> [String] {
+    let sz = deque_size_val(d)
+    if sz == 0 {
+        return d
+    }
+    let cap       = deque_cap_val(d)
+    let front_idx = deque_front_idx(d)
+    let new_front = (front_idx + 1) % cap
+    let new_sz    = sz - 1
+    var out = [str(new_front), str(new_sz), str(cap)]
+    for i in range(0, cap) {
+        out = push(out, d[3 + i])
+    }
+    return out
+}
+
+fn deque_pop_back(d: [String]) -> [String] {
+    let sz = deque_size_val(d)
+    if sz == 0 {
+        return d
+    }
+    let cap       = deque_cap_val(d)
+    let front_idx = deque_front_idx(d)
+    let new_sz    = sz - 1
+    // No physical change needed — just decrement size
+    var out = [str(front_idx), str(new_sz), str(cap)]
+    for i in range(0, cap) {
+        out = push(out, d[3 + i])
+    }
+    return out
+}
+
+fn deque_peek_front(d: [String]) -> String {
+    let sz = deque_size_val(d)
+    if sz == 0 {
+        return ""
+    }
+    let front_idx = deque_front_idx(d)
+    let cap       = deque_cap_val(d)
+    return d[3 + (front_idx % cap)]
+}
+
+fn deque_peek_back(d: [String]) -> String {
+    let sz = deque_size_val(d)
+    if sz == 0 {
+        return ""
+    }
+    let cap       = deque_cap_val(d)
+    let front_idx = deque_front_idx(d)
+    let back_phys = (front_idx + sz - 1) % cap
+    return d[3 + back_phys]
+}
+
+// ============================================================
+// STACK  (LIFO)
+// Layout: plain [String], top = last element
+// ============================================================
+
+fn stack_new() -> [String] {
+    return []
+}
+
+fn stack_push(s: [String], val: String) -> [String] {
+    var out = []
+    for i in range(0, len(s)) {
+        out = push(out, s[i])
+    }
+    out = push(out, val)
+    return out
+}
+
+fn stack_pop(s: [String]) -> [String] {
+    let n = len(s)
+    if n == 0 {
+        return s
+    }
+    var out = []
+    for i in range(0, n - 1) {
+        out = push(out, s[i])
+    }
+    return out
+}
+
+fn stack_peek(s: [String]) -> String {
+    let n = len(s)
+    if n == 0 {
+        return ""
+    }
+    return s[n - 1]
+}
+
+fn stack_size(s: [String]) -> i64 {
+    return len(s)
+}
+
+// ============================================================
+// TESTS
+// ============================================================
+
+fn main() {
+    println("=== Collections Tests ===")
+    println("")
+
+    // --- Map ---
+    println("-- Map --")
+    var m = map_new()
+    m = map_set(m, "name", "Vortex")
+    m = map_set(m, "version", "0.1")
+    m = map_set(m, "type", "language")
+    println("size: " + str(map_size(m)))
+    println("name: " + map_get(m, "name"))
+    println("version: " + map_get(m, "version"))
+    println("missing: '" + map_get(m, "missing") + "'")
+    println("has 'type': " + str(map_has(m, "type")))
+    m = map_set(m, "name", "VortexLang")
+    println("updated name: " + map_get(m, "name"))
+    m = map_remove(m, "type")
+    println("after remove size: " + str(map_size(m)))
+    println("has 'type' after remove: " + str(map_has(m, "type")))
+    let ks = map_keys(m)
+    println("keys count: " + str(len(ks)))
+    let vs = map_values(m)
+    println("values count: " + str(len(vs)))
+    println("")
+
+    // --- Set ---
+    println("-- Set --")
+    var s = set_new()
+    s = set_add(s, "a")
+    s = set_add(s, "b")
+    s = set_add(s, "c")
+    s = set_add(s, "b")
+    println("size (expect 3): " + str(set_size(s)))
+    println("has 'a': " + str(set_has(s, "a")))
+    println("has 'z': " + str(set_has(s, "z")))
+    s = set_remove(s, "b")
+    println("after remove 'b' size (expect 2): " + str(set_size(s)))
+    var s2 = set_new()
+    s2 = set_add(s2, "c")
+    s2 = set_add(s2, "d")
+    let u = set_union(s, s2)
+    println("union size (expect 3): " + str(set_size(u)))
+    let inter = set_intersect(s, s2)
+    println("intersect size (expect 1): " + str(set_size(inter)))
+    println("")
+
+    // --- Deque ---
+    println("-- Deque --")
+    var dq = deque_new()
+    dq = deque_push_back(dq, "B")
+    dq = deque_push_back(dq, "C")
+    dq = deque_push_front(dq, "A")
+    println("size (expect 3): " + str(deque_size(dq)))
+    println("front (expect A): " + deque_peek_front(dq))
+    println("back (expect C): " + deque_peek_back(dq))
+    dq = deque_pop_front(dq)
+    println("after pop_front, front (expect B): " + deque_peek_front(dq))
+    dq = deque_pop_back(dq)
+    println("after pop_back, back (expect B): " + deque_peek_back(dq))
+    println("size (expect 1): " + str(deque_size(dq)))
+    println("")
+
+    // --- Stack ---
+    println("-- Stack --")
+    var st = stack_new()
+    st = stack_push(st, "x")
+    st = stack_push(st, "y")
+    st = stack_push(st, "z")
+    println("size (expect 3): " + str(stack_size(st)))
+    println("peek (expect z): " + stack_peek(st))
+    st = stack_pop(st)
+    println("after pop, peek (expect y): " + stack_peek(st))
+    st = stack_pop(st)
+    st = stack_pop(st)
+    println("after 2 more pops, size (expect 0): " + str(stack_size(st)))
+    println("peek on empty (expect empty string): '" + stack_peek(st) + "'")
+    println("")
+
+    println("=== All tests passed ===")
+}

@@ -34,6 +34,7 @@ static FFI_HANDLES: LazyLock<Mutex<HashMap<usize, String>>> =
 fn val_to_i64(v: &Value) -> Result<i64, String> {
     match v {
         Value::Int(n) => Ok(*n as i64),
+        Value::Pointer(p) => Ok(*p as i64),
         _ => Err(format!("expected Int, got {:?}", v)),
     }
 }

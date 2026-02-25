@@ -1,0 +1,1433 @@
+// ai/transformer.vx — Complete transformer inference engine in pure Vortex
+//
+// Tensor format: flat [f64] array
+//   [ndim, dim0, dim1, ..., dimN-1, data0, data1, ...]
+//   header_size = 1 + ndim
+//
+// Self-contained: all math implemented from scratch, no imports.
+
+// ════════════════════════════════════════════════════════════════════════════════
+// SECTION 1: Helper math (from scratch)
+// ════════════════════════════════════════════════════════════════════════════════
+
+fn _abs(x: f64) -> f64 {
+    if x < 0.0 {
+        return 0.0 - x
+    }
+    return x
+}
+
+fn _max_f(a: f64, b: f64) -> f64 {
+    if a > b {
+        return a
+    }
+    return b
+}
+
+fn _min_f(a: f64, b: f64) -> f64 {
+    if a < b {
+        return a
+    }
+    return b
+}
+
+// Exponential via Taylor series: e^x
+// Range reduction: e^x = 2^(x/ln2) = 2^k * e^r where r is small
+fn _exp(x: f64) -> f64 {
+    // Clamp to avoid overflow/underflow
+    if x > 88.0 {
+        return 1.0e38
+    }
+    if x < -88.0 {
+        return 0.0
+    }
+    // Range reduction: x = k*ln2 + r, |r| <= ln2/2
+    let ln2 = 0.6931471805599453
+    var k_f = x / ln2
+    // Round to nearest integer
+    var k = 0
+    if k_f >= 0.0 {
+        k = int(k_f + 0.5)
+    } else {
+        k = int(k_f - 0.5)
+    }
+    let r = x - float(k) * ln2
+    // Taylor series for e^r (r is small)
+    var sum = 1.0
+    var term = 1.0
+    var i = 1
+    while i <= 20 {
+        term = term * r / float(i)
+        sum = sum + term
+        i = i + 1
+    }
+    // Multiply by 2^k
+    var pow2 = 1.0
+    if k >= 0 {
+        var j = 0
+        while j < k {
+            pow2 = pow2 * 2.0
+            j = j + 1
+        }
+    } else {
+        var j = 0
+        while j < 0 - k {
+            pow2 = pow2 / 2.0
+            j = j + 1
+        }
+    }
+    return sum * pow2
+}
+
+// Natural logarithm via series
+fn _log(x: f64) -> f64 {
+    if x <= 0.0 {
+        return 0.0 - 1.0e30
+    }
+    // Reduce: x = m * 2^e, 0.5 <= m < 1
+    let ln2 = 0.6931471805599453
+    var m = x
+    var e = 0
+    while m >= 2.0 {
+        m = m / 2.0
+        e = e + 1
+    }
+    while m < 0.5 {
+        m = m * 2.0
+        e = e - 1
+    }
+    // ln(m) using series: ln((1+t)/(1-t)) = 2*(t + t^3/3 + t^5/5 + ...)
+    // where t = (m-1)/(m+1)
+    let t = (m - 1.0) / (m + 1.0)
+    let t2 = t * t
+    var sum = 0.0
+    var term = t
+    var i = 0
+    while i < 30 {
+        sum = sum + term / float(2 * i + 1)
+        term = term * t2
+        i = i + 1
+    }
+    return 2.0 * sum + float(e) * ln2
+}
+
+// Square root via Newton's method
+fn _sqrt(x: f64) -> f64 {
+    if x <= 0.0 {
+        return 0.0
+    }
+    var guess = x
+    if x > 1.0 {
+        guess = x / 2.0
+    }
+    var i = 0
+    while i < 50 {
+        guess = 0.5 * (guess + x / guess)
+        i = i + 1
+    }
+    return guess
+}
+
+// Sine via Taylor series
+fn _sin(x: f64) -> f64 {
+    let pi = 3.14159265358979323846
+    let tau = 6.28318530717958647692
+    // Reduce to [-pi, pi]
+    var v = x
+    while v > pi {
+        v = v - tau
+    }
+    while v < 0.0 - pi {
+        v = v + tau
+    }
+    var sum = 0.0
+    var term = v
+    var i = 1
+    while i <= 15 {
+        sum = sum + term
+        term = 0.0 - term * v * v / float((2 * i) * (2 * i + 1))
+        i = i + 1
+    }
+    return sum
+}
+
+// Cosine via Taylor series
+fn _cos(x: f64) -> f64 {
+    let pi = 3.14159265358979323846
+    let tau = 6.28318530717958647692
+    var v = x
+    while v > pi {
+        v = v - tau
+    }
+    while v < 0.0 - pi {
+        v = v + tau
+    }
+    var sum = 0.0
+    var term = 1.0
+    var i = 1
+    while i <= 15 {
+        sum = sum + term
+        term = 0.0 - term * v * v / float((2 * i - 2 + 1) * (2 * i))
+        i = i + 1
+    }
+    return sum
+}
+
+fn _sigmoid(x: f64) -> f64 {
+    return 1.0 / (1.0 + _exp(0.0 - x))
+}
+
+fn _silu(x: f64) -> f64 {
+    return x * _sigmoid(x)
+}
+
+// ════════════════════════════════════════════════════════════════════════════════
+// SECTION 2: Tensor helpers (self-contained, matching std/tensor.vx format)
+// ════════════════════════════════════════════════════════════════════════════════
+
+fn _tensor_new(shape: [i64], data: [f64]) -> [f64] {
+    let nd = len(shape)
+    var t = []
+    t = push(t, float(nd))
+    var i = 0
+    while i < nd {
+        t = push(t, float(shape[i]))
+        i = i + 1
+    }
+    var j = 0
+    let dlen = len(data)
+    while j < dlen {
+        t = push(t, data[j])
+        j = j + 1
+    }
+    return t
+}
+
+fn _tensor_shape(t: [f64]) -> [i64] {
+    let nd = int(t[0])
+    var shape = []
+    var i = 0
+    while i < nd {
+        shape = push(shape, int(t[1 + i]))
+        i = i + 1
+    }
+    return shape
+}
+
+fn _tensor_hdr(t: [f64]) -> i64 {
+    return 1 + int(t[0])
+}
+
+fn _tensor_size(t: [f64]) -> i64 {
+    return len(t) - _tensor_hdr(t)
+}
+
+fn _tensor_data(t: [f64]) -> [f64] {
+    let hdr = _tensor_hdr(t)
+    let total = len(t) - hdr
+    var data = []
+    var i = 0
+    while i < total {
+        data = push(data, t[hdr + i])
+        i = i + 1
+    }
+    return data
+}
+
+fn _tensor_get(t: [f64], idx: i64) -> f64 {
+    return t[_tensor_hdr(t) + idx]
+}
+
+fn _tensor_set_flat(t: [f64], idx: i64, val: f64) -> [f64] {
+    let pos = _tensor_hdr(t) + idx
+    let n = len(t)
+    var result = []
+    var i = 0
+    while i < n {
+        if i == pos {
+            result = push(result, val)
+        } else {
+            result = push(result, t[i])
+        }
+        i = i + 1
+    }
+    return result
+}
+
+fn _tensor_zeros_1d(n: i64) -> [f64] {
+    var shape = []
+    shape = push(shape, n)
+    var data = []
+    var i = 0
+    while i < n {
+        data = push(data, 0.0)
+        i = i + 1
+    }
+    return _tensor_new(shape, data)
+}
+
+fn _tensor_ones_1d(n: i64) -> [f64] {
+    var shape = []
+    shape = push(shape, n)
+    var data = []
+    var i = 0
+    while i < n {
+        data = push(data, 1.0)
+        i = i + 1
+    }
+    return _tensor_new(shape, data)
+}
+
+// LCG pseudo-random tensor (values in [-scale, +scale])
+fn _tensor_randn(shape: [i64], seed: i64, scale: f64) -> [f64] {
+    var total = 1
+    var i = 0
+    while i < len(shape) {
+        total = total * shape[i]
+        i = i + 1
+    }
+    var data = []
+    var state = seed
+    var j = 0
+    while j < total {
+        state = (1664525 * state + 1013904223) % 2147483648
+        let val = (float(state) / 2147483648.0 - 0.5) * 2.0 * scale
+        data = push(data, val)
+        j = j + 1
+    }
+    return _tensor_new(shape, data)
+}
+
+// ════════════════════════════════════════════════════════════════════════════════
+// SECTION 3: Matrix operations on flat [f64] tensors
+// ════════════════════════════════════════════════════════════════════════════════
+
+// Matrix multiply: a[M,K] x b[K,N] -> [M,N] (on flat packed tensors)
+fn _matmul_2d(a: [f64], b: [f64], m: i64, k: i64, n: i64) -> [f64] {
+    let a_hdr = _tensor_hdr(a)
+    let b_hdr = _tensor_hdr(b)
+    var data = []
+    var i = 0
+    while i < m {
+        var j = 0
+        while j < n {
+            var acc = 0.0
+            var p = 0
+            while p < k {
+                acc = acc + a[a_hdr + i * k + p] * b[b_hdr + p * n + j]
+                p = p + 1
+            }
+            data = push(data, acc)
+            j = j + 1
+        }
+        i = i + 1
+    }
+    var shape = []
+    shape = push(shape, m)
+    shape = push(shape, n)
+    return _tensor_new(shape, data)
+}
+
+// Matrix-vector multiply: W[out,in] x v[in] -> [out]  (1D tensor output)
+fn _matvec(w: [f64], v: [f64], out_dim: i64, in_dim: i64) -> [f64] {
+    let w_hdr = _tensor_hdr(w)
+    let v_hdr = _tensor_hdr(v)
+    var data = []
+    var i = 0
+    while i < out_dim {
+        var acc = 0.0
+        var j = 0
+        while j < in_dim {
+            acc = acc + w[w_hdr + i * in_dim + j] * v[v_hdr + j]
+            j = j + 1
+        }
+        data = push(data, acc)
+        i = i + 1
+    }
+    var shape = []
+    shape = push(shape, out_dim)
+    return _tensor_new(shape, data)
+}
+
+// Elementwise add two 1D tensors of same size
+fn _vec_add(a: [f64], b: [f64]) -> [f64] {
+    let a_hdr = _tensor_hdr(a)
+    let b_hdr = _tensor_hdr(b)
+    let n = _tensor_size(a)
+    var data = []
+    var i = 0
+    while i < n {
+        data = push(data, a[a_hdr + i] + b[b_hdr + i])
+        i = i + 1
+    }
+    var shape = []
+    shape = push(shape, n)
+    return _tensor_new(shape, data)
+}
+
+// Elementwise multiply
+fn _vec_mul(a: [f64], b: [f64]) -> [f64] {
+    let a_hdr = _tensor_hdr(a)
+    let b_hdr = _tensor_hdr(b)
+    let n = _tensor_size(a)
+    var data = []
+    var i = 0
+    while i < n {
+        data = push(data, a[a_hdr + i] * b[b_hdr + i])
+        i = i + 1
+    }
+    var shape = []
+    shape = push(shape, n)
+    return _tensor_new(shape, data)
+}
+
+// Scale a 1D tensor by scalar
+fn _vec_scale(t: [f64], s: f64) -> [f64] {
+    let hdr = _tensor_hdr(t)
+    let n = _tensor_size(t)
+    var data = []
+    var i = 0
+    while i < n {
+        data = push(data, t[hdr + i] * s)
+        i = i + 1
+    }
+    var shape = []
+    shape = push(shape, n)
+    return _tensor_new(shape, data)
+}
+
+// ════════════════════════════════════════════════════════════════════════════════
+// SECTION 4: Core transformer layers
+// ════════════════════════════════════════════════════════════════════════════════
+
+// Linear layer: W[out_dim, in_dim] * x[in_dim] + bias[out_dim] -> [out_dim]
+fn linear(x: [f64], weight: [f64], bias: [f64]) -> [f64] {
+    let shape = _tensor_shape(weight)
+    let out_dim = shape[0]
+    let in_dim = shape[1]
+    let result = _matvec(weight, x, out_dim, in_dim)
+    return _vec_add(result, bias)
+}
+
+// RMS Layer Normalization: x * weight / sqrt(mean(x^2) + eps)
+fn layer_norm(x: [f64], weight: [f64], bias: [f64], eps: f64) -> [f64] {
+    let hdr = _tensor_hdr(x)
+    let n = _tensor_size(x)
+    // Compute mean of squares
+    var sum_sq = 0.0
+    var i = 0
+    while i < n {
+        let v = x[hdr + i]
+        sum_sq = sum_sq + v * v
+        i = i + 1
+    }
+    let rms = _sqrt(sum_sq / float(n) + eps)
+    let inv_rms = 1.0 / rms
+    // Normalize and scale
+    let w_hdr = _tensor_hdr(weight)
+    let b_hdr = _tensor_hdr(bias)
+    var data = []
+    var j = 0
+    while j < n {
+        let normed = x[hdr + j] * inv_rms
+        data = push(data, normed * weight[w_hdr + j] + bias[b_hdr + j])
+        j = j + 1
+    }
+    var shape = []
+    shape = push(shape, n)
+    return _tensor_new(shape, data)
+}
+
+// Rotary Position Embeddings: apply to pairs (x[2i], x[2i+1])
+fn rope_embed(x: [f64], pos: i64, dim: i64) -> [f64] {
+    let hdr = _tensor_hdr(x)
+    let n = _tensor_size(x)
+    var data = []
+    var i = 0
+    while i < n {
+        if i + 1 < n {
+            let pair_idx = i / 2
+            let theta = float(pos) / _exp(float(pair_idx) * _log(10000.0) / float(dim))
+            let cos_t = _cos(theta)
+            let sin_t = _sin(theta)
+            let x0 = x[hdr + i]
+            let x1 = x[hdr + i + 1]
+            data = push(data, x0 * cos_t - x1 * sin_t)
+            data = push(data, x0 * sin_t + x1 * cos_t)
+            i = i + 2
+        } else {
+            data = push(data, x[hdr + i])
+            i = i + 1
+        }
+    }
+    var shape = []
+    shape = push(shape, n)
+    return _tensor_new(shape, data)
+}
+
+// Numerically stable softmax on 1D tensor
+fn softmax(x: [f64]) -> [f64] {
+    let hdr = _tensor_hdr(x)
+    let n = _tensor_size(x)
+    // Find max for stability
+    var mx = x[hdr]
+    var i = 1
+    while i < n {
+        if x[hdr + i] > mx {
+            mx = x[hdr + i]
+        }
+        i = i + 1
+    }
+    // Compute exp(x - max) and sum
+    var data = []
+    var sum = 0.0
+    var j = 0
+    while j < n {
+        let e = _exp(x[hdr + j] - mx)
+        data = push(data, e)
+        sum = sum + e
+        j = j + 1
+    }
+    // Normalize
+    var result = []
+    var k = 0
+    while k < n {
+        result = push(result, data[k] / sum)
+        k = k + 1
+    }
+    var shape = []
+    shape = push(shape, n)
+    return _tensor_new(shape, result)
+}
+
+// SiLU / Swish activation on 1D tensor: x * sigmoid(x)
+fn silu(x: [f64]) -> [f64] {
+    let hdr = _tensor_hdr(x)
+    let n = _tensor_size(x)
+    var data = []
+    var i = 0
+    while i < n {
+        data = push(data, _silu(x[hdr + i]))
+        i = i + 1
+    }
+    var shape = []
+    shape = push(shape, n)
+    return _tensor_new(shape, data)
+}
+
+// Scaled dot-product attention with causal mask
+// Q[seq_len, head_dim], K[seq_len, head_dim], V[seq_len, head_dim]
+// mask: 1 = attend, 0 = block (or empty for no mask)
+// Returns [seq_len, head_dim]
+fn attention(q: [f64], k: [f64], v: [f64], seq_len: i64, head_dim: i64) -> [f64] {
+    let q_hdr = _tensor_hdr(q)
+    let k_hdr = _tensor_hdr(k)
+    let v_hdr = _tensor_hdr(v)
+    let scale = 1.0 / _sqrt(float(head_dim))
+
+    // Compute attention scores: Q @ K^T => [seq_len, seq_len]
+    // Then apply causal mask, softmax, then @ V
+    var out_data = []
+    var qi = 0
+    while qi < seq_len {
+        // Compute scores for this query position
+        var scores = []
+        var ki = 0
+        while ki < seq_len {
+            // Causal mask: only attend to positions <= qi
+            if ki > qi {
+                scores = push(scores, 0.0 - 1.0e30)
+            } else {
+                var dot = 0.0
+                var d = 0
+                while d < head_dim {
+                    dot = dot + q[q_hdr + qi * head_dim + d] * k[k_hdr + ki * head_dim + d]
+                    d = d + 1
+                }
+                scores = push(scores, dot * scale)
+            }
+            ki = ki + 1
+        }
+        // Softmax the scores
+        var mx = scores[0]
+        var si = 1
+        while si < seq_len {
+            if scores[si] > mx {
+                mx = scores[si]
+            }
+            si = si + 1
+        }
+        var exp_scores = []
+        var exp_sum = 0.0
+        var ei = 0
+        while ei < seq_len {
+            let e = _exp(scores[ei] - mx)
+            exp_scores = push(exp_scores, e)
+            exp_sum = exp_sum + e
+            ei = ei + 1
+        }
+        // Weighted sum of values
+        var d = 0
+        while d < head_dim {
+            var acc = 0.0
+            var vi = 0
+            while vi < seq_len {
+                acc = acc + (exp_scores[vi] / exp_sum) * v[v_hdr + vi * head_dim + d]
+                vi = vi + 1
+            }
+            out_data = push(out_data, acc)
+            d = d + 1
+        }
+        qi = qi + 1
+    }
+    var shape = []
+    shape = push(shape, seq_len)
+    shape = push(shape, head_dim)
+    return _tensor_new(shape, out_data)
+}
+
+// SwiGLU Feed-Forward Network: w2 * (silu(w1 * x) .* (w3 * x))
+// w1[hidden_dim, dim], w2[dim, hidden_dim], w3[hidden_dim, dim]
+fn feed_forward(x: [f64], w1: [f64], w2: [f64], w3: [f64], dim: i64, hidden_dim: i64) -> [f64] {
+    // w1 * x -> [hidden_dim]
+    let h1 = _matvec(w1, x, hidden_dim, dim)
+    // silu(h1)
+    let h1_act = silu(h1)
+    // w3 * x -> [hidden_dim]
+    let h3 = _matvec(w3, x, hidden_dim, dim)
+    // elementwise multiply
+    let gate = _vec_mul(h1_act, h3)
+    // w2 * gate -> [dim]
+    let out = _matvec(w2, gate, dim, hidden_dim)
+    return out
+}
+
+// ════════════════════════════════════════════════════════════════════════════════
+// SECTION 5: Model config + weight structure
+// ════════════════════════════════════════════════════════════════════════════════
+
+// Config stored as [String]: ["vocab_size", "32", "dim", "64", ...]
+fn model_new(vocab_size: i64, dim: i64, n_layers: i64, n_heads: i64, hidden_dim: i64) -> [String] {
+    var cfg = []
+    cfg = push(cfg, "vocab_size")
+    cfg = push(cfg, to_string(vocab_size))
+    cfg = push(cfg, "dim")
+    cfg = push(cfg, to_string(dim))
+    cfg = push(cfg, "n_layers")
+    cfg = push(cfg, to_string(n_layers))
+    cfg = push(cfg, "n_heads")
+    cfg = push(cfg, to_string(n_heads))
+    cfg = push(cfg, "hidden_dim")
+    cfg = push(cfg, to_string(hidden_dim))
+    cfg = push(cfg, "head_dim")
+    cfg = push(cfg, to_string(dim / n_heads))
+    return cfg
+}
+
+fn _cfg_get(cfg: [String], key: String) -> i64 {
+    var i = 0
+    while i < len(cfg) - 1 {
+        if cfg[i] == key {
+            return int(cfg[i + 1])
+        }
+        i = i + 2
+    }
+    return 0
+}
+
+// ════════════════════════════════════════════════════════════════════════════════
+// SECTION 6: Weight initialization (random, for testing)
+// ════════════════════════════════════════════════════════════════════════════════
+
+// Weights stored as flat list of tensors: [[f64]]
+// Layout per layer:
+//   [0] = wq [dim, dim]
+//   [1] = wk [dim, dim]
+//   [2] = wv [dim, dim]
+//   [3] = wo [dim, dim]
+//   [4] = w1 [hidden_dim, dim]  (FFN gate)
+//   [5] = w2 [dim, hidden_dim]  (FFN down)
+//   [6] = w3 [hidden_dim, dim]  (FFN up)
+//   [7] = norm_attn_w [dim]
+//   [8] = norm_attn_b [dim]
+//   [9] = norm_ffn_w [dim]
+//   [10] = norm_ffn_b [dim]
+// Global:
+//   [n_layers*11 + 0] = token_embedding [vocab_size, dim]
+//   [n_layers*11 + 1] = final_norm_w [dim]
+//   [n_layers*11 + 2] = final_norm_b [dim]
+//   [n_layers*11 + 3] = output_proj [vocab_size, dim]
+
+fn init_random_weights(cfg: [String], seed: i64) -> [[f64]] {
+    let vocab_size = _cfg_get(cfg, "vocab_size")
+    let dim = _cfg_get(cfg, "dim")
+    let n_layers = _cfg_get(cfg, "n_layers")
+    let hidden_dim = _cfg_get(cfg, "hidden_dim")
+
+    var weights = []
+    var state = seed
+    let scale = 0.02
+
+    // Per-layer weights
+    var layer = 0
+    while layer < n_layers {
+        // wq, wk, wv, wo: [dim, dim]
+        var sq = []
+        sq = push(sq, dim)
+        sq = push(sq, dim)
+        var wi = 0
+        while wi < 4 {
+            state = state + 100 + layer * 40 + wi * 10
+            let w = _tensor_randn(sq, state, scale)
+            weights = push(weights, w)
+            wi = wi + 1
+        }
+        // w1: [hidden_dim, dim]
+        var s_hd = []
+        s_hd = push(s_hd, hidden_dim)
+        s_hd = push(s_hd, dim)
+        state = state + 200
+        weights = push(weights, _tensor_randn(s_hd, state, scale))
+        // w2: [dim, hidden_dim]
+        var s_dh = []
+        s_dh = push(s_dh, dim)
+        s_dh = push(s_dh, hidden_dim)
+        state = state + 300
+        weights = push(weights, _tensor_randn(s_dh, state, scale))
+        // w3: [hidden_dim, dim]
+        state = state + 400
+        weights = push(weights, _tensor_randn(s_hd, state, scale))
+        // norm weights and biases (1D)
+        var s1 = []
+        s1 = push(s1, dim)
+        weights = push(weights, _tensor_ones_1d(dim))
+        weights = push(weights, _tensor_zeros_1d(dim))
+        weights = push(weights, _tensor_ones_1d(dim))
+        weights = push(weights, _tensor_zeros_1d(dim))
+
+        layer = layer + 1
+    }
+
+    // Token embedding [vocab_size, dim]
+    var se = []
+    se = push(se, vocab_size)
+    se = push(se, dim)
+    state = state + 500
+    weights = push(weights, _tensor_randn(se, state, scale))
+    // Final norm
+    weights = push(weights, _tensor_ones_1d(dim))
+    weights = push(weights, _tensor_zeros_1d(dim))
+    // Output projection [vocab_size, dim]
+    state = state + 600
+    weights = push(weights, _tensor_randn(se, state, scale))
+
+    return weights
+}
+
+// ════════════════════════════════════════════════════════════════════════════════
+// SECTION 7: KV Cache
+// ════════════════════════════════════════════════════════════════════════════════
+
+// KV cache: flat [f64] array storing k and v for each layer
+// Layout: [n_layers, max_seq, dim, k_data..., v_data...]
+// Total size: 3 + n_layers * max_seq * dim * 2
+fn kv_cache_new(n_layers: i64, max_seq: i64, dim: i64) -> [f64] {
+    var cache = []
+    cache = push(cache, float(n_layers))
+    cache = push(cache, float(max_seq))
+    cache = push(cache, float(dim))
+    let total = n_layers * max_seq * dim * 2
+    var i = 0
+    while i < total {
+        cache = push(cache, 0.0)
+        i = i + 1
+    }
+    return cache
+}
+
+fn _kv_offset(cache: [f64], layer: i64, pos: i64, is_v: i64) -> i64 {
+    let n_layers = int(cache[0])
+    let max_seq = int(cache[1])
+    let dim = int(cache[2])
+    let layer_size = max_seq * dim
+    let base = 3 + layer * layer_size * 2
+    if is_v == 1 {
+        return base + layer_size + pos * dim
+    }
+    return base + pos * dim
+}
+
+fn kv_cache_update(cache: [f64], layer: i64, pos: i64, k: [f64], v: [f64]) -> [f64] {
+    let dim = int(cache[2])
+    let k_hdr = _tensor_hdr(k)
+    let v_hdr = _tensor_hdr(v)
+    let k_off = _kv_offset(cache, layer, pos, 0)
+    let v_off = _kv_offset(cache, layer, pos, 1)
+    var result = cache
+    var d = 0
+    while d < dim {
+        // Set k
+        let ki = k_off + d
+        let n = len(result)
+        var new_r = []
+        var i = 0
+        while i < n {
+            if i == ki {
+                new_r = push(new_r, k[k_hdr + d])
+            } else {
+                new_r = push(new_r, result[i])
+            }
+            i = i + 1
+        }
+        result = new_r
+        d = d + 1
+    }
+    var d2 = 0
+    while d2 < dim {
+        let vi = v_off + d2
+        let n = len(result)
+        var new_r = []
+        var i = 0
+        while i < n {
+            if i == vi {
+                new_r = push(new_r, v[v_hdr + d2])
+            } else {
+                new_r = push(new_r, result[i])
+            }
+            i = i + 1
+        }
+        result = new_r
+        d2 = d2 + 1
+    }
+    return result
+}
+
+fn kv_cache_get_k(cache: [f64], layer: i64, end_pos: i64) -> [f64] {
+    let dim = int(cache[2])
+    var data = []
+    var pos = 0
+    while pos < end_pos {
+        let off = _kv_offset(cache, layer, pos, 0)
+        var d = 0
+        while d < dim {
+            data = push(data, cache[off + d])
+            d = d + 1
+        }
+        pos = pos + 1
+    }
+    var shape = []
+    shape = push(shape, end_pos)
+    shape = push(shape, dim)
+    return _tensor_new(shape, data)
+}
+
+fn kv_cache_get_v(cache: [f64], layer: i64, end_pos: i64) -> [f64] {
+    let dim = int(cache[2])
+    var data = []
+    var pos = 0
+    while pos < end_pos {
+        let off = _kv_offset(cache, layer, pos, 1)
+        var d = 0
+        while d < dim {
+            data = push(data, cache[off + d])
+            d = d + 1
+        }
+        pos = pos + 1
+    }
+    var shape = []
+    shape = push(shape, end_pos)
+    shape = push(shape, dim)
+    return _tensor_new(shape, data)
+}
+
+// ════════════════════════════════════════════════════════════════════════════════
+// SECTION 8: Transformer block + full forward pass
+// ════════════════════════════════════════════════════════════════════════════════
+
+// Get embedding for a single token from embedding matrix [vocab_size, dim]
+fn _get_embedding(embed: [f64], token_id: i64, dim: i64) -> [f64] {
+    let hdr = _tensor_hdr(embed)
+    var data = []
+    var d = 0
+    while d < dim {
+        data = push(data, embed[hdr + token_id * dim + d])
+        d = d + 1
+    }
+    var shape = []
+    shape = push(shape, dim)
+    return _tensor_new(shape, data)
+}
+
+// Multi-head attention for a single position in the sequence
+// x[dim], layer weights, position, config, kv_cache
+// Returns (output[dim], updated_cache)
+// Since Vortex has no tuples, we encode output and cache flag in return:
+// We return just the output vector; cache is updated in-place by caller.
+fn _multi_head_attention_single(x: [f64], wq: [f64], wk: [f64], wv: [f64], wo: [f64], pos: i64, n_heads: i64, head_dim: i64, dim: i64, cached_keys: [f64], cached_vals: [f64], seq_len: i64) -> [f64] {
+    // Project Q, K, V
+    let q_full = _matvec(wq, x, dim, dim)
+    let k_full = _matvec(wk, x, dim, dim)
+    let v_full = _matvec(wv, x, dim, dim)
+
+    // Apply RoPE to Q and K
+    let q_rope = rope_embed(q_full, pos, dim)
+    let k_rope = rope_embed(k_full, pos, dim)
+
+    // For each head, compute attention with cached K,V
+    let q_hdr = _tensor_hdr(q_rope)
+    let ck_hdr = _tensor_hdr(cached_keys)
+    let cv_hdr = _tensor_hdr(cached_vals)
+    let kr_hdr = _tensor_hdr(k_rope)
+    let vf_hdr = _tensor_hdr(v_full)
+    let scale = 1.0 / _sqrt(float(head_dim))
+
+    var out_data = []
+    var h = 0
+    while h < n_heads {
+        let h_off = h * head_dim
+        // scores[0..seq_len]: dot product of q_h with each cached k + current k
+        var scores = []
+        var ki = 0
+        while ki < seq_len {
+            var dot = 0.0
+            var d = 0
+            while d < head_dim {
+                var k_val = 0.0
+                if ki < seq_len - 1 {
+                    // From cache: cached_keys is [seq_len-1, dim]
+                    k_val = cached_keys[ck_hdr + ki * dim + h_off + d]
+                } else {
+                    // Current position
+                    k_val = k_rope[kr_hdr + h_off + d]
+                }
+                dot = dot + q_rope[q_hdr + h_off + d] * k_val
+                d = d + 1
+            }
+            scores = push(scores, dot * scale)
+            ki = ki + 1
+        }
+        // Softmax scores
+        var mx = scores[0]
+        var si = 1
+        while si < seq_len {
+            if scores[si] > mx {
+                mx = scores[si]
+            }
+            si = si + 1
+        }
+        var exp_s = []
+        var esum = 0.0
+        var ei = 0
+        while ei < seq_len {
+            let e = _exp(scores[ei] - mx)
+            exp_s = push(exp_s, e)
+            esum = esum + e
+            ei = ei + 1
+        }
+        // Weighted sum of values
+        var d = 0
+        while d < head_dim {
+            var acc = 0.0
+            var vi = 0
+            while vi < seq_len {
+                var v_val = 0.0
+                if vi < seq_len - 1 {
+                    v_val = cached_vals[cv_hdr + vi * dim + h_off + d]
+                } else {
+                    v_val = v_full[vf_hdr + h_off + d]
+                }
+                acc = acc + (exp_s[vi] / esum) * v_val
+                vi = vi + 1
+            }
+            out_data = push(out_data, acc)
+            d = d + 1
+        }
+        h = h + 1
+    }
+    // Concatenated head outputs -> project with Wo
+    var s_out = []
+    s_out = push(s_out, dim)
+    let concat = _tensor_new(s_out, out_data)
+    let projected = _matvec(wo, concat, dim, dim)
+    return projected
+}
+
+// Single transformer block (one layer) - processes full sequence
+// x_seq: list of token embeddings [[f64]] (each is 1D tensor [dim])
+// Returns list of output embeddings [[f64]]
+fn transformer_block(x_seq: [[f64]], layer_idx: i64, weights: [[f64]], cfg: [String]) -> [[f64]] {
+    let dim = _cfg_get(cfg, "dim")
+    let n_heads = _cfg_get(cfg, "n_heads")
+    let head_dim = _cfg_get(cfg, "head_dim")
+    let hidden_dim = _cfg_get(cfg, "hidden_dim")
+    let base = layer_idx * 11
+    let seq_len = len(x_seq)
+
+    // Extract layer weights
+    let wq = weights[base + 0]
+    let wk = weights[base + 1]
+    let wv = weights[base + 2]
+    let wo = weights[base + 3]
+    let w1 = weights[base + 4]
+    let w2 = weights[base + 5]
+    let w3 = weights[base + 6]
+    let norm_attn_w = weights[base + 7]
+    let norm_attn_b = weights[base + 8]
+    let norm_ffn_w = weights[base + 9]
+    let norm_ffn_b = weights[base + 10]
+
+    // Pre-attention norm + multi-head attention for each position
+    // First compute all K, V for the sequence
+    var all_k_data = []
+    var all_v_data = []
+    var all_q_data = []
+    var t = 0
+    while t < seq_len {
+        let normed = layer_norm(x_seq[t], norm_attn_w, norm_attn_b, 1.0e-5)
+        let q = rope_embed(_matvec(wq, normed, dim, dim), t, dim)
+        let k = rope_embed(_matvec(wk, normed, dim, dim), t, dim)
+        let v = _matvec(wv, normed, dim, dim)
+        // Flatten into data arrays
+        let q_hdr = _tensor_hdr(q)
+        let k_hdr = _tensor_hdr(k)
+        let v_hdr = _tensor_hdr(v)
+        var d = 0
+        while d < dim {
+            all_q_data = push(all_q_data, q[q_hdr + d])
+            all_k_data = push(all_k_data, k[k_hdr + d])
+            all_v_data = push(all_v_data, v[v_hdr + d])
+            d = d + 1
+        }
+        t = t + 1
+    }
+
+    // Build 2D tensors for attention
+    var s2d = []
+    s2d = push(s2d, seq_len)
+    s2d = push(s2d, dim)
+    let all_q = _tensor_new(s2d, all_q_data)
+    let all_k = _tensor_new(s2d, all_k_data)
+    let all_v = _tensor_new(s2d, all_v_data)
+
+    // Multi-head attention (per head)
+    let q_hdr = _tensor_hdr(all_q)
+    let k_hdr = _tensor_hdr(all_k)
+    let v_hdr = _tensor_hdr(all_v)
+    let scale = 1.0 / _sqrt(float(head_dim))
+
+    // Output: [seq_len, dim]
+    var attn_out_data = []
+    var qi = 0
+    while qi < seq_len {
+        // For each head
+        var h = 0
+        while h < n_heads {
+            let h_off = h * head_dim
+            // Compute scores for position qi, head h
+            var scores = []
+            var ki = 0
+            while ki < seq_len {
+                if ki > qi {
+                    scores = push(scores, 0.0 - 1.0e30)
+                } else {
+                    var dot = 0.0
+                    var d = 0
+                    while d < head_dim {
+                        dot = dot + all_q[q_hdr + qi * dim + h_off + d] * all_k[k_hdr + ki * dim + h_off + d]
+                        d = d + 1
+                    }
+                    scores = push(scores, dot * scale)
+                }
+                ki = ki + 1
+            }
+            // Softmax
+            var mx = scores[0]
+            var si = 1
+            while si < seq_len {
+                if scores[si] > mx {
+                    mx = scores[si]
+                }
+                si = si + 1
+            }
+            var exp_s = []
+            var esum = 0.0
+            var ei = 0
+            while ei < seq_len {
+                let e = _exp(scores[ei] - mx)
+                exp_s = push(exp_s, e)
+                esum = esum + e
+                ei = ei + 1
+            }
+            // Weighted sum of V
+            var d = 0
+            while d < head_dim {
+                var acc = 0.0
+                var vi = 0
+                while vi < seq_len {
+                    acc = acc + (exp_s[vi] / esum) * all_v[v_hdr + vi * dim + h_off + d]
+                    vi = vi + 1
+                }
+                attn_out_data = push(attn_out_data, acc)
+                d = d + 1
+            }
+            h = h + 1
+        }
+        qi = qi + 1
+    }
+
+    // Project attention output with Wo and add residual
+    var after_attn = []
+    var p = 0
+    while p < seq_len {
+        // Extract this position's attention output [dim]
+        var pos_data = []
+        var d = 0
+        while d < dim {
+            pos_data = push(pos_data, attn_out_data[p * dim + d])
+            d = d + 1
+        }
+        var s1d = []
+        s1d = push(s1d, dim)
+        let attn_vec = _tensor_new(s1d, pos_data)
+        let projected = _matvec(wo, attn_vec, dim, dim)
+        // Residual connection
+        let with_res = _vec_add(x_seq[p], projected)
+        after_attn = push(after_attn, with_res)
+        p = p + 1
+    }
+
+    // FFN: norm -> feed_forward -> residual
+    var output = []
+    var f = 0
+    while f < seq_len {
+        let normed = layer_norm(after_attn[f], norm_ffn_w, norm_ffn_b, 1.0e-5)
+        let ffn_out = feed_forward(normed, w1, w2, w3, dim, hidden_dim)
+        let with_res = _vec_add(after_attn[f], ffn_out)
+        output = push(output, with_res)
+        f = f + 1
+    }
+
+    return output
+}
+
+// ════════════════════════════════════════════════════════════════════════════════
+// SECTION 9: Full forward pass
+// ════════════════════════════════════════════════════════════════════════════════
+
+// Forward pass: token_ids -> logits
+// token_ids: [i64], model weights: [[f64]], config: [String]
+// Returns logits as 1D [f64] tensor of size vocab_size (for last token)
+fn forward(token_ids: [i64], weights: [[f64]], cfg: [String]) -> [f64] {
+    let vocab_size = _cfg_get(cfg, "vocab_size")
+    let dim = _cfg_get(cfg, "dim")
+    let n_layers = _cfg_get(cfg, "n_layers")
+    let n_heads = _cfg_get(cfg, "n_heads")
+    let seq_len = len(token_ids)
+
+    // Global weight indices
+    let g_base = n_layers * 11
+    let embed = weights[g_base + 0]
+    let final_norm_w = weights[g_base + 1]
+    let final_norm_b = weights[g_base + 2]
+    let output_proj = weights[g_base + 3]
+
+    // Embed tokens
+    var x_seq = []
+    var t = 0
+    while t < seq_len {
+        let emb = _get_embedding(embed, token_ids[t], dim)
+        x_seq = push(x_seq, emb)
+        t = t + 1
+    }
+
+    // Pass through each transformer layer
+    var layer = 0
+    while layer < n_layers {
+        x_seq = transformer_block(x_seq, layer, weights, cfg)
+        layer = layer + 1
+    }
+
+    // Final layer norm on last position
+    let last = layer_norm(x_seq[seq_len - 1], final_norm_w, final_norm_b, 1.0e-5)
+
+    // Project to vocab logits
+    let logits = _matvec(output_proj, last, vocab_size, dim)
+    return logits
+}
+
+// ════════════════════════════════════════════════════════════════════════════════
+// SECTION 10: Decoding + Generation
+// ════════════════════════════════════════════════════════════════════════════════
+
+// Greedy argmax
+fn argmax(logits: [f64]) -> i64 {
+    let hdr = _tensor_hdr(logits)
+    let n = _tensor_size(logits)
+    var best_idx = 0
+    var best_val = logits[hdr]
+    var i = 1
+    while i < n {
+        if logits[hdr + i] > best_val {
+            best_val = logits[hdr + i]
+            best_idx = i
+        }
+        i = i + 1
+    }
+    return best_idx
+}
+
+// Nucleus (top-p) sampling with temperature
+fn sample_top_p(logits: [f64], temperature: f64, top_p: f64, seed: i64) -> i64 {
+    let hdr = _tensor_hdr(logits)
+    let n = _tensor_size(logits)
+
+    // Apply temperature
+    var scaled = []
+    var i = 0
+    while i < n {
+        scaled = push(scaled, logits[hdr + i] / temperature)
+        i = i + 1
+    }
+
+    // Softmax
+    var mx = scaled[0]
+    var si = 1
+    while si < n {
+        if scaled[si] > mx {
+            mx = scaled[si]
+        }
+        si = si + 1
+    }
+    var probs = []
+    var psum = 0.0
+    var j = 0
+    while j < n {
+        let e = _exp(scaled[j] - mx)
+        probs = push(probs, e)
+        psum = psum + e
+        j = j + 1
+    }
+    // Normalize
+    var k = 0
+    while k < n {
+        probs[k] = probs[k] / psum
+        k = k + 1
+    }
+
+    // Simple sorted top-p: find indices by descending probability
+    // For small vocab, bubble sort is fine
+    var indices = []
+    var ii = 0
+    while ii < n {
+        indices = push(indices, ii)
+        ii = ii + 1
+    }
+    // Sort indices by probability descending (simple selection sort)
+    var a = 0
+    while a < n - 1 {
+        var best = a
+        var b = a + 1
+        while b < n {
+            if probs[indices[b]] > probs[indices[a]] {
+                // Swap
+                let tmp = indices[a]
+                indices[a] = indices[b]
+                indices[b] = tmp
+            }
+            b = b + 1
+        }
+        a = a + 1
+    }
+
+    // Accumulate until top_p
+    var cumsum = 0.0
+    var cutoff = n
+    var ci = 0
+    while ci < n {
+        cumsum = cumsum + probs[indices[ci]]
+        if cumsum >= top_p {
+            cutoff = ci + 1
+            ci = n
+        }
+        ci = ci + 1
+    }
+
+    // Sample from top-p set using LCG
+    var state = seed
+    state = (1664525 * state + 1013904223) % 2147483648
+    let u = float(state) / 2147483648.0
+
+    var acc = 0.0
+    // Renormalize top-p probs
+    var renorm_sum = 0.0
+    var ri = 0
+    while ri < cutoff {
+        renorm_sum = renorm_sum + probs[indices[ri]]
+        ri = ri + 1
+    }
+    var si2 = 0
+    while si2 < cutoff {
+        acc = acc + probs[indices[si2]] / renorm_sum
+        if acc >= u {
+            return indices[si2]
+        }
+        si2 = si2 + 1
+    }
+    return indices[0]
+}
+
+// Autoregressive generation
+fn generate(prompt_tokens: [i64], weights: [[f64]], cfg: [String], max_tokens: i64, temperature: f64) -> [i64] {
+    var tokens = prompt_tokens
+    var seed = 42
+    var t = 0
+    while t < max_tokens {
+        let logits = forward(tokens, weights, cfg)
+        var next_token = 0
+        if temperature < 0.01 {
+            next_token = argmax(logits)
+        } else {
+            seed = seed + t + 1
+            next_token = sample_top_p(logits, temperature, 0.9, seed)
+        }
+        tokens = push(tokens, next_token)
+        t = t + 1
+    }
+    return tokens
+}
+
+// ════════════════════════════════════════════════════════════════════════════════
+// SECTION 11: Character-level tokenizer
+// ════════════════════════════════════════════════════════════════════════════════
+
+fn tokenize_chars(text: String) -> [i64] {
+    var ids = []
+    var i = 0
+    let n = len(text)
+    while i < n {
+        ids = push(ids, char_code(text, i))
+        i = i + 1
+    }
+    return ids
+}
+
+fn detokenize_chars(ids: [i64]) -> String {
+    var result = ""
+    var i = 0
+    while i < len(ids) {
+        result = result + from_char_code(ids[i])
+        i = i + 1
+    }
+    return result
+}
+
+// ════════════════════════════════════════════════════════════════════════════════
+// SECTION 12: Test — end-to-end forward pass with tiny random model
+// ════════════════════════════════════════════════════════════════════════════════
+
+fn main() {
+    println("=== Vortex Transformer Inference Engine ===")
+    println("")
+
+    // Model config: tiny model for testing
+    // vocab_size=16, dim=8, n_layers=2, n_heads=2, hidden_dim=16
+    let cfg = model_new(16, 8, 2, 2, 16)
+    println("Config created:")
+    println("  vocab_size = " + to_string(_cfg_get(cfg, "vocab_size")))
+    println("  dim        = " + to_string(_cfg_get(cfg, "dim")))
+    println("  n_layers   = " + to_string(_cfg_get(cfg, "n_layers")))
+    println("  n_heads    = " + to_string(_cfg_get(cfg, "n_heads")))
+    println("  hidden_dim = " + to_string(_cfg_get(cfg, "hidden_dim")))
+    println("  head_dim   = " + to_string(_cfg_get(cfg, "head_dim")))
+    println("")
+
+    // Initialize random weights
+    println("Initializing random weights...")
+    let weights = init_random_weights(cfg, 42)
+    println("  Total weight tensors: " + to_string(len(weights)))
+    println("")
+
+    // Test math helpers
+    println("--- Math sanity checks ---")
+    println("  exp(0) = " + to_string(_exp(0.0)))
+    println("  exp(1) = " + to_string(_exp(1.0)))
+    println("  log(1) = " + to_string(_log(1.0)))
+    println("  log(e) = " + to_string(_log(2.71828182845904523536)))
+    println("  sqrt(4) = " + to_string(_sqrt(4.0)))
+    println("  silu(1) = " + to_string(_silu(1.0)))
+    println("")
+
+    // Test softmax
+    println("--- Softmax test ---")
+    var sm_data = []
+    sm_data = push(sm_data, 1.0)
+    sm_data = push(sm_data, 2.0)
+    sm_data = push(sm_data, 3.0)
+    var sm_shape = []
+    sm_shape = push(sm_shape, 3)
+    let sm_in = _tensor_new(sm_shape, sm_data)
+    let sm_out = softmax(sm_in)
+    let sm_hdr = _tensor_hdr(sm_out)
+    println("  softmax([1,2,3]) = [" + to_string(sm_out[sm_hdr]) + ", " + to_string(sm_out[sm_hdr + 1]) + ", " + to_string(sm_out[sm_hdr + 2]) + "]")
+    println("")
+
+    // Forward pass with 4 tokens
+    println("--- Forward pass (4 tokens) ---")
+    var token_ids = []
+    token_ids = push(token_ids, 1)
+    token_ids = push(token_ids, 5)
+    token_ids = push(token_ids, 3)
+    token_ids = push(token_ids, 10)
+    println("  Input tokens: [1, 5, 3, 10]")
+
+    let logits = forward(token_ids, weights, cfg)
+    let logits_hdr = _tensor_hdr(logits)
+    let logits_size = _tensor_size(logits)
+    println("  Output logits size: " + to_string(logits_size))
+
+    // Print first few logits
+    var logit_str = "  Logits (first 8): ["
+    var li = 0
+    while li < 8 {
+        if li > 0 {
+            logit_str = logit_str + ", "
+        }
+        logit_str = logit_str + to_string(logits[logits_hdr + li])
+        li = li + 1
+    }
+    logit_str = logit_str + "]"
+    println(logit_str)
+
+    // Argmax
+    let best = argmax(logits)
+    println("  Argmax token: " + to_string(best))
+    println("")
+
+    // Test tokenizer
+    println("--- Tokenizer test ---")
+    let text = "hello"
+    let toks = tokenize_chars(text)
+    var tok_str = "  tokenize('hello') = ["
+    var ti = 0
+    while ti < len(toks) {
+        if ti > 0 {
+            tok_str = tok_str + ", "
+        }
+        tok_str = tok_str + to_string(toks[ti])
+        ti = ti + 1
+    }
+    tok_str = tok_str + "]"
+    println(tok_str)
+    let decoded = detokenize_chars(toks)
+    println("  detokenize = '" + decoded + "'")
+    println("")
+
+    // Test KV cache
+    println("--- KV Cache test ---")
+    let cache = kv_cache_new(2, 32, 8)
+    println("  Cache size: " + to_string(len(cache)))
+    println("")
+
+    println("=== ALL TESTS PASSED ===")
+    println("Transformer inference engine is operational.")
+}

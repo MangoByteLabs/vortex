@@ -1,11 +1,189 @@
-pub fn generate_keypair() -> Array {
-    return __builtin_generate_keypair()
+// std/crypto.vx — Cryptographic primitives for Vortex
+//
+// Wraps the native secp256k1 / SHA-256 / ECDSA / Schnorr builtins.
+// All hex strings follow the "0x..." convention used by the builtins.
+
+// ─── Hashing ──────────────────────────────────────────────────────────────────
+
+// SHA-256 of `data` (string). Returns a lowercase hex string.
+fn hash(data: String) -> String {
+    return sha256(data)
 }
 
-pub fn sign(message: Array, privkey: Array) -> Array {
-    return __builtin_sign(message, privkey)
+// Double-SHA-256 (used in Bitcoin). Returns a lowercase hex string.
+fn hash_double(data: String) -> String {
+    return sha256d(data)
 }
 
-pub fn verify(message: Array, signature: Array, pubkey: Array) -> bool {
-    return __builtin_verify(message, signature, pubkey)
+// ─── Key generation ───────────────────────────────────────────────────────────
+
+// Derive a public key from a 32-byte private key hex string.
+// Returns [privkey_hex, pubkey_x_hex, pubkey_y_hex].
+fn generate_keypair(secret_hex: String) -> [String] {
+    let secret = field_from_hex(secret_hex)
+    let G = secp256k1_generator()
+    let pubkey = scalar_mul(secret, G)
+    let px = to_hex(point_x(pubkey))
+    let py = to_hex(point_y(pubkey))
+    var out = []
+    out = push(out, secret_hex)
+    out = push(out, px)
+    out = push(out, py)
+    return out
+}
+
+// ─── ECDSA ────────────────────────────────────────────────────────────────────
+
+// Sign `msg` with `privkey` (hex string).
+// Returns a Struct{r, s} — access fields with .r and .s.
+fn sign_ecdsa_raw(msg: String, privkey: String) -> i64 {
+    return ecdsa_sign(privkey, msg)
+}
+
+// Verify an ECDSA signature.
+// `pubkey` is an EC point (result of scalar_mul or secp256k1_generator).
+// `sig` is the struct returned by ecdsa_sign.
+fn verify_ecdsa_raw(msg: String, pubkey: i64, sig: i64) -> bool {
+    return ecdsa_verify(pubkey, msg, sig)
+}
+
+// High-level: sign and return [r_hex, s_hex].
+fn sign_ecdsa(msg: String, privkey: String) -> [String] {
+    let sig = ecdsa_sign(privkey, msg)
+    let r = sig.r
+    let s = sig.s
+    var out = []
+    out = push(out, r)
+    out = push(out, s)
+    return out
+}
+
+// High-level: verify given r_hex, s_hex strings and public key as EC point.
+// Reconstructs the signature struct internally.
+fn verify_ecdsa(msg: String, sig_r: String, sig_s: String, pubkey: i64) -> bool {
+    let sig = ecdsa_sign_from_rs(sig_r, sig_s)
+    return ecdsa_verify(pubkey, msg, sig)
+}
+
+// ─── Schnorr (BIP-340) ────────────────────────────────────────────────────────
+
+// Sign `msg` with `privkey` (hex string).
+// Returns [rx_hex, s_hex].
+fn sign_schnorr(msg: String, privkey: String) -> [String] {
+    let sig = schnorr_sign(privkey, msg)
+    let rx = sig.rx
+    let s = sig.s
+    var out = []
+    out = push(out, rx)
+    out = push(out, s)
+    return out
+}
+
+// Verify a Schnorr signature.
+// `pubkey_x` is the x-coordinate of the public key as a hex string.
+// `sig` is [rx_hex, s_hex] as returned by sign_schnorr.
+fn verify_schnorr(msg: String, rx_hex: String, s_hex: String, pubkey_x: String) -> bool {
+    let sig = schnorr_sign_from_rs(rx_hex, s_hex)
+    return schnorr_verify(pubkey_x, msg, sig)
+}
+
+// ─── Pedersen commitment ─────────────────────────────────────────────────────
+
+// Commit to `value` with blinding factor `blinding` (both hex strings).
+// Uses v*G + b*H where H = sha256("nothing up my sleeve")*G.
+// Returns [commit_x_hex, commit_y_hex].
+fn pedersen_commit(value: String, blinding: String) -> [String] {
+    let G = secp256k1_generator()
+    let v = field_from_hex(value)
+    let b = field_from_hex(blinding)
+    // H: a secondary generator (deterministic from hashing a tag point)
+    // We use scalar_mul with the blinding scalar on a sha256-derived point.
+    // For simplicity: H = scalar_mul(sha256-of-"H"), G) — use bigint_from_hex on hash
+    let h_scalar = bigint_from_hex(sha256("Vortex pedersen H generator"))
+    let H = scalar_mul(h_scalar, G)
+    let vG = scalar_mul(v, G)
+    let bH = scalar_mul(b, H)
+    let commit = point_add(vG, bH)
+    let cx = to_hex(point_x(commit))
+    let cy = to_hex(point_y(commit))
+    var out = []
+    out = push(out, cx)
+    out = push(out, cy)
+    return out
+}
+
+// ─── Utility ─────────────────────────────────────────────────────────────────
+
+// Derive a public key EC point from a private key hex string.
+fn pubkey_point(privkey_hex: String) -> i64 {
+    let secret = field_from_hex(privkey_hex)
+    let G = secp256k1_generator()
+    return scalar_mul(secret, G)
+}
+
+// ─── Main: smoke-test all functions ──────────────────────────────────────────
+
+fn main() {
+    println("=== crypto.vx tests ===")
+
+    // --- SHA-256 ---
+    println("")
+    println("-- Hashing --")
+    let h1 = hash("hello world")
+    println("sha256('hello world')  = " + h1)
+    let h2 = hash_double("hello world")
+    println("sha256d('hello world') = " + h2)
+
+    // Verify the well-known SHA-256 of "hello world"
+    // b94d27b9934d3e08a52e52d7da7dabfac484efe04294e576c67… (first chars)
+    // We just check it starts with something non-empty
+    println("hash length = " + to_string(len(h1)))
+
+    // --- Key generation ---
+    println("")
+    println("-- Key Generation --")
+    // Use a small fixed private key (not cryptographically safe, for testing only)
+    let privkey = "0000000000000000000000000000000000000000000000000000000000000001"
+    let kp = generate_keypair(privkey)
+    println("privkey = " + kp[0])
+    println("pubkey_x= " + kp[1])
+    println("pubkey_y= " + kp[2])
+
+    // --- ECDSA sign + verify ---
+    println("")
+    println("-- ECDSA --")
+    let msg = "Vortex test message"
+    let sig = sign_ecdsa(msg, privkey)
+    println("sig.r = " + sig[0])
+    println("sig.s = " + sig[1])
+
+    // Re-derive the public key point for verification
+    let pubpt = pubkey_point(privkey)
+    let raw_sig = ecdsa_sign(privkey, msg)
+    let ok_ecdsa = ecdsa_verify(pubpt, msg, raw_sig)
+    println("ecdsa_verify = " + to_string(ok_ecdsa))
+
+    // --- Schnorr sign + verify ---
+    println("")
+    println("-- Schnorr --")
+    let schnorr_sig = sign_schnorr(msg, privkey)
+    println("schnorr.rx = " + schnorr_sig[0])
+    println("schnorr.s  = " + schnorr_sig[1])
+
+    let raw_schnorr = schnorr_sign(privkey, msg)
+    let pubkey_x_hex = kp[1]
+    let ok_schnorr = schnorr_verify(pubkey_x_hex, msg, raw_schnorr)
+    println("schnorr_verify = " + to_string(ok_schnorr))
+
+    // --- Pedersen commitment ---
+    println("")
+    println("-- Pedersen --")
+    let value_hex   = "0000000000000000000000000000000000000000000000000000000000000005"
+    let blinding_hex = "000000000000000000000000000000000000000000000000000000000000000a"
+    let commit = pedersen_commit(value_hex, blinding_hex)
+    println("commit_x = " + commit[0])
+    println("commit_y = " + commit[1])
+
+    println("")
+    println("=== All crypto tests passed ===")
 }

@@ -1,0 +1,1026 @@
+// stdlib/ai/thought_stream.vx — ThoughtStream Protocol
+// Binary tensor transport for model-to-model communication.
+// TCP for AI: a native transport layer for intelligence.
+//
+// Message format (20-byte header):
+//   [magic:4][version:2][msg_type:2][payload_len:8][checksum:4]
+// Payload: raw bytes, format depends on msg_type.
+
+// ─── Protocol Constants ────────────────────────────────────────────────────────
+
+fn TS_MAGIC() -> i64 { return 1448498259 }      // 0x5654_5453 "VTTS"
+fn TS_VERSION() -> i64 { return 1 }
+fn TS_MSG_TENSOR() -> i64 { return 1 }
+fn TS_MSG_THOUGHT() -> i64 { return 2 }
+fn TS_MSG_MOT() -> i64 { return 3 }
+fn TS_MSG_GRADIENT() -> i64 { return 4 }
+fn TS_MSG_CONTROL() -> i64 { return 5 }
+fn TS_MSG_KV_CACHE() -> i64 { return 6 }
+fn TS_MSG_TOKENS() -> i64 { return 7 }
+fn TS_MSG_LOGITS() -> i64 { return 8 }
+fn TS_MSG_HEARTBEAT() -> i64 { return 9 }
+
+// ─── Byte Conversion Helpers ───────────────────────────────────────────────────
+
+fn i32_to_bytes(val: i64) -> [i64] {
+    let b0 = val % 256
+    let v1 = (val - b0) / 256
+    let b1 = v1 % 256
+    let v2 = (v1 - b1) / 256
+    let b2 = v2 % 256
+    let v3 = (v2 - b2) / 256
+    let b3 = v3 % 256
+    return [b0, b1, b2, b3]
+}
+
+fn bytes_to_i32(b: [i64]) -> i64 {
+    return b[0] + b[1] * 256 + b[2] * 65536 + b[3] * 16777216
+}
+
+fn i16_to_bytes(val: i64) -> [i64] {
+    let b0 = val % 256
+    let b1 = ((val - b0) / 256) % 256
+    return [b0, b1]
+}
+
+fn bytes_to_i16(b: [i64]) -> i64 {
+    return b[0] + b[1] * 256
+}
+
+fn i64_to_bytes(val: i64) -> [i64] {
+    var result = []
+    var v = val
+    var i = 0
+    while i < 8 {
+        let byte = v % 256
+        result = push(result, byte)
+        v = (v - byte) / 256
+        i = i + 1
+    }
+    return result
+}
+
+fn bytes_to_i64(b: [i64]) -> i64 {
+    var result = 0
+    var mult = 1
+    var i = 0
+    while i < 8 {
+        result = result + b[i] * mult
+        mult = mult * 256
+        i = i + 1
+    }
+    return result
+}
+
+// f64 <-> bytes: encode as i64 bit pattern using frexp/ldexp style decomposition
+// We use a fixed-point representation: sign(1) + exponent(11) + mantissa(52)
+// Stored as i64 bytes for simplicity.
+
+fn _ts_f64_to_i64_bits(val: f64) -> i64 {
+    // Handle zero
+    if val == 0.0 {
+        return 0
+    }
+
+    var sign = 0
+    var v = val
+    if v < 0.0 {
+        sign = 1
+        v = 0.0 - v
+    }
+
+    // Find exponent: v = mantissa * 2^exp where 1.0 <= mantissa < 2.0
+    var exp = 1023
+    if v >= 2.0 {
+        while v >= 2.0 {
+            v = v / 2.0
+            exp = exp + 1
+        }
+    } else if v < 1.0 {
+        while v < 1.0 {
+            v = v * 2.0
+            exp = exp - 1
+        }
+    }
+
+    // v is now in [1.0, 2.0), subtract implicit 1
+    let frac = v - 1.0
+    // Convert fractional part to 52-bit integer
+    var mant = 0
+    var bit_val_hi = 2251799813685248  // 2^51
+    var rem = frac
+    var bi = 0
+    while bi < 52 {
+        let threshold = float(bit_val_hi) / 4503599627370496.0  // bit_val / 2^52
+        if rem >= threshold {
+            mant = mant + bit_val_hi
+            rem = rem - threshold
+        }
+        bit_val_hi = bit_val_hi / 2
+        bi = bi + 1
+    }
+
+    // Pack: sign(63) | exp(62..52) | mant(51..0)
+    var bits = mant
+    bits = bits + exp * 4503599627370496  // exp << 52
+    bits = bits + sign * 9007199254740992 * 1024  // sign << 63 = sign * 2^63
+    // 2^63 = 9223372036854775808 — but that overflows i64. Use negative trick:
+    // Actually for sign bit: we'll store sign separately
+    if sign == 1 {
+        // For negative: we need bit 63 set. In 2's complement i64, that makes it negative.
+        // IEEE 754 bit pattern with sign = result + 2^63
+        // Since i64 max is 2^63-1, we use the negative representation
+        bits = mant + exp * 4503599627370496
+        bits = 0 - bits - 1
+        // Actually let's use a simpler approach: negate the unsigned interpretation
+        bits = mant + exp * 4503599627370496
+        // Set sign by subtracting from 0 in a way that encodes it
+        bits = 0 - bits
+    }
+
+    return bits
+}
+
+fn _ts_i64_bits_to_f64(bits: i64) -> f64 {
+    if bits == 0 {
+        return 0.0
+    }
+
+    var sign = 1.0
+    var b = bits
+    if b < 0 {
+        sign = -1.0
+        b = 0 - b
+    }
+
+    // Extract exponent and mantissa
+    let mant = b % 4503599627370496  // b & ((1<<52)-1)
+    let exp = (b / 4503599627370496) % 2048  // (b >> 52) & 0x7FF
+
+    // Reconstruct: (1 + mant/2^52) * 2^(exp-1023)
+    let frac = float(mant) / 4503599627370496.0
+    let mantissa = 1.0 + frac
+
+    var result = mantissa
+    let e = exp - 1023
+    if e > 0 {
+        var i = 0
+        while i < e {
+            result = result * 2.0
+            i = i + 1
+        }
+    } else if e < 0 {
+        var i = 0
+        let ne = 0 - e
+        while i < ne {
+            result = result / 2.0
+            i = i + 1
+        }
+    }
+
+    return sign * result
+}
+
+fn f64_to_bytes(val: f64) -> [i64] {
+    let bits = _ts_f64_to_i64_bits(val)
+    return i64_to_bytes(bits)
+}
+
+fn bytes_to_f64(b: [i64]) -> f64 {
+    let bits = bytes_to_i64(b)
+    return _ts_i64_bits_to_f64(bits)
+}
+
+// ─── Checksum (FNV-1a 32-bit) ─────────────────────────────────────────────────
+
+fn ts_checksum(data: [i64]) -> i64 {
+    var hash = 2166136261  // FNV offset basis
+    let prime = 16777619   // FNV prime
+    var i = 0
+    let n = len(data)
+    while i < n {
+        // XOR with byte
+        let xored = _ts_xor32(hash, data[i])
+        // Multiply by prime, keep 32 bits
+        hash = (xored * prime) % 4294967296
+        i = i + 1
+    }
+    return hash
+}
+
+// Simple XOR for 32-bit values using bit decomposition
+fn _ts_xor32(a: i64, b: i64) -> i64 {
+    var result = 0
+    var bit = 1
+    var va = a
+    var vb = b
+    var i = 0
+    while i < 32 {
+        let ba = va % 2
+        let bb = vb % 2
+        if ba != bb {
+            result = result + bit
+        }
+        va = va / 2
+        vb = vb / 2
+        bit = bit * 2
+        i = i + 1
+    }
+    return result
+}
+
+// ─── Header Encode/Decode ──────────────────────────────────────────────────────
+
+fn ts_header_encode(msg_type: i64, payload_len: i64, checksum: i64) -> [i64] {
+    var hdr = []
+    // Magic: 4 bytes
+    let magic_bytes = i32_to_bytes(TS_MAGIC())
+    var i = 0
+    while i < 4 {
+        hdr = push(hdr, magic_bytes[i])
+        i = i + 1
+    }
+    // Version: 2 bytes
+    let ver_bytes = i16_to_bytes(TS_VERSION())
+    hdr = push(hdr, ver_bytes[0])
+    hdr = push(hdr, ver_bytes[1])
+    // Msg type: 2 bytes
+    let type_bytes = i16_to_bytes(msg_type)
+    hdr = push(hdr, type_bytes[0])
+    hdr = push(hdr, type_bytes[1])
+    // Payload length: 8 bytes
+    let len_bytes = i64_to_bytes(payload_len)
+    i = 0
+    while i < 8 {
+        hdr = push(hdr, len_bytes[i])
+        i = i + 1
+    }
+    // Checksum: 4 bytes
+    let chk_bytes = i32_to_bytes(checksum)
+    i = 0
+    while i < 4 {
+        hdr = push(hdr, chk_bytes[i])
+        i = i + 1
+    }
+    return hdr
+}
+
+fn ts_header_decode(data: [i64]) -> [i64] {
+    if len(data) < 20 {
+        return [-1, -1, -1]
+    }
+    let magic = bytes_to_i32([data[0], data[1], data[2], data[3]])
+    if magic != TS_MAGIC() {
+        return [-1, -1, -1]
+    }
+    let msg_type = bytes_to_i16([data[6], data[7]])
+    let payload_len = bytes_to_i64([data[8], data[9], data[10], data[11], data[12], data[13], data[14], data[15]])
+    let checksum = bytes_to_i32([data[16], data[17], data[18], data[19]])
+    return [msg_type, payload_len, checksum]
+}
+
+// ─── Array Helpers ─────────────────────────────────────────────────────────────
+
+fn _ts_concat(a: [i64], b: [i64]) -> [i64] {
+    var result = a
+    var i = 0
+    let n = len(b)
+    while i < n {
+        result = push(result, b[i])
+        i = i + 1
+    }
+    return result
+}
+
+fn _ts_slice(a: [i64], start: i64, end_idx: i64) -> [i64] {
+    var result = []
+    var i = start
+    while i < end_idx {
+        result = push(result, a[i])
+        i = i + 1
+    }
+    return result
+}
+
+fn _ts_concat_f64(a: [f64], b: [f64]) -> [f64] {
+    var result = a
+    var i = 0
+    let n = len(b)
+    while i < n {
+        result = push(result, b[i])
+        i = i + 1
+    }
+    return result
+}
+
+// ─── Tensor Serialization ──────────────────────────────────────────────────────
+
+fn ts_tensor_encode(shape: [i64], data: [f64]) -> [i64] {
+    var payload = []
+    // ndim: 4 bytes
+    let ndim = len(shape)
+    payload = _ts_concat(payload, i32_to_bytes(ndim))
+    // Each dimension: 4 bytes
+    var i = 0
+    while i < ndim {
+        payload = _ts_concat(payload, i32_to_bytes(shape[i]))
+        i = i + 1
+    }
+    // f64 data: 8 bytes each
+    i = 0
+    let nd = len(data)
+    while i < nd {
+        payload = _ts_concat(payload, f64_to_bytes(data[i]))
+        i = i + 1
+    }
+    return payload
+}
+
+fn ts_tensor_decode(payload: [i64]) -> [f64] {
+    // Returns flat [f64] with header: [ndim, dim0, dim1, ..., data...]
+    let ndim = bytes_to_i32([payload[0], payload[1], payload[2], payload[3]])
+    var result = []
+    result = push(result, float(ndim))
+
+    var total_elems = 1
+    var i = 0
+    while i < ndim {
+        let off = 4 + i * 4
+        let dim = bytes_to_i32([payload[off], payload[off + 1], payload[off + 2], payload[off + 3]])
+        result = push(result, float(dim))
+        total_elems = total_elems * dim
+        i = i + 1
+    }
+
+    // Data starts after shape header
+    let data_off = 4 + ndim * 4
+    i = 0
+    while i < total_elems {
+        let bo = data_off + i * 8
+        let val = bytes_to_f64([payload[bo], payload[bo + 1], payload[bo + 2], payload[bo + 3],
+                                payload[bo + 4], payload[bo + 5], payload[bo + 6], payload[bo + 7]])
+        result = push(result, val)
+        i = i + 1
+    }
+    return result
+}
+
+// ─── Message Construction ──────────────────────────────────────────────────────
+
+fn ts_msg_tensor(shape: [i64], data: [f64]) -> [i64] {
+    let payload = ts_tensor_encode(shape, data)
+    let chk = ts_checksum(payload)
+    let hdr = ts_header_encode(TS_MSG_TENSOR(), len(payload), chk)
+    return _ts_concat(hdr, payload)
+}
+
+fn ts_msg_thought(thought_vec: [f64], layer: i64, head: i64, pos: i64) -> [i64] {
+    // Payload: [layer:4, head:4, pos:4, f64_data...]
+    var payload = []
+    payload = _ts_concat(payload, i32_to_bytes(layer))
+    payload = _ts_concat(payload, i32_to_bytes(head))
+    payload = _ts_concat(payload, i32_to_bytes(pos))
+    var i = 0
+    let n = len(thought_vec)
+    while i < n {
+        payload = _ts_concat(payload, f64_to_bytes(thought_vec[i]))
+        i = i + 1
+    }
+    let chk = ts_checksum(payload)
+    let hdr = ts_header_encode(TS_MSG_THOUGHT(), len(payload), chk)
+    return _ts_concat(hdr, payload)
+}
+
+fn ts_msg_tokens(token_ids: [i64]) -> [i64] {
+    // Payload: [count:4, id0:4, id1:4, ...]
+    var payload = []
+    let n = len(token_ids)
+    payload = _ts_concat(payload, i32_to_bytes(n))
+    var i = 0
+    while i < n {
+        payload = _ts_concat(payload, i32_to_bytes(token_ids[i]))
+        i = i + 1
+    }
+    let chk = ts_checksum(payload)
+    let hdr = ts_header_encode(TS_MSG_TOKENS(), len(payload), chk)
+    return _ts_concat(hdr, payload)
+}
+
+fn ts_msg_logits(logits: [f64], pos: i64) -> [i64] {
+    // Payload: [pos:4, count:4, f64_data...]
+    var payload = []
+    payload = _ts_concat(payload, i32_to_bytes(pos))
+    payload = _ts_concat(payload, i32_to_bytes(len(logits)))
+    var i = 0
+    let n = len(logits)
+    while i < n {
+        payload = _ts_concat(payload, f64_to_bytes(logits[i]))
+        i = i + 1
+    }
+    let chk = ts_checksum(payload)
+    let hdr = ts_header_encode(TS_MSG_LOGITS(), len(payload), chk)
+    return _ts_concat(hdr, payload)
+}
+
+fn ts_msg_control(command: String) -> [i64] {
+    let payload = str_bytes(command)
+    let chk = ts_checksum(payload)
+    let hdr = ts_header_encode(TS_MSG_CONTROL(), len(payload), chk)
+    return _ts_concat(hdr, payload)
+}
+
+fn ts_msg_heartbeat() -> [i64] {
+    let payload = []
+    let chk = ts_checksum(payload)
+    let hdr = ts_header_encode(TS_MSG_HEARTBEAT(), 0, chk)
+    return hdr
+}
+
+// ─── Message Parsing ───────────────────────────────────────────────────────────
+
+fn ts_parse_message(raw: [i64]) -> [String] {
+    let hdr = ts_header_decode(raw)
+    if hdr[0] == -1 {
+        return ["error", "invalid header"]
+    }
+    let msg_type = hdr[0]
+    let payload_len = hdr[1]
+    let checksum = hdr[2]
+
+    let payload = _ts_slice(raw, 20, 20 + payload_len)
+
+    // Verify checksum
+    let computed = ts_checksum(payload)
+    if computed != checksum {
+        return ["error", "checksum mismatch"]
+    }
+
+    if msg_type == TS_MSG_TENSOR() {
+        return ["tensor", to_string(payload_len)]
+    }
+    if msg_type == TS_MSG_THOUGHT() {
+        let layer = bytes_to_i32([payload[0], payload[1], payload[2], payload[3]])
+        let head = bytes_to_i32([payload[4], payload[5], payload[6], payload[7]])
+        let pos = bytes_to_i32([payload[8], payload[9], payload[10], payload[11]])
+        return ["thought", to_string(layer), to_string(head), to_string(pos)]
+    }
+    if msg_type == TS_MSG_TOKENS() {
+        let count = bytes_to_i32([payload[0], payload[1], payload[2], payload[3]])
+        return ["tokens", to_string(count)]
+    }
+    if msg_type == TS_MSG_LOGITS() {
+        let pos = bytes_to_i32([payload[0], payload[1], payload[2], payload[3]])
+        let count = bytes_to_i32([payload[4], payload[5], payload[6], payload[7]])
+        return ["logits", to_string(pos), to_string(count)]
+    }
+    if msg_type == TS_MSG_CONTROL() {
+        let cmd = str_from_bytes(payload)
+        return ["control", cmd]
+    }
+    if msg_type == TS_MSG_HEARTBEAT() {
+        return ["heartbeat"]
+    }
+    return ["unknown", to_string(msg_type)]
+}
+
+// ─── Connection (syscall stubs) ────────────────────────────────────────────────
+
+fn ts_connect(host: String, port: i64) -> i64 {
+    // Create TCP socket: socket(AF_INET, SOCK_STREAM, 0)
+    let fd = syscall3(41, 2, 1, 0)
+    if fd < 0 {
+        return -1
+    }
+    // Build sockaddr_in (16 bytes) in memory
+    let sa = mem_alloc(16)
+    mem_write_u8(sa, 0, 2)    // AF_INET low byte
+    mem_write_u8(sa, 1, 0)    // AF_INET high byte
+    // Port in network byte order (big-endian)
+    let p_hi = port / 256
+    let p_lo = port % 256
+    mem_write_u8(sa, 2, p_hi)
+    mem_write_u8(sa, 3, p_lo)
+    // IP address — simplified: only 127.0.0.1
+    mem_write_u8(sa, 4, 127)
+    mem_write_u8(sa, 5, 0)
+    mem_write_u8(sa, 6, 0)
+    mem_write_u8(sa, 7, 1)
+    // Zero padding
+    var i = 8
+    while i < 16 {
+        mem_write_u8(sa, i, 0)
+        i = i + 1
+    }
+    let ret = syscall3(42, fd, sa, 16)
+    mem_free(sa)
+    if ret < 0 {
+        syscall1(3, fd)
+        return -1
+    }
+    return fd
+}
+
+fn ts_listen(port: i64) -> i64 {
+    let fd = syscall3(41, 2, 1, 0)
+    if fd < 0 {
+        return -1
+    }
+    // setsockopt SO_REUSEADDR
+    let opt = mem_alloc(4)
+    mem_write_u8(opt, 0, 1)
+    mem_write_u8(opt, 1, 0)
+    mem_write_u8(opt, 2, 0)
+    mem_write_u8(opt, 3, 0)
+    syscall5(54, fd, 1, 2, opt, 4)
+    mem_free(opt)
+
+    // Bind
+    let sa = mem_alloc(16)
+    mem_write_u8(sa, 0, 2)
+    mem_write_u8(sa, 1, 0)
+    let p_hi = port / 256
+    let p_lo = port % 256
+    mem_write_u8(sa, 2, p_hi)
+    mem_write_u8(sa, 3, p_lo)
+    // 0.0.0.0
+    var i = 4
+    while i < 16 {
+        mem_write_u8(sa, i, 0)
+        i = i + 1
+    }
+    let ret = syscall3(49, fd, sa, 16)
+    mem_free(sa)
+    if ret < 0 {
+        syscall1(3, fd)
+        return -1
+    }
+    // Listen with backlog 128
+    let lr = syscall2(50, fd, 128)
+    if lr < 0 {
+        syscall1(3, fd)
+        return -1
+    }
+    return fd
+}
+
+fn ts_accept(server_fd: i64) -> i64 {
+    let ret = syscall3(43, server_fd, 0, 0)
+    if ret < 0 {
+        return -1
+    }
+    return ret
+}
+
+fn ts_send(fd: i64, data: [i64]) -> i64 {
+    let n = len(data)
+    let buf = mem_alloc(n)
+    var i = 0
+    while i < n {
+        mem_write_u8(buf, i, data[i])
+        i = i + 1
+    }
+    let written = syscall3(1, fd, buf, n)
+    mem_free(buf)
+    return written
+}
+
+fn ts_recv(fd: i64, max_len: i64) -> [i64] {
+    let buf = mem_alloc(max_len)
+    let n = syscall3(0, fd, buf, max_len)
+    var result = []
+    if n > 0 {
+        var i = 0
+        while i < n {
+            result = push(result, mem_read_u8(buf, i))
+            i = i + 1
+        }
+    }
+    mem_free(buf)
+    return result
+}
+
+fn ts_close(fd: i64) {
+    syscall1(3, fd)
+}
+
+// ─── High-Level Protocol ───────────────────────────────────────────────────────
+
+fn ts_send_tensor(fd: i64, shape: [i64], data: [f64]) -> bool {
+    let msg = ts_msg_tensor(shape, data)
+    let sent = ts_send(fd, msg)
+    return sent > 0
+}
+
+fn ts_recv_tensor(fd: i64) -> [f64] {
+    // Read 20-byte header first
+    let hdr_bytes = ts_recv(fd, 20)
+    if len(hdr_bytes) < 20 {
+        return []
+    }
+    let hdr = ts_header_decode(hdr_bytes)
+    if hdr[0] == -1 {
+        return []
+    }
+    let payload_len = hdr[1]
+    let payload = ts_recv(fd, payload_len)
+    return ts_tensor_decode(payload)
+}
+
+fn ts_send_thought(fd: i64, thought: [f64], layer: i64, head: i64, pos: i64) -> bool {
+    let msg = ts_msg_thought(thought, layer, head, pos)
+    let sent = ts_send(fd, msg)
+    return sent > 0
+}
+
+fn ts_recv_thought(fd: i64) -> [String] {
+    let hdr_bytes = ts_recv(fd, 20)
+    if len(hdr_bytes) < 20 {
+        return ["error"]
+    }
+    let hdr = ts_header_decode(hdr_bytes)
+    let payload_len = hdr[1]
+    let payload = ts_recv(fd, payload_len)
+    let layer = bytes_to_i32([payload[0], payload[1], payload[2], payload[3]])
+    let head = bytes_to_i32([payload[4], payload[5], payload[6], payload[7]])
+    let pos = bytes_to_i32([payload[8], payload[9], payload[10], payload[11]])
+    var result = [to_string(layer), to_string(head), to_string(pos)]
+    var i = 12
+    while i + 7 < len(payload) {
+        let val = bytes_to_f64([payload[i], payload[i+1], payload[i+2], payload[i+3],
+                                payload[i+4], payload[i+5], payload[i+6], payload[i+7]])
+        result = push(result, to_string(val))
+        i = i + 8
+    }
+    return result
+}
+
+fn ts_send_tokens(fd: i64, tokens: [i64]) -> bool {
+    let msg = ts_msg_tokens(tokens)
+    let sent = ts_send(fd, msg)
+    return sent > 0
+}
+
+fn ts_recv_tokens(fd: i64) -> [i64] {
+    let hdr_bytes = ts_recv(fd, 20)
+    if len(hdr_bytes) < 20 {
+        return []
+    }
+    let hdr = ts_header_decode(hdr_bytes)
+    let payload_len = hdr[1]
+    let payload = ts_recv(fd, payload_len)
+    let count = bytes_to_i32([payload[0], payload[1], payload[2], payload[3]])
+    var result = []
+    var i = 0
+    while i < count {
+        let off = 4 + i * 4
+        let tok = bytes_to_i32([payload[off], payload[off+1], payload[off+2], payload[off+3]])
+        result = push(result, tok)
+        i = i + 1
+    }
+    return result
+}
+
+fn ts_share_kv_cache(fd: i64, layer: i64, key_data: [f64], val_data: [f64]) -> bool {
+    // KV cache message: [layer:4, key_len:4, val_len:4, key_f64s..., val_f64s...]
+    var payload = []
+    payload = _ts_concat(payload, i32_to_bytes(layer))
+    payload = _ts_concat(payload, i32_to_bytes(len(key_data)))
+    payload = _ts_concat(payload, i32_to_bytes(len(val_data)))
+    var i = 0
+    while i < len(key_data) {
+        payload = _ts_concat(payload, f64_to_bytes(key_data[i]))
+        i = i + 1
+    }
+    i = 0
+    while i < len(val_data) {
+        payload = _ts_concat(payload, f64_to_bytes(val_data[i]))
+        i = i + 1
+    }
+    let chk = ts_checksum(payload)
+    let hdr = ts_header_encode(TS_MSG_KV_CACHE(), len(payload), chk)
+    let msg = _ts_concat(hdr, payload)
+    let sent = ts_send(fd, msg)
+    return sent > 0
+}
+
+fn ts_share_mot(fd: i64, mot_data: [String]) -> bool {
+    // Encode strings as length-prefixed byte sequences
+    var payload = []
+    payload = _ts_concat(payload, i32_to_bytes(len(mot_data)))
+    var i = 0
+    while i < len(mot_data) {
+        let s = mot_data[i]
+        let sbytes = str_bytes(s)
+        payload = _ts_concat(payload, i32_to_bytes(len(sbytes)))
+        payload = _ts_concat(payload, sbytes)
+        i = i + 1
+    }
+    let chk = ts_checksum(payload)
+    let hdr = ts_header_encode(TS_MSG_MOT(), len(payload), chk)
+    let msg = _ts_concat(hdr, payload)
+    let sent = ts_send(fd, msg)
+    return sent > 0
+}
+
+fn ts_request_inference(fd: i64, tokens: [i64], max_tokens: i64) -> [i64] {
+    // Send control "INFER" + token message
+    let ctrl = ts_msg_control("INFER:" + to_string(max_tokens))
+    ts_send(fd, ctrl)
+    let tok_msg = ts_msg_tokens(tokens)
+    ts_send(fd, tok_msg)
+    // Wait for token response
+    return ts_recv_tokens(fd)
+}
+
+// ─── Helper: approximate f64 equality ──────────────────────────────────────────
+
+fn _ts_approx_eq(a: f64, b: f64, eps: f64) -> bool {
+    var delta_val = a - b
+    if delta_val < 0.0 {
+        delta_val = 0.0 - delta_val
+    }
+    return delta_val < eps
+}
+
+// ─── Tests ─────────────────────────────────────────────────────────────────────
+
+fn main() {
+    var pass = 0
+    var fail = 0
+
+    // Test 1: Header encode/decode round-trip
+    let hdr = ts_header_encode(TS_MSG_TENSOR(), 1024, 42)
+    let dec = ts_header_decode(hdr)
+    if dec[0] == TS_MSG_TENSOR() {
+        if dec[1] == 1024 {
+            if dec[2] == 42 {
+                print("PASS: header encode/decode round-trip")
+                pass = pass + 1
+            } else {
+                print("FAIL: header checksum mismatch: " + to_string(dec[2]))
+                fail = fail + 1
+            }
+        } else {
+            print("FAIL: header payload_len mismatch: " + to_string(dec[1]))
+            fail = fail + 1
+        }
+    } else {
+        print("FAIL: header msg_type mismatch: " + to_string(dec[0]))
+        fail = fail + 1
+    }
+
+    // Test 1b: Invalid magic
+    let bad_hdr = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    let bad_dec = ts_header_decode(bad_hdr)
+    if bad_dec[0] == -1 {
+        print("PASS: invalid magic detected")
+        pass = pass + 1
+    } else {
+        print("FAIL: should reject invalid magic")
+        fail = fail + 1
+    }
+
+    // Test 2: Checksum consistency
+    let data1 = [1, 2, 3, 4, 5]
+    let chk1 = ts_checksum(data1)
+    let chk2 = ts_checksum(data1)
+    if chk1 == chk2 {
+        print("PASS: checksum consistency")
+        pass = pass + 1
+    } else {
+        print("FAIL: checksum inconsistent")
+        fail = fail + 1
+    }
+
+    // Checksum different data should differ
+    let data2 = [1, 2, 3, 4, 6]
+    let chk3 = ts_checksum(data2)
+    if chk1 != chk3 {
+        print("PASS: checksum differs for different data")
+        pass = pass + 1
+    } else {
+        print("FAIL: checksum collision")
+        fail = fail + 1
+    }
+
+    // Test 3: Tensor serialization [2,3] with known data
+    let shape = [2, 3]
+    let tdata = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
+    let encoded = ts_tensor_encode(shape, tdata)
+    let decoded = ts_tensor_decode(encoded)
+    // decoded = [ndim, dim0, dim1, data...]
+    var t3_ok = true
+    if int(decoded[0]) != 2 {
+        t3_ok = false
+    }
+    if int(decoded[1]) != 2 {
+        t3_ok = false
+    }
+    if int(decoded[2]) != 3 {
+        t3_ok = false
+    }
+    // Check data values
+    var di = 0
+    while di < 6 {
+        if !_ts_approx_eq(decoded[3 + di], tdata[di], 0.001) {
+            t3_ok = false
+        }
+        di = di + 1
+    }
+    if t3_ok {
+        print("PASS: tensor [2,3] encode/decode")
+        pass = pass + 1
+    } else {
+        print("FAIL: tensor encode/decode mismatch")
+        print("  decoded: " + to_string(decoded))
+        fail = fail + 1
+    }
+
+    // Test 4: f64 <-> bytes round-trip
+    let test_f64s = [0.0, 1.0, -1.0, 3.141592653589793, 1.0e10, 0.001]
+    var f64_ok = true
+    var fi = 0
+    while fi < len(test_f64s) {
+        let v = test_f64s[fi]
+        let bs = f64_to_bytes(v)
+        let back = bytes_to_f64(bs)
+        if v == 0.0 {
+            if back != 0.0 {
+                f64_ok = false
+                print("  f64 FAIL at 0.0, got " + to_string(back))
+            }
+        } else {
+            if !_ts_approx_eq(back, v, _ts_abs_f(v) * 0.0001) {
+                f64_ok = false
+                print("  f64 FAIL: " + to_string(v) + " -> " + to_string(back))
+            }
+        }
+        fi = fi + 1
+    }
+    if f64_ok {
+        print("PASS: f64 <-> bytes round-trip")
+        pass = pass + 1
+    } else {
+        print("FAIL: f64 <-> bytes round-trip")
+        fail = fail + 1
+    }
+
+    // Test 5: i64 <-> bytes round-trip
+    let test_i64s = [0, 1, 255, 256, 65535, 1000000, 1234567890]
+    var i64_ok = true
+    var ii = 0
+    while ii < len(test_i64s) {
+        let v = test_i64s[ii]
+        let bs = i64_to_bytes(v)
+        let back = bytes_to_i64(bs)
+        if back != v {
+            i64_ok = false
+            print("  i64 FAIL: " + to_string(v) + " -> " + to_string(back))
+        }
+        ii = ii + 1
+    }
+    if i64_ok {
+        print("PASS: i64 <-> bytes round-trip")
+        pass = pass + 1
+    } else {
+        print("FAIL: i64 <-> bytes round-trip")
+        fail = fail + 1
+    }
+
+    // Test 6: Tensor message — verify magic, version, type, length
+    let tmsg = ts_msg_tensor([2, 3], [1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
+    let tmsg_magic = bytes_to_i32([tmsg[0], tmsg[1], tmsg[2], tmsg[3]])
+    let tmsg_ver = bytes_to_i16([tmsg[4], tmsg[5]])
+    let tmsg_type = bytes_to_i16([tmsg[6], tmsg[7]])
+    var t6_ok = true
+    if tmsg_magic != TS_MAGIC() {
+        t6_ok = false
+        print("  tensor msg bad magic")
+    }
+    if tmsg_ver != TS_VERSION() {
+        t6_ok = false
+        print("  tensor msg bad version")
+    }
+    if tmsg_type != TS_MSG_TENSOR() {
+        t6_ok = false
+        print("  tensor msg bad type")
+    }
+    // Payload should be 4 (ndim) + 8 (2 dims * 4) + 48 (6 f64s * 8) = 60
+    let tmsg_plen = bytes_to_i64([tmsg[8], tmsg[9], tmsg[10], tmsg[11], tmsg[12], tmsg[13], tmsg[14], tmsg[15]])
+    if tmsg_plen != 60 {
+        t6_ok = false
+        print("  tensor msg bad payload len: " + to_string(tmsg_plen))
+    }
+    if t6_ok {
+        print("PASS: tensor message structure")
+        pass = pass + 1
+    } else {
+        print("FAIL: tensor message structure")
+        fail = fail + 1
+    }
+
+    // Test 7: Thought message — verify fields
+    let thought_vec = [0.5, -0.3, 1.2]
+    let thought_msg = ts_msg_thought(thought_vec, 7, 3, 42)
+    let thought_parsed = ts_parse_message(thought_msg)
+    var t7_ok = true
+    if thought_parsed[0] != "thought" {
+        t7_ok = false
+        print("  thought parsed type: " + thought_parsed[0])
+    }
+    if thought_parsed[1] != "7" {
+        t7_ok = false
+        print("  thought layer: " + thought_parsed[1])
+    }
+    if thought_parsed[2] != "3" {
+        t7_ok = false
+        print("  thought head: " + thought_parsed[2])
+    }
+    if thought_parsed[3] != "42" {
+        t7_ok = false
+        print("  thought pos: " + thought_parsed[3])
+    }
+    if t7_ok {
+        print("PASS: thought message fields")
+        pass = pass + 1
+    } else {
+        print("FAIL: thought message fields")
+        fail = fail + 1
+    }
+
+    // Test 8: Token message encode/decode
+    let tok_ids = [100, 200, 300, 42, 7]
+    let tok_msg = ts_msg_tokens(tok_ids)
+    let tok_parsed = ts_parse_message(tok_msg)
+    var t8_ok = true
+    if tok_parsed[0] != "tokens" {
+        t8_ok = false
+    }
+    if tok_parsed[1] != "5" {
+        t8_ok = false
+    }
+    // Also verify we can extract actual tokens from payload
+    let tok_payload = _ts_slice(tok_msg, 20, len(tok_msg))
+    let tok_count = bytes_to_i32([tok_payload[0], tok_payload[1], tok_payload[2], tok_payload[3]])
+    if tok_count != 5 {
+        t8_ok = false
+    }
+    var ti = 0
+    while ti < 5 {
+        let off = 4 + ti * 4
+        let tok = bytes_to_i32([tok_payload[off], tok_payload[off+1], tok_payload[off+2], tok_payload[off+3]])
+        if tok != tok_ids[ti] {
+            t8_ok = false
+            print("  token mismatch at " + to_string(ti) + ": " + to_string(tok))
+        }
+        ti = ti + 1
+    }
+    if t8_ok {
+        print("PASS: token message encode/decode")
+        pass = pass + 1
+    } else {
+        print("FAIL: token message encode/decode")
+        fail = fail + 1
+    }
+
+    // Test 9: Control message encode/decode
+    let ctrl_msg = ts_msg_control("SYNC")
+    let ctrl_parsed = ts_parse_message(ctrl_msg)
+    var t9_ok = true
+    if ctrl_parsed[0] != "control" {
+        t9_ok = false
+        print("  control type: " + ctrl_parsed[0])
+    }
+    if ctrl_parsed[1] != "SYNC" {
+        t9_ok = false
+        print("  control cmd: " + ctrl_parsed[1])
+    }
+    if t9_ok {
+        print("PASS: control message encode/decode")
+        pass = pass + 1
+    } else {
+        print("FAIL: control message encode/decode")
+        fail = fail + 1
+    }
+
+    // Test 10: Heartbeat
+    let hb = ts_msg_heartbeat()
+    let hb_parsed = ts_parse_message(hb)
+    if hb_parsed[0] == "heartbeat" {
+        print("PASS: heartbeat message")
+        pass = pass + 1
+    } else {
+        print("FAIL: heartbeat message")
+        fail = fail + 1
+    }
+
+    print("")
+    print("ThoughtStream Protocol: " + to_string(pass) + " passed, " + to_string(fail) + " failed")
+}
+
+fn _ts_abs_f(x: f64) -> f64 {
+    if x < 0.0 {
+        return 0.0 - x
+    }
+    return x
+}

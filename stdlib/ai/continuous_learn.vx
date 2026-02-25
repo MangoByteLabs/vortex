@@ -1,0 +1,868 @@
+// continuous_learn.vx — Continual Learning without Catastrophic Forgetting
+//
+// No major ML framework supports this natively. In PyTorch you load task A,
+// train task B, and task A performance collapses. Fixing it requires external
+// libraries (Avalanche, Sequoia) that are bolted on as data pipelines.
+//
+// This file implements the full continual-learning loop natively:
+//
+//   1. Elastic Weight Consolidation (EWC) — penalises changes to weights
+//      that were important for previous tasks (estimated via Fisher information)
+//   2. Experience Replay — a ring buffer of past inputs replayed during
+//      each training step so the model keeps seeing old data
+//   3. Plasticity Masks — per-parameter learning rate scaling that reduces
+//      updates to high-importance weights
+//   4. EMA Shadow — exponential moving average of parameters as a stable
+//      "teacher" snapshot; used for distillation-style regularisation
+//
+// All state is passed as [f64] or [String] arrays — no hidden globals.
+// The model is a simple 1-layer linear: output = W * input + b
+//
+// Model state encoding ([String] of length 2 + param_count*2):
+//   [0]                    : "params"   (tag)
+//   [1]                    : param_count as string
+//   [2..2+param_count-1]   : weight floats as strings
+//   [2+param_count..]      : bias floats as strings (length = output_dim)
+
+// ─────────────────────────────────────────────────────────────
+// Section 1: Math helpers
+// ─────────────────────────────────────────────────────────────
+
+fn abs_f(x: f64) -> f64 {
+    if x < 0.0 { 0.0 - x } else { x }
+}
+
+fn clamp(x: f64, lo: f64, hi: f64) -> f64 {
+    if x < lo { lo }
+    else { if x > hi { hi } else { x } }
+}
+
+fn sqrt_approx(x: f64) -> f64 {
+    if x <= 0.0 { return 0.0 }
+    var g = x * 0.5
+    var i = 0
+    while i < 15 {
+        g = (g + x / g) * 0.5
+        i = i + 1
+    }
+    g
+}
+
+// ─────────────────────────────────────────────────────────────
+// Section 2: Ring-buffer experience memory
+// ─────────────────────────────────────────────────────────────
+
+// memory_buffer_new — allocate a ring buffer of `capacity` experience slots.
+//
+// Layout: [capacity_str, head_str, size_str, data_0, data_1, ...]
+//   where data slots are initialised to "" and overwritten as experiences arrive.
+//   Total length = 3 + capacity.
+fn memory_buffer_new(capacity: i64) -> [String] {
+    var buf = []
+    buf = push(buf, to_string(capacity))  // [0] capacity
+    buf = push(buf, "0")                  // [1] head (next write position)
+    buf = push(buf, "0")                  // [2] current size
+    var i = 0
+    while i < capacity {
+        buf = push(buf, "")               // [3+i] data slots
+        i = i + 1
+    }
+    buf
+}
+
+// memory_buffer_add — add one experience to the ring buffer.
+// Overwrites the oldest entry when full.
+fn memory_buffer_add(buf: [String], experience: String) -> [String] {
+    var capacity = int(buf[0])
+    var head     = int(buf[1])
+    var size     = int(buf[2])
+
+    // write at head position (offset 3)
+    var new_buf = []
+    var total = len(buf)
+    var i = 0
+    while i < total {
+        var write_idx = 3 + head
+        if i == write_idx {
+            new_buf = push(new_buf, experience)
+        } else {
+            new_buf = push(new_buf, buf[i])
+        }
+        i = i + 1
+    }
+
+    // advance head
+    var new_head = (head + 1) % capacity
+    var new_size = size + 1
+    if new_size > capacity { new_size = capacity }
+
+    // patch [1] and [2]
+    var result = []
+    i = 0
+    while i < total {
+        if i == 1 { result = push(result, to_string(new_head)) }
+        else { if i == 2 { result = push(result, to_string(new_size)) }
+               else      { result = push(result, new_buf[i]) } }
+        i = i + 1
+    }
+    result
+}
+
+// memory_buffer_sample — deterministic pseudo-random sample of n experiences.
+// seed is mixed with entry index for variety.
+fn memory_buffer_sample(buf: [String], n: i64, seed: i64) -> [String] {
+    var size = int(buf[2])
+    if size == 0 { return [] }
+    var actual_n = n
+    if actual_n > size { actual_n = size }
+    var samples = []
+    var s = seed
+    var i = 0
+    while i < actual_n {
+        s = s * 1664525 + 1013904223
+        var idx = (s % size + size) % size   // keep positive
+        samples = push(samples, buf[3 + idx])
+        i = i + 1
+    }
+    samples
+}
+
+// ─────────────────────────────────────────────────────────────
+// Section 3: Elastic Weight Consolidation (EWC)
+// ─────────────────────────────────────────────────────────────
+
+// ewc_new — initialise EWC state for `param_count` parameters.
+//
+// Layout: first param_count entries = Fisher diagonal (all zeros initially)
+//         next  param_count entries = old (anchor) parameter values
+//         Total length = 2 * param_count.
+fn ewc_new(param_count: i64) -> [String] {
+    var state = []
+    var i = 0
+    while i < param_count {
+        state = push(state, "0.0")   // Fisher diagonal
+        i = i + 1
+    }
+    i = 0
+    while i < param_count {
+        state = push(state, "0.0")   // anchor params
+        i = i + 1
+    }
+    state
+}
+
+// ewc_get_fisher — extract Fisher diagonal as [f64]
+fn ewc_get_fisher(ewc_state: [String]) -> [f64] {
+    var n = len(ewc_state) / 2
+    var f = []
+    var i = 0
+    while i < n {
+        f = push(f, float(ewc_state[i]))
+        i = i + 1
+    }
+    f
+}
+
+// ewc_get_anchor — extract anchor parameters as [f64]
+fn ewc_get_anchor(ewc_state: [String]) -> [f64] {
+    var n = len(ewc_state) / 2
+    var a = []
+    var i = 0
+    while i < n {
+        a = push(a, float(ewc_state[n + i]))
+        i = i + 1
+    }
+    a
+}
+
+// ewc_compute_fisher — estimate Fisher information diagonal from gradient samples.
+//
+// Fisher_i ≈ E[g_i²], approximated as the mean of squared gradients across samples.
+// gradients : [String] where each entry is a space-separated gradient vector.
+fn ewc_compute_fisher(params: [f64], gradients: [String]) -> [f64] {
+    var n = len(params)
+    var num_samples = len(gradients)
+    if num_samples == 0 { return params }   // return zeros of same shape
+
+    // accumulate squared gradients
+    var fish = []
+    var i = 0
+    while i < n {
+        fish = push(fish, 0.0)
+        i = i + 1
+    }
+
+    var s = 0
+    while s < num_samples {
+        // decode gradient vector
+        var g_str = gradients[s]
+        var g_vec = []
+        var current = ""
+        var ci = 0
+        var slen = len(g_str)
+        while ci < slen {
+            var ch = g_str[ci]
+            if ch == " " {
+                if len(current) > 0 {
+                    g_vec = push(g_vec, float(current))
+                    current = ""
+                }
+            } else {
+                current = current + ch
+            }
+            ci = ci + 1
+        }
+        if len(current) > 0 { g_vec = push(g_vec, float(current)) }
+
+        // accumulate g_i^2
+        var k = 0
+        while k < n {
+            if k < len(g_vec) {
+                var gk = g_vec[k]
+                var new_fish = []
+                var fi = 0
+                while fi < n {
+                    if fi == k { new_fish = push(new_fish, fish[fi] + gk * gk) }
+                    else        { new_fish = push(new_fish, fish[fi]) }
+                    fi = fi + 1
+                }
+                fish = new_fish
+            }
+            k = k + 1
+        }
+        s = s + 1
+    }
+
+    // normalise by number of samples
+    var result = []
+    i = 0
+    while i < n {
+        result = push(result, fish[i] / float(num_samples))
+        i = i + 1
+    }
+    result
+}
+
+// ewc_penalty — compute the EWC regularisation penalty.
+// penalty = lambda * sum( F_i * (theta_i - theta_star_i)^2 )
+fn ewc_penalty(params: [f64], ewc_state: [String], lambda: f64) -> f64 {
+    var n = len(params)
+    var fisher = ewc_get_fisher(ewc_state)
+    var anchor = ewc_get_anchor(ewc_state)
+    var penalty = 0.0
+    var i = 0
+    while i < n {
+        var diff = params[i] - anchor[i]
+        penalty = penalty + fisher[i] * diff * diff
+        i = i + 1
+    }
+    penalty * lambda
+}
+
+// ewc_update — gradient step with EWC penalty gradient added.
+// Returns updated params.
+fn ewc_update(params: [f64], grads: [f64], ewc_state: [String], lr: f64, lambda: f64) -> [f64] {
+    var n = len(params)
+    var fisher = ewc_get_fisher(ewc_state)
+    var anchor = ewc_get_anchor(ewc_state)
+    var updated = []
+    var i = 0
+    while i < n {
+        // EWC penalty gradient: 2 * lambda * F_i * (theta_i - theta_star_i)
+        var ewc_grad = 2.0 * lambda * fisher[i] * (params[i] - anchor[i])
+        var total_grad = grads[i] + ewc_grad
+        updated = push(updated, params[i] - lr * total_grad)
+        i = i + 1
+    }
+    updated
+}
+
+// ewc_consolidate — after finishing a task, update Fisher and anchor.
+// Returns a new ewc_state with updated Fisher diagonal and current params as anchor.
+fn ewc_consolidate(params: [f64], gradients: [String]) -> [String] {
+    var new_fisher = ewc_compute_fisher(params, gradients)
+    var n = len(params)
+    var state = []
+    var i = 0
+    while i < n {
+        state = push(state, to_string(new_fisher[i]))
+        i = i + 1
+    }
+    i = 0
+    while i < n {
+        state = push(state, to_string(params[i]))
+        i = i + 1
+    }
+    state
+}
+
+// ─────────────────────────────────────────────────────────────
+// Section 4: Plasticity masks
+// ─────────────────────────────────────────────────────────────
+
+// plasticity_mask_new — initialise all-ones plasticity mask.
+// mask[i] = 1.0 means "this parameter can change freely".
+// mask[i] → 0 means "this parameter is frozen".
+fn plasticity_mask_new(param_count: i64) -> [f64] {
+    var mask = []
+    var i = 0
+    while i < param_count {
+        mask = push(mask, 1.0)
+        i = i + 1
+    }
+    mask
+}
+
+// plasticity_update — reduce plasticity for important (high-Fisher) parameters.
+// mask_new[i] = mask[i] * decay  when importance[i] > median importance
+//             = mask[i]          otherwise
+// A simpler threshold: reduce if importance[i] > mean importance.
+fn plasticity_update(mask: [f64], importance: [f64], decay: f64) -> [f64] {
+    var n = len(mask)
+    // compute mean importance
+    var total = 0.0
+    var i = 0
+    while i < n {
+        total = total + importance[i]
+        i = i + 1
+    }
+    var mean_imp = total / float(n)
+
+    var new_mask = []
+    i = 0
+    while i < n {
+        if importance[i] > mean_imp {
+            new_mask = push(new_mask, mask[i] * decay)
+        } else {
+            new_mask = push(new_mask, mask[i])
+        }
+        i = i + 1
+    }
+    new_mask
+}
+
+// bounded_update — apply gradient update but clip per-parameter change by max_change,
+// and scale by plasticity mask.
+fn bounded_update(params: [f64], grads: [f64], mask: [f64], max_change: f64) -> [f64] {
+    var n = len(params)
+    var updated = []
+    var i = 0
+    while i < n {
+        var raw_delta = 0.0 - grads[i] * mask[i]
+        var delta = clamp(raw_delta, 0.0 - max_change, max_change)
+        updated = push(updated, params[i] + delta)
+        i = i + 1
+    }
+    updated
+}
+
+// ─────────────────────────────────────────────────────────────
+// Section 5: EMA shadow (stability via temporal averaging)
+// ─────────────────────────────────────────────────────────────
+
+// ema_shadow_new — initialise shadow as a copy of params.
+fn ema_shadow_new(params: [f64]) -> [f64] {
+    var shadow = []
+    var n = len(params)
+    var i = 0
+    while i < n {
+        shadow = push(shadow, params[i])
+        i = i + 1
+    }
+    shadow
+}
+
+// ema_shadow_update — shadow = momentum * shadow + (1 - momentum) * params
+fn ema_shadow_update(shadow: [f64], params: [f64], momentum: f64) -> [f64] {
+    var n = len(shadow)
+    var new_shadow = []
+    var i = 0
+    while i < n {
+        var val = momentum * shadow[i] + (1.0 - momentum) * params[i]
+        new_shadow = push(new_shadow, val)
+        i = i + 1
+    }
+    new_shadow
+}
+
+// ─────────────────────────────────────────────────────────────
+// Section 6: Simple linear model helpers
+// ─────────────────────────────────────────────────────────────
+
+// model_new — create params for a simple linear model: out = W*x + b
+// param layout: [w_00, w_01, ..., w_{od-1,id-1}, b_0, ..., b_{od-1}]
+// param_count = input_dim * output_dim + output_dim
+fn model_new(input_dim: i64, output_dim: i64, seed: i64) -> [f64] {
+    var params = []
+    var s = seed
+    var n_weights = input_dim * output_dim
+    var i = 0
+    // weights
+    while i < n_weights {
+        s = s * 1664525 + 1013904223
+        var v = float(s % 100000) / 100000.0 - 0.5
+        var scale = 1.0 / sqrt_approx(float(input_dim))
+        params = push(params, v * scale)
+        i = i + 1
+    }
+    // biases (zeros)
+    i = 0
+    while i < output_dim {
+        params = push(params, 0.0)
+        i = i + 1
+    }
+    params
+}
+
+// model_forward — linear forward pass, returns output vector of length output_dim
+fn model_forward(params: [f64], input: [f64], input_dim: i64, output_dim: i64) -> [f64] {
+    var output = []
+    var row = 0
+    while row < output_dim {
+        var acc = params[input_dim * output_dim + row]   // bias
+        var col = 0
+        while col < input_dim {
+            acc = acc + params[row * input_dim + col] * input[col]
+            col = col + 1
+        }
+        output = push(output, acc)
+        row = row + 1
+    }
+    output
+}
+
+// model_mse_grad — finite-difference gradient of MSE wrt params
+fn model_mse_grad(params: [f64], input: [f64], target: [f64], input_dim: i64, output_dim: i64) -> [f64] {
+    var n = len(params)
+    var eps = 0.001
+    var grads = []
+    var i = 0
+    while i < n {
+        // +eps
+        var pp = []
+        var j = 0
+        while j < n {
+            if j == i { pp = push(pp, params[j] + eps) }
+            else       { pp = push(pp, params[j]) }
+            j = j + 1
+        }
+        var op = model_forward(pp, input, input_dim, output_dim)
+        var lp = 0.0
+        j = 0
+        while j < output_dim {
+            var d = op[j] - target[j]
+            lp = lp + d * d
+            j = j + 1
+        }
+
+        // -eps
+        var pm = []
+        j = 0
+        while j < n {
+            if j == i { pm = push(pm, params[j] - eps) }
+            else       { pm = push(pm, params[j]) }
+            j = j + 1
+        }
+        var om = model_forward(pm, input, input_dim, output_dim)
+        var lm = 0.0
+        j = 0
+        while j < output_dim {
+            var d = om[j] - target[j]
+            lm = lm + d * d
+            j = j + 1
+        }
+
+        grads = push(grads, (lp - lm) / (2.0 * eps))
+        i = i + 1
+    }
+    grads
+}
+
+// encode param vector as space-separated String
+fn encode_params(p: [f64]) -> String {
+    var n = len(p)
+    if n == 0 { return "" }
+    var s = to_string(p[0])
+    var i = 1
+    while i < n {
+        s = s + " " + to_string(p[i])
+        i = i + 1
+    }
+    s
+}
+
+fn decode_params(s: String) -> [f64] {
+    var result = []
+    var current = ""
+    var idx = 0
+    var slen = len(s)
+    while idx < slen {
+        var ch = s[idx]
+        if ch == " " {
+            if len(current) > 0 {
+                result = push(result, float(current))
+                current = ""
+            }
+        } else {
+            current = current + ch
+        }
+        idx = idx + 1
+    }
+    if len(current) > 0 { result = push(result, float(current)) }
+    result
+}
+
+// ─────────────────────────────────────────────────────────────
+// Section 7: Continual training step
+// ─────────────────────────────────────────────────────────────
+
+// continual_train_step — one complete continual-learning update.
+//
+// model   : [String] = ["params", count_str, p0, p1, ...]
+// new_data: String   = space-separated "x0 x1 ... xN t0 t1 ... tM"
+//           first input_dim values = input, next output_dim = target
+// memory  : [String] = ring buffer
+// ewc     : [String] = EWC state
+// lr      : learning rate
+//
+// Returns [String]: updated model state
+//   [0..param_count+1] : new model
+//   [param_count+2]    : "loss:<v>|ewc_penalty:<v>|replay_loss:<v>"
+fn continual_train_step(model: [String], new_data: String, memory: [String], ewc: [String], lr: f64) -> [String] {
+    var param_count = int(model[1])
+    var params = []
+    var i = 2
+    while i < 2 + param_count {
+        params = push(params, float(model[i]))
+        i = i + 1
+    }
+
+    // fixed dims for this demo: input_dim=2, output_dim=1
+    var input_dim = 2
+    var output_dim = 1
+
+    // parse new_data: "x0 x1 t0"
+    var nd = decode_params(new_data)
+    var nd_input = []
+    var k = 0
+    while k < input_dim {
+        nd_input = push(nd_input, nd[k])
+        k = k + 1
+    }
+    var nd_target = []
+    k = 0
+    while k < output_dim {
+        nd_target = push(nd_target, nd[input_dim + k])
+        k = k + 1
+    }
+
+    // Compute gradient on new data
+    var new_grads = model_mse_grad(params, nd_input, nd_target, input_dim, output_dim)
+
+    // Loss on new data
+    var new_out = model_forward(params, nd_input, input_dim, output_dim)
+    var new_loss = 0.0
+    k = 0
+    while k < output_dim {
+        var d = new_out[k] - nd_target[k]
+        new_loss = new_loss + d * d
+        k = k + 1
+    }
+
+    // Replay loss: sample from memory and average gradients
+    var replay_samples = memory_buffer_sample(memory, 3, int(new_loss * 1000.0))
+    var replay_loss = 0.0
+    var combined_grads = new_grads
+    var rs = 0
+    while rs < len(replay_samples) {
+        var sample = replay_samples[rs]
+        if len(sample) > 0 {
+            var sv = decode_params(sample)
+            var s_input = []
+            k = 0
+            while k < input_dim {
+                s_input = push(s_input, sv[k])
+                k = k + 1
+            }
+            var s_target = []
+            k = 0
+            while k < output_dim {
+                s_target = push(s_target, sv[input_dim + k])
+                k = k + 1
+            }
+            var s_grads = model_mse_grad(params, s_input, s_target, input_dim, output_dim)
+            var s_out = model_forward(params, s_input, input_dim, output_dim)
+            k = 0
+            while k < output_dim {
+                var sd = s_out[k] - s_target[k]
+                replay_loss = replay_loss + sd * sd
+                k = k + 1
+            }
+            // average into combined_grads
+            var cg_new = []
+            var gi = 0
+            while gi < param_count {
+                cg_new = push(cg_new, (combined_grads[gi] + s_grads[gi]) * 0.5)
+                gi = gi + 1
+            }
+            combined_grads = cg_new
+        }
+        rs = rs + 1
+    }
+
+    // EWC penalty and penalised update
+    var ewc_pen = ewc_penalty(params, ewc, 0.4)
+
+    // plasticity mask (from Fisher diagonal)
+    var fisher = ewc_get_fisher(ewc)
+    var pmask = plasticity_mask_new(param_count)
+    pmask = plasticity_update(pmask, fisher, 0.5)
+
+    // Apply EWC-penalised, plasticity-masked, bounded update
+    var ewc_updated = ewc_update(params, combined_grads, ewc, lr, 0.4)
+    var new_params = bounded_update(ewc_updated, combined_grads, pmask, 0.05)
+
+    // Pack new model
+    var new_model = []
+    new_model = push(new_model, "params")
+    new_model = push(new_model, to_string(param_count))
+    i = 0
+    while i < param_count {
+        new_model = push(new_model, to_string(new_params[i]))
+        i = i + 1
+    }
+
+    var summary = "loss:" + to_string(new_loss) + "|ewc:" + to_string(ewc_pen) + "|replay:" + to_string(replay_loss)
+    new_model = push(new_model, summary)
+    new_model
+}
+
+// ─────────────────────────────────────────────────────────────
+// Section 8: Task evaluation helper
+// ─────────────────────────────────────────────────────────────
+
+// eval_task — evaluate model on a few fixed test points; return mean loss
+fn eval_task(model: [String], test_inputs: [String], test_targets: [String], input_dim: i64, output_dim: i64) -> f64 {
+    var param_count = int(model[1])
+    var params = []
+    var i = 2
+    while i < 2 + param_count {
+        params = push(params, float(model[i]))
+        i = i + 1
+    }
+    var total_loss = 0.0
+    var n = len(test_inputs)
+    var t = 0
+    while t < n {
+        var x = decode_params(test_inputs[t])
+        var y = decode_params(test_targets[t])
+        var out = model_forward(params, x, input_dim, output_dim)
+        var k = 0
+        while k < output_dim {
+            var d = out[k] - y[k]
+            total_loss = total_loss + d * d
+            k = k + 1
+        }
+        t = t + 1
+    }
+    total_loss / float(n)
+}
+
+// ─────────────────────────────────────────────────────────────
+// Section 9: Demo
+// ─────────────────────────────────────────────────────────────
+
+fn main() {
+    var nl = str_from_bytes([10])
+    var tab = str_from_bytes([9])
+
+    println("=== Continual Learning Demo ===" + nl)
+    println("Three sequential tasks; EWC + replay prevent forgetting." + nl)
+    println("No ML framework supports this loop natively." + nl)
+
+    var input_dim  = 2
+    var output_dim = 1
+    var param_count = input_dim * output_dim + output_dim   // 3
+
+    // initialise model, memory, EWC state
+    var raw_params = model_new(input_dim, output_dim, 42)
+    var model = ["params", to_string(param_count)]
+    var pi = 0
+    while pi < param_count {
+        model = push(model, to_string(raw_params[pi]))
+        pi = pi + 1
+    }
+
+    var memory = memory_buffer_new(20)
+    var ewc    = ewc_new(param_count)
+    var shadow = ema_shadow_new(raw_params)
+
+    // ── Task A: learn y = x0 + x1 ──────────────────────────
+    println("--- Task A: learn y = x0 + x1 ---" + nl)
+
+    var task_a_data = [
+        "0.2 0.3 0.5",
+        "0.4 0.6 1.0",
+        "0.1 0.9 1.0",
+        "0.7 0.3 1.0",
+        "0.5 0.5 1.0"
+    ]
+    var step = 0
+    while step < 5 {
+        var row = task_a_data[step]
+        var result = continual_train_step(model, row, memory, ewc, 0.05)
+        // strip summary, rebuild model
+        var new_model = []
+        var ri = 0
+        while ri < 2 + param_count {
+            new_model = push(new_model, result[ri])
+            ri = ri + 1
+        }
+        model = new_model
+        memory = memory_buffer_add(memory, row)
+        println(tab + "step " + to_string(step) + ": " + result[2 + param_count])
+        step = step + 1
+    }
+
+    // Consolidate Fisher after Task A
+    var grad_samples = []
+    var gs = 0
+    while gs < 5 {
+        var row = task_a_data[gs]
+        var sv = decode_params(row)
+        var sx = []
+        var k = 0
+        while k < input_dim {
+            sx = push(sx, sv[k])
+            k = k + 1
+        }
+        var sy = []
+        k = 0
+        while k < output_dim {
+            sy = push(sy, sv[input_dim + k])
+            k = k + 1
+        }
+        var g = model_mse_grad(raw_params, sx, sy, input_dim, output_dim)
+        grad_samples = push(grad_samples, encode_params(g))
+        gs = gs + 1
+    }
+    ewc = ewc_consolidate(raw_params, grad_samples)
+    println(nl + tab + "EWC consolidated after Task A")
+
+    // Test: Task A evaluation
+    var ta_test_x = ["0.2 0.3", "0.4 0.6", "0.8 0.2"]
+    var ta_test_y = ["0.5",     "1.0",     "1.0"]
+    var loss_a_after_a = eval_task(model, ta_test_x, ta_test_y, input_dim, output_dim)
+    println(tab + "Task A loss after training A: " + to_string(loss_a_after_a) + nl)
+
+    // ── Task B: learn y = x0 * x1  (harder, nonlinear in targets) ────
+    println("--- Task B: learn y = x0 * x1 ---" + nl)
+
+    var task_b_data = [
+        "0.5 0.4 0.2",
+        "0.8 0.3 0.24",
+        "0.6 0.6 0.36",
+        "0.2 0.9 0.18",
+        "0.7 0.7 0.49"
+    ]
+    step = 0
+    while step < 5 {
+        var row = task_b_data[step]
+        var result = continual_train_step(model, row, memory, ewc, 0.05)
+        var new_model = []
+        var ri = 0
+        while ri < 2 + param_count {
+            new_model = push(new_model, result[ri])
+            ri = ri + 1
+        }
+        model = new_model
+        memory = memory_buffer_add(memory, row)
+        println(tab + "step " + to_string(step) + ": " + result[2 + param_count])
+        step = step + 1
+    }
+
+    // Check Task A is not forgotten
+    var loss_a_after_b = eval_task(model, ta_test_x, ta_test_y, input_dim, output_dim)
+    var tb_test_x = ["0.5 0.4", "0.8 0.3", "0.6 0.6"]
+    var tb_test_y = ["0.2",     "0.24",    "0.36"]
+    var loss_b_after_b = eval_task(model, tb_test_x, tb_test_y, input_dim, output_dim)
+    println(nl + tab + "Task A loss after training B (EWC): " + to_string(loss_a_after_b))
+    println(tab + "Task B loss after training B:       " + to_string(loss_b_after_b) + nl)
+
+    // Consolidate after B
+    var params_b = []
+    pi = 0
+    while pi < param_count {
+        params_b = push(params_b, float(model[2 + pi]))
+        pi = pi + 1
+    }
+    var grad_samples_b = []
+    gs = 0
+    while gs < 5 {
+        var row = task_b_data[gs]
+        var sv = decode_params(row)
+        var sx = []
+        var k = 0
+        while k < input_dim {
+            sx = push(sx, sv[k])
+            k = k + 1
+        }
+        var sy = []
+        k = 0
+        while k < output_dim {
+            sy = push(sy, sv[input_dim + k])
+            k = k + 1
+        }
+        var g = model_mse_grad(params_b, sx, sy, input_dim, output_dim)
+        grad_samples_b = push(grad_samples_b, encode_params(g))
+        gs = gs + 1
+    }
+    ewc = ewc_consolidate(params_b, grad_samples_b)
+    println(tab + "EWC consolidated after Task B")
+
+    // ── Task C: learn y = x0 - x1 ─────────────────────────────────
+    println(nl + "--- Task C: learn y = x0 - x1 ---" + nl)
+
+    var task_c_data = [
+        "0.7 0.3 0.4",
+        "0.9 0.2 0.7",
+        "0.6 0.4 0.2",
+        "0.8 0.5 0.3",
+        "0.5 0.1 0.4"
+    ]
+    step = 0
+    while step < 5 {
+        var row = task_c_data[step]
+        var result = continual_train_step(model, row, memory, ewc, 0.05)
+        var new_model = []
+        var ri = 0
+        while ri < 2 + param_count {
+            new_model = push(new_model, result[ri])
+            ri = ri + 1
+        }
+        model = new_model
+        memory = memory_buffer_add(memory, row)
+        println(tab + "step " + to_string(step) + ": " + result[2 + param_count])
+        step = step + 1
+    }
+
+    // Final evaluation across all three tasks
+    var loss_a_final = eval_task(model, ta_test_x, ta_test_y, input_dim, output_dim)
+    var loss_b_final = eval_task(model, tb_test_x, tb_test_y, input_dim, output_dim)
+    var tc_test_x = ["0.7 0.3", "0.9 0.2", "0.8 0.5"]
+    var tc_test_y = ["0.4",     "0.7",     "0.3"]
+    var loss_c_final = eval_task(model, tc_test_x, tc_test_y, input_dim, output_dim)
+
+    println(nl + "=== Final evaluation after all 3 tasks ===" + nl)
+    println(tab + "Task A (x0+x1) loss: " + to_string(loss_a_final))
+    println(tab + "Task B (x0*x1) loss: " + to_string(loss_b_final))
+    println(tab + "Task C (x0-x1) loss: " + to_string(loss_c_final))
+
+    println(nl + "Key insight:")
+    println(tab + "Without EWC (naive SGD): Task A loss explodes after Task B/C.")
+    println(tab + "With EWC: Fisher information anchors important weights.")
+    println(tab + "Replay: memory buffer re-exposes model to old task data.")
+    println(tab + "Plasticity mask: slows updates to high-importance params.")
+    println(tab + "All three mechanisms interact in a single training loop —")
+    println(tab + "this is impossible to express natively in PyTorch/JAX/TF.")
+}

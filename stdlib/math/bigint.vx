@@ -1,0 +1,860 @@
+// stdlib/math/bigint.vx — Arbitrary Precision Integer Arithmetic
+//
+// Representation: [i64] array where:
+//   Element 0: sign (0 = positive, 1 = negative)
+//   Elements 1..n: base-10000 digits, little-endian (least significant first)
+//   Example: 123456789 -> [0, 6789, 2345, 1]
+//
+// Zero is represented as [0, 0]
+
+let BI_BASE = 10000
+
+// ============================================================
+// Construction
+// ============================================================
+
+fn bi_zero() -> [i64] {
+    return [0, 0]
+}
+
+fn bi_one() -> [i64] {
+    return [0, 1]
+}
+
+fn bi_from_int(n: i64) -> [i64] {
+    if n == 0 {
+        return [0, 0]
+    }
+    var sign = 0
+    var v = n
+    if v < 0 {
+        sign = 1
+        v = 0 - v
+    }
+    var result = [sign]
+    while v > 0 {
+        result = push(result, v % BI_BASE)
+        v = v / BI_BASE
+    }
+    return result
+}
+
+fn bi_from_string(s: String) -> [i64] {
+    let n = len(s)
+    if n == 0 {
+        return [0, 0]
+    }
+    var sign = 0
+    var start = 0
+    if str_char_at(s, 0) == "-" {
+        sign = 1
+        start = 1
+    }
+    // skip leading zeros
+    while start < n - 1 {
+        if str_char_at(s, start) == "0" {
+            start = start + 1
+        } else {
+            break
+        }
+    }
+    let digit_count = n - start
+    if digit_count == 0 {
+        return [0, 0]
+    }
+    // check if all zeros
+    if digit_count == 1 {
+        if str_char_at(s, start) == "0" {
+            return [0, 0]
+        }
+    }
+    // parse from right to left in groups of 4
+    var result = [sign]
+    var pos = n
+    while pos > start {
+        var chunk_start = pos - 4
+        if chunk_start < start {
+            chunk_start = start
+        }
+        let chunk_len = pos - chunk_start
+        let chunk = str_substr(s, chunk_start, chunk_len)
+        result = push(result, int(chunk))
+        pos = chunk_start
+    }
+    return bi_normalize(result)
+}
+
+fn bi_normalize(a: [i64]) -> [i64] {
+    // remove trailing zero digits (high-order)
+    var n = len(a)
+    while n > 2 {
+        if a[n - 1] == 0 {
+            n = n - 1
+        } else {
+            break
+        }
+    }
+    // if only sign + one zero digit, ensure positive zero
+    if n == 2 {
+        if a[1] == 0 {
+            return [0, 0]
+        }
+    }
+    if n == len(a) {
+        return a
+    }
+    var result = []
+    var i = 0
+    while i < n {
+        result = push(result, a[i])
+        i = i + 1
+    }
+    return result
+}
+
+fn bi_to_string(a: [i64]) -> String {
+    let a2 = bi_normalize(a)
+    if bi_is_zero(a2) {
+        return "0"
+    }
+    var result = ""
+    if a2[0] == 1 {
+        result = "-"
+    }
+    let n = len(a2)
+    // most significant digit first (no leading zeros on it)
+    result = result + to_string(a2[n - 1])
+    // remaining digits padded to 4 chars
+    var i = n - 2
+    while i >= 1 {
+        let d = a2[i]
+        if d < 10 {
+            result = result + "000" + to_string(d)
+        } else {
+            if d < 100 {
+                result = result + "00" + to_string(d)
+            } else {
+                if d < 1000 {
+                    result = result + "0" + to_string(d)
+                } else {
+                    result = result + to_string(d)
+                }
+            }
+        }
+        i = i - 1
+    }
+    return result
+}
+
+// ============================================================
+// Comparison
+// ============================================================
+
+fn bi_is_zero(a: [i64]) -> bool {
+    if len(a) == 2 {
+        if a[1] == 0 {
+            return true
+        }
+    }
+    return false
+}
+
+// compare magnitudes only, returns -1, 0, 1
+fn bi_cmp_mag(a: [i64], b: [i64]) -> i64 {
+    let la = len(a) - 1
+    let lb = len(b) - 1
+    if la < lb { return -1 }
+    if la > lb { return 1 }
+    // same number of digits, compare from most significant
+    var i = la
+    while i >= 1 {
+        if a[i] < b[i] { return -1 }
+        if a[i] > b[i] { return 1 }
+        i = i - 1
+    }
+    return 0
+}
+
+fn bi_cmp(a: [i64], b: [i64]) -> i64 {
+    let az = bi_is_zero(a)
+    let bz = bi_is_zero(b)
+    if az {
+        if bz { return 0 }
+        if b[0] == 1 { return 1 }
+        return -1
+    }
+    if bz {
+        if a[0] == 1 { return -1 }
+        return 1
+    }
+    // both nonzero
+    if a[0] == 0 {
+        if b[0] == 1 { return 1 }
+        return bi_cmp_mag(a, b)
+    }
+    // a is negative
+    if b[0] == 0 { return -1 }
+    // both negative: reverse magnitude comparison
+    return bi_cmp_mag(b, a)
+}
+
+fn bi_eq(a: [i64], b: [i64]) -> bool {
+    return bi_cmp(a, b) == 0
+}
+
+fn bi_lt(a: [i64], b: [i64]) -> bool {
+    return bi_cmp(a, b) < 0
+}
+
+fn bi_gt(a: [i64], b: [i64]) -> bool {
+    return bi_cmp(a, b) > 0
+}
+
+// ============================================================
+// Sign / absolute value
+// ============================================================
+
+fn bi_neg(a: [i64]) -> [i64] {
+    if bi_is_zero(a) { return bi_zero() }
+    var result = []
+    if a[0] == 0 {
+        result = push(result, 1)
+    } else {
+        result = push(result, 0)
+    }
+    var i = 1
+    while i < len(a) {
+        result = push(result, a[i])
+        i = i + 1
+    }
+    return result
+}
+
+fn bi_abs(a: [i64]) -> [i64] {
+    if a[0] == 0 { return a }
+    var result = [0]
+    var i = 1
+    while i < len(a) {
+        result = push(result, a[i])
+        i = i + 1
+    }
+    return result
+}
+
+// ============================================================
+// Addition / Subtraction of magnitudes
+// ============================================================
+
+// add magnitudes, return result with given sign
+fn bi_add_mag(a: [i64], b: [i64], sign: i64) -> [i64] {
+    let la = len(a) - 1
+    let lb = len(b) - 1
+    var maxlen = la
+    if lb > maxlen { maxlen = lb }
+    var result = [sign]
+    var carry = 0
+    var i = 0
+    while i < maxlen {
+        var s = carry
+        if i < la { s = s + a[i + 1] }
+        if i < lb { s = s + b[i + 1] }
+        result = push(result, s % BI_BASE)
+        carry = s / BI_BASE
+        i = i + 1
+    }
+    if carry > 0 {
+        result = push(result, carry)
+    }
+    return result
+}
+
+// subtract magnitudes |a| - |b|, assumes |a| >= |b|, returns with given sign
+fn bi_sub_mag(a: [i64], b: [i64], sign: i64) -> [i64] {
+    let la = len(a) - 1
+    let lb = len(b) - 1
+    var result = [sign]
+    var borrow = 0
+    var i = 0
+    while i < la {
+        var d = a[i + 1] - borrow
+        if i < lb { d = d - b[i + 1] }
+        if d < 0 {
+            d = d + BI_BASE
+            borrow = 1
+        } else {
+            borrow = 0
+        }
+        result = push(result, d)
+        i = i + 1
+    }
+    return bi_normalize(result)
+}
+
+fn bi_add(a: [i64], b: [i64]) -> [i64] {
+    if bi_is_zero(a) { return b }
+    if bi_is_zero(b) { return a }
+    // same sign: add magnitudes
+    if a[0] == b[0] {
+        return bi_add_mag(a, b, a[0])
+    }
+    // different signs: subtract smaller magnitude from larger
+    let c = bi_cmp_mag(a, b)
+    if c == 0 { return bi_zero() }
+    if c > 0 {
+        return bi_sub_mag(a, b, a[0])
+    }
+    return bi_sub_mag(b, a, b[0])
+}
+
+fn bi_sub(a: [i64], b: [i64]) -> [i64] {
+    return bi_add(a, bi_neg(b))
+}
+
+// ============================================================
+// Multiplication (schoolbook)
+// ============================================================
+
+fn bi_mul(a: [i64], b: [i64]) -> [i64] {
+    if bi_is_zero(a) { return bi_zero() }
+    if bi_is_zero(b) { return bi_zero() }
+    let la = len(a) - 1
+    let lb = len(b) - 1
+    var sign = 0
+    if a[0] != b[0] { sign = 1 }
+    // allocate result digits initialized to zero
+    let rlen = la + lb
+    var digits = []
+    var k = 0
+    while k < rlen {
+        digits = push(digits, 0)
+        k = k + 1
+    }
+    // schoolbook multiply
+    var i = 0
+    while i < la {
+        var carry = 0
+        var j = 0
+        while j < lb {
+            let prod = a[i + 1] * b[j + 1] + digits[i + j] + carry
+            digits[i + j] = prod % BI_BASE
+            carry = prod / BI_BASE
+            j = j + 1
+        }
+        if carry > 0 {
+            digits[i + lb] = digits[i + lb] + carry
+        }
+        i = i + 1
+    }
+    // build result
+    var result = [sign]
+    k = 0
+    while k < rlen {
+        result = push(result, digits[k])
+        k = k + 1
+    }
+    return bi_normalize(result)
+}
+
+// ============================================================
+// Division and Modulo
+// ============================================================
+
+// divide magnitudes, returns [quotient_digits..., -1, remainder_digits...]
+// both as magnitude arrays (no sign prefix)
+fn bi_divmod_mag(a: [i64], b: [i64]) -> [i64] {
+    let cmp = bi_cmp_mag(a, b)
+    if cmp < 0 {
+        // quotient = 0, remainder = a magnitude
+        var result = [0, -1]
+        var i = 1
+        while i < len(a) {
+            result = push(result, a[i])
+            i = i + 1
+        }
+        return result
+    }
+    if cmp == 0 {
+        // quotient = 1, remainder = 0
+        return [1, -1, 0]
+    }
+    // long division
+    // We work digit by digit from most significant
+    var remainder = bi_zero()
+    let la = len(a) - 1
+    var quot_digits = []
+    var qi = 0
+    while qi < la {
+        quot_digits = push(quot_digits, 0)
+        qi = qi + 1
+    }
+    var i = la - 1
+    while i >= 0 {
+        // shift remainder left by one digit and add a[i+1]
+        remainder = bi_mul_small(remainder, BI_BASE)
+        remainder = bi_add(remainder, bi_from_int(a[i + 1]))
+        // find how many times b fits into remainder (binary search)
+        var lo = 0
+        var hi = BI_BASE - 1
+        while lo < hi {
+            let mid = (lo + hi + 1) / 2
+            let trial = bi_mul_small(bi_abs(b), mid)
+            if bi_cmp_mag(trial, remainder) > 0 {
+                hi = mid - 1
+            } else {
+                lo = mid
+            }
+        }
+        quot_digits[i] = lo
+        if lo > 0 {
+            let sub_val = bi_mul_small(bi_abs(b), lo)
+            remainder = bi_sub(remainder, sub_val)
+        }
+        i = i - 1
+    }
+    // pack result: quot digits, -1, remainder digits
+    var result = []
+    qi = 0
+    while qi < len(quot_digits) {
+        result = push(result, quot_digits[qi])
+        qi = qi + 1
+    }
+    result = push(result, -1)
+    // remainder digits (skip sign)
+    var ri = 1
+    while ri < len(remainder) {
+        result = push(result, remainder[ri])
+        ri = ri + 1
+    }
+    return result
+}
+
+// multiply by a small integer (0..BASE-1)
+fn bi_mul_small(a: [i64], n: i64) -> [i64] {
+    if n == 0 { return bi_zero() }
+    if bi_is_zero(a) { return bi_zero() }
+    let la = len(a) - 1
+    var result = [a[0]]
+    var carry = 0
+    var i = 0
+    while i < la {
+        let prod = a[i + 1] * n + carry
+        result = push(result, prod % BI_BASE)
+        carry = prod / BI_BASE
+        i = i + 1
+    }
+    if carry > 0 {
+        result = push(result, carry)
+    }
+    return bi_normalize(result)
+}
+
+fn bi_divmod(a: [i64], b: [i64]) -> [i64] {
+    if bi_is_zero(b) {
+        // division by zero - return zeros
+        return [0, -1, 0]
+    }
+    if bi_is_zero(a) {
+        return [0, -1, 0]
+    }
+    let dm = bi_divmod_mag(a, b)
+    // find separator
+    var sep = 0
+    while sep < len(dm) {
+        if dm[sep] == -1 { break }
+        sep = sep + 1
+    }
+    // build quotient
+    var quot = [0]
+    var i = 0
+    while i < sep {
+        quot = push(quot, dm[i])
+        i = i + 1
+    }
+    quot = bi_normalize(quot)
+    // build remainder
+    var rem = [0]
+    i = sep + 1
+    while i < len(dm) {
+        rem = push(rem, dm[i])
+        i = i + 1
+    }
+    rem = bi_normalize(rem)
+    // determine signs: quotient negative if signs differ
+    var qsign = 0
+    if a[0] != b[0] { qsign = 1 }
+    if bi_is_zero(quot) { qsign = 0 }
+    quot[0] = qsign
+    // remainder has sign of dividend
+    if bi_is_zero(rem) == false {
+        rem[0] = a[0]
+    }
+    // pack back with separator
+    var result = []
+    i = 0
+    while i < len(quot) {
+        result = push(result, quot[i])
+        i = i + 1
+    }
+    result = push(result, -9999)
+    i = 0
+    while i < len(rem) {
+        result = push(result, rem[i])
+        i = i + 1
+    }
+    return result
+}
+
+// extract quotient from divmod result (separator = -9999)
+fn bi_divmod_quot(dm: [i64]) -> [i64] {
+    var result = []
+    var i = 0
+    while i < len(dm) {
+        if dm[i] == -9999 { break }
+        result = push(result, dm[i])
+        i = i + 1
+    }
+    return result
+}
+
+// extract remainder from divmod result
+fn bi_divmod_rem(dm: [i64]) -> [i64] {
+    var i = 0
+    while i < len(dm) {
+        if dm[i] == -9999 { break }
+        i = i + 1
+    }
+    i = i + 1
+    var result = []
+    while i < len(dm) {
+        result = push(result, dm[i])
+        i = i + 1
+    }
+    return result
+}
+
+fn bi_div(a: [i64], b: [i64]) -> [i64] {
+    let dm = bi_divmod(a, b)
+    return bi_divmod_quot(dm)
+}
+
+fn bi_mod(a: [i64], b: [i64]) -> [i64] {
+    let dm = bi_divmod(a, b)
+    return bi_divmod_rem(dm)
+}
+
+// ============================================================
+// Exponentiation
+// ============================================================
+
+fn bi_pow(base: [i64], exp: [i64]) -> [i64] {
+    if bi_is_zero(exp) { return bi_one() }
+    var result = bi_one()
+    var b = base
+    var e = exp
+    // square-and-multiply using divmod by 2
+    let two = bi_from_int(2)
+    while bi_is_zero(e) == false {
+        let dm = bi_divmod(e, two)
+        let rem = bi_divmod_rem(dm)
+        if bi_is_zero(rem) == false {
+            result = bi_mul(result, b)
+        }
+        b = bi_mul(b, b)
+        e = bi_divmod_quot(dm)
+    }
+    return result
+}
+
+// ============================================================
+// Modular Arithmetic (for cryptography)
+// ============================================================
+
+fn bi_modmul(a: [i64], b: [i64], m: [i64]) -> [i64] {
+    return bi_mod(bi_mul(a, b), m)
+}
+
+fn bi_modpow(base: [i64], exp: [i64], modulus: [i64]) -> [i64] {
+    if bi_is_zero(modulus) { return bi_zero() }
+    var result = bi_one()
+    var b = bi_mod(base, modulus)
+    var e = exp
+    let two = bi_from_int(2)
+    while bi_is_zero(e) == false {
+        let dm = bi_divmod(e, two)
+        let rem = bi_divmod_rem(dm)
+        if bi_is_zero(rem) == false {
+            result = bi_modmul(result, b, modulus)
+        }
+        b = bi_modmul(b, b, modulus)
+        e = bi_divmod_quot(dm)
+    }
+    return result
+}
+
+fn bi_gcd(a: [i64], b: [i64]) -> [i64] {
+    var x = bi_abs(a)
+    var y = bi_abs(b)
+    while bi_is_zero(y) == false {
+        let t = y
+        y = bi_mod(x, y)
+        x = t
+    }
+    return x
+}
+
+fn bi_modinv(a: [i64], m: [i64]) -> [i64] {
+    // Extended Euclidean algorithm
+    var old_r = bi_abs(a)
+    var r = bi_abs(m)
+    var old_s = bi_one()
+    var s = bi_zero()
+    while bi_is_zero(r) == false {
+        let q = bi_div(old_r, r)
+        let temp_r = r
+        r = bi_sub(old_r, bi_mul(q, r))
+        old_r = temp_r
+        let temp_s = s
+        s = bi_sub(old_s, bi_mul(q, s))
+        old_s = temp_s
+    }
+    // old_s might be negative, adjust mod m
+    if bi_lt(old_s, bi_zero()) {
+        old_s = bi_add(old_s, m)
+    }
+    return bi_mod(old_s, m)
+}
+
+// ============================================================
+// Bitwise operations (on magnitude)
+// ============================================================
+
+fn bi_bit_length(a: [i64]) -> i64 {
+    let a2 = bi_normalize(bi_abs(a))
+    if bi_is_zero(a2) { return 0 }
+    let n = len(a2) - 1
+    // top digit contributes some bits
+    var top = a2[n]
+    var bits = (n - 1) * 14  // approximate; we use base 10000
+    // actually, we need exact bit length
+    // base 10000 doesn't map to bits cleanly, so convert approach:
+    // count bits of magnitude via repeated div by 2
+    var x = bi_abs(a)
+    var count = 0
+    let two = bi_from_int(2)
+    while bi_is_zero(x) == false {
+        x = bi_div(x, two)
+        count = count + 1
+    }
+    return count
+}
+
+fn bi_shl(a: [i64], bits: i64) -> [i64] {
+    // left shift = multiply by 2^bits
+    var result = a
+    var i = 0
+    while i < bits {
+        result = bi_mul_small(result, 2)
+        i = i + 1
+    }
+    return result
+}
+
+fn bi_shr(a: [i64], bits: i64) -> [i64] {
+    // right shift = divide by 2^bits
+    var result = a
+    let two = bi_from_int(2)
+    var i = 0
+    while i < bits {
+        result = bi_div(result, two)
+        i = i + 1
+    }
+    return result
+}
+
+// ============================================================
+// Crypto Primitives
+// ============================================================
+
+fn bi_factorial(n: i64) -> [i64] {
+    var result = bi_one()
+    var i = 2
+    while i <= n {
+        result = bi_mul_small(result, i)
+        i = i + 1
+    }
+    return result
+}
+
+fn bi_random_bits(bits: i64, seed: i64) -> [i64] {
+    // Simple LCG-based PRNG, NOT cryptographically secure
+    var state = seed
+    var result = bi_one()
+    var i = 0
+    while i < bits {
+        state = (state * 6364136223846793005 + 1442695040888963407) % 1000000007
+        var bit = 0
+        if state % 2 == 1 { bit = 1 }
+        result = bi_mul_small(result, 2)
+        if bit == 1 {
+            result = bi_add(result, bi_one())
+        }
+        i = i + 1
+    }
+    return result
+}
+
+fn bi_miller_rabin(n: [i64], k: i64) -> bool {
+    // Handle small cases
+    let two = bi_from_int(2)
+    let three = bi_from_int(3)
+    if bi_lt(n, two) { return false }
+    if bi_eq(n, two) { return true }
+    if bi_eq(n, three) { return true }
+    // check even
+    let dm = bi_divmod(n, two)
+    let rem = bi_divmod_rem(dm)
+    if bi_is_zero(rem) { return false }
+    // write n-1 as 2^r * d
+    var d = bi_sub(n, bi_one())
+    var r = 0
+    var cont = true
+    while cont {
+        let dm2 = bi_divmod(d, two)
+        let rem2 = bi_divmod_rem(dm2)
+        if bi_is_zero(rem2) {
+            d = bi_divmod_quot(dm2)
+            r = r + 1
+        } else {
+            cont = false
+        }
+    }
+    // witness loop
+    let n_minus_one = bi_sub(n, bi_one())
+    let n_minus_two = bi_sub(n, two)
+    var round = 0
+    while round < k {
+        // pick a pseudo-random witness based on round
+        var a_val = bi_from_int(round * 7 + 2)
+        // ensure 2 <= a <= n-2
+        if bi_gt(a_val, n_minus_two) {
+            a_val = bi_mod(a_val, n_minus_two)
+            if bi_lt(a_val, two) {
+                a_val = two
+            }
+        }
+        var x = bi_modpow(a_val, d, n)
+        if bi_eq(x, bi_one()) {
+            round = round + 1
+            continue
+        }
+        if bi_eq(x, n_minus_one) {
+            round = round + 1
+            continue
+        }
+        var found = false
+        var j = 0
+        while j < r - 1 {
+            x = bi_modmul(x, x, n)
+            if bi_eq(x, n_minus_one) {
+                found = true
+                break
+            }
+            j = j + 1
+        }
+        if found == false {
+            return false
+        }
+        round = round + 1
+    }
+    return true
+}
+
+// ============================================================
+// Test
+// ============================================================
+
+fn main() {
+    println("=== BigInt Library Test ===")
+    println("")
+
+    // Test 1: Construction and string round-trip
+    println("Test 1: Construction and string round-trip")
+    let a = bi_from_int(123456789)
+    println("  bi_from_int(123456789) = " + bi_to_string(a))
+    let b = bi_from_string("987654321012345678901234567890")
+    println("  bi_from_string('987654321012345678901234567890') = " + bi_to_string(b))
+    let c = bi_from_string("-42")
+    println("  bi_from_string('-42') = " + bi_to_string(c))
+    println("")
+
+    // Test 2: Factorial 50 (65-digit number)
+    println("Test 2: bi_factorial(50)")
+    let f50 = bi_factorial(50)
+    let f50_str = bi_to_string(f50)
+    println("  50! = " + f50_str)
+    println("  length = " + to_string(len(f50_str)) + " digits")
+    // Expected: 30414093201713378043612608166979581188299763898377856820553615673507270386838265252138185638
+    // Wait, 50! = 30414093201713378043612608166979581188299763898377856820553615673507270386838265252138185638 -- nope
+    // Actually 50! = 30414093201713378043612608166979581188299763898377856820553615673507270386838265252138185638 is wrong
+    // 50! = 30414093201713378043612608166979581188299763898377856820553615673507270386838265252138185638 -- let me not hardcode
+    println("")
+
+    // Test 3: Multiplication of two 100-digit numbers
+    println("Test 3: Multiply two large numbers")
+    let big1 = bi_from_string("1234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890")
+    let big2 = bi_from_string("9876543210987654321098765432109876543210987654321098765432109876543210987654321098765432109876543210")
+    let product = bi_mul(big1, big2)
+    println("  product = " + bi_to_string(product))
+    println("  product digits = " + to_string(len(bi_to_string(product))))
+    println("")
+
+    // Test 4: Modular exponentiation
+    println("Test 4: bi_modpow(2, 256, prime)")
+    let base = bi_from_int(2)
+    let exp = bi_from_int(256)
+    // Use a large prime (a Mersenne-like prime for testing)
+    let big_prime = bi_from_string("115792089237316195423570985008687907853269984665640564039457584007908834671663")
+    let mp = bi_modpow(base, exp, big_prime)
+    println("  2^256 mod p = " + bi_to_string(mp))
+    println("")
+
+    // Test 5: GCD
+    println("Test 5: GCD")
+    let g = bi_gcd(bi_from_int(48), bi_from_int(18))
+    println("  gcd(48, 18) = " + bi_to_string(g))
+    println("")
+
+    // Test 6: Modular inverse
+    println("Test 6: Modular inverse")
+    let inv = bi_modinv(bi_from_int(3), bi_from_int(11))
+    println("  modinv(3, 11) = " + bi_to_string(inv))
+    // 3 * 4 = 12 = 1 mod 11, so answer should be 4
+    let check = bi_mod(bi_mul(bi_from_int(3), inv), bi_from_int(11))
+    println("  verify: 3 * inv mod 11 = " + bi_to_string(check))
+    println("")
+
+    // Test 7: Comparison
+    println("Test 7: Comparison")
+    println("  bi_cmp(100, 200) = " + to_string(bi_cmp(bi_from_int(100), bi_from_int(200))))
+    println("  bi_cmp(200, 100) = " + to_string(bi_cmp(bi_from_int(200), bi_from_int(100))))
+    println("  bi_cmp(42, 42) = " + to_string(bi_cmp(bi_from_int(42), bi_from_int(42))))
+    println("")
+
+    // Test 8: Division
+    println("Test 8: Division and modulo")
+    let dv = bi_div(bi_from_int(100), bi_from_int(7))
+    let md = bi_mod(bi_from_int(100), bi_from_int(7))
+    println("  100 / 7 = " + bi_to_string(dv))
+    println("  100 % 7 = " + bi_to_string(md))
+    println("")
+
+    // Test 9: Bit length
+    println("Test 9: Bit operations")
+    let bl = bi_bit_length(bi_from_int(255))
+    println("  bit_length(255) = " + to_string(bl))
+    let shifted = bi_shl(bi_from_int(1), 10)
+    println("  1 << 10 = " + bi_to_string(shifted))
+    println("")
+
+    println("=== All BigInt tests complete ===")
+}

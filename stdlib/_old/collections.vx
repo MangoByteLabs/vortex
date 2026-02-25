@@ -2,7 +2,7 @@
 
 // Stack operations
 fn stack_new() { [] }
-fn stack_push(s, val) { push(s, val); s }
+fn stack_push(s, val) { s = push(s, val); s }
 fn stack_pop(s) {
     let val = s[len(s) - 1]
     // Note: no pop builtin, just return value
@@ -13,17 +13,17 @@ fn stack_is_empty(s) { len(s) == 0 }
 
 // Queue (simple array-based)
 fn queue_new() { [] }
-fn queue_enqueue(q, val) { push(q, val); q }
+fn queue_enqueue(q, val) { q = push(q, val); q }
 
 // Matrix operations
 fn matrix_add(a, b, rows, cols) {
     let result = []
-    for i in 0..rows * cols { push(result, a[i] + b[i]) }
+    for i in 0..rows * cols { result = push(result, a[i] + b[i]) }
     result
 }
 
 fn matrix_scale(a, scalar, n) {
     let result = []
-    for i in 0..n { push(result, a[i] * scalar) }
+    for i in 0..n { result = push(result, a[i] * scalar) }
     result
 }

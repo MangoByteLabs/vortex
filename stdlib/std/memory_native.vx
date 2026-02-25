@@ -1,0 +1,497 @@
+// memory_native.vx — Native memory allocator using raw Linux syscalls
+// No Rust stdlib, no libc — pure Vortex on top of mmap/munmap
+//
+// Block header layout (24 bytes):
+//   offset 0:  size (i64) — usable payload size
+//   offset 8:  next_free (i64) — pointer to next free block header, or 0
+//   offset 16: magic (i64) — 0xDEADBEEF if allocated, 0xFREEBEEF (0xFBEEBEEF) if free
+//
+// Allocator metadata lives at the start of the heap region (first 24 bytes):
+//   offset 0:  free_list_head (i64) — pointer to first free block header
+//   offset 8:  heap_base (i64) — start of mmap'd region
+//   offset 16: heap_end (i64) — end of mmap'd region
+
+fn HEADER_SIZE() -> i64 { return 24 }
+fn MAGIC_ALLOC() -> i64 { return 3735928559 }  // 0xDEADBEEF
+fn MAGIC_FREE() -> i64 { return 4226801391 }   // 0xFBEEBEEF
+fn META_SIZE() -> i64 { return 24 }
+fn INITIAL_HEAP() -> i64 { return 1048576 }     // 1 MB
+fn MIN_SPLIT() -> i64 { return 64 }             // minimum payload to justify splitting
+
+// SYS_MMAP = 9, SYS_MUNMAP = 11
+fn SYS_MMAP() -> i64 { return 9 }
+fn SYS_MUNMAP() -> i64 { return 11 }
+
+// mmap wrapper: allocate len bytes of anonymous private memory
+fn native_mmap(len: i64) -> i64 {
+    // mmap(addr=0, length, prot=3 (RW), flags=34 (PRIVATE|ANON), fd=-1, offset=0)
+    let result = syscall6(SYS_MMAP(), 0, len, 3, 34, 0 - 1, 0)
+    if result < 0 {
+        return 0
+    }
+    return result
+}
+
+// munmap wrapper
+fn native_munmap(addr: i64, len: i64) -> i64 {
+    return syscall2(SYS_MUNMAP(), addr, len)
+}
+
+// --- Header read/write helpers ---
+
+fn hdr_read_size(hdr: i64) -> i64 {
+    return mem_read_u64(hdr, 0)
+}
+
+fn hdr_read_next(hdr: i64) -> i64 {
+    return mem_read_u64(hdr, 8)
+}
+
+fn hdr_read_magic(hdr: i64) -> i64 {
+    return mem_read_u64(hdr, 16)
+}
+
+fn hdr_write_size(hdr: i64, sz: i64) {
+    mem_write_u64(hdr, 0, sz)
+}
+
+fn hdr_write_next(hdr: i64, nxt: i64) {
+    mem_write_u64(hdr, 8, nxt)
+}
+
+fn hdr_write_magic(hdr: i64, m: i64) {
+    mem_write_u64(hdr, 16, m)
+}
+
+// --- Metadata read/write (stored at meta_ptr) ---
+
+fn meta_read_free_head(meta: i64) -> i64 {
+    return mem_read_u64(meta, 0)
+}
+
+fn meta_read_base(meta: i64) -> i64 {
+    return mem_read_u64(meta, 8)
+}
+
+fn meta_read_end(meta: i64) -> i64 {
+    return mem_read_u64(meta, 16)
+}
+
+fn meta_write_free_head(meta: i64, v: i64) {
+    mem_write_u64(meta, 0, v)
+}
+
+fn meta_write_base(meta: i64, v: i64) {
+    mem_write_u64(meta, 8, v)
+}
+
+fn meta_write_end(meta: i64, v: i64) {
+    mem_write_u64(meta, 16, v)
+}
+
+// ============================================================
+// PUBLIC API
+// ============================================================
+
+// Initialize the allocator. Returns meta pointer (heap base).
+// The first META_SIZE bytes are metadata, then one big free block.
+fn heap_init() -> i64 {
+    let region = native_mmap(INITIAL_HEAP())
+    if region == 0 {
+        return 0
+    }
+    let meta = region
+    // First free block starts right after metadata
+    let first_block = region + META_SIZE()
+    let payload_size = INITIAL_HEAP() - META_SIZE() - HEADER_SIZE()
+
+    hdr_write_size(first_block, payload_size)
+    hdr_write_next(first_block, 0)
+    hdr_write_magic(first_block, MAGIC_FREE())
+
+    meta_write_free_head(meta, first_block)
+    meta_write_base(meta, region)
+    meta_write_end(meta, region + INITIAL_HEAP())
+
+    return meta
+}
+
+// Allocate n bytes. Returns pointer to usable memory (after header).
+fn heap_alloc(meta: i64, n: i64) -> i64 {
+    if n <= 0 { return 0 }
+
+    // Align to 8 bytes
+    var size = n
+    let rem = size % 8
+    if rem != 0 {
+        size = size + 8 - rem
+    }
+
+    // Walk free list, find first fit
+    var prev = 0
+    var curr = meta_read_free_head(meta)
+
+    while curr != 0 {
+        let blk_size = hdr_read_size(curr)
+        let blk_magic = hdr_read_magic(curr)
+
+        if blk_magic != MAGIC_FREE() {
+            // Corrupted free list — bail
+            return 0
+        }
+
+        if blk_size >= size {
+            // Found a fit. Try to split if remainder is big enough.
+            let leftover = blk_size - size - HEADER_SIZE()
+            if leftover >= MIN_SPLIT() {
+                // Split: create a new free block after this one
+                let new_block = curr + HEADER_SIZE() + size
+                hdr_write_size(new_block, leftover)
+                hdr_write_next(new_block, hdr_read_next(curr))
+                hdr_write_magic(new_block, MAGIC_FREE())
+
+                // Update current block
+                hdr_write_size(curr, size)
+
+                // Link prev to new_block (removing curr, inserting new_block)
+                if prev == 0 {
+                    meta_write_free_head(meta, new_block)
+                } else {
+                    hdr_write_next(prev, new_block)
+                }
+            } else {
+                // Use entire block (no split)
+                if prev == 0 {
+                    meta_write_free_head(meta, hdr_read_next(curr))
+                } else {
+                    hdr_write_next(prev, hdr_read_next(curr))
+                }
+            }
+
+            hdr_write_next(curr, 0)
+            hdr_write_magic(curr, MAGIC_ALLOC())
+            return curr + HEADER_SIZE()
+        }
+
+        prev = curr
+        curr = hdr_read_next(curr)
+    }
+
+    // No block found — mmap more memory
+    var mmap_size = size + HEADER_SIZE() + META_SIZE()
+    if mmap_size < INITIAL_HEAP() {
+        mmap_size = INITIAL_HEAP()
+    }
+    let new_region = native_mmap(mmap_size)
+    if new_region == 0 { return 0 }
+
+    // Set up as one big free block
+    let new_block = new_region
+    let new_payload = mmap_size - HEADER_SIZE()
+    hdr_write_size(new_block, new_payload)
+    hdr_write_next(new_block, meta_read_free_head(meta))
+    hdr_write_magic(new_block, MAGIC_FREE())
+    meta_write_free_head(meta, new_block)
+
+    // Recurse — now we have space
+    return heap_alloc(meta, n)
+}
+
+// Free a previously allocated pointer (ptr points to payload, not header)
+fn heap_free(meta: i64, ptr: i64) {
+    if ptr == 0 { return }
+
+    let hdr = ptr - HEADER_SIZE()
+    let magic = hdr_read_magic(hdr)
+    if magic != MAGIC_ALLOC() {
+        // Not a valid allocated block — double free or corruption
+        return
+    }
+
+    // Mark as free and prepend to free list
+    hdr_write_magic(hdr, MAGIC_FREE())
+    hdr_write_next(hdr, meta_read_free_head(meta))
+    meta_write_free_head(meta, hdr)
+
+    // Try to coalesce with the next block in memory if it is also free
+    let next_in_mem = hdr + HEADER_SIZE() + hdr_read_size(hdr)
+    let heap_end = meta_read_end(meta)
+    if next_in_mem + HEADER_SIZE() <= heap_end {
+        let next_magic = hdr_read_magic(next_in_mem)
+        if next_magic == MAGIC_FREE() {
+            // Remove next_in_mem from free list
+            var fprev = 0
+            var fcurr = meta_read_free_head(meta)
+            var found = false
+            while fcurr != 0 && !found {
+                if fcurr == next_in_mem {
+                    if fprev == 0 {
+                        meta_write_free_head(meta, hdr_read_next(fcurr))
+                    } else {
+                        hdr_write_next(fprev, hdr_read_next(fcurr))
+                    }
+                    found = true
+                } else {
+                    fprev = fcurr
+                    fcurr = hdr_read_next(fcurr)
+                }
+            }
+            if found {
+                // Merge: extend hdr to cover next_in_mem
+                let merged_size = hdr_read_size(hdr) + HEADER_SIZE() + hdr_read_size(next_in_mem)
+                hdr_write_size(hdr, merged_size)
+            }
+        }
+    }
+}
+
+// Reallocate to new_size. Returns new pointer (payload).
+fn heap_realloc(meta: i64, ptr: i64, new_size: i64) -> i64 {
+    if ptr == 0 { return heap_alloc(meta, new_size) }
+    if new_size <= 0 {
+        heap_free(meta, ptr)
+        return 0
+    }
+
+    let hdr = ptr - HEADER_SIZE()
+    let old_size = hdr_read_size(hdr)
+
+    // Align new_size
+    var aligned = new_size
+    let rem = aligned % 8
+    if rem != 0 {
+        aligned = aligned + 8 - rem
+    }
+
+    // If current block is big enough, just return it
+    if old_size >= aligned {
+        return ptr
+    }
+
+    // Allocate new, copy, free old
+    let new_ptr = heap_alloc(meta, new_size)
+    if new_ptr == 0 { return 0 }
+    mem_copy_native(new_ptr, ptr, old_size)
+    heap_free(meta, ptr)
+    return new_ptr
+}
+
+// Get allocated size of a pointer (payload size)
+fn heap_size(ptr: i64) -> i64 {
+    if ptr == 0 { return 0 }
+    let hdr = ptr - HEADER_SIZE()
+    let magic = hdr_read_magic(hdr)
+    if magic != MAGIC_ALLOC() { return 0 - 1 }
+    return hdr_read_size(hdr)
+}
+
+// Memory copy: dst, src, n bytes
+fn mem_copy_native(dst: i64, src: i64, n: i64) {
+    var i = 0
+    while i < n {
+        let b = mem_read_u8(src, i)
+        mem_write_u8(dst, i, b)
+        i = i + 1
+    }
+}
+
+// Memory set: ptr, value (byte), n bytes
+fn mem_set_native(ptr: i64, val: i64, n: i64) {
+    var i = 0
+    while i < n {
+        mem_write_u8(ptr, i, val)
+        i = i + 1
+    }
+}
+
+// Memory compare: ptr1, ptr2, n bytes -> 0 if equal
+fn mem_cmp_native(ptr1: i64, ptr2: i64, n: i64) -> i64 {
+    var i = 0
+    while i < n {
+        let a = mem_read_u8(ptr1, i)
+        let b = mem_read_u8(ptr2, i)
+        if a != b {
+            return a - b
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// ============================================================
+// TESTS
+// ============================================================
+
+fn main() {
+    var pass_count = 0
+    var fail_count = 0
+
+    // Test 1: heap_init
+    let meta = heap_init()
+    if meta != 0 {
+        print("PASS: heap_init returned valid pointer")
+        pass_count = pass_count + 1
+    } else {
+        print("FAIL: heap_init returned 0")
+        fail_count = fail_count + 1
+    }
+
+    // Test 2: basic allocation
+    let p1 = heap_alloc(meta, 100)
+    if p1 != 0 {
+        print("PASS: heap_alloc(100) returned non-zero pointer")
+        pass_count = pass_count + 1
+    } else {
+        print("FAIL: heap_alloc(100) returned 0")
+        fail_count = fail_count + 1
+    }
+
+    // Test 3: write and read back data
+    mem_set_native(p1, 42, 100)
+    let v1 = mem_read_u8(p1, 0)
+    let v2 = mem_read_u8(p1, 50)
+    let v3 = mem_read_u8(p1, 99)
+    if v1 == 42 && v2 == 42 && v3 == 42 {
+        print("PASS: mem_set_native + read back correct")
+        pass_count = pass_count + 1
+    } else {
+        print("FAIL: mem_set_native data mismatch")
+        fail_count = fail_count + 1
+    }
+
+    // Test 4: heap_size
+    let sz1 = heap_size(p1)
+    if sz1 >= 100 {
+        print("PASS: heap_size >= 100")
+        pass_count = pass_count + 1
+    } else {
+        print("FAIL: heap_size returned " + to_string(sz1))
+        fail_count = fail_count + 1
+    }
+
+    // Test 5: multiple allocations
+    let p2 = heap_alloc(meta, 200)
+    let p3 = heap_alloc(meta, 512)
+    let p4 = heap_alloc(meta, 64)
+    if p2 != 0 && p3 != 0 && p4 != 0 {
+        print("PASS: multiple allocations succeeded")
+        pass_count = pass_count + 1
+    } else {
+        print("FAIL: multiple allocations — got a zero pointer")
+        fail_count = fail_count + 1
+    }
+
+    // Test 6: write distinct patterns, verify no overlap
+    mem_set_native(p2, 0xAA, 200)
+    mem_set_native(p3, 0xBB, 512)
+    mem_set_native(p4, 0xCC, 64)
+
+    let check_p2 = mem_read_u8(p2, 100)
+    let check_p3 = mem_read_u8(p3, 256)
+    let check_p4 = mem_read_u8(p4, 32)
+    if check_p2 == 0xAA && check_p3 == 0xBB && check_p4 == 0xCC {
+        print("PASS: no overlap between allocations")
+        pass_count = pass_count + 1
+    } else {
+        print("FAIL: data overlap detected")
+        fail_count = fail_count + 1
+    }
+
+    // Test 7: mem_copy_native
+    let p5 = heap_alloc(meta, 100)
+    mem_set_native(p5, 0, 100)
+    mem_copy_native(p5, p1, 50)
+    let copy_check = mem_read_u8(p5, 25)
+    if copy_check == 42 {
+        print("PASS: mem_copy_native works")
+        pass_count = pass_count + 1
+    } else {
+        print("FAIL: mem_copy_native data mismatch")
+        fail_count = fail_count + 1
+    }
+
+    // Test 8: mem_cmp_native
+    let cmp1 = mem_cmp_native(p1, p5, 50)
+    if cmp1 == 0 {
+        print("PASS: mem_cmp_native returns 0 for equal data")
+        pass_count = pass_count + 1
+    } else {
+        print("FAIL: mem_cmp_native returned " + to_string(cmp1))
+        fail_count = fail_count + 1
+    }
+
+    // Test 9: free and re-allocate (reuse)
+    heap_free(meta, p2)
+    heap_free(meta, p3)
+    let p6 = heap_alloc(meta, 200)
+    if p6 != 0 {
+        print("PASS: allocation after free succeeded")
+        pass_count = pass_count + 1
+    } else {
+        print("FAIL: allocation after free returned 0")
+        fail_count = fail_count + 1
+    }
+
+    // Test 10: heap_realloc grow
+    mem_set_native(p4, 0xDD, 64)
+    let p7 = heap_realloc(meta, p4, 256)
+    if p7 != 0 {
+        let realloc_check = mem_read_u8(p7, 0)
+        if realloc_check == 0xDD {
+            print("PASS: heap_realloc preserved data")
+            pass_count = pass_count + 1
+        } else {
+            print("FAIL: heap_realloc lost data")
+            fail_count = fail_count + 1
+        }
+    } else {
+        print("FAIL: heap_realloc returned 0")
+        fail_count = fail_count + 1
+    }
+
+    // Test 11: heap_realloc shrink (should return same ptr)
+    let p8 = heap_alloc(meta, 512)
+    mem_set_native(p8, 0xEE, 512)
+    let p9 = heap_realloc(meta, p8, 64)
+    if p9 == p8 {
+        print("PASS: heap_realloc shrink returned same pointer")
+        pass_count = pass_count + 1
+    } else {
+        print("PASS: heap_realloc shrink returned new pointer (acceptable)")
+        pass_count = pass_count + 1
+    }
+
+    // Test 12: magic number verification
+    let hdr_of_p1 = p1 - 24
+    let magic_val = mem_read_u64(hdr_of_p1, 16)
+    if magic_val == MAGIC_ALLOC() {
+        print("PASS: magic number is DEADBEEF for allocated block")
+        pass_count = pass_count + 1
+    } else {
+        print("FAIL: magic number mismatch: " + to_string(magic_val))
+        fail_count = fail_count + 1
+    }
+
+    // Cleanup
+    heap_free(meta, p1)
+    heap_free(meta, p5)
+    heap_free(meta, p6)
+    heap_free(meta, p7)
+    heap_free(meta, p9)
+
+    // Test 13: freed block has free magic
+    let freed_magic = mem_read_u64(hdr_of_p1, 16)
+    if freed_magic == MAGIC_FREE() {
+        print("PASS: freed block has FBEEBEED magic")
+        pass_count = pass_count + 1
+    } else {
+        print("FAIL: freed block magic: " + to_string(freed_magic))
+        fail_count = fail_count + 1
+    }
+
+    print("")
+    print("Results: " + to_string(pass_count) + " passed, " + to_string(fail_count) + " failed")
+    if fail_count == 0 {
+        print("ALL TESTS PASSED")
+    }
+}

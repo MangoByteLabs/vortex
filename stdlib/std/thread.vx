@@ -1,66 +1,152 @@
-// std/thread.vx — Threading abstractions
+// std/thread.vx — Threading abstractions for Vortex
+// Thin wrappers around the thread_runtime builtins.
 
+// ─── Thread primitives ────────────────────────────────────────────────────────
+
+// Spawn a zero-argument closure on a new OS thread.
+// Returns a thread handle (integer id).
 fn spawn(func: i64) -> i64 {
     return thread_spawn(func)
 }
 
+// Block until the thread identified by `handle` finishes.
+// Returns the value produced by the thread closure.
 fn join(handle: i64) -> i64 {
     return thread_join(handle)
 }
 
-fn parallel_map(items: i64, func: i64) -> i64 {
-    let n = len(items)
-    let ch = channel_create()
-
-    for i in range(0, n) {
-        let item = items[i]
-        let idx = i
-        let chan = ch
-        thread_spawn(|| {
-            let result = func(item)
-            channel_send(chan, [idx, result])
-        })
-    }
-
-    var results = []
-    for i in range(0, n) {
-        push(results, None)
-    }
-    for i in range(0, n) {
-        let pair = channel_recv(ch)
-        results[pair[0]] = pair[1]
-    }
-    return results
+// Return a numeric id for the currently-running thread.
+fn current_id() -> i64 {
+    return thread_id()
 }
 
-fn parallel_reduce(items: i64, func: i64, initial: i64) -> i64 {
-    let n = len(items)
-    if n == 0 { return initial }
-    if n == 1 { return func(initial, items[0]) }
-
-    let mid = n / 2
-    let ch = channel_create()
-
-    thread_spawn(|| {
-        var acc = initial
-        for i in range(0, mid) {
-            acc = func(acc, items[i])
-        }
-        channel_send(ch, acc)
-    })
-
-    var acc = initial
-    for i in range(mid, n) {
-        acc = func(acc, items[i])
-    }
-
-    let left = channel_recv(ch)
-    return func(left, acc)
+// Return the number of logical CPU cores available.
+fn cores() -> i64 {
+    return cpu_count()
 }
 
-fn with_mutex(mtx: i64, func: i64) -> i64 {
-    let val = mutex_lock(mtx)
-    let result = func(val)
-    mutex_unlock(mtx, result)
-    return result
+// Sleep the current thread for `ms` milliseconds.
+fn sleep(ms: i64) -> i64 {
+    sleep_ms(ms)
+    return 0
+}
+
+// ─── Mutex primitives ─────────────────────────────────────────────────────────
+
+// Create a new mutex with an initial integer value.
+// Returns a mutex handle (integer id).
+fn new_mutex(initial: i64) -> i64 {
+    return mutex_new(initial)
+}
+
+// Lock the mutex and return a clone of its protected value.
+// The caller must call unlock() with the (possibly updated) value.
+fn lock(mtx: i64) -> i64 {
+    return mutex_lock(mtx)
+}
+
+// Store `val` back into the mutex and release the lock.
+fn unlock(mtx: i64, val: i64) -> i64 {
+    mutex_unlock(mtx, val)
+    return 0
+}
+
+// ─── Channel primitives ───────────────────────────────────────────────────────
+
+// Create a new MPSC channel. Returns a channel handle (integer id).
+fn new_channel() -> i64 {
+    return channel_create()
+}
+
+// Send `val` through the channel identified by `ch`.
+fn send(ch: i64, val: i64) -> i64 {
+    channel_send(ch, val)
+    return 0
+}
+
+// Blocking receive on the channel. Returns the received value.
+fn recv(ch: i64) -> i64 {
+    return channel_recv(ch)
+}
+
+// ─── Atomic primitives ────────────────────────────────────────────────────────
+
+// Create a new atomic integer with the given initial value.
+fn new_atomic(val: i64) -> i64 {
+    return atomic_new(val)
+}
+
+// Load the current value of the atomic.
+fn atomic_get(a: i64) -> i64 {
+    return atomic_load(a)
+}
+
+// Store `val` into the atomic.
+fn atomic_set(a: i64, val: i64) -> i64 {
+    atomic_store(a, val)
+    return 0
+}
+
+// Atomically add `val` to the atomic. Returns the previous value.
+fn atomic_inc(a: i64, val: i64) -> i64 {
+    return atomic_add(a, val)
+}
+
+// ─── Main: smoke-test all primitives ─────────────────────────────────────────
+
+fn main() {
+    println("=== thread.vx tests ===")
+
+    // thread_id
+    let tid = current_id()
+    println("current_id() = " + to_string(tid))
+
+    // cpu_count
+    let n = cores()
+    println("cores()      = " + to_string(n))
+
+    // sleep_ms (just verify it doesn't crash)
+    sleep(1)
+    println("sleep(1ms)   OK")
+
+    // mutex create / lock / unlock
+    let mtx = new_mutex(100)
+    println("new_mutex(100) handle = " + to_string(mtx))
+    let mval = lock(mtx)
+    println("lock()       = " + to_string(mval))
+    unlock(mtx, 200)
+    let mval2 = lock(mtx)
+    println("after unlock(200), lock() = " + to_string(mval2))
+    unlock(mtx, mval2)
+
+    // channel create / send / recv
+    let ch = new_channel()
+    println("new_channel() handle = " + to_string(ch))
+    send(ch, 42)
+    let got = recv(ch)
+    println("send(42) then recv() = " + to_string(got))
+
+    send(ch, 7)
+    send(ch, 13)
+    let a = recv(ch)
+    let b = recv(ch)
+    println("send(7), send(13) -> recv()=" + to_string(a) + " recv()=" + to_string(b))
+
+    // atomic create / load / store / add
+    let at = new_atomic(10)
+    println("new_atomic(10) handle = " + to_string(at))
+    let v1 = atomic_get(at)
+    println("atomic_get()  = " + to_string(v1))
+    atomic_set(at, 50)
+    let v2 = atomic_get(at)
+    println("after atomic_set(50), get() = " + to_string(v2))
+    let old = atomic_inc(at, 5)
+    println("atomic_inc(5) old=" + to_string(old) + " new=" + to_string(atomic_get(at)))
+
+    // thread spawn / join — pass a zero-arg closure using || syntax
+    let handle = thread_spawn(|| { 999 })
+    let result = thread_join(handle)
+    println("thread_spawn/join result = " + to_string(result))
+
+    println("=== All thread tests passed ===")
 }

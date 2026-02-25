@@ -1,21 +1,545 @@
-// Vortex Standard Neural Network Library
+// std/nn.vx — Pure Vortex Neural Network Library
+// No external dependencies — all math implemented from scratch
+
+// ─── Math Helpers ─────────────────────────────────────────────────────────────
+
+fn abs_f(x: f64) -> f64 {
+    if x < 0.0 {
+        return 0.0 - x
+    }
+    return x
+}
+
+// exp via range reduction + Taylor series (accurate)
+fn exp_approx(x: f64) -> f64 {
+    // Range reduce: e^x = e^k * e^r where k = floor(x/ln2), r = x - k*ln2
+    let ln2 = 0.6931471805599453
+    let k = int(x / ln2)
+    let r = x - float(k) * ln2
+
+    // Taylor: e^r = sum r^n / n!
+    var term = 1.0
+    var s = 1.0
+    var n = 1
+    while n <= 20 {
+        term = term * r / float(n)
+        s = s + term
+        n = n + 1
+    }
+
+    // Multiply by 2^k
+    if k >= 0 {
+        var factor = 1.0
+        var i = 0
+        while i < k {
+            factor = factor * 2.0
+            i = i + 1
+        }
+        return s * factor
+    } else {
+        var factor = 1.0
+        var i = 0
+        let nk = 0 - k
+        while i < nk {
+            factor = factor * 2.0
+            i = i + 1
+        }
+        return s / factor
+    }
+}
+
+// Natural log via range reduction + Padé-style series
+fn ln_approx(x: f64) -> f64 {
+    if x <= 0.0 {
+        return -999999.0
+    }
+    if x == 1.0 {
+        return 0.0
+    }
+    let ln2 = 0.6931471805599453
+    var v = x
+    var k = 0
+    while v >= 2.0 {
+        v = v / 2.0
+        k = k + 1
+    }
+    while v < 0.5 {
+        v = v * 2.0
+        k = k - 1
+    }
+    // v in [0.5, 2.0): use t-series ln((1+t)/(1-t)) = 2*(t + t^3/3 + t^5/5 + ...)
+    let t = (v - 1.0) / (v + 1.0)
+    let t2 = t * t
+    var term = t
+    var sum = t
+    var n = 1
+    while n < 40 {
+        term = term * t2
+        n = n + 2
+        sum = sum + term / float(n)
+    }
+    return 2.0 * sum + float(k) * ln2
+}
+
+// Square root via Newton's method
+fn sqrt_approx(x: f64) -> f64 {
+    if x < 0.0 {
+        return 0.0
+    }
+    if x == 0.0 {
+        return 0.0
+    }
+    var guess = x / 2.0
+    if guess < 1.0 {
+        guess = 1.0
+    }
+    var i = 0
+    while i < 60 {
+        let next = (guess + x / guess) / 2.0
+        let d = next - guess
+        if d < 0.0 {
+            if (0.0 - d) < 1.0e-15 {
+                return next
+            }
+        } else {
+            if d < 1.0e-15 {
+                return next
+            }
+        }
+        guess = next
+        i = i + 1
+    }
+    return guess
+}
+
+// ─── Activation Functions ─────────────────────────────────────────────────────
 
 pub fn relu(x: f64) -> f64 {
-    if x > 0.0 { x } else { 0.0 }
+    if x > 0.0 {
+        return x
+    }
+    return 0.0
 }
 
 pub fn sigmoid(x: f64) -> f64 {
-    return 1.0 / (1.0 + exp(-x))
+    // numerically stable: for x < 0 use exp(x)/(1+exp(x))
+    if x >= 0.0 {
+        let e = exp_approx(0.0 - x)
+        return 1.0 / (1.0 + e)
+    } else {
+        let e = exp_approx(x)
+        return e / (1.0 + e)
+    }
 }
 
 pub fn tanh_act(x: f64) -> f64 {
-    return (exp(x) - exp(-x)) / (exp(x) + exp(-x))
+    // tanh(x) = (e^2x - 1) / (e^2x + 1)  — avoids two separate exp calls
+    let e2 = exp_approx(2.0 * x)
+    return (e2 - 1.0) / (e2 + 1.0)
 }
 
 pub fn gelu(x: f64) -> f64 {
-    return 0.5 * x * (1.0 + tanh_act(0.7978845608 * (x + 0.044715 * x * x * x)))
+    // GELU approximation: 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715*x^3)))
+    let k = 0.7978845608028654
+    let inner = k * (x + 0.044715 * x * x * x)
+    return 0.5 * x * (1.0 + tanh_act(inner))
 }
 
-pub fn swish(x: f64) -> f64 {
-    return x * sigmoid(x)
+pub fn swish(x: f64, beta: f64) -> f64 {
+    return x * sigmoid(beta * x)
+}
+
+pub fn silu(x: f64) -> f64 {
+    // SiLU = swish with beta=1
+    return swish(x, 1.0)
+}
+
+// ─── Array Activations ────────────────────────────────────────────────────────
+
+// Numerically stable softmax: subtract max before exp
+pub fn softmax(arr: [f64]) -> [f64] {
+    let n = len(arr)
+    if n == 0 {
+        return arr
+    }
+
+    // find max
+    var mx = arr[0]
+    var i = 1
+    while i < n {
+        if arr[i] > mx {
+            mx = arr[i]
+        }
+        i = i + 1
+    }
+
+    // compute exp(x - max) and sum
+    var exps: [f64] = []
+    var total = 0.0
+    i = 0
+    while i < n {
+        let e = exp_approx(arr[i] - mx)
+        exps = push(exps, e)
+        total = total + e
+        i = i + 1
+    }
+
+    // normalize
+    var out: [f64] = []
+    i = 0
+    while i < n {
+        out = push(out, exps[i] / total)
+        i = i + 1
+    }
+    return out
+}
+
+// Layer normalization: normalize to zero mean, unit variance, then scale by 1 and shift by 0
+pub fn layer_norm(arr: [f64], eps: f64) -> [f64] {
+    let n = len(arr)
+    if n == 0 {
+        return arr
+    }
+
+    // mean
+    var sum = 0.0
+    var i = 0
+    while i < n {
+        sum = sum + arr[i]
+        i = i + 1
+    }
+    let mu = sum / float(n)
+
+    // variance
+    var var_sum = 0.0
+    i = 0
+    while i < n {
+        let d = arr[i] - mu
+        var_sum = var_sum + d * d
+        i = i + 1
+    }
+    let variance = var_sum / float(n)
+    let std = sqrt_approx(variance + eps)
+
+    // normalize
+    var out: [f64] = []
+    i = 0
+    while i < n {
+        out = push(out, (arr[i] - mu) / std)
+        i = i + 1
+    }
+    return out
+}
+
+// RMS normalization: normalize by root mean square
+pub fn rms_norm(arr: [f64], eps: f64) -> [f64] {
+    let n = len(arr)
+    if n == 0 {
+        return arr
+    }
+
+    // mean of squares
+    var sum = 0.0
+    var i = 0
+    while i < n {
+        sum = sum + arr[i] * arr[i]
+        i = i + 1
+    }
+    let rms = sqrt_approx(sum / float(n) + eps)
+
+    var out: [f64] = []
+    i = 0
+    while i < n {
+        out = push(out, arr[i] / rms)
+        i = i + 1
+    }
+    return out
+}
+
+// ─── Loss Functions ───────────────────────────────────────────────────────────
+
+pub fn mse_loss(pred: [f64], target: [f64]) -> f64 {
+    let n = len(pred)
+    if n == 0 {
+        return 0.0
+    }
+    var sum = 0.0
+    var i = 0
+    while i < n {
+        let d = pred[i] - target[i]
+        sum = sum + d * d
+        i = i + 1
+    }
+    return sum / float(n)
+}
+
+pub fn cross_entropy_loss(pred: [f64], target: [f64]) -> f64 {
+    // pred should be softmax outputs (probabilities)
+    // target is one-hot encoded
+    let n = len(pred)
+    if n == 0 {
+        return 0.0
+    }
+    var loss = 0.0
+    var i = 0
+    while i < n {
+        if target[i] > 0.0 {
+            let p = pred[i]
+            var safe_p = p
+            if safe_p < 1.0e-15 {
+                safe_p = 1.0e-15
+            }
+            loss = loss - target[i] * ln_approx(safe_p)
+        }
+        i = i + 1
+    }
+    return loss
+}
+
+// ─── Dense Layer ──────────────────────────────────────────────────────────────
+
+// Flat weight matrix: weights[out_dim * in_dim] row-major (weights[o*in_dim + i])
+pub fn dense_forward(input: [f64], weights: [f64], bias: [f64], in_dim: i64, out_dim: i64) -> [f64] {
+    var out: [f64] = []
+    var o = 0
+    while o < out_dim {
+        var acc = bias[o]
+        var i = 0
+        while i < in_dim {
+            acc = acc + weights[o * in_dim + i] * input[i]
+            i = i + 1
+        }
+        out = push(out, acc)
+        o = o + 1
+    }
+    return out
+}
+
+// ─── Dropout ──────────────────────────────────────────────────────────────────
+
+// LCG-based pseudo-random dropout
+// During inference set rate=0.0 to disable
+pub fn dropout(arr: [f64], rate: f64, seed: i64) -> [f64] {
+    if rate <= 0.0 {
+        return arr
+    }
+    if rate >= 1.0 {
+        let n = len(arr)
+        var out: [f64] = []
+        var i = 0
+        while i < n {
+            out = push(out, 0.0)
+            i = i + 1
+        }
+        return out
+    }
+
+    let scale = 1.0 / (1.0 - rate)
+    let n = len(arr)
+    var out: [f64] = []
+    var rng = seed
+    var i = 0
+    while i < n {
+        // LCG: next = (a * rng + c) mod m
+        rng = (1664525 * rng + 1013904223) - ((1664525 * rng + 1013904223) / 2147483647) * 2147483647
+        var r = float(rng) / 2147483647.0
+        if r < 0.0 {
+            r = 0.0 - r
+        }
+        if r < rate {
+            out = push(out, 0.0)
+        } else {
+            out = push(out, arr[i] * scale)
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// ─── Tests ────────────────────────────────────────────────────────────────────
+
+fn assert_near(label: str, got: f64, expected: f64, tol: f64) {
+    let d = got - expected
+    var ad = d
+    if d < 0.0 {
+        ad = 0.0 - d
+    }
+    if ad < tol {
+        print("  PASS " + label + " = " + to_string(got))
+    } else {
+        print("  FAIL " + label + " got=" + to_string(got) + " expected=" + to_string(expected))
+    }
+}
+
+fn main() {
+    print("=== nn.vx Tests ===")
+    print("")
+
+    // exp_approx
+    print("--- exp_approx ---")
+    assert_near("exp(0)", exp_approx(0.0), 1.0, 1.0e-10)
+    assert_near("exp(1)", exp_approx(1.0), 2.718281828, 1.0e-7)
+    assert_near("exp(2)", exp_approx(2.0), 7.389056099, 1.0e-7)
+    assert_near("exp(-1)", exp_approx(-1.0), 0.367879441, 1.0e-7)
+    assert_near("exp(10)", exp_approx(10.0), 22026.465795, 0.01)
+
+    // ln_approx
+    print("")
+    print("--- ln_approx ---")
+    assert_near("ln(1)", ln_approx(1.0), 0.0, 1.0e-10)
+    assert_near("ln(e)", ln_approx(2.71828182845904), 1.0, 1.0e-7)
+    assert_near("ln(2)", ln_approx(2.0), 0.693147180, 1.0e-7)
+    assert_near("ln(10)", ln_approx(10.0), 2.302585093, 1.0e-7)
+
+    // sqrt_approx
+    print("")
+    print("--- sqrt_approx ---")
+    assert_near("sqrt(4)", sqrt_approx(4.0), 2.0, 1.0e-10)
+    assert_near("sqrt(2)", sqrt_approx(2.0), 1.41421356, 1.0e-7)
+    assert_near("sqrt(9)", sqrt_approx(9.0), 3.0, 1.0e-10)
+    assert_near("sqrt(0.25)", sqrt_approx(0.25), 0.5, 1.0e-10)
+
+    // relu
+    print("")
+    print("--- relu ---")
+    assert_near("relu(3.0)", relu(3.0), 3.0, 1.0e-10)
+    assert_near("relu(-2.0)", relu(-2.0), 0.0, 1.0e-10)
+    assert_near("relu(0.0)", relu(0.0), 0.0, 1.0e-10)
+
+    // sigmoid
+    print("")
+    print("--- sigmoid ---")
+    assert_near("sigmoid(0)", sigmoid(0.0), 0.5, 1.0e-10)
+    assert_near("sigmoid(1)", sigmoid(1.0), 0.7310585786, 1.0e-7)
+    assert_near("sigmoid(-1)", sigmoid(-1.0), 0.2689414214, 1.0e-7)
+    assert_near("sigmoid(10)", sigmoid(10.0), 0.9999546021, 1.0e-7)
+
+    // tanh_act
+    print("")
+    print("--- tanh_act ---")
+    assert_near("tanh(0)", tanh_act(0.0), 0.0, 1.0e-10)
+    assert_near("tanh(1)", tanh_act(1.0), 0.7615941559, 1.0e-7)
+    assert_near("tanh(-1)", tanh_act(-1.0), -0.7615941559, 1.0e-7)
+
+    // gelu
+    print("")
+    print("--- gelu ---")
+    assert_near("gelu(0)", gelu(0.0), 0.0, 1.0e-10)
+    assert_near("gelu(1)", gelu(1.0), 0.8413, 0.002)
+    assert_near("gelu(-1)", gelu(-1.0), -0.1587, 0.002)
+
+    // swish / silu
+    print("")
+    print("--- swish / silu ---")
+    assert_near("swish(1,1)", swish(1.0, 1.0), 0.7310585786, 1.0e-7)
+    assert_near("silu(1)", silu(1.0), 0.7310585786, 1.0e-7)
+    assert_near("silu(0)", silu(0.0), 0.0, 1.0e-10)
+
+    // softmax
+    print("")
+    print("--- softmax ---")
+    let sm_in = [1.0, 2.0, 3.0]
+    let sm_out = softmax(sm_in)
+    print("  softmax([1,2,3]) = [" + to_string(sm_out[0]) + ", " + to_string(sm_out[1]) + ", " + to_string(sm_out[2]) + "]")
+    // sum should be 1
+    let sm_sum = sm_out[0] + sm_out[1] + sm_out[2]
+    assert_near("softmax sum=1", sm_sum, 1.0, 1.0e-10)
+    // max should be last
+    var sm_ok = sm_out[2] > sm_out[1]
+    if sm_ok {
+        print("  PASS softmax ordering")
+    } else {
+        print("  FAIL softmax ordering")
+    }
+
+    // layer_norm
+    print("")
+    print("--- layer_norm ---")
+    let ln_in = [2.0, 4.0, 4.0, 4.0, 5.0, 5.0, 7.0, 9.0]
+    let ln_out = layer_norm(ln_in, 1.0e-8)
+    // mean of output should be ~0
+    var ln_mean = 0.0
+    var li = 0
+    while li < len(ln_out) {
+        ln_mean = ln_mean + ln_out[li]
+        li = li + 1
+    }
+    ln_mean = ln_mean / float(len(ln_out))
+    assert_near("layer_norm mean~0", ln_mean, 0.0, 1.0e-10)
+    // std of output should be ~1
+    var ln_var = 0.0
+    li = 0
+    while li < len(ln_out) {
+        let d = ln_out[li] - ln_mean
+        ln_var = ln_var + d * d
+        li = li + 1
+    }
+    ln_var = ln_var / float(len(ln_out))
+    assert_near("layer_norm std~1", sqrt_approx(ln_var), 1.0, 1.0e-7)
+
+    // rms_norm
+    print("")
+    print("--- rms_norm ---")
+    let rms_in = [1.0, 2.0, 3.0, 4.0]
+    let rms_out = rms_norm(rms_in, 1.0e-8)
+    // RMS of output should be ~1
+    var rms_sum2 = 0.0
+    var ri = 0
+    while ri < len(rms_out) {
+        rms_sum2 = rms_sum2 + rms_out[ri] * rms_out[ri]
+        ri = ri + 1
+    }
+    let rms_val = sqrt_approx(rms_sum2 / float(len(rms_out)))
+    assert_near("rms_norm rms~1", rms_val, 1.0, 1.0e-7)
+
+    // mse_loss
+    print("")
+    print("--- mse_loss ---")
+    let pred1 = [1.0, 2.0, 3.0]
+    let tgt1 = [1.5, 2.5, 3.5]
+    assert_near("mse_loss", mse_loss(pred1, tgt1), 0.25, 1.0e-10)
+    assert_near("mse_loss(same)", mse_loss(pred1, pred1), 0.0, 1.0e-10)
+
+    // cross_entropy_loss
+    print("")
+    print("--- cross_entropy_loss ---")
+    let ce_pred = [0.7, 0.2, 0.1]
+    let ce_tgt = [1.0, 0.0, 0.0]
+    let ce_loss = cross_entropy_loss(ce_pred, ce_tgt)
+    // should be -ln(0.7) ≈ 0.3567
+    assert_near("cross_entropy", ce_loss, 0.35667, 0.001)
+
+    // dense_forward
+    print("")
+    print("--- dense_forward ---")
+    // 2-input, 2-output: identity-ish
+    // weights row-major: [[1,0],[0,1]] = [1,0,0,1]
+    let df_input = [3.0, 5.0]
+    let df_weights = [1.0, 0.0, 0.0, 1.0]
+    let df_bias = [0.5, 0.5]
+    let df_out = dense_forward(df_input, df_weights, df_bias, 2, 2)
+    assert_near("dense out[0]", df_out[0], 3.5, 1.0e-10)
+    assert_near("dense out[1]", df_out[1], 5.5, 1.0e-10)
+
+    // dropout (rate=0 => no change)
+    print("")
+    print("--- dropout ---")
+    let do_in = [1.0, 2.0, 3.0, 4.0, 5.0]
+    let do_out = dropout(do_in, 0.0, 42)
+    assert_near("dropout(0) x[0]", do_out[0], 1.0, 1.0e-10)
+    assert_near("dropout(0) x[4]", do_out[4], 5.0, 1.0e-10)
+    // dropout rate=0.5: at least some zeros, at least some non-zeros
+    let do_out2 = dropout(do_in, 0.5, 12345)
+    var do_nonzero = 0
+    var di = 0
+    while di < len(do_out2) {
+        if do_out2[di] > 0.0 {
+            do_nonzero = do_nonzero + 1
+        }
+        di = di + 1
+    }
+    print("  dropout(0.5) nonzero count = " + to_string(do_nonzero) + " (expect ~2-3)")
+
+    print("")
+    print("=== All nn.vx tests complete ===")
 }

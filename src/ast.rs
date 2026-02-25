@@ -25,8 +25,18 @@ pub enum ItemKind {
     Impl(ImplBlock),
     Import(ImportDecl),
     Const(ConstDecl),
+    Static(StaticDecl),
     TypeAlias(TypeAlias),
     FieldDef(FieldDef),
+}
+
+/// Top-level mutable variable (var) or immutable (let)
+#[derive(Debug, Clone)]
+pub struct StaticDecl {
+    pub name: Ident,
+    pub ty: Option<TypeExpr>,
+    pub value: Expr,
+    pub mutable: bool,
 }
 
 /// A regular function
@@ -808,6 +818,7 @@ impl fmt::Display for Item {
             ItemKind::Impl(i) => write!(f, "{}", i),
             ItemKind::Import(i) => write!(f, "{}", i),
             ItemKind::Const(c) => write!(f, "{}", c),
+            ItemKind::Static(s) => write!(f, "{} {} = {}", if s.mutable { "var" } else { "let" }, s.name.name, s.value),
             ItemKind::TypeAlias(t) => write!(f, "{}", t),
             ItemKind::FieldDef(fd) => write!(f, "field {} = {}", fd.name.name, fd.modulus),
         }

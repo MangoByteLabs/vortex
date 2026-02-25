@@ -1,0 +1,605 @@
+// std/collections_native.vx — Pure Vortex data structures for the self-hosting compiler
+// No Rust, no external dependencies. All structures use built-in arrays.
+//
+// HashMap: flat [String] with interleaved keys/values: [k0, v0, k1, v1, ...]
+// Stack: plain [String], top = last element
+// Queue: plain [String], front = index 0
+// Set: plain [String] of unique values
+
+// ============================================================
+// HASHMAP (String -> String, flat parallel array)
+// ============================================================
+
+fn map_new() -> [String] {
+    return []
+}
+
+fn map_set(m: [String], key: String, val: String) -> [String] {
+    let n = len(m)
+    var i = 0
+    while i < n {
+        if m[i] == key {
+            // Update existing: rebuild with new value at i+1
+            var out = []
+            var j = 0
+            while j < n {
+                if j == i + 1 {
+                    out = push(out, val)
+                } else {
+                    out = push(out, m[j])
+                }
+                j = j + 1
+            }
+            return out
+        }
+        i = i + 2
+    }
+    // Append new pair
+    var out = m
+    out = push(out, key)
+    out = push(out, val)
+    return out
+}
+
+fn map_get(m: [String], key: String) -> String {
+    let n = len(m)
+    var i = 0
+    while i < n {
+        if m[i] == key {
+            return m[i + 1]
+        }
+        i = i + 2
+    }
+    return ""
+}
+
+fn map_has(m: [String], key: String) -> bool {
+    let n = len(m)
+    var i = 0
+    while i < n {
+        if m[i] == key {
+            return true
+        }
+        i = i + 2
+    }
+    return false
+}
+
+fn map_remove(m: [String], key: String) -> [String] {
+    let n = len(m)
+    var i = 0
+    while i < n {
+        if m[i] == key {
+            var out = []
+            var j = 0
+            while j < n {
+                if j == i || j == i + 1 {
+                    // skip
+                } else {
+                    out = push(out, m[j])
+                }
+                j = j + 1
+            }
+            return out
+        }
+        i = i + 2
+    }
+    return m
+}
+
+fn map_keys(m: [String]) -> [String] {
+    let n = len(m)
+    var out = []
+    var i = 0
+    while i < n {
+        out = push(out, m[i])
+        i = i + 2
+    }
+    return out
+}
+
+fn map_values(m: [String]) -> [String] {
+    let n = len(m)
+    var out = []
+    var i = 0
+    while i < n {
+        out = push(out, m[i + 1])
+        i = i + 2
+    }
+    return out
+}
+
+fn map_size(m: [String]) -> i64 {
+    return len(m) / 2
+}
+
+// ============================================================
+// STACK (LIFO, top = last element)
+// ============================================================
+
+fn stack_new() -> [String] {
+    return []
+}
+
+fn stack_push(s: [String], val: String) -> [String] {
+    return push(s, val)
+}
+
+fn stack_pop(s: [String]) -> [String] {
+    let n = len(s)
+    if n == 0 {
+        return ["", ""]
+    }
+    let popped = s[n - 1]
+    var new_stack = []
+    var i = 0
+    while i < n - 1 {
+        new_stack = push(new_stack, s[i])
+        i = i + 1
+    }
+    // Return [new_stack_encoded_as_join, popped_value]
+    // Actually spec says returns [new_stack_as_first_elem, popped_value]
+    // But we cannot nest arrays in [String]. Encode new stack as flat then append popped.
+    // Re-reading spec: "returns [new_stack_as_first_elem, popped_value]"
+    // We return a 2-element array: first is the serialized stack, second is the value.
+    // But that breaks the type. Let's just return the new stack with the popped value appended
+    // as a sentinel at the end, marked by a special protocol.
+    // Simplest: return array where last element is popped value, rest is new stack.
+    return push(new_stack, popped)
+}
+
+fn stack_peek(s: [String]) -> String {
+    let n = len(s)
+    if n == 0 {
+        return ""
+    }
+    return s[n - 1]
+}
+
+fn stack_is_empty(s: [String]) -> bool {
+    return len(s) == 0
+}
+
+fn stack_size(s: [String]) -> i64 {
+    return len(s)
+}
+
+// ============================================================
+// QUEUE (FIFO, front = index 0)
+// ============================================================
+
+fn queue_new() -> [String] {
+    return []
+}
+
+fn queue_enqueue(q: [String], val: String) -> [String] {
+    return push(q, val)
+}
+
+fn queue_dequeue(q: [String]) -> [String] {
+    let n = len(q)
+    if n == 0 {
+        return ["", ""]
+    }
+    let front_val = q[0]
+    var new_q = []
+    var i = 1
+    while i < n {
+        new_q = push(new_q, q[i])
+        i = i + 1
+    }
+    // Last element is the dequeued value, rest is the new queue
+    return push(new_q, front_val)
+}
+
+fn queue_front(q: [String]) -> String {
+    if len(q) == 0 {
+        return ""
+    }
+    return q[0]
+}
+
+fn queue_is_empty(q: [String]) -> bool {
+    return len(q) == 0
+}
+
+fn queue_size(q: [String]) -> i64 {
+    return len(q)
+}
+
+// ============================================================
+// SET (unique strings)
+// ============================================================
+
+fn set_new() -> [String] {
+    return []
+}
+
+fn set_add(s: [String], val: String) -> [String] {
+    var i = 0
+    let n = len(s)
+    while i < n {
+        if s[i] == val {
+            return s
+        }
+        i = i + 1
+    }
+    return push(s, val)
+}
+
+fn set_has(s: [String], val: String) -> bool {
+    var i = 0
+    let n = len(s)
+    while i < n {
+        if s[i] == val {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+fn set_remove(s: [String], val: String) -> [String] {
+    var out = []
+    var i = 0
+    let n = len(s)
+    while i < n {
+        if s[i] != val {
+            out = push(out, s[i])
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn set_size(s: [String]) -> i64 {
+    return len(s)
+}
+
+fn set_union(a: [String], b: [String]) -> [String] {
+    var out = a
+    var i = 0
+    let n = len(b)
+    while i < n {
+        if !set_has(out, b[i]) {
+            out = push(out, b[i])
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn set_intersection(a: [String], b: [String]) -> [String] {
+    var out = []
+    var i = 0
+    let n = len(a)
+    while i < n {
+        if set_has(b, a[i]) {
+            out = push(out, a[i])
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// ============================================================
+// SORTING (merge sort — stable)
+// ============================================================
+
+fn _str_less(a: String, b: String) -> bool {
+    let ab = str_bytes(a)
+    let bb = str_bytes(b)
+    let la = len(ab)
+    let lb = len(bb)
+    var min_len = la
+    if lb < la {
+        min_len = lb
+    }
+    var i = 0
+    while i < min_len {
+        let ca = int(ab[i])
+        let cb = int(bb[i])
+        if ca < cb {
+            return true
+        }
+        if ca > cb {
+            return false
+        }
+        i = i + 1
+    }
+    return la < lb
+}
+
+fn _slice_str(arr: [String], start: i64, end_idx: i64) -> [String] {
+    var out = []
+    var i = start
+    while i < end_idx {
+        out = push(out, arr[i])
+        i = i + 1
+    }
+    return out
+}
+
+fn _slice_int(arr: [i64], start: i64, end_idx: i64) -> [i64] {
+    var out = []
+    var i = start
+    while i < end_idx {
+        out = push(out, arr[i])
+        i = i + 1
+    }
+    return out
+}
+
+fn _merge_str(a: [String], b: [String]) -> [String] {
+    var out = []
+    var i = 0
+    var j = 0
+    let na = len(a)
+    let nb = len(b)
+    while i < na && j < nb {
+        if _str_less(a[i], b[j]) || a[i] == b[j] {
+            out = push(out, a[i])
+            i = i + 1
+        } else {
+            out = push(out, b[j])
+            j = j + 1
+        }
+    }
+    while i < na {
+        out = push(out, a[i])
+        i = i + 1
+    }
+    while j < nb {
+        out = push(out, b[j])
+        j = j + 1
+    }
+    return out
+}
+
+fn sort_strings(arr: [String]) -> [String] {
+    let n = len(arr)
+    if n <= 1 {
+        return arr
+    }
+    let mid = n / 2
+    let left = sort_strings(_slice_str(arr, 0, mid))
+    let right = sort_strings(_slice_str(arr, mid, n))
+    return _merge_str(left, right)
+}
+
+fn _merge_int(a: [i64], b: [i64]) -> [i64] {
+    var out = []
+    var i = 0
+    var j = 0
+    let na = len(a)
+    let nb = len(b)
+    while i < na && j < nb {
+        if a[i] <= b[j] {
+            out = push(out, a[i])
+            i = i + 1
+        } else {
+            out = push(out, b[j])
+            j = j + 1
+        }
+    }
+    while i < na {
+        out = push(out, a[i])
+        i = i + 1
+    }
+    while j < nb {
+        out = push(out, b[j])
+        j = j + 1
+    }
+    return out
+}
+
+fn sort_ints(arr: [i64]) -> [i64] {
+    let n = len(arr)
+    if n <= 1 {
+        return arr
+    }
+    let mid = n / 2
+    let left = sort_ints(_slice_int(arr, 0, mid))
+    let right = sort_ints(_slice_int(arr, mid, n))
+    return _merge_int(left, right)
+}
+
+fn sort_by(arr: [String], key_fn_name: String) -> [String] {
+    // Sort using named comparison: "asc" for ascending, "desc" for descending
+    let sorted = sort_strings(arr)
+    if key_fn_name == "desc" {
+        let n = len(sorted)
+        var out = []
+        var i = n - 1
+        while i >= 0 {
+            out = push(out, sorted[i])
+            i = i - 1
+        }
+        return out
+    }
+    return sorted
+}
+
+// ============================================================
+// BINARY SEARCH
+// ============================================================
+
+fn binary_search(sorted: [String], target: String) -> i64 {
+    var lo = 0
+    var hi = len(sorted) - 1
+    while lo <= hi {
+        let mid = lo + (hi - lo) / 2
+        if sorted[mid] == target {
+            return mid
+        }
+        if _str_less(sorted[mid], target) {
+            lo = mid + 1
+        } else {
+            hi = mid - 1
+        }
+    }
+    return -1
+}
+
+fn binary_search_int(sorted: [i64], target: i64) -> i64 {
+    var lo = 0
+    var hi = len(sorted) - 1
+    while lo <= hi {
+        let mid = lo + (hi - lo) / 2
+        if sorted[mid] == target {
+            return mid
+        }
+        if sorted[mid] < target {
+            lo = mid + 1
+        } else {
+            hi = mid - 1
+        }
+    }
+    return -1
+}
+
+// ============================================================
+// TESTS
+// ============================================================
+
+fn _assert(name: String, condition: bool) -> String {
+    if condition {
+        println("  PASS: " + name)
+        return "pass"
+    }
+    println("  FAIL: " + name)
+    return "fail"
+}
+
+fn main() {
+    var fails = 0
+
+    // --- Map tests ---
+    println("== Map ==")
+    var m = map_new()
+    m = map_set(m, "a", "1")
+    m = map_set(m, "b", "2")
+    m = map_set(m, "c", "3")
+    if _assert("map_size after 3 inserts", map_size(m) == 3) == "fail" { fails = fails + 1 }
+    if _assert("map_get existing", map_get(m, "b") == "2") == "fail" { fails = fails + 1 }
+    if _assert("map_get missing", map_get(m, "z") == "") == "fail" { fails = fails + 1 }
+    if _assert("map_has existing", map_has(m, "a")) == "fail" { fails = fails + 1 }
+    if _assert("map_has missing", !map_has(m, "z")) == "fail" { fails = fails + 1 }
+    m = map_set(m, "b", "22")
+    if _assert("map_set update", map_get(m, "b") == "22") == "fail" { fails = fails + 1 }
+    if _assert("map_size after update", map_size(m) == 3) == "fail" { fails = fails + 1 }
+    m = map_remove(m, "c")
+    if _assert("map_remove size", map_size(m) == 2) == "fail" { fails = fails + 1 }
+    if _assert("map_remove gone", !map_has(m, "c")) == "fail" { fails = fails + 1 }
+    let ks = map_keys(m)
+    if _assert("map_keys count", len(ks) == 2) == "fail" { fails = fails + 1 }
+    let vs = map_values(m)
+    if _assert("map_values count", len(vs) == 2) == "fail" { fails = fails + 1 }
+    println("")
+
+    // --- Stack tests ---
+    println("== Stack ==")
+    var st = stack_new()
+    if _assert("stack_is_empty new", stack_is_empty(st)) == "fail" { fails = fails + 1 }
+    st = stack_push(st, "x")
+    st = stack_push(st, "y")
+    st = stack_push(st, "z")
+    if _assert("stack_size 3", stack_size(st) == 3) == "fail" { fails = fails + 1 }
+    if _assert("stack_peek z", stack_peek(st) == "z") == "fail" { fails = fails + 1 }
+    let pop_result = stack_pop(st)
+    // pop_result: [x, y, z] where last elem is popped value, rest is new stack
+    let pop_len = len(pop_result)
+    let popped_val = pop_result[pop_len - 1]
+    if _assert("stack_pop value", popped_val == "z") == "fail" { fails = fails + 1 }
+    // New stack is pop_result without last element
+    var new_st = []
+    var si = 0
+    while si < pop_len - 1 {
+        new_st = push(new_st, pop_result[si])
+        si = si + 1
+    }
+    if _assert("stack_pop new size", stack_size(new_st) == 2) == "fail" { fails = fails + 1 }
+    if _assert("stack_peek after pop", stack_peek(new_st) == "y") == "fail" { fails = fails + 1 }
+    if _assert("stack_is_empty false", !stack_is_empty(new_st)) == "fail" { fails = fails + 1 }
+    println("")
+
+    // --- Queue tests ---
+    println("== Queue ==")
+    var q = queue_new()
+    if _assert("queue_is_empty new", queue_is_empty(q)) == "fail" { fails = fails + 1 }
+    q = queue_enqueue(q, "first")
+    q = queue_enqueue(q, "second")
+    q = queue_enqueue(q, "third")
+    if _assert("queue_size 3", queue_size(q) == 3) == "fail" { fails = fails + 1 }
+    if _assert("queue_front", queue_front(q) == "first") == "fail" { fails = fails + 1 }
+    let dq_result = queue_dequeue(q)
+    let dq_len = len(dq_result)
+    let dq_val = dq_result[dq_len - 1]
+    if _assert("queue_dequeue FIFO", dq_val == "first") == "fail" { fails = fails + 1 }
+    var new_q = []
+    var qi = 0
+    while qi < dq_len - 1 {
+        new_q = push(new_q, dq_result[qi])
+        qi = qi + 1
+    }
+    if _assert("queue after dequeue size", queue_size(new_q) == 2) == "fail" { fails = fails + 1 }
+    if _assert("queue after dequeue front", queue_front(new_q) == "second") == "fail" { fails = fails + 1 }
+    println("")
+
+    // --- Set tests ---
+    println("== Set ==")
+    var s = set_new()
+    s = set_add(s, "a")
+    s = set_add(s, "b")
+    s = set_add(s, "c")
+    s = set_add(s, "b")
+    if _assert("set_size no dupes", set_size(s) == 3) == "fail" { fails = fails + 1 }
+    if _assert("set_has a", set_has(s, "a")) == "fail" { fails = fails + 1 }
+    if _assert("set_has missing", !set_has(s, "z")) == "fail" { fails = fails + 1 }
+    s = set_remove(s, "b")
+    if _assert("set_remove size", set_size(s) == 2) == "fail" { fails = fails + 1 }
+    if _assert("set_remove gone", !set_has(s, "b")) == "fail" { fails = fails + 1 }
+    var s2 = set_new()
+    s2 = set_add(s2, "c")
+    s2 = set_add(s2, "d")
+    s2 = set_add(s2, "e")
+    let u = set_union(s, s2)
+    if _assert("set_union size", set_size(u) == 4) == "fail" { fails = fails + 1 }
+    let inter = set_intersection(s, s2)
+    if _assert("set_intersection size", set_size(inter) == 1) == "fail" { fails = fails + 1 }
+    if _assert("set_intersection has c", set_has(inter, "c")) == "fail" { fails = fails + 1 }
+    println("")
+
+    // --- Sort tests ---
+    println("== Sort ==")
+    let sorted_s = sort_strings(["banana", "apple", "cherry", "date"])
+    if _assert("sort_strings[0]", sorted_s[0] == "apple") == "fail" { fails = fails + 1 }
+    if _assert("sort_strings[1]", sorted_s[1] == "banana") == "fail" { fails = fails + 1 }
+    if _assert("sort_strings[2]", sorted_s[2] == "cherry") == "fail" { fails = fails + 1 }
+    if _assert("sort_strings[3]", sorted_s[3] == "date") == "fail" { fails = fails + 1 }
+    let sorted_i = sort_ints([42, 7, 99, 1, 55])
+    if _assert("sort_ints[0]", sorted_i[0] == 1) == "fail" { fails = fails + 1 }
+    if _assert("sort_ints[1]", sorted_i[1] == 7) == "fail" { fails = fails + 1 }
+    if _assert("sort_ints[4]", sorted_i[4] == 99) == "fail" { fails = fails + 1 }
+    let desc = sort_by(["banana", "apple", "cherry"], "desc")
+    if _assert("sort_by desc[0]", desc[0] == "cherry") == "fail" { fails = fails + 1 }
+    if _assert("sort_by desc[2]", desc[2] == "apple") == "fail" { fails = fails + 1 }
+    println("")
+
+    // --- Binary search tests ---
+    println("== Binary Search ==")
+    let bs_arr = ["apple", "banana", "cherry", "date", "fig"]
+    if _assert("binary_search found", binary_search(bs_arr, "cherry") == 2) == "fail" { fails = fails + 1 }
+    if _assert("binary_search missing", binary_search(bs_arr, "grape") == -1) == "fail" { fails = fails + 1 }
+    let bs_ints = [1, 7, 42, 55, 99]
+    if _assert("binary_search_int found", binary_search_int(bs_ints, 42) == 2) == "fail" { fails = fails + 1 }
+    if _assert("binary_search_int missing", binary_search_int(bs_ints, 50) == -1) == "fail" { fails = fails + 1 }
+    println("")
+
+    // --- Summary ---
+    if fails == 0 {
+        println("ALL TESTS PASSED")
+    } else {
+        println("FAILURES: " + str(fails))
+    }
+}

@@ -1,0 +1,650 @@
+// std/math_native.vx — Pure Vortex math library
+// Software implementations of all standard math functions
+// No Rust, no libc, no external libraries
+
+// ─── Constants ───────────────────────────────────────────────────────────────
+
+fn PI() -> f64 {
+    return 3.14159265358979323846
+}
+
+fn E() -> f64 {
+    return 2.71828182845904523536
+}
+
+fn TAU() -> f64 {
+    return 6.28318530717958647692
+}
+
+fn INF() -> f64 {
+    return 1.0e308
+}
+
+fn NEG_INF() -> f64 {
+    return -1.0e308
+}
+
+fn EPSILON() -> f64 {
+    return 1.0e-15
+}
+
+// ─── Basic ───────────────────────────────────────────────────────────────────
+
+fn abs_f(x: f64) -> f64 {
+    if x < 0.0 {
+        return 0.0 - x
+    }
+    return x
+}
+
+fn abs_i(x: i64) -> i64 {
+    if x < 0 {
+        return 0 - x
+    }
+    return x
+}
+
+fn max_f(a: f64, b: f64) -> f64 {
+    if a > b {
+        return a
+    }
+    return b
+}
+
+fn min_f(a: f64, b: f64) -> f64 {
+    if a < b {
+        return a
+    }
+    return b
+}
+
+fn clamp_f(x: f64, lo: f64, hi: f64) -> f64 {
+    if x < lo {
+        return lo
+    }
+    if x > hi {
+        return hi
+    }
+    return x
+}
+
+fn sign(x: f64) -> f64 {
+    if x > 0.0 {
+        return 1.0
+    }
+    if x < 0.0 {
+        return -1.0
+    }
+    return 0.0
+}
+
+fn floor_f(x: f64) -> f64 {
+    let i = int(x)
+    let f = float(i)
+    if x < 0.0 && f != x {
+        return f - 1.0
+    }
+    return f
+}
+
+fn ceil_f(x: f64) -> f64 {
+    let i = int(x)
+    let f = float(i)
+    if x > 0.0 && f != x {
+        return f + 1.0
+    }
+    return f
+}
+
+fn round_f(x: f64) -> f64 {
+    if x >= 0.0 {
+        return floor_f(x + 0.5)
+    }
+    return ceil_f(x - 0.5)
+}
+
+fn fmod(x: f64, y: f64) -> f64 {
+    if y == 0.0 {
+        return 0.0
+    }
+    return x - floor_f(x / y) * y
+}
+
+// ─── Powers and roots ────────────────────────────────────────────────────────
+
+fn sqrt_f(x: f64) -> f64 {
+    if x < 0.0 {
+        return 0.0
+    }
+    if x == 0.0 {
+        return 0.0
+    }
+    var guess = x / 2.0
+    if guess < 1.0 {
+        guess = 1.0
+    }
+    var i = 0
+    while i < 100 {
+        let next = (guess + x / guess) / 2.0
+        let delta = next - guess
+        if abs_f(delta) < 1.0e-15 * abs_f(next) {
+            return next
+        }
+        guess = next
+        i = i + 1
+    }
+    return guess
+}
+
+fn cbrt_f(x: f64) -> f64 {
+    if x == 0.0 {
+        return 0.0
+    }
+    let neg = x < 0.0
+    var v = x
+    if neg {
+        v = 0.0 - x
+    }
+    var guess = v / 3.0
+    if guess < 1.0 {
+        guess = 1.0
+    }
+    var i = 0
+    while i < 100 {
+        let g2 = guess * guess
+        let next = (2.0 * guess + v / g2) / 3.0
+        if abs_f(next - guess) < 1.0e-15 * abs_f(next) {
+            if neg {
+                return 0.0 - next
+            }
+            return next
+        }
+        guess = next
+        i = i + 1
+    }
+    if neg {
+        return 0.0 - guess
+    }
+    return guess
+}
+
+fn pow_i(base: i64, exp: i64) -> i64 {
+    if exp < 0 {
+        return 0
+    }
+    var result = 1
+    var b = base
+    var e = exp
+    while e > 0 {
+        if e - (e / 2) * 2 == 1 {
+            result = result * b
+        }
+        b = b * b
+        e = e / 2
+    }
+    return result
+}
+
+fn pow_f(base: f64, exp: f64) -> f64 {
+    let exp_int = int(exp)
+    let exp_fl = float(exp_int)
+    if exp_fl == exp && exp_int >= 0 {
+        var result = 1.0
+        var b = base
+        var e = exp_int
+        while e > 0 {
+            if e - (e / 2) * 2 == 1 {
+                result = result * b
+            }
+            b = b * b
+            e = e / 2
+        }
+        return result
+    }
+    if exp_fl == exp && exp_int < 0 {
+        var result = 1.0
+        var b = base
+        var e = 0 - exp_int
+        while e > 0 {
+            if e - (e / 2) * 2 == 1 {
+                result = result * b
+            }
+            b = b * b
+            e = e / 2
+        }
+        return 1.0 / result
+    }
+    if base <= 0.0 {
+        return 0.0
+    }
+    return exp_f(exp * ln_f(base))
+}
+
+// ─── Exponential and logarithmic ─────────────────────────────────────────────
+
+fn exp_f(x: f64) -> f64 {
+    let ln2 = 0.6931471805599453
+    let k = int(x / ln2)
+    let r = x - float(k) * ln2
+    var term = 1.0
+    var sum = 1.0
+    var n = 1
+    while n < 50 {
+        term = term * r / float(n)
+        sum = sum + term
+        if abs_f(term) < 1.0e-17 {
+            n = 100
+        }
+        n = n + 1
+    }
+    if k >= 0 {
+        var factor = 1.0
+        var i = 0
+        while i < k {
+            factor = factor * 2.0
+            i = i + 1
+        }
+        return sum * factor
+    } else {
+        var factor = 1.0
+        var i = 0
+        let nk = 0 - k
+        while i < nk {
+            factor = factor * 2.0
+            i = i + 1
+        }
+        return sum / factor
+    }
+}
+
+fn exp2_f(x: f64) -> f64 {
+    return exp_f(x * 0.6931471805599453)
+}
+
+fn ln_f(x: f64) -> f64 {
+    if x <= 0.0 {
+        return NEG_INF()
+    }
+    if x == 1.0 {
+        return 0.0
+    }
+    let ln2 = 0.6931471805599453
+    var v = x
+    var k = 0
+    while v >= 2.0 {
+        v = v / 2.0
+        k = k + 1
+    }
+    while v < 0.5 {
+        v = v * 2.0
+        k = k - 1
+    }
+    let t = (v - 1.0) / (v + 1.0)
+    let t2 = t * t
+    var term = t
+    var sum = t
+    var n = 1
+    while n < 80 {
+        term = term * t2
+        n = n + 2
+        let contrib = term / float(n)
+        sum = sum + contrib
+        if abs_f(contrib) < 1.0e-16 {
+            n = 200
+        }
+    }
+    return 2.0 * sum + float(k) * ln2
+}
+
+fn log2_f(x: f64) -> f64 {
+    return ln_f(x) / 0.6931471805599453
+}
+
+fn log10_f(x: f64) -> f64 {
+    return ln_f(x) / 2.302585092994046
+}
+
+fn log_f(x: f64, base: f64) -> f64 {
+    return ln_f(x) / ln_f(base)
+}
+
+// ─── Trigonometric ───────────────────────────────────────────────────────────
+
+fn sin_f(x: f64) -> f64 {
+    let two_pi = TAU()
+    let pi_val = PI()
+    var v = x
+    // Range reduction to [-pi, pi]
+    if v > pi_val || v < 0.0 - pi_val {
+        v = v - floor_f(v / two_pi) * two_pi
+        if v > pi_val {
+            v = v - two_pi
+        }
+        if v < 0.0 - pi_val {
+            v = v + two_pi
+        }
+    }
+    let x2 = v * v
+    var term = v
+    var sum = v
+    var n = 1
+    while n < 30 {
+        term = 0.0 - term * x2 / float((2 * n) * (2 * n + 1))
+        sum = sum + term
+        if abs_f(term) < 1.0e-17 {
+            return sum
+        }
+        n = n + 1
+    }
+    return sum
+}
+
+fn cos_f(x: f64) -> f64 {
+    let two_pi = TAU()
+    let pi_val = PI()
+    var v = x
+    if v > pi_val || v < 0.0 - pi_val {
+        v = v - floor_f(v / two_pi) * two_pi
+        if v > pi_val {
+            v = v - two_pi
+        }
+        if v < 0.0 - pi_val {
+            v = v + two_pi
+        }
+    }
+    let x2 = v * v
+    var term = 1.0
+    var sum = 1.0
+    var n = 1
+    while n < 30 {
+        term = 0.0 - term * x2 / float((2 * n - 1) * (2 * n))
+        sum = sum + term
+        if abs_f(term) < 1.0e-17 {
+            return sum
+        }
+        n = n + 1
+    }
+    return sum
+}
+
+fn tan_f(x: f64) -> f64 {
+    let c = cos_f(x)
+    if abs_f(c) < 1.0e-15 {
+        return INF()
+    }
+    return sin_f(x) / c
+}
+
+fn atan_f(x: f64) -> f64 {
+    let pi_val = PI()
+    let neg = x < 0.0
+    var v = x
+    if neg {
+        v = 0.0 - x
+    }
+    // Handle v >= 1 by using identity atan(x) = pi/2 - atan(1/x)
+    var shift = 0.0
+    if v >= 1.0 {
+        v = 1.0 / v
+        shift = pi_val / 2.0
+    }
+    // For faster convergence near boundary, use atan(v) = atan(c) + atan((v-c)/(1+v*c))
+    // with c = 0.5, atan(0.5) = 0.46364760900080611621...
+    var result = 0.0
+    if v > 0.4 {
+        let c = 0.5
+        let atan_c = 0.46364760900080611621
+        let u = (v - c) / (1.0 + v * c)
+        let u2 = u * u
+        var term = u
+        var sum = u
+        var n = 1
+        while n < 60 {
+            term = 0.0 - term * u2
+            let contrib = term / float(2 * n + 1)
+            sum = sum + contrib
+            if abs_f(contrib) < 1.0e-16 {
+                n = 200
+            }
+            n = n + 1
+        }
+        result = atan_c + sum
+    } else {
+        let v2 = v * v
+        var term = v
+        var sum = v
+        var n = 1
+        while n < 60 {
+            term = 0.0 - term * v2
+            let contrib = term / float(2 * n + 1)
+            sum = sum + contrib
+            if abs_f(contrib) < 1.0e-16 {
+                n = 200
+            }
+            n = n + 1
+        }
+        result = sum
+    }
+    if shift > 0.0 {
+        result = shift - result
+    }
+    if neg {
+        return 0.0 - result
+    }
+    return result
+}
+
+fn asin_f(x: f64) -> f64 {
+    if x >= 1.0 {
+        return PI() / 2.0
+    }
+    if x <= -1.0 {
+        return 0.0 - PI() / 2.0
+    }
+    return atan_f(x / sqrt_f(1.0 - x * x))
+}
+
+fn acos_f(x: f64) -> f64 {
+    return PI() / 2.0 - asin_f(x)
+}
+
+fn atan2_f(y: f64, x: f64) -> f64 {
+    let pi_val = PI()
+    if x > 0.0 {
+        return atan_f(y / x)
+    }
+    if x < 0.0 && y >= 0.0 {
+        return atan_f(y / x) + pi_val
+    }
+    if x < 0.0 && y < 0.0 {
+        return atan_f(y / x) - pi_val
+    }
+    if x == 0.0 && y > 0.0 {
+        return pi_val / 2.0
+    }
+    if x == 0.0 && y < 0.0 {
+        return 0.0 - pi_val / 2.0
+    }
+    return 0.0
+}
+
+// ─── Hyperbolic ──────────────────────────────────────────────────────────────
+
+fn sinh_f(x: f64) -> f64 {
+    return (exp_f(x) - exp_f(0.0 - x)) / 2.0
+}
+
+fn cosh_f(x: f64) -> f64 {
+    return (exp_f(x) + exp_f(0.0 - x)) / 2.0
+}
+
+fn tanh_f(x: f64) -> f64 {
+    if x > 20.0 {
+        return 1.0
+    }
+    if x < -20.0 {
+        return -1.0
+    }
+    let ep = exp_f(x)
+    let en = exp_f(0.0 - x)
+    return (ep - en) / (ep + en)
+}
+
+// ─── Special ─────────────────────────────────────────────────────────────────
+
+fn factorial(n: i64) -> i64 {
+    if n <= 1 {
+        return 1
+    }
+    var result = 1
+    for i in range(2, n + 1) {
+        result = result * i
+    }
+    return result
+}
+
+fn gcd(a: i64, b: i64) -> i64 {
+    var aa = abs_i(a)
+    var bb = abs_i(b)
+    while bb != 0 {
+        let tmp = bb
+        bb = aa - (aa / bb) * bb
+        aa = tmp
+    }
+    return aa
+}
+
+fn lcm(a: i64, b: i64) -> i64 {
+    let g = gcd(a, b)
+    if g == 0 {
+        return 0
+    }
+    return abs_i(a / g * b)
+}
+
+fn is_prime(n: i64) -> bool {
+    if n < 2 {
+        return false
+    }
+    if n == 2 {
+        return true
+    }
+    if n - (n / 2) * 2 == 0 {
+        return false
+    }
+    var i = 3
+    while i * i <= n {
+        if n - (n / i) * i == 0 {
+            return false
+        }
+        i = i + 2
+    }
+    return true
+}
+
+fn fibonacci(n: i64) -> i64 {
+    if n <= 0 {
+        return 0
+    }
+    if n == 1 {
+        return 1
+    }
+    var a = 0
+    var b = 1
+    for i in range(2, n + 1) {
+        let tmp = a + b
+        a = b
+        b = tmp
+    }
+    return b
+}
+
+// ─── Random (xorshift64) ────────────────────────────────────────────────────
+
+fn random_seed(seed: i64) -> i64 {
+    if seed == 0 {
+        return 1
+    }
+    return seed
+}
+
+fn random_next(state: i64) -> i64 {
+    // xorshift64 — works with positive values
+    var s = state
+    // xorshift steps using manual bit manipulation via multiply/divide
+    // Simplified LCG instead since Vortex may not have bitwise XOR/shift
+    // Using LCG: state = (state * 6364136223846793005 + 1442695040888963407) mod 2^63
+    let a = 6364136223846793005
+    let c = 1442695040888963407
+    let m = 9223372036854775807
+    var next = s * a + c
+    if next < 0 {
+        next = 0 - next
+    }
+    if next == 0 {
+        next = 1
+    }
+    return next
+}
+
+fn random_float(state: i64) -> f64 {
+    var s = state
+    if s < 0 {
+        s = 0 - s
+    }
+    return float(s) / 9223372036854775807.0
+}
+
+// ─── Test helpers ────────────────────────────────────────────────────────────
+
+fn approx_eq(a: f64, b: f64, tol: f64) -> bool {
+    if abs_f(a - b) < tol {
+        return true
+    }
+    return false
+}
+
+fn check(name: String, passed: bool) -> bool {
+    if passed {
+        print("PASS: " + name)
+    } else {
+        print("FAIL: " + name)
+    }
+    return passed
+}
+
+// ─── Main: test all functions ────────────────────────────────────────────────
+
+fn main() {
+    let tol = 1.0e-10
+
+    check("sqrt(4.0) == 2.0", approx_eq(sqrt_f(4.0), 2.0, tol))
+    check("sqrt(2.0) == 1.41421...", approx_eq(sqrt_f(2.0), 1.41421356237309504, tol))
+    check("sin(0) == 0", approx_eq(sin_f(0.0), 0.0, tol))
+    check("sin(pi/2) == 1", approx_eq(sin_f(PI() / 2.0), 1.0, tol))
+    check("cos(0) == 1", approx_eq(cos_f(0.0), 1.0, tol))
+    check("cos(pi) == -1", approx_eq(cos_f(PI()), -1.0, tol))
+    check("exp(1) == E()", approx_eq(exp_f(1.0), E(), tol))
+    check("ln(E()) == 1", approx_eq(ln_f(E()), 1.0, tol))
+    check("pow_f(2.0, 10.0) == 1024.0", approx_eq(pow_f(2.0, 10.0), 1024.0, tol))
+    check("factorial(10) == 3628800", factorial(10) == 3628800)
+    check("gcd(48, 18) == 6", gcd(48, 18) == 6)
+    check("lcm(4, 6) == 12", lcm(4, 6) == 12)
+    check("is_prime(97) == true", is_prime(97))
+    check("is_prime(100) == false", is_prime(100) == false)
+    check("fibonacci(10) == 55", fibonacci(10) == 55)
+    check("floor_f(2.7) == 2.0", approx_eq(floor_f(2.7), 2.0, tol))
+    check("ceil_f(2.3) == 3.0", approx_eq(ceil_f(2.3), 3.0, tol))
+    check("round_f(2.5) == 3.0", approx_eq(round_f(2.5), 3.0, tol))
+    check("fmod(5.3, 2.0) == 1.3", approx_eq(fmod(5.3, 2.0), 1.3, tol))
+    check("cbrt_f(27.0) == 3.0", approx_eq(cbrt_f(27.0), 3.0, tol))
+    check("log2_f(8.0) == 3.0", approx_eq(log2_f(8.0), 3.0, tol))
+    check("log10_f(1000.0) == 3.0", approx_eq(log10_f(1000.0), 3.0, tol))
+    check("tanh_f(0.0) == 0.0", approx_eq(tanh_f(0.0), 0.0, tol))
+    check("atan_f(1.0) == pi/4", approx_eq(atan_f(1.0), PI() / 4.0, tol))
+    check("asin_f(1.0) == pi/2", approx_eq(asin_f(1.0), PI() / 2.0, tol))
+    check("pow_i(2, 10) == 1024", pow_i(2, 10) == 1024)
+
+    print("")
+    print("=== All math_native tests complete ===")
+}
