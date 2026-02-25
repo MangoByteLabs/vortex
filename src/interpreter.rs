@@ -1012,6 +1012,9 @@ impl Env {
         // Reversible computation builtins
         crate::reversible::register_builtins(self);
 
+        // RL training builtins (PPO/DPO/GRPO)
+        crate::rl_training::register_builtins(self);
+
         // Provenance and privacy builtins
         crate::provenance::register_builtins(self);
 
@@ -1101,6 +1104,30 @@ impl Env {
 
         // Field arithmetic (secp256k1 Fp/Fn, fractions, EC points, M_k scanner)
         crate::field_arithmetic::register_builtins(self);
+
+        // Model merging + RAG
+        crate::model_merge::register_builtins(self);
+
+        // Continual learning
+        crate::continual_engine::register_builtins(self);
+
+        // BPE tokenizer
+        crate::tokenizer::register_builtins(self);
+
+        // Agent protocol, NAS, reasoning
+        crate::agent_protocol::register_builtins(self);
+
+        // Mixture of Experts + Speculative Decoding
+        crate::moe::register_builtins(self);
+
+        // Native PTX codegen
+        crate::ptx_native::register_builtins(self);
+
+        // Autodiff engine
+        crate::autodiff_engine::register_builtins(self);
+
+        // KV cache + paged attention
+        crate::kv_cache::register_builtins(self);
 
         // Math constants
         self.define("PI", Value::Float(std::f64::consts::PI));
