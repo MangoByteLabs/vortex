@@ -1,0 +1,78 @@
+// std/string.vx — String utilities
+
+fn starts_with(s: String, prefix: String) -> bool {
+    if len(prefix) > len(s) { return false }
+    return str_substr(s, 0, len(prefix)) == prefix
+}
+
+fn ends_with(s: String, suffix: String) -> bool {
+    if len(suffix) > len(s) { return false }
+    let start = len(s) - len(suffix)
+    return str_substr(s, start, len(suffix)) == suffix
+}
+
+fn trim(s: String) -> String {
+    var start = 0
+    var end_idx = len(s)
+    let chars = str_to_chars(s)
+    while start < end_idx {
+        if str_is_ascii_whitespace(chars[start]) {
+            start = start + 1
+        } else {
+            break
+        }
+    }
+    while end_idx > start {
+        if str_is_ascii_whitespace(chars[end_idx - 1]) {
+            end_idx = end_idx - 1
+        } else {
+            break
+        }
+    }
+    return str_substr(s, start, end_idx - start)
+}
+
+fn to_upper(s: String) -> String {
+    let bytes = str_bytes(s)
+    var result = []
+    for i in range(0, len(bytes)) {
+        let b = bytes[i]
+        if b >= 97 && b <= 122 {
+            push(result, b - 32)
+        } else {
+            push(result, b)
+        }
+    }
+    return str_from_bytes(result)
+}
+
+fn to_lower(s: String) -> String {
+    let bytes = str_bytes(s)
+    var result = []
+    for i in range(0, len(bytes)) {
+        let b = bytes[i]
+        if b >= 65 && b <= 90 {
+            push(result, b + 32)
+        } else {
+            push(result, b)
+        }
+    }
+    return str_from_bytes(result)
+}
+
+fn join(arr: i64, sep: String) -> String {
+    var result = ""
+    for i in range(0, len(arr)) {
+        if i > 0 { result = result + sep }
+        result = result + str(arr[i])
+    }
+    return result
+}
+
+fn repeat(s: String, n: i64) -> String {
+    var result = ""
+    for i in range(0, n) {
+        result = result + s
+    }
+    return result
+}

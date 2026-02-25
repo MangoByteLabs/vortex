@@ -819,6 +819,61 @@ impl PtxBackend {
                 let rbs = self.get_reg(*b_scale)?;
                 Ok(format!("// quantized matmul\n    call ({dst}), __vortex_qmatmul, ({ra}, {rb}, {ras}, {rbs});"))
             }
+
+            // -- GPU / SIMT intrinsics --
+            VirInstKind::ThreadId { axis } => {
+                let dim = ["x", "y", "z"][*axis as usize];
+                Ok(format!("mov.u32 {}, %tid.{};", dst, dim))
+            }
+            VirInstKind::BlockId { axis } => {
+                let dim = ["x", "y", "z"][*axis as usize];
+                Ok(format!("mov.u32 {}, %ctaid.{};", dst, dim))
+            }
+            VirInstKind::BlockDim { axis } => {
+                let dim = ["x", "y", "z"][*axis as usize];
+                Ok(format!("mov.u32 {}, %ntid.{};", dst, dim))
+            }
+            VirInstKind::Barrier => {
+                Ok("bar.sync 0;".to_string())
+            }
+            VirInstKind::SharedAlloca { ty, count } => {
+                let ptx_ty = Self::vir_type_to_ptx(ty);
+                Ok(format!(".shared {}{} shared_{}[{}];", ptx_ty.reg_prefix(), "", dst, count))
+            }
+            VirInstKind::SharedLoad { ptr } => {
+                let rp = self.get_reg(*ptr)?;
+                Ok(format!("ld.shared{} {}, [{}];", dst.ty.suffix(), dst, rp))
+            }
+            VirInstKind::SharedStore { ptr, val } => {
+                let rp = self.get_reg(*ptr)?;
+                let rv = self.get_reg(*val)?;
+                Ok(format!("st.shared{} [{}], {};", rv.ty.suffix(), rp, rv))
+            }
+            VirInstKind::AtomicAdd { ptr, val } => {
+                let rp = self.get_reg(*ptr)?;
+                let rv = self.get_reg(*val)?;
+                Ok(format!("atom.global.add{} {}, [{}], {};", rv.ty.suffix(), dst, rp, rv))
+            }
+            VirInstKind::AtomicCAS { ptr, cmp, val } => {
+                let rp = self.get_reg(*ptr)?;
+                let rc = self.get_reg(*cmp)?;
+                let rv = self.get_reg(*val)?;
+                Ok(format!("atom.global.cas{} {}, [{}], {}, {};", rv.ty.suffix(), dst, rp, rc, rv))
+            }
+            VirInstKind::WarpShuffle { src, offset } => {
+                let rs = self.get_reg(*src)?;
+                Ok(format!("shfl.sync.down.b32 {}, {}, {}, 31, 0xFFFFFFFF;", dst, rs, offset))
+            }
+            VirInstKind::WarpReduceSum { val } => {
+                let rv = self.get_reg(*val)?;
+                Ok(format!("// warp reduce sum\n    mov{s} {dst}, {rv};\n    shfl.sync.down.b32 %t_f, {dst}, 16, 31, 0xFFFFFFFF;\n    add{s} {dst}, {dst}, %t_f;",
+                    s = dst.ty.suffix(), dst = dst, rv = rv))
+            }
+            VirInstKind::WarpReduceMax { val } => {
+                let rv = self.get_reg(*val)?;
+                Ok(format!("// warp reduce max\n    mov{s} {dst}, {rv};\n    shfl.sync.down.b32 %t_f, {dst}, 16, 31, 0xFFFFFFFF;\n    max{s} {dst}, {dst}, %t_f;",
+                    s = dst.ty.suffix(), dst = dst, rv = rv))
+            }
         }
     }
 

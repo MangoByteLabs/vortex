@@ -1,0 +1,35 @@
+// Raw file I/O using Linux syscalls
+fn main() {
+    // Write to a temp file
+    let path = "/tmp/vortex_test.txt"
+    let msg = "Hello from Vortex syscalls!\n"
+
+    // Open file: SYS_OPEN=2, O_WRONLY|O_CREAT|O_TRUNC = 1|64|512 = 577, mode 0644=420
+    // First we need to write the path string into raw memory
+    let path_ptr = mem_alloc(256)
+    mem_write_string(path_ptr, path)
+    let fd = syscall3(SYS_OPEN, ptr_to_int(path_ptr), 577, 420)
+
+    // Write message
+    let msg_ptr = mem_alloc(256)
+    mem_write_string(msg_ptr, msg)
+    let written = syscall3(SYS_WRITE, fd, ptr_to_int(msg_ptr), 27)
+    println("Wrote " + str(written) + " bytes")
+
+    // Close
+    syscall1(SYS_CLOSE, fd)
+
+    // Read it back
+    let fd2 = syscall3(SYS_OPEN, ptr_to_int(path_ptr), 0, 0)  // O_RDONLY=0
+    let buf = mem_alloc(256)
+    let n = syscall3(SYS_READ, fd2, ptr_to_int(buf), 256)
+    let content = mem_read_string(buf, n)
+    println("Read back: " + content)
+    syscall1(SYS_CLOSE, fd2)
+
+    // Cleanup
+    mem_free(path_ptr)
+    mem_free(msg_ptr)
+    mem_free(buf)
+    println("Done!")
+}

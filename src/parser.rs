@@ -214,7 +214,8 @@ impl Parser {
         let mut annotations = Vec::new();
         while self.check(TokenKind::At) {
             self.advance(); // eat @
-            let name = self.parse_ident()?;
+            // Annotation names may be keywords (e.g. @gpu, @jit) — accept any token as a name
+            let name = self.parse_ident_or_keyword()?;
             match name.name.as_str() {
                 "schedule" => {
                     let sched = self.parse_schedule_params(name.span)?;
@@ -2452,6 +2453,17 @@ impl Parser {
     }
 
     // --- Identifier ---
+
+    fn parse_ident_or_keyword(&mut self) -> Result<Ident, ()> {
+        let tok = self.peek().clone();
+        if tok.kind != TokenKind::Eof {
+            self.advance();
+            Ok(Ident::new(tok.text, tok.span))
+        } else {
+            self.error(tok.span, "expected annotation name".to_string());
+            Err(())
+        }
+    }
 
     fn parse_ident(&mut self) -> Result<Ident, ()> {
         let tok = self.peek().clone();

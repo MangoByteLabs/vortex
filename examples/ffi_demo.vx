@@ -1,0 +1,30 @@
+// FFI: calling C library functions from Vortex
+fn main() {
+    // Open libc
+    let lib = ffi_open("libc.so.6")
+    println("Opened libc at: " + str(lib))
+
+    // Get getpid
+    let getpid_fn = ffi_sym(lib, "getpid")
+    let pid = ffi_call(getpid_fn, [])
+    println("PID via FFI: " + str(pid))
+
+    // Get getuid
+    let getuid_fn = ffi_sym(lib, "getuid")
+    let uid = ffi_call(getuid_fn, [])
+    println("UID via FFI: " + str(uid))
+
+    // Compare with syscall
+    let pid2 = syscall0(SYS_GETPID)
+    println("PID via syscall: " + str(pid2))
+
+    // C struct example: pack a timespec and call clock_gettime
+    let ts_ptr = cstruct_pack("timespec", {"tv_sec": 0, "tv_nsec": 0})
+    syscall2(SYS_CLOCK_GETTIME, 0, ptr_to_int(ts_ptr))
+    let ts = cstruct_unpack("timespec", ts_ptr)
+    println("Current time: " + str(ts["tv_sec"]) + "s")
+
+    mem_free(ts_ptr)
+    ffi_close(lib)
+    println("Done!")
+}

@@ -1122,6 +1122,285 @@ pub fn use_fast_backend() -> bool {
     USE_FAST_BACKEND.load(Ordering::Relaxed)
 }
 
+// ─── SIMD / AVX2 Accelerated f32 Operations ─────────────────────────────────
+
+#[cfg(target_arch = "x86_64")]
+use std::arch::x86_64::*;
+
+/// Runtime detection of AVX2 support.
+pub fn has_avx2() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    { std::arch::is_x86_feature_detected!("avx2") }
+    #[cfg(not(target_arch = "x86_64"))]
+    { false }
+}
+
+/// Returns a human-readable string describing available SIMD features.
+pub fn simd_available() -> String {
+    let mut features = Vec::new();
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::arch::is_x86_feature_detected!("avx2") { features.push("avx2"); }
+        if std::arch::is_x86_feature_detected!("avx") { features.push("avx"); }
+        if std::arch::is_x86_feature_detected!("sse4.2") { features.push("sse4.2"); }
+        if std::arch::is_x86_feature_detected!("fma") { features.push("fma"); }
+    }
+    if features.is_empty() {
+        "none (scalar fallback)".to_string()
+    } else {
+        features.join(", ")
+    }
+}
+
+/// Dot product of two f32 slices. AVX2-accelerated when available.
+pub fn simd_dot_f32(a: &[f32], b: &[f32]) -> f32 {
+    assert_eq!(a.len(), b.len(), "simd_dot_f32: length mismatch");
+    #[cfg(target_arch = "x86_64")]
+    {
+        if has_avx2() {
+            return unsafe { simd_dot_f32_avx2(a, b) };
+        }
+    }
+    scalar_dot_f32(a, b)
+}
+
+fn scalar_dot_f32(a: &[f32], b: &[f32]) -> f32 {
+    a.iter().zip(b.iter()).map(|(x, y)| x * y).sum()
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn simd_dot_f32_avx2(a: &[f32], b: &[f32]) -> f32 {
+    let n = a.len();
+    let chunks = n / 8;
+    let mut acc = _mm256_setzero_ps();
+    for i in 0..chunks {
+        let va = _mm256_loadu_ps(a.as_ptr().add(i * 8));
+        let vb = _mm256_loadu_ps(b.as_ptr().add(i * 8));
+        acc = _mm256_add_ps(acc, _mm256_mul_ps(va, vb));
+    }
+    // Horizontal sum of 8 floats
+    let hi = _mm256_extractf128_ps(acc, 1);
+    let lo = _mm256_castps256_ps128(acc);
+    let sum128 = _mm_add_ps(lo, hi);
+    let shuf = _mm_movehdup_ps(sum128);
+    let sums = _mm_add_ps(sum128, shuf);
+    let shuf2 = _mm_movehl_ps(sums, sums);
+    let result = _mm_add_ss(sums, shuf2);
+    let mut total = _mm_cvtss_f32(result);
+    // Remainder
+    for i in (chunks * 8)..n {
+        total += a[i] * b[i];
+    }
+    total
+}
+
+/// Elementwise add: out[i] = a[i] + b[i].
+pub fn simd_add_f32(a: &[f32], b: &[f32], out: &mut [f32]) {
+    assert_eq!(a.len(), b.len());
+    assert_eq!(a.len(), out.len());
+    #[cfg(target_arch = "x86_64")]
+    {
+        if has_avx2() {
+            unsafe { simd_elementwise_avx2(a, b, out, ElementwiseOp::Add); }
+            return;
+        }
+    }
+    for i in 0..a.len() { out[i] = a[i] + b[i]; }
+}
+
+/// Elementwise mul: out[i] = a[i] * b[i].
+pub fn simd_mul_f32(a: &[f32], b: &[f32], out: &mut [f32]) {
+    assert_eq!(a.len(), b.len());
+    assert_eq!(a.len(), out.len());
+    #[cfg(target_arch = "x86_64")]
+    {
+        if has_avx2() {
+            unsafe { simd_elementwise_avx2(a, b, out, ElementwiseOp::Mul); }
+            return;
+        }
+    }
+    for i in 0..a.len() { out[i] = a[i] * b[i]; }
+}
+
+#[derive(Clone, Copy)]
+enum ElementwiseOp { Add, Mul }
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn simd_elementwise_avx2(a: &[f32], b: &[f32], out: &mut [f32], op: ElementwiseOp) {
+    let n = a.len();
+    let chunks = n / 8;
+    for i in 0..chunks {
+        let va = _mm256_loadu_ps(a.as_ptr().add(i * 8));
+        let vb = _mm256_loadu_ps(b.as_ptr().add(i * 8));
+        let vr = match op {
+            ElementwiseOp::Add => _mm256_add_ps(va, vb),
+            ElementwiseOp::Mul => _mm256_mul_ps(va, vb),
+        };
+        _mm256_storeu_ps(out.as_mut_ptr().add(i * 8), vr);
+    }
+    for i in (chunks * 8)..n {
+        out[i] = match op {
+            ElementwiseOp::Add => a[i] + b[i],
+            ElementwiseOp::Mul => a[i] * b[i],
+        };
+    }
+}
+
+/// Scalar multiply: out[i] = a[i] * s.
+pub fn simd_scale_f32(a: &[f32], s: f32, out: &mut [f32]) {
+    assert_eq!(a.len(), out.len());
+    #[cfg(target_arch = "x86_64")]
+    {
+        if has_avx2() {
+            unsafe { simd_scale_f32_avx2(a, s, out); }
+            return;
+        }
+    }
+    for i in 0..a.len() { out[i] = a[i] * s; }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn simd_scale_f32_avx2(a: &[f32], s: f32, out: &mut [f32]) {
+    let n = a.len();
+    let chunks = n / 8;
+    let vs = _mm256_set1_ps(s);
+    for i in 0..chunks {
+        let va = _mm256_loadu_ps(a.as_ptr().add(i * 8));
+        _mm256_storeu_ps(out.as_mut_ptr().add(i * 8), _mm256_mul_ps(va, vs));
+    }
+    for i in (chunks * 8)..n { out[i] = a[i] * s; }
+}
+
+/// ReLU: out[i] = max(0, a[i]).
+pub fn simd_relu_f32(a: &[f32], out: &mut [f32]) {
+    assert_eq!(a.len(), out.len());
+    #[cfg(target_arch = "x86_64")]
+    {
+        if has_avx2() {
+            unsafe { simd_relu_f32_avx2(a, out); }
+            return;
+        }
+    }
+    for i in 0..a.len() { out[i] = a[i].max(0.0); }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn simd_relu_f32_avx2(a: &[f32], out: &mut [f32]) {
+    let n = a.len();
+    let chunks = n / 8;
+    let zero = _mm256_setzero_ps();
+    for i in 0..chunks {
+        let va = _mm256_loadu_ps(a.as_ptr().add(i * 8));
+        _mm256_storeu_ps(out.as_mut_ptr().add(i * 8), _mm256_max_ps(va, zero));
+    }
+    for i in (chunks * 8)..n { out[i] = a[i].max(0.0); }
+}
+
+/// Approximate GELU: 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3))).
+pub fn simd_gelu_f32(a: &[f32], out: &mut [f32]) {
+    assert_eq!(a.len(), out.len());
+    // GELU uses transcendentals — scalar path (AVX2 has no tanh intrinsic)
+    let sqrt_2_pi: f32 = 0.7978845608;
+    let coeff: f32 = 0.044715;
+    for i in 0..a.len() {
+        let x = a[i];
+        let inner = sqrt_2_pi * (x + coeff * x * x * x);
+        out[i] = 0.5 * x * (1.0 + inner.tanh());
+    }
+}
+
+/// SiLU (Swish): out[i] = x * sigmoid(x).
+pub fn simd_silu_f32(a: &[f32], out: &mut [f32]) {
+    assert_eq!(a.len(), out.len());
+    for i in 0..a.len() {
+        let x = a[i];
+        out[i] = x / (1.0 + (-x).exp());
+    }
+}
+
+/// Numerically stable softmax over a 1-D f32 slice.
+pub fn simd_softmax_f32(a: &[f32], out: &mut [f32]) {
+    assert_eq!(a.len(), out.len());
+    if a.is_empty() { return; }
+    let max_val = a.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+    let mut sum = 0.0f32;
+    for i in 0..a.len() {
+        out[i] = (a[i] - max_val).exp();
+        sum += out[i];
+    }
+    let inv_sum = 1.0 / sum;
+    #[cfg(target_arch = "x86_64")]
+    {
+        if has_avx2() {
+            unsafe {
+                let n = out.len();
+                let chunks = n / 8;
+                let vs = _mm256_set1_ps(inv_sum);
+                for c in 0..chunks {
+                    let v = _mm256_loadu_ps(out.as_ptr().add(c * 8));
+                    _mm256_storeu_ps(out.as_mut_ptr().add(c * 8), _mm256_mul_ps(v, vs));
+                }
+                for i in (chunks * 8)..n { out[i] *= inv_sum; }
+            }
+            return;
+        }
+    }
+    for v in out.iter_mut() { *v *= inv_sum; }
+}
+
+/// Layer normalization: out = gamma * (x - mean) / sqrt(var + eps) + beta.
+pub fn simd_layernorm_f32(a: &[f32], gamma: &[f32], beta: &[f32], eps: f32, out: &mut [f32]) {
+    let n = a.len();
+    assert_eq!(n, gamma.len());
+    assert_eq!(n, beta.len());
+    assert_eq!(n, out.len());
+    if n == 0 { return; }
+    // Compute mean
+    let mean: f32 = a.iter().sum::<f32>() / n as f32;
+    // Compute variance
+    let var: f32 = a.iter().map(|x| (x - mean) * (x - mean)).sum::<f32>() / n as f32;
+    let inv_std = 1.0 / (var + eps).sqrt();
+    for i in 0..n {
+        out[i] = gamma[i] * (a[i] - mean) * inv_std + beta[i];
+    }
+}
+
+/// SIMD-accelerated matrix multiply: C = A * B.
+/// A is (m x k), B is (k x n), result is (m x n). Row-major layout.
+/// Uses tiling for cache efficiency and simd_dot_f32 for inner products.
+pub fn simd_matmul_f32(a: &[f32], b: &[f32], m: usize, k: usize, n: usize) -> Vec<f32> {
+    assert_eq!(a.len(), m * k, "simd_matmul_f32: A size mismatch");
+    assert_eq!(b.len(), k * n, "simd_matmul_f32: B size mismatch");
+    let mut c = vec![0.0f32; m * n];
+    // Transpose B for better cache locality (row-access in dot product)
+    let mut bt = vec![0.0f32; k * n];
+    for j in 0..n {
+        for p in 0..k {
+            bt[j * k + p] = b[p * n + j];
+        }
+    }
+    const TILE: usize = 32;
+    // Tiled over m and n
+    for i0 in (0..m).step_by(TILE) {
+        let i_end = (i0 + TILE).min(m);
+        for j0 in (0..n).step_by(TILE) {
+            let j_end = (j0 + TILE).min(n);
+            for i in i0..i_end {
+                let a_row = &a[i * k..(i + 1) * k];
+                for j in j0..j_end {
+                    let b_col = &bt[j * k..(j + 1) * k];
+                    c[i * n + j] = simd_dot_f32(a_row, b_col);
+                }
+            }
+        }
+    }
+    c
+}
+
 // ─── Tests ───────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -1473,5 +1752,118 @@ mod tests {
     fn test_strides_col_major() {
         let s = compute_strides(&[2, 3, 4], Layout::ColMajor);
         assert_eq!(s, vec![1, 2, 6]);
+    }
+
+    // ─── SIMD operation tests ────────────────────────────────────────────────
+
+    #[test]
+    fn test_simd_dot_f32() {
+        let a = vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0];
+        let b = vec![10.0f32, 9.0, 8.0, 7.0, 6.0, 5.0, 4.0, 3.0, 2.0, 1.0];
+        let result = simd_dot_f32(&a, &b);
+        let expected: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
+        assert!((result - expected).abs() < 1e-3, "dot: got {}, expected {}", result, expected);
+    }
+
+    #[test]
+    fn test_simd_add_f32() {
+        let a = vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0];
+        let b = vec![9.0f32, 8.0, 7.0, 6.0, 5.0, 4.0, 3.0, 2.0, 1.0];
+        let mut out = vec![0.0f32; 9];
+        simd_add_f32(&a, &b, &mut out);
+        for i in 0..9 { assert!((out[i] - (a[i] + b[i])).abs() < 1e-6); }
+    }
+
+    #[test]
+    fn test_simd_mul_f32() {
+        let a = vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0];
+        let b = vec![9.0f32, 8.0, 7.0, 6.0, 5.0, 4.0, 3.0, 2.0, 1.0];
+        let mut out = vec![0.0f32; 9];
+        simd_mul_f32(&a, &b, &mut out);
+        for i in 0..9 { assert!((out[i] - (a[i] * b[i])).abs() < 1e-6); }
+    }
+
+    #[test]
+    fn test_simd_scale_f32() {
+        let a = vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0];
+        let mut out = vec![0.0f32; 9];
+        simd_scale_f32(&a, 3.0, &mut out);
+        for i in 0..9 { assert!((out[i] - a[i] * 3.0).abs() < 1e-6); }
+    }
+
+    #[test]
+    fn test_simd_relu_f32() {
+        let a = vec![-3.0f32, -1.0, 0.0, 1.0, 3.0, -0.5, 0.5, -2.0, 2.0];
+        let mut out = vec![0.0f32; 9];
+        simd_relu_f32(&a, &mut out);
+        for i in 0..9 { assert_eq!(out[i], a[i].max(0.0)); }
+    }
+
+    #[test]
+    fn test_simd_gelu_f32() {
+        let a = vec![0.0f32, 1.0, -1.0, 2.0, -2.0];
+        let mut out = vec![0.0f32; 5];
+        simd_gelu_f32(&a, &mut out);
+        // GELU(0) ≈ 0
+        assert!(out[0].abs() < 1e-5);
+        // GELU(x) > 0 for x > 0
+        assert!(out[1] > 0.0);
+        // GELU(-x) < 0 for moderate negative x
+        assert!(out[2] < 0.0);
+    }
+
+    #[test]
+    fn test_simd_silu_f32() {
+        let a = vec![0.0f32, 1.0, -1.0, 5.0];
+        let mut out = vec![0.0f32; 4];
+        simd_silu_f32(&a, &mut out);
+        // SiLU(0) = 0
+        assert!(out[0].abs() < 1e-6);
+        // SiLU(x) ≈ x for large positive x
+        assert!((out[3] - 5.0).abs() < 0.1);
+    }
+
+    #[test]
+    fn test_simd_softmax_f32() {
+        let a = vec![1.0f32, 2.0, 3.0, 4.0];
+        let mut out = vec![0.0f32; 4];
+        simd_softmax_f32(&a, &mut out);
+        let sum: f32 = out.iter().sum();
+        assert!((sum - 1.0).abs() < 1e-5, "softmax sum = {}", sum);
+        // Monotonicity
+        for i in 0..3 { assert!(out[i] < out[i + 1]); }
+    }
+
+    #[test]
+    fn test_simd_layernorm_f32() {
+        let a = vec![1.0f32, 2.0, 3.0, 4.0];
+        let gamma = vec![1.0f32; 4];
+        let beta = vec![0.0f32; 4];
+        let mut out = vec![0.0f32; 4];
+        simd_layernorm_f32(&a, &gamma, &beta, 1e-5, &mut out);
+        // Mean of output should be ~0
+        let mean: f32 = out.iter().sum::<f32>() / 4.0;
+        assert!(mean.abs() < 1e-5, "layernorm mean = {}", mean);
+    }
+
+    #[test]
+    fn test_simd_matmul_f32() {
+        // 2x3 * 3x2 = 2x2
+        let a = vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let b = vec![7.0f32, 8.0, 9.0, 10.0, 11.0, 12.0];
+        let c = simd_matmul_f32(&a, &b, 2, 3, 2);
+        assert_eq!(c.len(), 4);
+        // Row 0: [1*7+2*9+3*11, 1*8+2*10+3*12] = [58, 64]
+        assert!((c[0] - 58.0).abs() < 1e-3);
+        assert!((c[1] - 64.0).abs() < 1e-3);
+        // Row 1: [4*7+5*9+6*11, 4*8+5*10+6*12] = [139, 154]
+        assert!((c[2] - 139.0).abs() < 1e-3);
+        assert!((c[3] - 154.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn test_simd_available() {
+        let info = simd_available();
+        assert!(!info.is_empty());
     }
 }

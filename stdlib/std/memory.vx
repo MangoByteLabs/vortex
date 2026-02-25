@@ -1,0 +1,40 @@
+// std/memory.vx — Safe memory management
+// A buffer is represented as [ptr, size] (2-element array)
+
+fn buffer_new(size: i64) -> [i64] {
+    let ptr = mem_alloc(size)
+    return [ptr_to_int(ptr), size]
+}
+
+fn buffer_free(buf: [i64]) {
+    mem_free(int_to_ptr(buf[0]))
+}
+
+fn buffer_write_u8(buf: [i64], offset: i64, val: i64) -> i64 {
+    if offset >= buf[1] { return 0 - 1 }
+    mem_write_u8(ptr_add(int_to_ptr(buf[0]), offset), val)
+    return 0
+}
+
+fn buffer_read_u8(buf: [i64], offset: i64) -> i64 {
+    if offset >= buf[1] { return 0 - 1 }
+    return mem_read_u8(ptr_add(int_to_ptr(buf[0]), offset))
+}
+
+fn buffer_write_string(buf: [i64], offset: i64, s: String) -> i64 {
+    if offset + len(s) > buf[1] { return 0 - 1 }
+    mem_write_string(ptr_add(int_to_ptr(buf[0]), offset), s)
+    return 0
+}
+
+fn buffer_read_string(buf: [i64], offset: i64, n: i64) -> String {
+    if offset + n > buf[1] { return "" }
+    return mem_read_string(ptr_add(int_to_ptr(buf[0]), offset), n)
+}
+
+fn buffer_copy(dst: [i64], dst_offset: i64, src: [i64], src_offset: i64, n: i64) -> i64 {
+    if dst_offset + n > dst[1] { return 0 - 1 }
+    if src_offset + n > src[1] { return 0 - 1 }
+    mem_copy(ptr_add(int_to_ptr(dst[0]), dst_offset), ptr_add(int_to_ptr(src[0]), src_offset), n)
+    return 0
+}

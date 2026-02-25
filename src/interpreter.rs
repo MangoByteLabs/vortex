@@ -85,6 +85,8 @@ pub enum Value {
     LiveModel { id: usize },
     /// ZK proof value
     ZkProof(crate::zkp::Proof),
+    /// Raw memory pointer (for FFI / self-hosting)
+    Pointer(usize),
 }
 
 impl fmt::Display for Value {
@@ -165,6 +167,7 @@ impl fmt::Display for Value {
             Value::Continue => write!(f, "<continue>"),
             Value::LiveModel { id } => write!(f, "<live model #{}>", id),
             Value::ZkProof(p) => write!(f, "<proof constraints={} output={}>", p.num_constraints, p.output),
+            Value::Pointer(addr) => write!(f, "<ptr 0x{:x}>", addr),
         }
     }
 }
@@ -1128,6 +1131,34 @@ impl Env {
 
         // KV cache + paged attention
         crate::kv_cache::register_builtins(self);
+
+        // GGUF loader
+        crate::gguf_loader::register_builtins(self);
+
+        // Vortex ISA
+        crate::vortex_isa::register_builtins(self);
+
+        // DRM GPU driver
+        crate::drm_driver::register_builtins(self);
+
+        // Data loader
+        crate::data_loader::register_builtins(self);
+
+        // SIMT execution engine
+        crate::simt_engine::register_builtins(self);
+
+        // Inference server
+        crate::inference_server::register_builtins(self);
+
+        // Transformer
+        crate::transformer::register_builtins(self);
+
+        // Self-hosting foundation: raw memory, syscalls/FFI, C structs, threads, parser combinators
+        crate::raw_memory::register_builtins(self);
+        crate::syscall_ffi::register_builtins(self);
+        crate::c_struct::register_builtins(self);
+        crate::thread_runtime::register_builtins(self);
+        crate::parser_combinators::register_builtins(self);
 
         // Math constants
         self.define("PI", Value::Float(std::f64::consts::PI));

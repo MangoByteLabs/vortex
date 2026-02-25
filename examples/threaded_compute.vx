@@ -1,0 +1,43 @@
+// Threaded computation with channels and atomics
+fn main() {
+    println("CPU cores: " + str(cpu_count()))
+
+    // Create a channel for results
+    let ch = channel_create()
+
+    // Spawn 4 workers
+    for i in range(0, 4) {
+        let worker_id = i
+        let chan = ch
+        thread_spawn(|| {
+            // Each worker computes sum of a range
+            var total = 0
+            let start = worker_id * 1000
+            for j in range(start, start + 1000) {
+                total = total + j
+            }
+            channel_send(chan, total)
+        })
+    }
+
+    // Collect results
+    var grand_total = 0
+    for i in range(0, 4) {
+        let result = channel_recv(ch)
+        println("Worker result: " + str(result))
+        grand_total = grand_total + result
+    }
+
+    println("Grand total: " + str(grand_total))
+
+    // Verify with atomic counter
+    let counter = atomic_new(0)
+    let m = mutex_new(0)
+    for i in range(0, 10) {
+        thread_spawn(|| {
+            atomic_add(counter, 1)
+        })
+    }
+    sleep_ms(100)
+    println("Atomic counter: " + str(atomic_load(counter)))
+}

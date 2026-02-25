@@ -1,0 +1,359 @@
+// Vortex Self-Hosting Lexer
+// Tokenizes Vortex source code into a token stream.
+// Part of the self-hosting compiler pipeline: lexer -> parser -> codegen
+
+// --- Token type constants ---
+let TK_INT = "INT"
+let TK_FLOAT = "FLOAT"
+let TK_STRING = "STRING"
+let TK_IDENT = "IDENT"
+let TK_KEYWORD = "KEYWORD"
+let TK_PLUS = "PLUS"
+let TK_MINUS = "MINUS"
+let TK_STAR = "STAR"
+let TK_SLASH = "SLASH"
+let TK_PERCENT = "PERCENT"
+let TK_EQ = "EQ"
+let TK_EQEQ = "EQEQ"
+let TK_NEQ = "NEQ"
+let TK_LT = "LT"
+let TK_GT = "GT"
+let TK_LTEQ = "LTEQ"
+let TK_GTEQ = "GTEQ"
+let TK_AND = "AND"
+let TK_OR = "OR"
+let TK_NOT = "NOT"
+let TK_LPAREN = "LPAREN"
+let TK_RPAREN = "RPAREN"
+let TK_LBRACE = "LBRACE"
+let TK_RBRACE = "RBRACE"
+let TK_LBRACKET = "LBRACKET"
+let TK_RBRACKET = "RBRACKET"
+let TK_COMMA = "COMMA"
+let TK_DOT = "DOT"
+let TK_COLON = "COLON"
+let TK_ARROW = "ARROW"
+let TK_PIPE = "PIPE"
+let TK_QUESTION = "QUESTION"
+let TK_EOF = "EOF"
+
+// --- Keywords ---
+let KEYWORDS = [
+    "fn", "let", "var", "if", "else", "for", "while", "in",
+    "return", "true", "false", "struct", "enum", "impl", "trait",
+    "match", "import", "break", "continue", "pub", "mut", "self"
+]
+
+fn is_keyword(word) {
+    for i in range(0, len(KEYWORDS)) {
+        if KEYWORDS[i] == word {
+            return true
+        }
+    }
+    return false
+}
+
+// --- Token constructor ---
+fn token(typ, value, line, col) {
+    return {"type": typ, "value": value, "line": line, "col": col}
+}
+
+// --- Main lexer ---
+fn lex(source) {
+    let tokens = []
+    var pos = 0
+    var line = 1
+    var col = 1
+    let src_len = len(source)
+
+    while pos < src_len {
+        let ch = str_char_at(source, pos)
+
+        // Skip whitespace
+        if str_is_ascii_whitespace(ch) {
+            if ch == "\n" {
+                line = line + 1
+                col = 1
+            } else {
+                col = col + 1
+            }
+            pos = pos + 1
+            continue
+        }
+
+        // Skip line comments
+        if ch == "/" {
+            if pos + 1 < src_len {
+                let next = str_char_at(source, pos + 1)
+                if next == "/" {
+                    pos = pos + 2
+                    col = col + 2
+                    while pos < src_len {
+                        let cc = str_char_at(source, pos)
+                        if cc == "\n" {
+                            break
+                        }
+                        pos = pos + 1
+                        col = col + 1
+                    }
+                    continue
+                }
+            }
+        }
+
+        // Numbers (integer or float)
+        if str_is_ascii_digit(ch) {
+            let start = pos
+            let start_col = col
+            while pos < src_len {
+                let c = str_char_at(source, pos)
+                if str_is_ascii_digit(c) {
+                    pos = pos + 1
+                    col = col + 1
+                } else {
+                    break
+                }
+            }
+            // Check for float
+            if pos < src_len {
+                let c = str_char_at(source, pos)
+                if c == "." {
+                    if pos + 1 < src_len {
+                        let after_dot = str_char_at(source, pos + 1)
+                        if str_is_ascii_digit(after_dot) {
+                            pos = pos + 1
+                            col = col + 1
+                            while pos < src_len {
+                                let d = str_char_at(source, pos)
+                                if str_is_ascii_digit(d) {
+                                    pos = pos + 1
+                                    col = col + 1
+                                } else {
+                                    break
+                                }
+                            }
+                            let val = str_substr(source, start, pos - start)
+                            push(tokens, token(TK_FLOAT, val, line, start_col))
+                            continue
+                        }
+                    }
+                }
+            }
+            let val = str_substr(source, start, pos - start)
+            push(tokens, token(TK_INT, val, line, start_col))
+            continue
+        }
+
+        // Identifiers and keywords
+        if str_is_ascii_alpha(ch) {
+            let start = pos
+            let start_col = col
+            while pos < src_len {
+                let c = str_char_at(source, pos)
+                if str_is_ascii_alpha(c) {
+                    pos = pos + 1
+                    col = col + 1
+                } else if str_is_ascii_digit(c) {
+                    pos = pos + 1
+                    col = col + 1
+                } else if c == "_" {
+                    pos = pos + 1
+                    col = col + 1
+                } else {
+                    break
+                }
+            }
+            let word = str_substr(source, start, pos - start)
+            if is_keyword(word) {
+                push(tokens, token(TK_KEYWORD, word, line, start_col))
+            } else {
+                let interned = str_intern(word)
+                push(tokens, token(TK_IDENT, word, line, start_col))
+            }
+            continue
+        }
+
+        // Also allow underscore-leading identifiers
+        if ch == "_" {
+            let start = pos
+            let start_col = col
+            pos = pos + 1
+            col = col + 1
+            while pos < src_len {
+                let c = str_char_at(source, pos)
+                if str_is_ascii_alpha(c) {
+                    pos = pos + 1
+                    col = col + 1
+                } else if str_is_ascii_digit(c) {
+                    pos = pos + 1
+                    col = col + 1
+                } else if c == "_" {
+                    pos = pos + 1
+                    col = col + 1
+                } else {
+                    break
+                }
+            }
+            let word = str_substr(source, start, pos - start)
+            let interned = str_intern(word)
+            push(tokens, token(TK_IDENT, word, line, start_col))
+            continue
+        }
+
+        // String literals
+        if ch == "\"" {
+            let start_col = col
+            pos = pos + 1
+            col = col + 1
+            var buf = ""
+            while pos < src_len {
+                let c = str_char_at(source, pos)
+                if c == "\\" {
+                    pos = pos + 1
+                    col = col + 1
+                    if pos < src_len {
+                        let esc = str_char_at(source, pos)
+                        if esc == "n" {
+                            buf = buf + "\n"
+                        } else if esc == "t" {
+                            buf = buf + "\t"
+                        } else if esc == "\\" {
+                            buf = buf + "\\"
+                        } else if esc == "\"" {
+                            buf = buf + "\""
+                        } else {
+                            buf = buf + esc
+                        }
+                        pos = pos + 1
+                        col = col + 1
+                    }
+                } else if c == "\"" {
+                    pos = pos + 1
+                    col = col + 1
+                    break
+                } else {
+                    if c == "\n" {
+                        line = line + 1
+                        col = 1
+                    } else {
+                        col = col + 1
+                    }
+                    buf = buf + c
+                    pos = pos + 1
+                }
+            }
+            push(tokens, token(TK_STRING, buf, line, start_col))
+            continue
+        }
+
+        // Two-character operators
+        if pos + 1 < src_len {
+            let two = str_substr(source, pos, 2)
+            if two == "==" {
+                push(tokens, token(TK_EQEQ, "==", line, col))
+                pos = pos + 2
+                col = col + 2
+                continue
+            }
+            if two == "!=" {
+                push(tokens, token(TK_NEQ, "!=", line, col))
+                pos = pos + 2
+                col = col + 2
+                continue
+            }
+            if two == "<=" {
+                push(tokens, token(TK_LTEQ, "<=", line, col))
+                pos = pos + 2
+                col = col + 2
+                continue
+            }
+            if two == ">=" {
+                push(tokens, token(TK_GTEQ, ">=", line, col))
+                pos = pos + 2
+                col = col + 2
+                continue
+            }
+            if two == "&&" {
+                push(tokens, token(TK_AND, "&&", line, col))
+                pos = pos + 2
+                col = col + 2
+                continue
+            }
+            if two == "||" {
+                push(tokens, token(TK_OR, "||", line, col))
+                pos = pos + 2
+                col = col + 2
+                continue
+            }
+            if two == "->" {
+                push(tokens, token(TK_ARROW, "->", line, col))
+                pos = pos + 2
+                col = col + 2
+                continue
+            }
+        }
+
+        // Single-character tokens
+        let start_col = col
+        if ch == "+" {
+            push(tokens, token(TK_PLUS, "+", line, start_col))
+        } else if ch == "-" {
+            push(tokens, token(TK_MINUS, "-", line, start_col))
+        } else if ch == "*" {
+            push(tokens, token(TK_STAR, "*", line, start_col))
+        } else if ch == "/" {
+            push(tokens, token(TK_SLASH, "/", line, start_col))
+        } else if ch == "%" {
+            push(tokens, token(TK_PERCENT, "%", line, start_col))
+        } else if ch == "=" {
+            push(tokens, token(TK_EQ, "=", line, start_col))
+        } else if ch == "<" {
+            push(tokens, token(TK_LT, "<", line, start_col))
+        } else if ch == ">" {
+            push(tokens, token(TK_GT, ">", line, start_col))
+        } else if ch == "!" {
+            push(tokens, token(TK_NOT, "!", line, start_col))
+        } else if ch == "(" {
+            push(tokens, token(TK_LPAREN, "(", line, start_col))
+        } else if ch == ")" {
+            push(tokens, token(TK_RPAREN, ")", line, start_col))
+        } else if ch == "{" {
+            push(tokens, token(TK_LBRACE, "{", line, start_col))
+        } else if ch == "}" {
+            push(tokens, token(TK_RBRACE, "}", line, start_col))
+        } else if ch == "[" {
+            push(tokens, token(TK_LBRACKET, "[", line, start_col))
+        } else if ch == "]" {
+            push(tokens, token(TK_RBRACKET, "]", line, start_col))
+        } else if ch == "," {
+            push(tokens, token(TK_COMMA, ",", line, start_col))
+        } else if ch == "." {
+            push(tokens, token(TK_DOT, ".", line, start_col))
+        } else if ch == ":" {
+            push(tokens, token(TK_COLON, ":", line, start_col))
+        } else if ch == "|" {
+            push(tokens, token(TK_PIPE, "|", line, start_col))
+        } else if ch == "?" {
+            push(tokens, token(TK_QUESTION, "?", line, start_col))
+        } else {
+            // Unknown character - skip it
+            println("lexer: unexpected character '" + ch + "' at line " + line)
+        }
+
+        pos = pos + 1
+        col = col + 1
+    }
+
+    push(tokens, token(TK_EOF, "", line, col))
+    return tokens
+}
+
+// --- Test ---
+fn main() {
+    let source = "fn add(a, b) { return a + b }"
+    let tokens = lex(source)
+    for i in range(0, len(tokens)) {
+        let t = tokens[i]
+        println(t["type"] + ": " + t["value"])
+    }
+}

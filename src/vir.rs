@@ -339,6 +339,32 @@ pub enum VirInstKind {
 
     // -- Function parameter --
     Param(usize),
+
+    // -- GPU / SIMT intrinsics --
+    /// Thread index within block (axis: 0=x, 1=y, 2=z)
+    ThreadId { axis: u8 },
+    /// Block index within grid (axis: 0=x, 1=y, 2=z)
+    BlockId { axis: u8 },
+    /// Block dimension (axis: 0=x, 1=y, 2=z)
+    BlockDim { axis: u8 },
+    /// Barrier synchronization across threads in a block
+    Barrier,
+    /// Allocate shared memory within a block
+    SharedAlloca { ty: VirType, count: usize },
+    /// Load from shared memory
+    SharedLoad { ptr: VirId },
+    /// Store to shared memory
+    SharedStore { ptr: VirId, val: VirId },
+    /// Atomic add on global/shared memory
+    AtomicAdd { ptr: VirId, val: VirId },
+    /// Atomic compare-and-swap
+    AtomicCAS { ptr: VirId, cmp: VirId, val: VirId },
+    /// Warp shuffle (read register from lane at offset)
+    WarpShuffle { src: VirId, offset: u32 },
+    /// Warp-level sum reduction
+    WarpReduceSum { val: VirId },
+    /// Warp-level max reduction
+    WarpReduceMax { val: VirId },
 }
 
 impl VirInstKind {
@@ -458,6 +484,20 @@ impl VirInstKind {
 
             VirInstKind::Phi(pairs) => pairs.iter().map(|(id, _)| *id).collect(),
             VirInstKind::Call(_, args) => args.clone(),
+
+            // GPU / SIMT
+            VirInstKind::ThreadId { .. }
+            | VirInstKind::BlockId { .. }
+            | VirInstKind::BlockDim { .. }
+            | VirInstKind::Barrier
+            | VirInstKind::SharedAlloca { .. } => vec![],
+            VirInstKind::SharedLoad { ptr } => vec![*ptr],
+            VirInstKind::SharedStore { ptr, val } => vec![*ptr, *val],
+            VirInstKind::AtomicAdd { ptr, val } => vec![*ptr, *val],
+            VirInstKind::AtomicCAS { ptr, cmp, val } => vec![*ptr, *cmp, *val],
+            VirInstKind::WarpShuffle { src, .. } => vec![*src],
+            VirInstKind::WarpReduceSum { val } => vec![*val],
+            VirInstKind::WarpReduceMax { val } => vec![*val],
         }
     }
 }
@@ -661,6 +701,19 @@ impl fmt::Display for VirInst {
             }
             VirInstKind::Cast(v, ty) => write!(f, "cast %{} to {}", v, ty),
             VirInstKind::Param(idx) => write!(f, "param {}", idx),
+            // GPU / SIMT
+            VirInstKind::ThreadId { axis } => write!(f, "thread_id.{}", ["x","y","z"][*axis as usize]),
+            VirInstKind::BlockId { axis } => write!(f, "block_id.{}", ["x","y","z"][*axis as usize]),
+            VirInstKind::BlockDim { axis } => write!(f, "block_dim.{}", ["x","y","z"][*axis as usize]),
+            VirInstKind::Barrier => write!(f, "barrier"),
+            VirInstKind::SharedAlloca { ty, count } => write!(f, "shared_alloca {} x {}", ty, count),
+            VirInstKind::SharedLoad { ptr } => write!(f, "shared_load %{}", ptr),
+            VirInstKind::SharedStore { ptr, val } => write!(f, "shared_store %{}, %{}", ptr, val),
+            VirInstKind::AtomicAdd { ptr, val } => write!(f, "atomic_add %{}, %{}", ptr, val),
+            VirInstKind::AtomicCAS { ptr, cmp, val } => write!(f, "atomic_cas %{}, %{}, %{}", ptr, cmp, val),
+            VirInstKind::WarpShuffle { src, offset } => write!(f, "warp_shuffle %{}, {}", src, offset),
+            VirInstKind::WarpReduceSum { val } => write!(f, "warp_reduce_sum %{}", val),
+            VirInstKind::WarpReduceMax { val } => write!(f, "warp_reduce_max %{}", val),
         }
     }
 }
@@ -1706,7 +1759,11 @@ pub fn dead_code_eliminate(module: &mut VirModule) {
                     VirInstKind::Store(_, _)
                     | VirInstKind::TensorStore(_, _, _)
                     | VirInstKind::Call(_, _)
-                    | VirInstKind::Param(_) => true,
+                    | VirInstKind::Param(_)
+                    | VirInstKind::Barrier
+                    | VirInstKind::SharedStore { .. }
+                    | VirInstKind::AtomicAdd { .. }
+                    | VirInstKind::AtomicCAS { .. } => true,
                     _ => used.contains(&inst.id),
                 }
             });
@@ -2026,7 +2083,19 @@ fn rewrite_uses(kind: &mut VirInstKind, map: &HashMap<VirId, VirId>) {
         | VirInstKind::ConstInt(_)
         | VirInstKind::ConstFloat(_)
         | VirInstKind::ConstBool(_)
-        | VirInstKind::Param(_) => {}
+        | VirInstKind::Param(_)
+        | VirInstKind::ThreadId { .. }
+        | VirInstKind::BlockId { .. }
+        | VirInstKind::BlockDim { .. }
+        | VirInstKind::Barrier
+        | VirInstKind::SharedAlloca { .. } => {}
+        VirInstKind::SharedLoad { ptr } => { r(ptr, map); }
+        VirInstKind::SharedStore { ptr, val } => { r(ptr, map); r(val, map); }
+        VirInstKind::AtomicAdd { ptr, val } => { r(ptr, map); r(val, map); }
+        VirInstKind::AtomicCAS { ptr, cmp, val } => { r(ptr, map); r(cmp, map); r(val, map); }
+        VirInstKind::WarpShuffle { src, .. } => { r(src, map); }
+        VirInstKind::WarpReduceSum { val } => { r(val, map); }
+        VirInstKind::WarpReduceMax { val } => { r(val, map); }
     }
 }
 

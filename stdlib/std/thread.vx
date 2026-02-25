@@ -1,0 +1,66 @@
+// std/thread.vx — Threading abstractions
+
+fn spawn(func: i64) -> i64 {
+    return thread_spawn(func)
+}
+
+fn join(handle: i64) -> i64 {
+    return thread_join(handle)
+}
+
+fn parallel_map(items: i64, func: i64) -> i64 {
+    let n = len(items)
+    let ch = channel_create()
+
+    for i in range(0, n) {
+        let item = items[i]
+        let idx = i
+        let chan = ch
+        thread_spawn(|| {
+            let result = func(item)
+            channel_send(chan, [idx, result])
+        })
+    }
+
+    var results = []
+    for i in range(0, n) {
+        push(results, None)
+    }
+    for i in range(0, n) {
+        let pair = channel_recv(ch)
+        results[pair[0]] = pair[1]
+    }
+    return results
+}
+
+fn parallel_reduce(items: i64, func: i64, initial: i64) -> i64 {
+    let n = len(items)
+    if n == 0 { return initial }
+    if n == 1 { return func(initial, items[0]) }
+
+    let mid = n / 2
+    let ch = channel_create()
+
+    thread_spawn(|| {
+        var acc = initial
+        for i in range(0, mid) {
+            acc = func(acc, items[i])
+        }
+        channel_send(ch, acc)
+    })
+
+    var acc = initial
+    for i in range(mid, n) {
+        acc = func(acc, items[i])
+    }
+
+    let left = channel_recv(ch)
+    return func(left, acc)
+}
+
+fn with_mutex(mtx: i64, func: i64) -> i64 {
+    let val = mutex_lock(mtx)
+    let result = func(val)
+    mutex_unlock(mtx, result)
+    return result
+}

@@ -1,0 +1,56 @@
+// std/io.vx — File I/O for Vortex
+// Uses raw syscalls and memory builtins
+
+fn file_open(path: String, mode: String) -> i64 {
+    let path_ptr = mem_alloc(len(path) + 1)
+    mem_write_string(path_ptr, path)
+
+    var flags = 0
+    if mode == "r" {
+        flags = O_RDONLY
+    } else if mode == "w" {
+        flags = O_WRONLY + O_CREAT + O_TRUNC
+    } else if mode == "a" {
+        flags = O_WRONLY + O_CREAT + O_APPEND
+    } else if mode == "rw" {
+        flags = O_RDWR + O_CREAT
+    }
+
+    let fd = syscall3(SYS_OPEN, ptr_to_int(path_ptr), flags, 420)
+    mem_free(path_ptr)
+    return fd
+}
+
+fn file_read(fd: i64, max_bytes: i64) -> String {
+    let buf = mem_alloc(max_bytes)
+    let n = syscall3(SYS_READ, fd, ptr_to_int(buf), max_bytes)
+    let content = mem_read_string(buf, n)
+    mem_free(buf)
+    return content
+}
+
+fn file_write(fd: i64, data: String) -> i64 {
+    let buf = mem_alloc(len(data))
+    mem_write_string(buf, data)
+    let n = syscall3(SYS_WRITE, fd, ptr_to_int(buf), len(data))
+    mem_free(buf)
+    return n
+}
+
+fn file_close(fd: i64) -> i64 {
+    return syscall1(SYS_CLOSE, fd)
+}
+
+fn read_file(path: String) -> String {
+    let fd = file_open(path, "r")
+    let content = file_read(fd, 1048576)
+    file_close(fd)
+    return content
+}
+
+fn write_file(path: String, content: String) -> i64 {
+    let fd = file_open(path, "w")
+    let result = file_write(fd, content)
+    file_close(fd)
+    return result
+}

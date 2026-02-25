@@ -639,28 +639,38 @@ fn command_output_timeout(mut cmd: Command) -> Result<Output, String> {
         .map_err(|e| format!("failed to collect output: {}", e))
 }
 
-/// Find a tool by trying versioned and unversioned names
+/// Find a tool by trying versioned and unversioned names.
+/// Uses native PATH lookup (no subprocess spawning) for speed.
 fn find_tool(base_name: &str) -> Option<String> {
     // Try versioned names first (e.g., mlir-opt-20, mlir-opt-19, etc.)
     for version in (14..=22).rev() {
         let versioned = format!("{}-{}", base_name, version);
-        if tool_exists(&versioned) {
+        if tool_exists_in_path(&versioned) {
             return Some(versioned);
         }
     }
     // Try unversioned
-    if tool_exists(base_name) {
+    if tool_exists_in_path(base_name) {
         return Some(base_name.to_string());
     }
     None
 }
 
+/// Check if a tool exists in PATH without spawning a subprocess.
+fn tool_exists_in_path(name: &str) -> bool {
+    if let Ok(path_var) = std::env::var("PATH") {
+        for dir in path_var.split(':') {
+            let candidate = std::path::Path::new(dir).join(name);
+            if candidate.is_file() {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 fn tool_exists(name: &str) -> bool {
-    Command::new("which")
-        .arg(name)
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+    tool_exists_in_path(name)
 }
 
 /// Check if a function has the @gpu or @jit annotation
