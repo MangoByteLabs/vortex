@@ -2,23 +2,13 @@
 // Pipeline: AST (from parser.vx) -> bytecode string instructions -> VM execution
 // Self-contained: includes compiler + inline VM for testing
 //
-// AST format (flat string arrays):
-//   Expressions: ["int", "42"], ["ident", "x"], ["+", left, right],
-//                ["call", "fname", arg1, arg2], ["string", "hello"],
-//                ["array", elem1, ...], ["index", arr, idx],
-//                ["len", expr], ["push", arr, val]
-//   Statements:  ["let", "x", expr...], ["var", "x", expr...],
-//                ["assign", "x", expr...], ["return", expr...],
-//                ["println", expr...], ["print_str", expr...],
-//                ["if", cond..., "THEN", then_stmts, "ELSE", else_stmts],
-//                ["while", cond..., "BODY", body_stmts],
-//                ["expr_stmt", expr...]
-//   Functions:   ["fn", "name", "PARAMS", p1, p2, ..., "BODY", stmt1, ...]
+// Instead of encoding AST as strings, we build bytecode directly using
+// helper functions that append to a code array. Tests construct AST by
+// calling compiler functions directly.
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 fn _nl() -> String { return str_from_bytes([10]) }
-fn _pipe() -> String { return str_from_bytes([124]) }
 
 fn sw(s: String, prefix: String) -> bool {
     if len(s) < len(prefix) { return false }
@@ -33,179 +23,6 @@ fn find_idx(haystack: String, needle: String) -> i64 {
     return unwrap_or(str_find(haystack, needle), -1)
 }
 
-// ── Compiler state: we pass arrays around ─────────────────────────────────────
-// code: [String] — emitted instructions (same format as vm.vx)
-// locals: [String] — flat [name, name, ...] for current function scope
-// label_counter: tracked via a global-ish counter encoded in a 1-element array
-
-fn emit(code: [String], instr: String) -> [String] {
-    return push(code, instr)
-}
-
-// ── Expression compiler ───────────────────────────────────────────────────────
-// An expression is encoded as a flat string array.
-// We need to know where an expression ends, so we use a recursive approach
-// that returns [code..., "##EXPREND##", consumed_count_str]
-// Actually simpler: expressions are pre-packaged as nested-via-encoding.
-//
-// For simplicity, we encode compound expressions as a single string with
-// a prefix tag system:
-//   "INT:42"         integer literal
-//   "STR:hello"      string literal
-//   "ID:x"           identifier
-//   "ADD:a|||b"       binary op (a and b are encoded exprs, ||| separated)
-//   "SUB:a|||b"
-//   "MUL:a|||b"
-//   "DIV:a|||b"
-//   "MOD:a|||b"
-//   "EQ:a|||b"  "NEQ:a|||b"  "LT:a|||b"  "GT:a|||b"  "LTEQ:a|||b"  "GTEQ:a|||b"
-//   "CALL:fname|||arg1|||arg2|||..."
-//   "NEG:a"
-//   "NOT:a"
-//   "AND:a|||b"  "OR:a|||b"
-//
-// Statements are encoded similarly:
-//   "LET:name|||expr"
-//   "VAR:name|||expr"
-//   "ASSIGN:name|||expr"
-//   "RETURN:expr"
-//   "PRINTLN:expr"
-//   "PRINT_STR:expr"
-//   "IF:cond|||then_count|||s1|||s2...|||else_count|||s1|||s2..."
-//   "WHILE:cond|||body_count|||s1|||s2..."
-//   "EXPR_STMT:expr"
-//
-// Functions:
-//   "FN:name|||param_count|||p1|||p2...|||body_count|||s1|||s2..."
-
-fn _sep() -> String { return "|||" }
-
-fn _split3(s: String) -> [String] {
-    var parts: [String] = []
-    var sep = _sep()
-    var seplen = len(sep)
-    var cur = ""
-    var i = 0
-    while i < len(s) {
-        if i + seplen <= len(s) {
-            var chunk = str_substr(s, i, i + seplen)
-            if chunk == sep {
-                parts = push(parts, cur)
-                cur = ""
-                i = i + seplen
-            } else {
-                cur = cur + str_substr(s, i, i + 1)
-                i = i + 1
-            }
-        } else {
-            cur = cur + str_substr(s, i, i + 1)
-            i = i + 1
-        }
-    }
-    parts = push(parts, cur)
-    return parts
-}
-
-// ── Expression constructors ──────────────────────────────────────────────────
-
-fn expr_int(n: i64) -> String { return "INT:" + to_string(n) }
-fn expr_str(s: String) -> String { return "STR:" + s }
-fn expr_id(name: String) -> String { return "ID:" + name }
-fn expr_bin(op: String, a: String, b: String) -> String {
-    return op + ":" + a + _sep() + b
-}
-fn expr_add(a: String, b: String) -> String { return expr_bin("ADD", a, b) }
-fn expr_sub(a: String, b: String) -> String { return expr_bin("SUB", a, b) }
-fn expr_mul(a: String, b: String) -> String { return expr_bin("MUL", a, b) }
-fn expr_div(a: String, b: String) -> String { return expr_bin("DIV", a, b) }
-fn expr_mod(a: String, b: String) -> String { return expr_bin("MOD", a, b) }
-fn expr_eq(a: String, b: String) -> String { return expr_bin("EQ", a, b) }
-fn expr_ne(a: String, b: String) -> String { return expr_bin("NEQ", a, b) }
-fn expr_lt(a: String, b: String) -> String { return expr_bin("LT", a, b) }
-fn expr_gt(a: String, b: String) -> String { return expr_bin("GT", a, b) }
-fn expr_le(a: String, b: String) -> String { return expr_bin("LTEQ", a, b) }
-fn expr_ge(a: String, b: String) -> String { return expr_bin("GTEQ", a, b) }
-fn expr_and(a: String, b: String) -> String { return expr_bin("AND", a, b) }
-fn expr_or(a: String, b: String) -> String { return expr_bin("OR", a, b) }
-fn expr_neg(a: String) -> String { return "NEG:" + a }
-fn expr_not(a: String) -> String { return "NOT:" + a }
-
-fn expr_call(fname: String, args: [String]) -> String {
-    var result = "CALL:" + fname
-    var i = 0
-    while i < len(args) {
-        result = result + _sep() + args[i]
-        i = i + 1
-    }
-    return result
-}
-
-// ── Statement constructors ───────────────────────────────────────────────────
-
-fn stmt_let(name: String, expr: String) -> String {
-    return "LET:" + name + _sep() + expr
-}
-fn stmt_var(name: String, expr: String) -> String {
-    return "VAR:" + name + _sep() + expr
-}
-fn stmt_assign(name: String, expr: String) -> String {
-    return "ASSIGN:" + name + _sep() + expr
-}
-fn stmt_return(expr: String) -> String {
-    return "RETURN:" + expr
-}
-fn stmt_println(expr: String) -> String {
-    return "PRINTLN:" + expr
-}
-fn stmt_print_str(expr: String) -> String {
-    return "PRINT_STR:" + expr
-}
-fn stmt_expr(expr: String) -> String {
-    return "EXPR_STMT:" + expr
-}
-
-fn stmt_if(cond: String, then_stmts: [String], else_stmts: [String]) -> String {
-    var result = "IF:" + cond + _sep() + to_string(len(then_stmts))
-    var i = 0
-    while i < len(then_stmts) {
-        result = result + _sep() + then_stmts[i]
-        i = i + 1
-    }
-    result = result + _sep() + to_string(len(else_stmts))
-    i = 0
-    while i < len(else_stmts) {
-        result = result + _sep() + else_stmts[i]
-        i = i + 1
-    }
-    return result
-}
-
-fn stmt_while(cond: String, body: [String]) -> String {
-    var result = "WHILE:" + cond + _sep() + to_string(len(body))
-    var i = 0
-    while i < len(body) {
-        result = result + _sep() + body[i]
-        i = i + 1
-    }
-    return result
-}
-
-fn make_fn(name: String, params: [String], body: [String]) -> String {
-    var result = "FN:" + name + _sep() + to_string(len(params))
-    var i = 0
-    while i < len(params) {
-        result = result + _sep() + params[i]
-        i = i + 1
-    }
-    result = result + _sep() + to_string(len(body))
-    i = 0
-    while i < len(body) {
-        result = result + _sep() + body[i]
-        i = i + 1
-    }
-    return result
-}
-
 // ── Label generation ─────────────────────────────────────────────────────────
 
 var _label_id = 0
@@ -215,274 +32,69 @@ fn new_label(prefix: String) -> String {
     return prefix + "_" + to_string(_label_id)
 }
 
-// ── Core compiler: AST node -> VM instructions ──────────────────────────────
+// ── Bytecode emitter helpers ─────────────────────────────────────────────────
 
-fn compile_expr(code: [String], expr: String) -> [String] {
-    // Integer literal
-    if sw(expr, "INT:") {
-        var val = after(expr, 4)
-        code = emit(code, "PUSH_INT " + val)
-        return code
-    }
-
-    // String literal
-    if sw(expr, "STR:") {
-        var val = after(expr, 4)
-        code = emit(code, "PUSH_STRING " + val)
-        return code
-    }
-
-    // Identifier
-    if sw(expr, "ID:") {
-        var name = after(expr, 3)
-        code = emit(code, "LOAD " + name)
-        return code
-    }
-
-    // Negation
-    if sw(expr, "NEG:") {
-        var inner = after(expr, 4)
-        code = compile_expr(code, inner)
-        code = emit(code, "NEG")
-        return code
-    }
-
-    // Logical NOT
-    if sw(expr, "NOT:") {
-        var inner = after(expr, 4)
-        code = compile_expr(code, inner)
-        code = emit(code, "NOT")
-        return code
-    }
-
-    // Function call
-    if sw(expr, "CALL:") {
-        var rest = after(expr, 5)
-        var parts = _split3(rest)
-        var fname = parts[0]
-        var argc = len(parts) - 1
-        // Compile arguments
-        var i = 1
-        while i < len(parts) {
-            code = compile_expr(code, parts[i])
-            i = i + 1
-        }
-        code = emit(code, "CALL " + fname + " " + to_string(argc))
-        return code
-    }
-
-    // Binary operations
-    var bin_ops: [String] = ["ADD", "SUB", "MUL", "DIV", "MOD", "EQ", "NEQ", "LT", "GT", "LTEQ", "GTEQ", "AND", "OR"]
-    var bi = 0
-    while bi < len(bin_ops) {
-        var op = bin_ops[bi]
-        var prefix = op + ":"
-        if sw(expr, prefix) {
-            var rest = after(expr, len(prefix))
-            var parts = _split3(rest)
-            if len(parts) >= 2 {
-                code = compile_expr(code, parts[0])
-                code = compile_expr(code, parts[1])
-                code = emit(code, op)
-                return code
-            }
-        }
-        bi = bi + 1
-    }
-
-    // Fallback: treat as integer 0
-    code = emit(code, "PUSH_INT 0")
-    return code
+fn emit(code: [String], instr: String) -> [String] {
+    return push(code, instr)
 }
 
-fn compile_stmt(code: [String], stmt: String) -> [String] {
-    // let binding
-    if sw(stmt, "LET:") {
-        var rest = after(stmt, 4)
-        var parts = _split3(rest)
-        var name = parts[0]
-        var expr = parts[1]
-        code = compile_expr(code, expr)
-        code = emit(code, "STORE " + name)
-        return code
-    }
+// ── Expression compilers (append to code array, return updated code) ─────────
 
-    // var binding
-    if sw(stmt, "VAR:") {
-        var rest = after(stmt, 4)
-        var parts = _split3(rest)
-        var name = parts[0]
-        var expr = parts[1]
-        code = compile_expr(code, expr)
-        code = emit(code, "STORE " + name)
-        return code
-    }
-
-    // assignment
-    if sw(stmt, "ASSIGN:") {
-        var rest = after(stmt, 7)
-        var parts = _split3(rest)
-        var name = parts[0]
-        var expr = parts[1]
-        code = compile_expr(code, expr)
-        code = emit(code, "STORE " + name)
-        return code
-    }
-
-    // return
-    if sw(stmt, "RETURN:") {
-        var expr = after(stmt, 7)
-        code = compile_expr(code, expr)
-        code = emit(code, "RET")
-        return code
-    }
-
-    // println
-    if sw(stmt, "PRINTLN:") {
-        var expr = after(stmt, 8)
-        code = compile_expr(code, expr)
-        code = emit(code, "CALL println 1")
-        return code
-    }
-
-    // print_str
-    if sw(stmt, "PRINT_STR:") {
-        var expr = after(stmt, 10)
-        code = compile_expr(code, expr)
-        code = emit(code, "CALL print 1")
-        return code
-    }
-
-    // if-else
-    if sw(stmt, "IF:") {
-        var rest = after(stmt, 3)
-        var parts = _split3(rest)
-        // parts[0] = cond, parts[1] = then_count, then stmts..., else_count, else stmts...
-        var cond = parts[0]
-        var then_count = int(parts[1])
-        var else_label = new_label("else")
-        var end_label = new_label("endif")
-
-        code = compile_expr(code, cond)
-        code = emit(code, "JZ " + else_label)
-
-        // Then branch
-        var idx = 2
-        var ti = 0
-        while ti < then_count {
-            code = compile_stmt(code, parts[idx])
-            idx = idx + 1
-            ti = ti + 1
-        }
-        code = emit(code, "JMP " + end_label)
-
-        // Else branch
-        code = emit(code, "LABEL " + else_label)
-        var else_count = int(parts[idx])
-        idx = idx + 1
-        var ei = 0
-        while ei < else_count {
-            code = compile_stmt(code, parts[idx])
-            idx = idx + 1
-            ei = ei + 1
-        }
-
-        code = emit(code, "LABEL " + end_label)
-        return code
-    }
-
-    // while loop
-    if sw(stmt, "WHILE:") {
-        var rest = after(stmt, 6)
-        var parts = _split3(rest)
-        var cond = parts[0]
-        var body_count = int(parts[1])
-
-        var loop_label = new_label("loop")
-        var end_label = new_label("endloop")
-
-        code = emit(code, "LABEL " + loop_label)
-        code = compile_expr(code, cond)
-        code = emit(code, "JZ " + end_label)
-
-        var idx = 2
-        var bi = 0
-        while bi < body_count {
-            code = compile_stmt(code, parts[idx])
-            idx = idx + 1
-            bi = bi + 1
-        }
-        code = emit(code, "JMP " + loop_label)
-        code = emit(code, "LABEL " + end_label)
-        return code
-    }
-
-    // expression statement
-    if sw(stmt, "EXPR_STMT:") {
-        var expr = after(stmt, 10)
-        code = compile_expr(code, expr)
-        code = emit(code, "POP")
-        return code
-    }
-
-    return code
+fn emit_int(code: [String], n: i64) -> [String] {
+    return emit(code, "PUSH_INT " + to_string(n))
 }
 
-fn compile_function(code: [String], func: String) -> [String] {
-    var rest = after(func, 3)
-    var parts = _split3(rest)
-    var name = parts[0]
-    var param_count = int(parts[1])
-
-    code = emit(code, "FN_START " + name)
-
-    // Store params in reverse order (they were pushed left-to-right)
-    var pi = param_count - 1
-    while pi >= 0 {
-        var param_name = parts[2 + pi]
-        code = emit(code, "STORE " + param_name)
-        pi = pi - 1
-    }
-
-    // Compile body statements
-    var body_count_idx = 2 + param_count
-    var body_count = int(parts[body_count_idx])
-    var si = 0
-    while si < body_count {
-        code = compile_stmt(code, parts[body_count_idx + 1 + si])
-        si = si + 1
-    }
-
-    // If this is main, add HALT
-    if name == "main" {
-        code = emit(code, "HALT")
-    }
-
-    code = emit(code, "FN_END")
-    return code
+fn emit_str(code: [String], s: String) -> [String] {
+    return emit(code, "PUSH_STRING " + s)
 }
 
-fn compile_program(functions: [String]) -> [String] {
-    var code: [String] = []
-    var i = 0
-    while i < len(functions) {
-        code = compile_function(code, functions[i])
-        i = i + 1
-    }
-    return code
+fn emit_load(code: [String], name: String) -> [String] {
+    return emit(code, "LOAD " + name)
 }
+
+fn emit_store(code: [String], name: String) -> [String] {
+    return emit(code, "STORE " + name)
+}
+
+fn emit_add(code: [String]) -> [String] { return emit(code, "ADD") }
+fn emit_sub(code: [String]) -> [String] { return emit(code, "SUB") }
+fn emit_mul(code: [String]) -> [String] { return emit(code, "MUL") }
+fn emit_div(code: [String]) -> [String] { return emit(code, "DIV") }
+fn emit_mod(code: [String]) -> [String] { return emit(code, "MOD") }
+fn emit_neg(code: [String]) -> [String] { return emit(code, "NEG") }
+fn emit_not(code: [String]) -> [String] { return emit(code, "NOT") }
+fn emit_eq(code: [String]) -> [String] { return emit(code, "EQ") }
+fn emit_neq(code: [String]) -> [String] { return emit(code, "NEQ") }
+fn emit_lt(code: [String]) -> [String] { return emit(code, "LT") }
+fn emit_gt(code: [String]) -> [String] { return emit(code, "GT") }
+fn emit_le(code: [String]) -> [String] { return emit(code, "LTEQ") }
+fn emit_ge(code: [String]) -> [String] { return emit(code, "GTEQ") }
+fn emit_and(code: [String]) -> [String] { return emit(code, "AND") }
+fn emit_or(code: [String]) -> [String] { return emit(code, "OR") }
+
+fn emit_call(code: [String], fname: String, argc: i64) -> [String] {
+    return emit(code, "CALL " + fname + " " + to_string(argc))
+}
+
+fn emit_ret(code: [String]) -> [String] { return emit(code, "RET") }
+fn emit_pop(code: [String]) -> [String] { return emit(code, "POP") }
+fn emit_halt(code: [String]) -> [String] { return emit(code, "HALT") }
+fn emit_label(code: [String], lbl: String) -> [String] { return emit(code, "LABEL " + lbl) }
+fn emit_jmp(code: [String], lbl: String) -> [String] { return emit(code, "JMP " + lbl) }
+fn emit_jz(code: [String], lbl: String) -> [String] { return emit(code, "JZ " + lbl) }
+fn emit_fn_start(code: [String], name: String) -> [String] { return emit(code, "FN_START " + name) }
+fn emit_fn_end(code: [String]) -> [String] { return emit(code, "FN_END") }
 
 // ══════════════════════════════════════════════════════════════════════════════
-// INLINE VM (copied core from vm.vx for self-contained testing)
+// INLINE VM (core from vm.vx for self-contained testing)
 // ══════════════════════════════════════════════════════════════════════════════
 
 fn make_int(n: i64) -> String   { return "i:" + to_string(n) }
-fn make_str(s: String) -> String { return "s:" + s }
+fn make_str_val(s: String) -> String { return "s:" + s }
 fn make_bool(b: bool) -> String {
     if b { return "b:true" }
     return "b:false"
 }
-fn make_float(f: f64) -> String { return "f:" + to_string(f) }
 
 fn val_display(v: String) -> String {
     if sw(v, "i:")    { return after(v, 2) }
@@ -509,8 +121,8 @@ fn val_as_int(v: String) -> i64 {
 }
 
 fn val_add(a: String, b: String) -> String {
-    if sw(a, "s:") { return make_str(val_display(a) + val_display(b)) }
-    if sw(b, "s:") { return make_str(val_display(a) + val_display(b)) }
+    if sw(a, "s:") { return make_str_val(val_display(a) + val_display(b)) }
+    if sw(b, "s:") { return make_str_val(val_display(a) + val_display(b)) }
     return make_int(val_as_int(a) + val_as_int(b))
 }
 fn val_sub(a: String, b: String) -> String { return make_int(val_as_int(a) - val_as_int(b)) }
@@ -520,7 +132,7 @@ fn val_div(a: String, b: String) -> String {
     if d == 0 { return "i:0" }
     return make_int(val_as_int(a) / d)
 }
-fn val_mod(a: String, b: String) -> String {
+fn val_mod_op(a: String, b: String) -> String {
     var d = val_as_int(b)
     if d == 0 { return "i:0" }
     return make_int(val_as_int(a) % d)
@@ -717,7 +329,6 @@ fn call_builtin(name: String, argc: i64, stack: [String]) -> [String] {
         return ns
     }
 
-    // Unknown — pop args, push void
     var ns: [String] = []
     var start = len(stack) - argc
     var i = 0
@@ -740,7 +351,6 @@ fn vm_exec(instrs: [String]) -> String {
     var status = "running"
     var result = "void"
 
-    // Find main
     var main_ip = table_get(fns, "main")
     if main_ip >= 0 {
         ip = main_ip + 1
@@ -763,7 +373,7 @@ fn vm_exec(instrs: [String]) -> String {
                 ip = ip + 1
             }
             if op == "PUSH_STRING" {
-                stack = push(stack, make_str(instr_arg1(instr)))
+                stack = push(stack, make_str_val(instr_arg1(instr)))
                 ip = ip + 1
             }
             if op == "PUSH_BOOL" {
@@ -825,7 +435,7 @@ fn vm_exec(instrs: [String]) -> String {
                 var b = stack_top(stack)
                 var a = stack_second(stack)
                 stack = stack_pop2(stack)
-                stack = push(stack, val_mod(a, b))
+                stack = push(stack, val_mod_op(a, b))
                 ip = ip + 1
             }
             if op == "NEG" {
@@ -883,9 +493,9 @@ fn vm_exec(instrs: [String]) -> String {
 
             if op == "JZ" {
                 var lbl = instr_arg1(instr)
-                var top = stack_top(stack)
+                var cond_val = stack_top(stack)
                 stack = stack_pop(stack)
-                if val_is_truthy(top) {
+                if val_is_truthy(cond_val) {
                     ip = ip + 1
                 } else {
                     var target = table_get(labels, lbl)
@@ -972,15 +582,8 @@ fn vm_exec(instrs: [String]) -> String {
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
-// TESTS: AST -> Compile -> VM Execute
+// TESTS: Build bytecode with compiler helpers, then execute with VM
 // ══════════════════════════════════════════════════════════════════════════════
-
-fn run_test(name: String, bytecode: [String], expected: String) {
-    print("Test: " + name + " ... ")
-    var result = vm_exec(bytecode)
-    print("output above")
-    print(_nl())
-}
 
 fn main() {
     print("=== Vortex Bytecode Compiler ===" + _nl())
@@ -989,101 +592,178 @@ fn main() {
 
     // ── Test 1: println(40 + 2) → should print 42 ──
     print("Test 1: println(40 + 2)" + _nl())
-    var prog1: [String] = []
-    var body1: [String] = [stmt_println(expr_add(expr_int(40), expr_int(2)))]
-    var params1: [String] = []
-    prog1 = push(prog1, make_fn("main", params1, body1))
-    var bc1 = compile_program(prog1)
-    print("  Bytecode: ")
+    var c1: [String] = []
+    c1 = emit_fn_start(c1, "main")
+    c1 = emit_int(c1, 40)
+    c1 = emit_int(c1, 2)
+    c1 = emit_add(c1)
+    c1 = emit_call(c1, "println", 1)
+    c1 = emit_halt(c1)
+    c1 = emit_fn_end(c1)
+    print("  Bytecode (" + to_string(len(c1)) + " instrs): ")
     var di = 0
-    while di < len(bc1) {
-        print("[" + bc1[di] + "] ")
+    while di < len(c1) {
+        print("[" + c1[di] + "] ")
         di = di + 1
     }
     print(_nl())
     print("  Output: ")
-    vm_exec(bc1)
+    vm_exec(c1)
     print(_nl())
 
     // ── Test 2: let x = 10; println(x * 3) → 30 ──
     print("Test 2: let x = 10; println(x * 3)" + _nl())
-    var body2: [String] = [
-        stmt_let("x", expr_int(10)),
-        stmt_println(expr_mul(expr_id("x"), expr_int(3)))
-    ]
-    var prog2: [String] = [make_fn("main", params1, body2)]
-    var bc2 = compile_program(prog2)
+    var c2: [String] = []
+    c2 = emit_fn_start(c2, "main")
+    c2 = emit_int(c2, 10)
+    c2 = emit_store(c2, "x")
+    c2 = emit_load(c2, "x")
+    c2 = emit_int(c2, 3)
+    c2 = emit_mul(c2)
+    c2 = emit_call(c2, "println", 1)
+    c2 = emit_halt(c2)
+    c2 = emit_fn_end(c2)
     print("  Output: ")
-    vm_exec(bc2)
+    vm_exec(c2)
     print(_nl())
 
     // ── Test 3: if 1 > 0 { println(1) } else { println(0) } → 1 ──
     print("Test 3: if 1 > 0 { println(1) } else { println(0) }" + _nl())
-    var then3: [String] = [stmt_println(expr_int(1))]
-    var else3: [String] = [stmt_println(expr_int(0))]
-    var body3: [String] = [stmt_if(expr_gt(expr_int(1), expr_int(0)), then3, else3)]
-    var prog3: [String] = [make_fn("main", params1, body3)]
-    var bc3 = compile_program(prog3)
+    var c3: [String] = []
+    c3 = emit_fn_start(c3, "main")
+    c3 = emit_int(c3, 1)
+    c3 = emit_int(c3, 0)
+    c3 = emit_gt(c3)
+    var else_lbl = new_label("else")
+    var end_lbl = new_label("endif")
+    c3 = emit_jz(c3, else_lbl)
+    // then
+    c3 = emit_int(c3, 1)
+    c3 = emit_call(c3, "println", 1)
+    c3 = emit_jmp(c3, end_lbl)
+    // else
+    c3 = emit_label(c3, else_lbl)
+    c3 = emit_int(c3, 0)
+    c3 = emit_call(c3, "println", 1)
+    c3 = emit_label(c3, end_lbl)
+    c3 = emit_halt(c3)
+    c3 = emit_fn_end(c3)
     print("  Output: ")
-    vm_exec(bc3)
+    vm_exec(c3)
     print(_nl())
 
-    // ── Test 4: while loop counting 1..5, print sum → 15 ──
-    print("Test 4: while loop sum 1..5" + _nl())
-    var loop_body: [String] = [
-        stmt_assign("sum", expr_add(expr_id("sum"), expr_id("i"))),
-        stmt_assign("i", expr_add(expr_id("i"), expr_int(1)))
-    ]
-    var body4: [String] = [
-        stmt_var("sum", expr_int(0)),
-        stmt_var("i", expr_int(1)),
-        stmt_while(expr_le(expr_id("i"), expr_int(5)), loop_body),
-        stmt_println(expr_id("sum"))
-    ]
-    var prog4: [String] = [make_fn("main", params1, body4)]
-    var bc4 = compile_program(prog4)
+    // ── Test 4: while loop: sum = 0; i = 1; while i <= 5 { sum += i; i += 1 }; println(sum) → 15 ──
+    print("Test 4: while loop sum 1..5 = 15" + _nl())
+    var c4: [String] = []
+    c4 = emit_fn_start(c4, "main")
+    // var sum = 0
+    c4 = emit_int(c4, 0)
+    c4 = emit_store(c4, "sum")
+    // var i = 1
+    c4 = emit_int(c4, 1)
+    c4 = emit_store(c4, "i")
+    // while i <= 5
+    var loop_lbl = new_label("loop")
+    var endloop_lbl = new_label("endloop")
+    c4 = emit_label(c4, loop_lbl)
+    c4 = emit_load(c4, "i")
+    c4 = emit_int(c4, 5)
+    c4 = emit_le(c4)
+    c4 = emit_jz(c4, endloop_lbl)
+    // sum = sum + i
+    c4 = emit_load(c4, "sum")
+    c4 = emit_load(c4, "i")
+    c4 = emit_add(c4)
+    c4 = emit_store(c4, "sum")
+    // i = i + 1
+    c4 = emit_load(c4, "i")
+    c4 = emit_int(c4, 1)
+    c4 = emit_add(c4)
+    c4 = emit_store(c4, "i")
+    c4 = emit_jmp(c4, loop_lbl)
+    c4 = emit_label(c4, endloop_lbl)
+    // println(sum)
+    c4 = emit_load(c4, "sum")
+    c4 = emit_call(c4, "println", 1)
+    c4 = emit_halt(c4)
+    c4 = emit_fn_end(c4)
     print("  Output: ")
-    vm_exec(bc4)
+    vm_exec(c4)
     print(_nl())
 
     // ── Test 5: function call — square(9) → 81 ──
-    print("Test 5: fn square(n) -> n * n; println(square(9))" + _nl())
-    var sq_params: [String] = ["n"]
-    var sq_body: [String] = [stmt_return(expr_mul(expr_id("n"), expr_id("n")))]
-    var sq_args: [String] = [expr_int(9)]
-    var main_body5: [String] = [stmt_println(expr_call("square", sq_args))]
-    var prog5: [String] = [
-        make_fn("main", params1, main_body5),
-        make_fn("square", sq_params, sq_body)
-    ]
-    var bc5 = compile_program(prog5)
+    print("Test 5: fn square(n) { return n * n }; println(square(9))" + _nl())
+    var c5: [String] = []
+    // main function
+    c5 = emit_fn_start(c5, "main")
+    c5 = emit_int(c5, 9)
+    c5 = emit_call(c5, "square", 1)
+    c5 = emit_call(c5, "println", 1)
+    c5 = emit_halt(c5)
+    c5 = emit_fn_end(c5)
+    // square function
+    c5 = emit_fn_start(c5, "square")
+    c5 = emit_store(c5, "n")
+    c5 = emit_load(c5, "n")
+    c5 = emit_load(c5, "n")
+    c5 = emit_mul(c5)
+    c5 = emit_ret(c5)
+    c5 = emit_fn_end(c5)
     print("  Output: ")
-    vm_exec(bc5)
+    vm_exec(c5)
     print(_nl())
 
     // ── Test 6: nested expression — (3 + 4) * (10 - 2) → 56 ──
-    print("Test 6: (3 + 4) * (10 - 2)" + _nl())
-    var body6: [String] = [
-        stmt_println(expr_mul(
-            expr_add(expr_int(3), expr_int(4)),
-            expr_sub(expr_int(10), expr_int(2))
-        ))
-    ]
-    var prog6: [String] = [make_fn("main", params1, body6)]
-    var bc6 = compile_program(prog6)
+    print("Test 6: (3 + 4) * (10 - 2) = 56" + _nl())
+    var c6: [String] = []
+    c6 = emit_fn_start(c6, "main")
+    c6 = emit_int(c6, 3)
+    c6 = emit_int(c6, 4)
+    c6 = emit_add(c6)
+    c6 = emit_int(c6, 10)
+    c6 = emit_int(c6, 2)
+    c6 = emit_sub(c6)
+    c6 = emit_mul(c6)
+    c6 = emit_call(c6, "println", 1)
+    c6 = emit_halt(c6)
+    c6 = emit_fn_end(c6)
     print("  Output: ")
-    vm_exec(bc6)
+    vm_exec(c6)
     print(_nl())
 
-    // ── Test 7: string printing ──
-    print("Test 7: print_str hello" + _nl())
-    var body7: [String] = [stmt_println(expr_str("hello_world"))]
-    var prog7: [String] = [make_fn("main", params1, body7)]
-    var bc7 = compile_program(prog7)
+    // ── Test 7: string output ──
+    print("Test 7: println(hello_world)" + _nl())
+    var c7: [String] = []
+    c7 = emit_fn_start(c7, "main")
+    c7 = emit_str(c7, "hello_world")
+    c7 = emit_call(c7, "println", 1)
+    c7 = emit_halt(c7)
+    c7 = emit_fn_end(c7)
     print("  Output: ")
-    vm_exec(bc7)
+    vm_exec(c7)
     print(_nl())
 
+    // ── Test 8: two-function pipeline — add(a, b) called from main ──
+    print("Test 8: fn add(a, b) { return a + b }; println(add(17, 25)) = 42" + _nl())
+    var c8: [String] = []
+    c8 = emit_fn_start(c8, "main")
+    c8 = emit_int(c8, 17)
+    c8 = emit_int(c8, 25)
+    c8 = emit_call(c8, "add_fn", 2)
+    c8 = emit_call(c8, "println", 1)
+    c8 = emit_halt(c8)
+    c8 = emit_fn_end(c8)
+    c8 = emit_fn_start(c8, "add_fn")
+    c8 = emit_store(c8, "b")
+    c8 = emit_store(c8, "a")
+    c8 = emit_load(c8, "a")
+    c8 = emit_load(c8, "b")
+    c8 = emit_add(c8)
+    c8 = emit_ret(c8)
+    c8 = emit_fn_end(c8)
+    print("  Output: ")
+    vm_exec(c8)
     print(_nl())
+
     print("=== All tests complete ===" + _nl())
 }
