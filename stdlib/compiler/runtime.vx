@@ -2,6 +2,12 @@
 // Provides x86-64 machine code stubs that get embedded into every compiled binary.
 // All stubs follow System V AMD64 ABI: args in rdi, rsi, rdx, rcx, r8, r9; return in rax.
 
+struct RuntimeResult {
+    code: [i64],
+    names: [String],
+    offsets: [i64]
+}
+
 // ============================================================================
 // Byte emission helpers (same pattern as vxc.vx)
 // ============================================================================
@@ -1898,7 +1904,7 @@ fn make_symbol(name: String, offset: i64) -> (String, i64) {
 
 // Assembles all stubs into a single byte array.
 // Returns a tuple of (code_bytes, symbol_names, symbol_offsets)
-fn build_runtime() -> ([i64], [String], [i64]) {
+fn build_runtime() -> RuntimeResult {
     var code: [i64] = []
     var names: [String] = []
     var offsets: [i64] = []
@@ -2128,7 +2134,7 @@ fn build_runtime() -> ([i64], [String], [i64]) {
         i = i + 1
     }
 
-    return (code, names, offsets)
+    return RuntimeResult { code: code, names: names, offsets: offsets }
 }
 
 // ============================================================================
@@ -2367,9 +2373,9 @@ fn main() {
     println("")
     println("--- build_runtime integration ---")
     let result = build_runtime()
-    let all_code = result.0
-    let all_names = result.1
-    let all_offsets = result.2
+    let all_code = result.code
+    let all_names = result.names
+    let all_offsets = result.offsets
 
     println("Total runtime code: " + to_string(len(all_code)) + " bytes")
     println("Total symbols: " + to_string(len(all_names)))

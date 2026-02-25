@@ -1,0 +1,1006 @@
+// stdlib/ai/distributed_cognition.vx — Distributed Cognition
+// Multiple models share cognitive state and think together.
+// Not agent chat — actual shared reasoning spaces.
+//
+// Node layout: ["node", id_str, name, dim_str, thought_0, thought_1, ...]
+// Network layout: ["network", n_nodes_str, ...flat_nodes, "edges", ...edge_data]
+//   edge_data: ["from_id", "to_id", "weight", ...]
+// Memory layout: ["memory", capacity_str, dim_str, n_entries_str, ...entries]
+//   entry: [key, val_0, val_1, ...]
+
+// ─── Math Helpers ───────────────────────────────────────────────────────────
+
+fn _abs(x: f64) -> f64 {
+    if x < 0.0 {
+        return 0.0 - x
+    }
+    return x
+}
+
+fn _sqrt(x: f64) -> f64 {
+    if x <= 0.0 {
+        return 0.0
+    }
+    var guess = x / 2.0
+    if guess < 1.0 {
+        guess = 1.0
+    }
+    var i = 0
+    while i < 60 {
+        let next = (guess + x / guess) / 2.0
+        if _abs(next - guess) < 1.0e-15 {
+            return next
+        }
+        guess = next
+        i = i + 1
+    }
+    return guess
+}
+
+fn _exp(x: f64) -> f64 {
+    let ln2 = 0.6931471805599453
+    let k = int(x / ln2)
+    let r = x - float(k) * ln2
+    var term = 1.0
+    var sum = 1.0
+    var n = 1
+    while n < 40 {
+        term = term * r / float(n)
+        sum = sum + term
+        if _abs(term) < 1.0e-17 {
+            n = 100
+        }
+        n = n + 1
+    }
+    if k >= 0 {
+        var factor = 1.0
+        var j = 0
+        while j < k {
+            factor = factor * 2.0
+            j = j + 1
+        }
+        return sum * factor
+    } else {
+        var factor = 1.0
+        var j = 0
+        while j < (0 - k) {
+            factor = factor * 2.0
+            j = j + 1
+        }
+        return sum / factor
+    }
+}
+
+// ─── Thought Metrics ────────────────────────────────────────────────────────
+
+fn thought_magnitude(t: [f64]) -> f64 {
+    var sum = 0.0
+    var i = 0
+    while i < len(t) {
+        sum = sum + t[i] * t[i]
+        i = i + 1
+    }
+    return _sqrt(sum)
+}
+
+fn thought_normalize(t: [f64]) -> [f64] {
+    let mag = thought_magnitude(t)
+    if mag < 1.0e-12 {
+        return t
+    }
+    var result: [f64] = []
+    var i = 0
+    while i < len(t) {
+        result = push(result, t[i] / mag)
+        i = i + 1
+    }
+    return result
+}
+
+fn thought_similarity(a: [f64], b: [f64]) -> f64 {
+    var dot = 0.0
+    var i = 0
+    let n = len(a)
+    while i < n {
+        dot = dot + a[i] * b[i]
+        i = i + 1
+    }
+    let ma = thought_magnitude(a)
+    let mb = thought_magnitude(b)
+    if ma < 1.0e-12 {
+        return 0.0
+    }
+    if mb < 1.0e-12 {
+        return 0.0
+    }
+    return dot / (ma * mb)
+}
+
+fn thought_blend(a: [f64], b: [f64], alpha: f64) -> [f64] {
+    var result: [f64] = []
+    var i = 0
+    while i < len(a) {
+        result = push(result, a[i] * (1.0 - alpha) + b[i] * alpha)
+        i = i + 1
+    }
+    return result
+}
+
+fn thought_random(dim: i64, seed: i64) -> [f64] {
+    var result: [f64] = []
+    var s = seed
+    var i = 0
+    while i < dim {
+        // Simple LCG
+        s = (s * 1103515245 + 12345) % 2147483648
+        let val = float(s) / 2147483648.0 - 0.5
+        result = push(result, val)
+        i = i + 1
+    }
+    return thought_normalize(result)
+}
+
+// ─── Cognitive Node ─────────────────────────────────────────────────────────
+// Layout: ["node", id_str, name, dim_str, t0, t1, ...]
+// Header size = 4, thought data starts at index 4
+
+fn _NODE_HDR() -> i64 { return 4 }
+
+fn node_new(id: i64, name: String, dim: i64) -> [String] {
+    var n: [String] = ["node", to_string(id), name, to_string(dim)]
+    var i = 0
+    while i < dim {
+        n = push(n, "0.0")
+        i = i + 1
+    }
+    return n
+}
+
+fn node_id(n: [String]) -> i64 { return int(n[1]) }
+fn node_name(n: [String]) -> String { return n[2] }
+fn node_dim(n: [String]) -> i64 { return int(n[3]) }
+
+fn node_set_thought(n: [String], thought: [f64]) -> [String] {
+    let dim = node_dim(n)
+    var result: [String] = [n[0], n[1], n[2], n[3]]
+    var i = 0
+    while i < dim {
+        result = push(result, to_string(thought[i]))
+        i = i + 1
+    }
+    return result
+}
+
+fn node_get_thought(n: [String]) -> [f64] {
+    let dim = node_dim(n)
+    var result: [f64] = []
+    var i = 0
+    while i < dim {
+        result = push(result, float(n[_NODE_HDR() + i]))
+        i = i + 1
+    }
+    return result
+}
+
+fn node_think(n: [String], transform: [f64]) -> [String] {
+    // transform is dim x dim matrix stored row-major
+    let dim = node_dim(n)
+    let thought = node_get_thought(n)
+    var new_thought: [f64] = []
+    var r = 0
+    while r < dim {
+        var val = 0.0
+        var c = 0
+        while c < dim {
+            val = val + transform[r * dim + c] * thought[c]
+            c = c + 1
+        }
+        new_thought = push(new_thought, val)
+        r = r + 1
+    }
+    return node_set_thought(n, new_thought)
+}
+
+fn node_attend_to(observer: [String], target: [String]) -> [String] {
+    let dim = node_dim(observer)
+    let obs_t = node_get_thought(observer)
+    let tgt_t = node_get_thought(target)
+    // dot product
+    var dot = 0.0
+    var i = 0
+    while i < dim {
+        dot = dot + obs_t[i] * tgt_t[i]
+        i = i + 1
+    }
+    let scale = dot / _sqrt(float(dim))
+    // softmax of single value = 1.0, so attention weight = sigmoid-like
+    let attn = _exp(scale) / (_exp(scale) + 1.0)
+    var new_t: [f64] = []
+    i = 0
+    while i < dim {
+        new_t = push(new_t, obs_t[i] + attn * tgt_t[i])
+        i = i + 1
+    }
+    return node_set_thought(observer, new_t)
+}
+
+// ─── Cognitive Network ──────────────────────────────────────────────────────
+// Layout: ["network", n_nodes_str, ...node_data, "edges", ...edge_triples]
+// Each node is (4 + dim) strings. Edge triples: [from_str, to_str, weight_str]
+
+fn _net_node_count(net: [String]) -> i64 {
+    return int(net[1])
+}
+
+fn _net_edges_start(net: [String]) -> i64 {
+    // Find "edges" marker
+    var i = 2
+    while i < len(net) {
+        if net[i] == "edges" {
+            return i + 1
+        }
+        i = i + 1
+    }
+    return len(net)
+}
+
+fn _net_node_start(net: [String], node_id: i64) -> i64 {
+    // Each node starts after header; we scan by tag "node"
+    var pos = 2
+    var found = 0
+    while pos < len(net) {
+        if net[pos] == "edges" {
+            return -1
+        }
+        if net[pos] == "node" {
+            if found == node_id {
+                return pos
+            }
+            // skip this node: 4 + dim fields
+            let dim = int(net[pos + 3])
+            pos = pos + 4 + dim
+            found = found + 1
+        } else {
+            pos = pos + 1
+        }
+    }
+    return -1
+}
+
+fn _net_extract_node(net: [String], start: i64) -> [String] {
+    let dim = int(net[start + 3])
+    let sz = 4 + dim
+    var result: [String] = []
+    var i = 0
+    while i < sz {
+        result = push(result, net[start + i])
+        i = i + 1
+    }
+    return result
+}
+
+fn network_new() -> [String] {
+    return ["network", "0", "edges"]
+}
+
+fn network_add_node(net: [String], node: [String]) -> [String] {
+    let nc = _net_node_count(net)
+    let es = _net_edges_start(net)
+    // Build new net: header, existing nodes, new node, edges marker, existing edges
+    var result: [String] = ["network", to_string(nc + 1)]
+    // Copy existing nodes
+    var i = 2
+    while i < es - 1 {
+        result = push(result, net[i])
+        i = i + 1
+    }
+    // Append new node
+    var j = 0
+    while j < len(node) {
+        result = push(result, node[j])
+        j = j + 1
+    }
+    // Edges marker + edge data
+    result = push(result, "edges")
+    i = es
+    while i < len(net) {
+        result = push(result, net[i])
+        i = i + 1
+    }
+    return result
+}
+
+fn network_get_node(net: [String], nid: i64) -> [String] {
+    let start = _net_node_start(net, nid)
+    if start < 0 {
+        return []
+    }
+    return _net_extract_node(net, start)
+}
+
+fn network_update_node(net: [String], node: [String]) -> [String] {
+    let nid = node_id(node)
+    let start = _net_node_start(net, nid)
+    if start < 0 {
+        return net
+    }
+    let old_node = _net_extract_node(net, start)
+    let old_sz = len(old_node)
+    let new_sz = len(node)
+    var result: [String] = []
+    var i = 0
+    // Copy before old node
+    while i < start {
+        result = push(result, net[i])
+        i = i + 1
+    }
+    // Insert new node
+    var j = 0
+    while j < new_sz {
+        result = push(result, node[j])
+        j = j + 1
+    }
+    // Skip old node, copy rest
+    i = start + old_sz
+    while i < len(net) {
+        result = push(result, net[i])
+        i = i + 1
+    }
+    return result
+}
+
+fn network_size(net: [String]) -> i64 {
+    return _net_node_count(net)
+}
+
+fn network_connect(net: [String], from_id: i64, to_id: i64, weight: f64) -> [String] {
+    var result: [String] = []
+    var i = 0
+    while i < len(net) {
+        result = push(result, net[i])
+        i = i + 1
+    }
+    result = push(result, to_string(from_id))
+    result = push(result, to_string(to_id))
+    result = push(result, to_string(weight))
+    return result
+}
+
+fn network_disconnect(net: [String], from_id: i64, to_id: i64) -> [String] {
+    let es = _net_edges_start(net)
+    var result: [String] = []
+    var i = 0
+    while i < es {
+        result = push(result, net[i])
+        i = i + 1
+    }
+    i = es
+    while i + 2 < len(net) {
+        let f = int(net[i])
+        let t = int(net[i + 1])
+        if f == from_id {
+            if t == to_id {
+                i = i + 3
+            } else {
+                result = push(result, net[i])
+                result = push(result, net[i + 1])
+                result = push(result, net[i + 2])
+                i = i + 3
+            }
+        } else {
+            result = push(result, net[i])
+            result = push(result, net[i + 1])
+            result = push(result, net[i + 2])
+            i = i + 3
+        }
+    }
+    return result
+}
+
+fn network_get_connections(net: [String], nid: i64) -> [String] {
+    let es = _net_edges_start(net)
+    var result: [String] = []
+    var i = es
+    while i + 2 < len(net) {
+        let f = int(net[i])
+        if f == nid {
+            result = push(result, net[i + 1])
+            result = push(result, net[i + 2])
+        }
+        i = i + 3
+    }
+    return result
+}
+
+// ─── Collective Reasoning ───────────────────────────────────────────────────
+
+fn network_propagate(net: [String]) -> [String] {
+    let nc = network_size(net)
+    var new_net = net
+    var nid = 0
+    while nid < nc {
+        let node = network_get_node(new_net, nid)
+        let dim = node_dim(node)
+        let thought = node_get_thought(node)
+        let conns = network_get_connections(new_net, nid)
+        let n_conns = len(conns) / 2
+        if n_conns > 0 {
+            // Aggregate connected thoughts
+            var agg: [f64] = []
+            var d = 0
+            while d < dim {
+                agg = push(agg, 0.0)
+                d = d + 1
+            }
+            var ci = 0
+            while ci < n_conns {
+                let target_id = int(conns[ci * 2])
+                let w = float(conns[ci * 2 + 1])
+                let target_node = network_get_node(new_net, target_id)
+                let target_t = node_get_thought(target_node)
+                var dd = 0
+                var new_agg: [f64] = []
+                while dd < dim {
+                    new_agg = push(new_agg, agg[dd] + w * target_t[dd])
+                    dd = dd + 1
+                }
+                agg = new_agg
+                ci = ci + 1
+            }
+            // new thought = normalize(old + agg)
+            var blended: [f64] = []
+            d = 0
+            while d < dim {
+                blended = push(blended, thought[d] + agg[d])
+                d = d + 1
+            }
+            let normed = thought_normalize(blended)
+            let updated = node_set_thought(node, normed)
+            new_net = network_update_node(new_net, updated)
+        }
+        nid = nid + 1
+    }
+    return new_net
+}
+
+fn network_consensus(net: [String]) -> [f64] {
+    let nc = network_size(net)
+    if nc == 0 {
+        return []
+    }
+    let first_node = network_get_node(net, 0)
+    let dim = node_dim(first_node)
+    // Weight per node = sum of incoming connection weights
+    var total_weight = 0.0
+    var weighted_sum: [f64] = []
+    var d = 0
+    while d < dim {
+        weighted_sum = push(weighted_sum, 0.0)
+        d = d + 1
+    }
+    var nid = 0
+    while nid < nc {
+        // Count connections TO this node
+        var w = 0.0
+        let es = _net_edges_start(net)
+        var ei = es
+        while ei + 2 < len(net) {
+            let to_id = int(net[ei + 1])
+            if to_id == nid {
+                w = w + float(net[ei + 2])
+            }
+            ei = ei + 3
+        }
+        if w < 0.001 {
+            w = 1.0
+        }
+        let node = network_get_node(net, nid)
+        let thought = node_get_thought(node)
+        total_weight = total_weight + w
+        var new_ws: [f64] = []
+        d = 0
+        while d < dim {
+            new_ws = push(new_ws, weighted_sum[d] + w * thought[d])
+            d = d + 1
+        }
+        weighted_sum = new_ws
+        nid = nid + 1
+    }
+    var result: [f64] = []
+    d = 0
+    while d < dim {
+        result = push(result, weighted_sum[d] / total_weight)
+        d = d + 1
+    }
+    return result
+}
+
+fn network_divergence(net: [String]) -> f64 {
+    let nc = network_size(net)
+    if nc < 2 {
+        return 0.0
+    }
+    var total = 0.0
+    var count = 0
+    var i = 0
+    while i < nc {
+        let ni = network_get_node(net, i)
+        let ti = node_get_thought(ni)
+        var j = i + 1
+        while j < nc {
+            let nj = network_get_node(net, j)
+            let tj = node_get_thought(nj)
+            let sim = thought_similarity(ti, tj)
+            total = total + (1.0 - sim)
+            count = count + 1
+            j = j + 1
+        }
+        i = i + 1
+    }
+    return total / float(count)
+}
+
+fn network_converge(net: [String], max_steps: i64, threshold: f64) -> [String] {
+    var current = net
+    var step = 0
+    while step < max_steps {
+        let div = network_divergence(current)
+        if div < threshold {
+            return current
+        }
+        current = network_propagate(current)
+        step = step + 1
+    }
+    return current
+}
+
+// ─── Specialized Cognitive Patterns ─────────────────────────────────────────
+
+fn pattern_debate(net: [String], proposition: [f64], n_rounds: i64) -> [String] {
+    let nc = network_size(net)
+    var current = net
+    var round = 0
+    while round < n_rounds {
+        var nid = 0
+        while nid < nc {
+            let node = network_get_node(current, nid)
+            let thought = node_get_thought(node)
+            let sim = thought_similarity(thought, proposition)
+            // Supporters strengthen, opposers counter
+            let dim = node_dim(node)
+            var new_t: [f64] = []
+            var d = 0
+            if sim > 0.0 {
+                // Agree: move toward proposition
+                while d < dim {
+                    new_t = push(new_t, thought[d] + 0.3 * proposition[d])
+                    d = d + 1
+                }
+            } else {
+                // Oppose: move away from proposition
+                while d < dim {
+                    new_t = push(new_t, thought[d] - 0.3 * proposition[d])
+                    d = d + 1
+                }
+            }
+            let updated = node_set_thought(node, thought_normalize(new_t))
+            current = network_update_node(current, updated)
+            nid = nid + 1
+        }
+        // Propagate between nodes
+        current = network_propagate(current)
+        round = round + 1
+    }
+    return current
+}
+
+fn pattern_brainstorm(net: [String], seed_thought: [f64], n_rounds: i64) -> [String] {
+    let nc = network_size(net)
+    let dim = len(seed_thought)
+    var current = net
+    // Initialize all nodes with seed + perturbation
+    var nid = 0
+    while nid < nc {
+        let perturbed = thought_random(dim, nid * 7 + 42)
+        let blend = thought_blend(seed_thought, perturbed, 0.4)
+        let node = network_get_node(current, nid)
+        let updated = node_set_thought(node, thought_normalize(blend))
+        current = network_update_node(current, updated)
+        nid = nid + 1
+    }
+    var round = 0
+    while round < n_rounds {
+        // Each node diverges further based on its own state
+        nid = 0
+        while nid < nc {
+            let node = network_get_node(current, nid)
+            let thought = node_get_thought(node)
+            let noise = thought_random(dim, nid * 13 + round * 997)
+            let new_t = thought_blend(thought, noise, 0.2)
+            let updated = node_set_thought(node, thought_normalize(new_t))
+            current = network_update_node(current, updated)
+            nid = nid + 1
+        }
+        // Share ideas
+        current = network_propagate(current)
+        round = round + 1
+    }
+    return current
+}
+
+fn pattern_expert_panel(net: [String], query: [f64]) -> [f64] {
+    let nc = network_size(net)
+    let dim = len(query)
+    var total_weight = 0.0
+    var result: [f64] = []
+    var d = 0
+    while d < dim {
+        result = push(result, 0.0)
+        d = d + 1
+    }
+    var nid = 0
+    while nid < nc {
+        let node = network_get_node(net, nid)
+        let thought = node_get_thought(node)
+        // Response: thought influenced by query
+        let sim = thought_similarity(thought, query)
+        let confidence = thought_magnitude(thought)
+        let w = _abs(sim) * confidence + 0.01
+        total_weight = total_weight + w
+        var new_r: [f64] = []
+        d = 0
+        while d < dim {
+            new_r = push(new_r, result[d] + w * thought[d])
+            d = d + 1
+        }
+        result = new_r
+        nid = nid + 1
+    }
+    var final_r: [f64] = []
+    d = 0
+    while d < dim {
+        final_r = push(final_r, result[d] / total_weight)
+        d = d + 1
+    }
+    return final_r
+}
+
+fn pattern_chain_reasoning(net: [String], input: [f64], chain_order: [i64]) -> [f64] {
+    var current = input
+    var step = 0
+    while step < len(chain_order) {
+        let nid = chain_order[step]
+        let node = network_get_node(net, nid)
+        let thought = node_get_thought(node)
+        let dim = len(current)
+        // Transform: blend current with node's thought
+        var new_t: [f64] = []
+        var d = 0
+        while d < dim {
+            new_t = push(new_t, current[d] * 0.5 + thought[d] * 0.5)
+            d = d + 1
+        }
+        current = thought_normalize(new_t)
+        step = step + 1
+    }
+    return current
+}
+
+// ─── Cognitive Memory ───────────────────────────────────────────────────────
+// Layout: ["memory", capacity_str, dim_str, n_str, key1, v1_0, v1_1, ..., key2, ...]
+
+fn memory_new(capacity: i64, dim: i64) -> [String] {
+    return ["memory", to_string(capacity), to_string(dim), "0"]
+}
+
+fn _mem_dim(mem: [String]) -> i64 { return int(mem[2]) }
+fn _mem_n(mem: [String]) -> i64 { return int(mem[3]) }
+fn _mem_cap(mem: [String]) -> i64 { return int(mem[1]) }
+fn _mem_entry_sz(mem: [String]) -> i64 { return 1 + _mem_dim(mem) }
+
+fn memory_size(mem: [String]) -> i64 { return _mem_n(mem) }
+
+fn memory_store(mem: [String], thought: [f64], key: String) -> [String] {
+    let dim = _mem_dim(mem)
+    let n = _mem_n(mem)
+    let cap = _mem_cap(mem)
+    // If at capacity, don't add (simple policy)
+    if n >= cap {
+        return mem
+    }
+    var result: [String] = ["memory", mem[1], mem[2], to_string(n + 1)]
+    // Copy existing entries
+    var i = 4
+    while i < len(mem) {
+        result = push(result, mem[i])
+        i = i + 1
+    }
+    // Add new entry
+    result = push(result, key)
+    var d = 0
+    while d < dim {
+        result = push(result, to_string(thought[d]))
+        d = d + 1
+    }
+    return result
+}
+
+fn _mem_get_thought(mem: [String], idx: i64) -> [f64] {
+    let dim = _mem_dim(mem)
+    let entry_sz = 1 + dim
+    let base = 4 + idx * entry_sz + 1
+    var result: [f64] = []
+    var d = 0
+    while d < dim {
+        result = push(result, float(mem[base + d]))
+        d = d + 1
+    }
+    return result
+}
+
+fn _mem_get_key(mem: [String], idx: i64) -> String {
+    let dim = _mem_dim(mem)
+    let entry_sz = 1 + dim
+    return mem[4 + idx * entry_sz]
+}
+
+fn memory_recall(mem: [String], query: [f64], top_k: i64) -> [String] {
+    let n = _mem_n(mem)
+    // Find similarities
+    var best_keys: [String] = []
+    var best_sims: [f64] = []
+    var i = 0
+    while i < n {
+        let t = _mem_get_thought(mem, i)
+        let k = _mem_get_key(mem, i)
+        let sim = thought_similarity(query, t)
+        // Insert into sorted list
+        var inserted = false
+        var new_keys: [String] = []
+        var new_sims: [f64] = []
+        var j = 0
+        while j < len(best_keys) {
+            if sim > best_sims[j] {
+                if inserted == false {
+                    new_keys = push(new_keys, k)
+                    new_sims = push(new_sims, sim)
+                    inserted = true
+                }
+            }
+            new_keys = push(new_keys, best_keys[j])
+            new_sims = push(new_sims, best_sims[j])
+            j = j + 1
+        }
+        if inserted == false {
+            new_keys = push(new_keys, k)
+            new_sims = push(new_sims, sim)
+        }
+        // Trim to top_k
+        best_keys = []
+        best_sims = []
+        j = 0
+        while j < len(new_keys) {
+            if j < top_k {
+                best_keys = push(best_keys, new_keys[j])
+                best_sims = push(best_sims, new_sims[j])
+            }
+            j = j + 1
+        }
+        i = i + 1
+    }
+    // Return interleaved [key, sim, key, sim, ...]
+    var result: [String] = []
+    i = 0
+    while i < len(best_keys) {
+        result = push(result, best_keys[i])
+        result = push(result, to_string(best_sims[i]))
+        i = i + 1
+    }
+    return result
+}
+
+fn memory_forget(mem: [String], key: String) -> [String] {
+    let n = _mem_n(mem)
+    let dim = _mem_dim(mem)
+    let entry_sz = 1 + dim
+    var result: [String] = ["memory", mem[1], mem[2], "0"]
+    var count = 0
+    var i = 0
+    while i < n {
+        let k = _mem_get_key(mem, i)
+        if k == key {
+            // Skip
+            i = i + 1
+        } else {
+            let base = 4 + i * entry_sz
+            var j = 0
+            while j < entry_sz {
+                result = push(result, mem[base + j])
+                j = j + 1
+            }
+            count = count + 1
+            i = i + 1
+        }
+    }
+    // Fix count
+    var fixed: [String] = ["memory", mem[1], mem[2], to_string(count)]
+    i = 4
+    while i < len(result) {
+        fixed = push(fixed, result[i])
+        i = i + 1
+    }
+    return fixed
+}
+
+// ─── Main: Tests ────────────────────────────────────────────────────────────
+
+fn main() {
+    var all_pass = true
+    let dim = 8
+
+    // 1. Create 3 cognitive nodes with different initial thoughts
+    var a = node_new(0, "Alpha", dim)
+    var b = node_new(1, "Beta", dim)
+    var c = node_new(2, "Gamma", dim)
+    let ta = thought_random(dim, 1)
+    let tb = thought_random(dim, 2)
+    let tc = thought_random(dim, 3)
+    a = node_set_thought(a, ta)
+    b = node_set_thought(b, tb)
+    c = node_set_thought(c, tc)
+
+    if node_id(a) != 0 { all_pass = false }
+    if node_name(b) != "Beta" { all_pass = false }
+    if node_dim(c) != dim { all_pass = false }
+    print("1. Nodes created: PASS")
+
+    // 2. Build network, connect all pairs
+    var net = network_new()
+    net = network_add_node(net, a)
+    net = network_add_node(net, b)
+    net = network_add_node(net, c)
+    net = network_connect(net, 0, 1, 1.0)
+    net = network_connect(net, 0, 2, 1.0)
+    net = network_connect(net, 1, 0, 1.0)
+    net = network_connect(net, 1, 2, 1.0)
+    net = network_connect(net, 2, 0, 1.0)
+    net = network_connect(net, 2, 1, 1.0)
+
+    if network_size(net) != 3 {
+        print("2. Network build: FAIL (wrong size)")
+        all_pass = false
+    } else {
+        print("2. Network built: PASS")
+    }
+
+    // 3. Measure initial divergence (should be high)
+    let init_div = network_divergence(net)
+    if init_div < 0.01 {
+        print("3. Initial divergence too low: FAIL")
+        all_pass = false
+    } else {
+        print("3. Initial divergence = " + to_string(init_div) + ": PASS")
+    }
+
+    // 4. Propagate 5 steps — divergence should decrease
+    var prop_net = net
+    var step = 0
+    while step < 5 {
+        prop_net = network_propagate(prop_net)
+        step = step + 1
+    }
+    let prop_div = network_divergence(prop_net)
+    if prop_div >= init_div {
+        print("4. Divergence did not decrease: FAIL (" + to_string(prop_div) + " >= " + to_string(init_div) + ")")
+        all_pass = false
+    } else {
+        print("4. Propagated divergence = " + to_string(prop_div) + ": PASS")
+    }
+
+    // 5. Converge — divergence < threshold
+    let conv_net = network_converge(net, 50, 0.05)
+    let conv_div = network_divergence(conv_net)
+    if conv_div >= 0.05 {
+        print("5. Convergence failed, div = " + to_string(conv_div) + ": FAIL")
+        all_pass = false
+    } else {
+        print("5. Converged, divergence = " + to_string(conv_div) + ": PASS")
+    }
+
+    // 6. Consensus thought — should be non-zero
+    let cons_result = network_consensus(conv_net)
+    let cons_mag = thought_magnitude(cons_result)
+    if cons_mag < 0.01 {
+        print("6. Consensus magnitude too low: FAIL")
+        all_pass = false
+    } else {
+        print("6. Consensus magnitude = " + to_string(cons_mag) + ": PASS")
+    }
+
+    // 7. Chain reasoning: A→B→C transforms input
+    let chain_input = thought_random(dim, 99)
+    let chain_result = pattern_chain_reasoning(net, chain_input, [0, 1, 2])
+    let chain_sim = thought_similarity(chain_input, chain_result)
+    if chain_sim > 0.999 {
+        print("7. Chain reasoning: no transformation: FAIL")
+        all_pass = false
+    } else {
+        print("7. Chain reasoning sim = " + to_string(chain_sim) + ": PASS")
+    }
+
+    // 8. Expert panel: verify weighted response
+    let query = thought_random(dim, 55)
+    let panel_response = pattern_expert_panel(net, query)
+    let panel_mag = thought_magnitude(panel_response)
+    if panel_mag < 0.01 {
+        print("8. Expert panel: zero response: FAIL")
+        all_pass = false
+    } else {
+        print("8. Expert panel response magnitude = " + to_string(panel_mag) + ": PASS")
+    }
+
+    // 9. Cognitive memory: store 3 thoughts, recall top-1 should match
+    var mem = memory_new(10, dim)
+    mem = memory_store(mem, ta, "alpha")
+    mem = memory_store(mem, tb, "beta")
+    mem = memory_store(mem, tc, "gamma")
+    if memory_size(mem) != 3 {
+        print("9. Memory size wrong: FAIL")
+        all_pass = false
+    } else {
+        let recall_a = memory_recall(mem, ta, 1)
+        let recall_b = memory_recall(mem, tb, 1)
+        let recall_c = memory_recall(mem, tc, 1)
+        if recall_a[0] != "alpha" {
+            print("9. Recall alpha failed, got " + recall_a[0] + ": FAIL")
+            all_pass = false
+        } else if recall_b[0] != "beta" {
+            print("9. Recall beta failed, got " + recall_b[0] + ": FAIL")
+            all_pass = false
+        } else if recall_c[0] != "gamma" {
+            print("9. Recall gamma failed, got " + recall_c[0] + ": FAIL")
+            all_pass = false
+        } else {
+            print("9. Memory recall: PASS")
+        }
+    }
+
+    // 10. Debate: 3 rounds on a proposition — verify thoughts change
+    let proposition = thought_random(dim, 77)
+    let pre_debate_t0 = node_get_thought(network_get_node(net, 0))
+    let debated = pattern_debate(net, proposition, 3)
+    let post_debate_t0 = node_get_thought(network_get_node(debated, 0))
+    let debate_sim = thought_similarity(pre_debate_t0, post_debate_t0)
+    if debate_sim > 0.999 {
+        print("10. Debate: thoughts did not change: FAIL")
+        all_pass = false
+    } else {
+        print("10. Debate change sim = " + to_string(debate_sim) + ": PASS")
+    }
+
+    // 11. Brainstorm: verify thoughts diverge from seed
+    let seed = thought_random(dim, 33)
+    let brainstormed = pattern_brainstorm(net, seed, 3)
+    var max_sim = 0.0
+    var bi = 0
+    while bi < network_size(brainstormed) {
+        let bt = node_get_thought(network_get_node(brainstormed, bi))
+        let bs = thought_similarity(seed, bt)
+        if bs > max_sim {
+            max_sim = bs
+        }
+        bi = bi + 1
+    }
+    if max_sim > 0.99 {
+        print("11. Brainstorm: no divergence: FAIL")
+        all_pass = false
+    } else {
+        print("11. Brainstorm max similarity to seed = " + to_string(max_sim) + ": PASS")
+    }
+
+    if all_pass {
+        print("ALL TESTS PASSED")
+    } else {
+        print("SOME TESTS FAILED")
+    }
+}

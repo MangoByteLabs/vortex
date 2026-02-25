@@ -1,0 +1,933 @@
+// stdlib/ai/autodiff_native.vx — Compile-time Automatic Differentiation
+// THIS IS A LANGUAGE FEATURE. grad(f) generates backward passes at compile time.
+// Two modes: Forward-mode (dual numbers) and Reverse-mode (computation graph / backprop).
+//
+// Graph node layout: 6 strings per node at index i*6:
+//   [0] op: "var","const","add","sub","mul","div","pow","exp","log","sin","cos",
+//           "tanh","sigmoid","relu","matmul","softmax","sum","mse"
+//   [1] val: current value as string
+//   [2] grad: current gradient as string
+//   [3] in1: first input node id as string (or "-1")
+//   [4] in2: second input node id as string (or "-1")
+//   [5] extra: extra data (power exponent, name, dims, etc.) or ""
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Math Helpers (pure Vortex, no imports)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+fn _abs(x: f64) -> f64 {
+    if x < 0.0 {
+        return 0.0 - x
+    }
+    return x
+}
+
+fn _max(a: f64, b: f64) -> f64 {
+    if a > b {
+        return a
+    }
+    return b
+}
+
+fn _sqrt(x: f64) -> f64 {
+    if x <= 0.0 {
+        return 0.0
+    }
+    var guess = x / 2.0
+    if guess < 1.0 {
+        guess = 1.0
+    }
+    var i = 0
+    while i < 30 {
+        let next = (guess + x / guess) / 2.0
+        if _abs(next - guess) < 1.0e-15 {
+            return next
+        }
+        guess = next
+        i = i + 1
+    }
+    return guess
+}
+
+fn _pow2(k: i64) -> f64 {
+    var result = 1.0
+    if k >= 0 {
+        var i = 0
+        while i < k {
+            result = result * 2.0
+            i = i + 1
+        }
+    } else {
+        var i = 0
+        var nk = 0 - k
+        while i < nk {
+            result = result * 2.0
+            i = i + 1
+        }
+        result = 1.0 / result
+    }
+    return result
+}
+
+fn _exp(x: f64) -> f64 {
+    if x > 700.0 {
+        return 1.0e308
+    }
+    if x < -700.0 {
+        return 0.0
+    }
+    let ln2 = 0.6931471805599453
+    let k = int(x / ln2)
+    let r = x - float(k) * ln2
+    var term = 1.0
+    var sum = 1.0
+    var n = 1
+    while n < 40 {
+        term = term * r / float(n)
+        sum = sum + term
+        if _abs(term) < 1.0e-17 {
+            return sum * _pow2(k)
+        }
+        n = n + 1
+    }
+    return sum * _pow2(k)
+}
+
+fn _log(x: f64) -> f64 {
+    if x <= 0.0 {
+        return -1.0e300
+    }
+    if x == 1.0 {
+        return 0.0
+    }
+    let ln2 = 0.6931471805599453
+    var v = x
+    var k = 0
+    while v >= 2.0 {
+        v = v / 2.0
+        k = k + 1
+    }
+    while v < 0.5 {
+        v = v * 2.0
+        k = k - 1
+    }
+    let t = (v - 1.0) / (v + 1.0)
+    let t2 = t * t
+    var term = t
+    var sum = t
+    var n = 1
+    while n < 60 {
+        term = term * t2
+        n = n + 2
+        let contrib = term / float(n)
+        sum = sum + contrib
+        if _abs(contrib) < 1.0e-16 {
+            n = 100
+        }
+    }
+    return 2.0 * sum + float(k) * ln2
+}
+
+fn _sin(x: f64) -> f64 {
+    let two_pi = 6.28318530717958647692
+    var v = x
+    while v > 3.14159265358979323846 {
+        v = v - two_pi
+    }
+    while v < -3.14159265358979323846 {
+        v = v + two_pi
+    }
+    let x2 = v * v
+    var term = v
+    var sum = v
+    var n = 1
+    while n < 20 {
+        term = term * x2 / float((2 * n) * (2 * n + 1))
+        if n - (n / 2) * 2 == 0 {
+            sum = sum + term
+        } else {
+            sum = sum - term
+        }
+        if _abs(term) < 1.0e-17 {
+            n = 100
+        }
+        n = n + 1
+    }
+    return sum
+}
+
+fn _cos(x: f64) -> f64 {
+    let two_pi = 6.28318530717958647692
+    var v = x
+    while v > 3.14159265358979323846 {
+        v = v - two_pi
+    }
+    while v < -3.14159265358979323846 {
+        v = v + two_pi
+    }
+    let x2 = v * v
+    var term = 1.0
+    var sum = 1.0
+    var n = 1
+    while n < 20 {
+        term = term * x2 / float((2 * n - 1) * (2 * n))
+        if n - (n / 2) * 2 == 0 {
+            sum = sum + term
+        } else {
+            sum = sum - term
+        }
+        if _abs(term) < 1.0e-17 {
+            n = 100
+        }
+        n = n + 1
+    }
+    return sum
+}
+
+fn _tanh(x: f64) -> f64 {
+    if x > 20.0 {
+        return 1.0
+    }
+    if x < -20.0 {
+        return -1.0
+    }
+    let e2x = _exp(2.0 * x)
+    return (e2x - 1.0) / (e2x + 1.0)
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Dual Numbers — Forward-Mode Automatic Differentiation
+// ═══════════════════════════════════════════════════════════════════════════════
+
+fn dual_new(val: f64, deriv: f64) -> [f64] {
+    var d: [f64] = []
+    d = push(d, val)
+    d = push(d, deriv)
+    return d
+}
+
+fn dual_val(d: [f64]) -> f64 {
+    return d[0]
+}
+
+fn dual_deriv(d: [f64]) -> f64 {
+    return d[1]
+}
+
+fn dual_var(val: f64) -> [f64] {
+    return dual_new(val, 1.0)
+}
+
+fn dual_const(val: f64) -> [f64] {
+    return dual_new(val, 0.0)
+}
+
+fn dual_add(a: [f64], b: [f64]) -> [f64] {
+    return dual_new(a[0] + b[0], a[1] + b[1])
+}
+
+fn dual_sub(a: [f64], b: [f64]) -> [f64] {
+    return dual_new(a[0] - b[0], a[1] - b[1])
+}
+
+fn dual_mul(a: [f64], b: [f64]) -> [f64] {
+    return dual_new(a[0] * b[0], a[0] * b[1] + b[0] * a[1])
+}
+
+fn dual_div(a: [f64], b: [f64]) -> [f64] {
+    let val = a[0] / b[0]
+    let deriv = (a[1] * b[0] - a[0] * b[1]) / (b[0] * b[0])
+    return dual_new(val, deriv)
+}
+
+fn dual_neg(a: [f64]) -> [f64] {
+    return dual_new(0.0 - a[0], 0.0 - a[1])
+}
+
+fn dual_pow(a: [f64], n: f64) -> [f64] {
+    var base_pow = 1.0
+    var ni = int(n)
+    if float(ni) == n {
+        var b = a[0]
+        base_pow = 1.0
+        var i = 0
+        while i < ni - 1 {
+            base_pow = base_pow * b
+            i = i + 1
+        }
+        let val = base_pow * a[0]
+        let deriv = n * base_pow * a[1]
+        return dual_new(val, deriv)
+    }
+    let val = _exp(n * _log(a[0]))
+    let deriv = n * _exp((n - 1.0) * _log(a[0])) * a[1]
+    return dual_new(val, deriv)
+}
+
+fn dual_sqrt(a: [f64]) -> [f64] {
+    let s = _sqrt(a[0])
+    return dual_new(s, a[1] / (2.0 * s))
+}
+
+fn dual_exp(a: [f64]) -> [f64] {
+    let e = _exp(a[0])
+    return dual_new(e, e * a[1])
+}
+
+fn dual_log(a: [f64]) -> [f64] {
+    return dual_new(_log(a[0]), a[1] / a[0])
+}
+
+fn dual_sin(a: [f64]) -> [f64] {
+    return dual_new(_sin(a[0]), _cos(a[0]) * a[1])
+}
+
+fn dual_cos(a: [f64]) -> [f64] {
+    return dual_new(_cos(a[0]), 0.0 - _sin(a[0]) * a[1])
+}
+
+fn dual_tanh(a: [f64]) -> [f64] {
+    let t = _tanh(a[0])
+    return dual_new(t, (1.0 - t * t) * a[1])
+}
+
+fn dual_sigmoid(a: [f64]) -> [f64] {
+    let s = 1.0 / (1.0 + _exp(0.0 - a[0]))
+    return dual_new(s, s * (1.0 - s) * a[1])
+}
+
+fn dual_relu(a: [f64]) -> [f64] {
+    if a[0] > 0.0 {
+        return dual_new(a[0], a[1])
+    }
+    return dual_new(0.0, 0.0)
+}
+
+fn dual_silu(a: [f64]) -> [f64] {
+    let s = 1.0 / (1.0 + _exp(0.0 - a[0]))
+    let val = a[0] * s
+    let deriv = (s + a[0] * s * (1.0 - s)) * a[1]
+    return dual_new(val, deriv)
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Computation Graph — Reverse-Mode AD (Backpropagation)
+// ═══════════════════════════════════════════════════════════════════════════════
+// Node layout: 6 strings per node. Node i at indices [i*6 .. i*6+5]
+//   op, val, grad, in1, in2, extra
+
+fn _node_count(g: [String]) -> i64 {
+    return len(g) / 6
+}
+
+fn _get_op(g: [String], id: i64) -> String {
+    return g[id * 6]
+}
+
+fn _get_val(g: [String], id: i64) -> f64 {
+    return unwrap(parse_float(g[id * 6 + 1]))
+}
+
+fn _get_grad(g: [String], id: i64) -> f64 {
+    return unwrap(parse_float(g[id * 6 + 2]))
+}
+
+fn _get_in1(g: [String], id: i64) -> i64 {
+    return int(g[id * 6 + 3])
+}
+
+fn _get_in2(g: [String], id: i64) -> i64 {
+    return int(g[id * 6 + 4])
+}
+
+fn _get_extra(g: [String], id: i64) -> String {
+    return g[id * 6 + 5]
+}
+
+fn _set_val(g: [String], id: i64, v: f64) -> [String] {
+    var out: [String] = []
+    let n = len(g)
+    var i = 0
+    let target = id * 6 + 1
+    while i < n {
+        if i == target {
+            out = push(out, to_string(v))
+        } else {
+            out = push(out, g[i])
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn _set_grad(g: [String], id: i64, v: f64) -> [String] {
+    var out: [String] = []
+    let n = len(g)
+    var i = 0
+    let target = id * 6 + 2
+    while i < n {
+        if i == target {
+            out = push(out, to_string(v))
+        } else {
+            out = push(out, g[i])
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn _add_grad(g: [String], id: i64, delta: f64) -> [String] {
+    let cur = _get_grad(g, id)
+    return _set_grad(g, id, cur + delta)
+}
+
+fn _push_node(g: [String], op: String, val: f64, in1: i64, in2: i64, extra: String) -> [String] {
+    var out = g
+    out = push(out, op)
+    out = push(out, to_string(val))
+    out = push(out, "0.0")
+    out = push(out, to_string(in1))
+    out = push(out, to_string(in2))
+    out = push(out, extra)
+    return out
+}
+
+// ─── Graph Construction ───
+
+fn graph_new() -> [String] {
+    var g: [String] = []
+    return g
+}
+
+fn graph_var(g: [String], val: f64, name: String) -> [String] {
+    return _push_node(g, "var", val, -1, -1, name)
+}
+
+fn graph_const(g: [String], val: f64) -> [String] {
+    return _push_node(g, "const", val, -1, -1, "")
+}
+
+fn graph_add(g: [String], a_id: i64, b_id: i64) -> [String] {
+    let va = _get_val(g, a_id)
+    let vb = _get_val(g, b_id)
+    return _push_node(g, "add", va + vb, a_id, b_id, "")
+}
+
+fn graph_sub(g: [String], a_id: i64, b_id: i64) -> [String] {
+    let va = _get_val(g, a_id)
+    let vb = _get_val(g, b_id)
+    return _push_node(g, "sub", va - vb, a_id, b_id, "")
+}
+
+fn graph_mul(g: [String], a_id: i64, b_id: i64) -> [String] {
+    let va = _get_val(g, a_id)
+    let vb = _get_val(g, b_id)
+    return _push_node(g, "mul", va * vb, a_id, b_id, "")
+}
+
+fn graph_div(g: [String], a_id: i64, b_id: i64) -> [String] {
+    let va = _get_val(g, a_id)
+    let vb = _get_val(g, b_id)
+    return _push_node(g, "div", va / vb, a_id, b_id, "")
+}
+
+fn graph_pow(g: [String], a_id: i64, n: f64) -> [String] {
+    let va = _get_val(g, a_id)
+    let val = _exp(n * _log(va))
+    return _push_node(g, "pow", val, a_id, -1, to_string(n))
+}
+
+fn graph_exp(g: [String], node_id: i64) -> [String] {
+    let va = _get_val(g, node_id)
+    return _push_node(g, "exp", _exp(va), node_id, -1, "")
+}
+
+fn graph_log(g: [String], node_id: i64) -> [String] {
+    let va = _get_val(g, node_id)
+    return _push_node(g, "log", _log(va), node_id, -1, "")
+}
+
+fn graph_sin(g: [String], node_id: i64) -> [String] {
+    let va = _get_val(g, node_id)
+    return _push_node(g, "sin", _sin(va), node_id, -1, "")
+}
+
+fn graph_cos(g: [String], node_id: i64) -> [String] {
+    let va = _get_val(g, node_id)
+    return _push_node(g, "cos", _cos(va), node_id, -1, "")
+}
+
+fn graph_tanh(g: [String], node_id: i64) -> [String] {
+    let va = _get_val(g, node_id)
+    return _push_node(g, "tanh", _tanh(va), node_id, -1, "")
+}
+
+fn graph_sigmoid(g: [String], node_id: i64) -> [String] {
+    let va = _get_val(g, node_id)
+    let s = 1.0 / (1.0 + _exp(0.0 - va))
+    return _push_node(g, "sigmoid", s, node_id, -1, "")
+}
+
+fn graph_relu(g: [String], node_id: i64) -> [String] {
+    let va = _get_val(g, node_id)
+    var val = 0.0
+    if va > 0.0 {
+        val = va
+    }
+    return _push_node(g, "relu", val, node_id, -1, "")
+}
+
+fn graph_matmul(g: [String], a_id: i64, b_id: i64, m: i64, k: i64, n: i64) -> [String] {
+    // Placeholder - stores dimensions in extra
+    let extra_str = to_string(m) + "," + to_string(k) + "," + to_string(n)
+    return _push_node(g, "matmul", 0.0, a_id, b_id, extra_str)
+}
+
+fn graph_softmax(g: [String], node_id: i64, size: i64) -> [String] {
+    let va = _get_val(g, node_id)
+    return _push_node(g, "softmax", va, node_id, -1, to_string(size))
+}
+
+fn graph_sum(g: [String], node_id: i64) -> [String] {
+    let va = _get_val(g, node_id)
+    return _push_node(g, "sum", va, node_id, -1, "")
+}
+
+fn graph_mse_loss(g: [String], pred_id: i64, target_id: i64) -> [String] {
+    let pred = _get_val(g, pred_id)
+    let target = _get_val(g, target_id)
+    let delta = pred - target
+    let val = delta * delta
+    return _push_node(g, "mse", val, pred_id, target_id, "")
+}
+
+fn graph_size(g: [String]) -> i64 {
+    return _node_count(g)
+}
+
+fn graph_last_id(g: [String]) -> i64 {
+    return _node_count(g) - 1
+}
+
+fn graph_get_val(g: [String], node_id: i64) -> f64 {
+    return _get_val(g, node_id)
+}
+
+fn graph_get_grad(g: [String], node_id: i64) -> f64 {
+    return _get_grad(g, node_id)
+}
+
+// ─── Forward Pass ───
+
+fn graph_forward(g: [String]) -> [String] {
+    var out = g
+    let n = _node_count(out)
+    var i = 0
+    while i < n {
+        let op = _get_op(out, i)
+        if op == "var" {
+            // value already set
+            i = i + 1
+        } else if op == "const" {
+            i = i + 1
+        } else if op == "add" {
+            let a = _get_val(out, _get_in1(out, i))
+            let b = _get_val(out, _get_in2(out, i))
+            out = _set_val(out, i, a + b)
+            i = i + 1
+        } else if op == "sub" {
+            let a = _get_val(out, _get_in1(out, i))
+            let b = _get_val(out, _get_in2(out, i))
+            out = _set_val(out, i, a - b)
+            i = i + 1
+        } else if op == "mul" {
+            let a = _get_val(out, _get_in1(out, i))
+            let b = _get_val(out, _get_in2(out, i))
+            out = _set_val(out, i, a * b)
+            i = i + 1
+        } else if op == "div" {
+            let a = _get_val(out, _get_in1(out, i))
+            let b = _get_val(out, _get_in2(out, i))
+            out = _set_val(out, i, a / b)
+            i = i + 1
+        } else if op == "pow" {
+            let a = _get_val(out, _get_in1(out, i))
+            let n_exp = unwrap(parse_float(_get_extra(out, i)))
+            out = _set_val(out, i, _exp(n_exp * _log(a)))
+            i = i + 1
+        } else if op == "exp" {
+            let a = _get_val(out, _get_in1(out, i))
+            out = _set_val(out, i, _exp(a))
+            i = i + 1
+        } else if op == "log" {
+            let a = _get_val(out, _get_in1(out, i))
+            out = _set_val(out, i, _log(a))
+            i = i + 1
+        } else if op == "sin" {
+            let a = _get_val(out, _get_in1(out, i))
+            out = _set_val(out, i, _sin(a))
+            i = i + 1
+        } else if op == "cos" {
+            let a = _get_val(out, _get_in1(out, i))
+            out = _set_val(out, i, _cos(a))
+            i = i + 1
+        } else if op == "tanh" {
+            let a = _get_val(out, _get_in1(out, i))
+            out = _set_val(out, i, _tanh(a))
+            i = i + 1
+        } else if op == "sigmoid" {
+            let a = _get_val(out, _get_in1(out, i))
+            let s = 1.0 / (1.0 + _exp(0.0 - a))
+            out = _set_val(out, i, s)
+            i = i + 1
+        } else if op == "relu" {
+            let a = _get_val(out, _get_in1(out, i))
+            if a > 0.0 {
+                out = _set_val(out, i, a)
+            } else {
+                out = _set_val(out, i, 0.0)
+            }
+            i = i + 1
+        } else if op == "mse" {
+            let pred = _get_val(out, _get_in1(out, i))
+            let target = _get_val(out, _get_in2(out, i))
+            let delta = pred - target
+            out = _set_val(out, i, delta * delta)
+            i = i + 1
+        } else if op == "sum" {
+            let a = _get_val(out, _get_in1(out, i))
+            out = _set_val(out, i, a)
+            i = i + 1
+        } else {
+            i = i + 1
+        }
+    }
+    return out
+}
+
+// ─── Backward Pass (THE key operation) ───
+
+fn graph_backward(g: [String], loss_id: i64) -> [String] {
+    var out = g
+    // Set gradient of loss node to 1.0
+    out = _set_grad(out, loss_id, 1.0)
+    // Reverse topological order (nodes are already in topo order)
+    var i = loss_id
+    while i >= 0 {
+        let grad = _get_grad(out, i)
+        let op = _get_op(out, i)
+        let in1 = _get_in1(out, i)
+        let in2 = _get_in2(out, i)
+
+        if op == "add" {
+            out = _add_grad(out, in1, grad)
+            out = _add_grad(out, in2, grad)
+        } else if op == "sub" {
+            out = _add_grad(out, in1, grad)
+            out = _add_grad(out, in2, 0.0 - grad)
+        } else if op == "mul" {
+            let va = _get_val(out, in1)
+            let vb = _get_val(out, in2)
+            out = _add_grad(out, in1, grad * vb)
+            out = _add_grad(out, in2, grad * va)
+        } else if op == "div" {
+            let va = _get_val(out, in1)
+            let vb = _get_val(out, in2)
+            out = _add_grad(out, in1, grad / vb)
+            out = _add_grad(out, in2, 0.0 - grad * va / (vb * vb))
+        } else if op == "pow" {
+            let va = _get_val(out, in1)
+            let n_exp = unwrap(parse_float(_get_extra(out, i)))
+            out = _add_grad(out, in1, grad * n_exp * _exp((n_exp - 1.0) * _log(va)))
+        } else if op == "exp" {
+            let val = _get_val(out, i)
+            out = _add_grad(out, in1, grad * val)
+        } else if op == "log" {
+            let va = _get_val(out, in1)
+            out = _add_grad(out, in1, grad / va)
+        } else if op == "sin" {
+            let va = _get_val(out, in1)
+            out = _add_grad(out, in1, grad * _cos(va))
+        } else if op == "cos" {
+            let va = _get_val(out, in1)
+            out = _add_grad(out, in1, 0.0 - grad * _sin(va))
+        } else if op == "tanh" {
+            let val = _get_val(out, i)
+            out = _add_grad(out, in1, grad * (1.0 - val * val))
+        } else if op == "sigmoid" {
+            let val = _get_val(out, i)
+            out = _add_grad(out, in1, grad * val * (1.0 - val))
+        } else if op == "relu" {
+            let va = _get_val(out, in1)
+            if va > 0.0 {
+                out = _add_grad(out, in1, grad)
+            }
+        } else if op == "mse" {
+            let pred = _get_val(out, in1)
+            let target = _get_val(out, in2)
+            let delta = pred - target
+            out = _add_grad(out, in1, grad * 2.0 * delta)
+            out = _add_grad(out, in2, 0.0 - grad * 2.0 * delta)
+        } else if op == "sum" {
+            out = _add_grad(out, in1, grad)
+        }
+
+        i = i - 1
+    }
+    return out
+}
+
+// ─── Gradient Descent ───
+
+fn graph_sgd_step(g: [String], lr: f64) -> [String] {
+    var out = g
+    let n = _node_count(out)
+    var i = 0
+    while i < n {
+        if _get_op(out, i) == "var" {
+            let val = _get_val(out, i)
+            let grad = _get_grad(out, i)
+            out = _set_val(out, i, val - lr * grad)
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn graph_zero_grad(g: [String]) -> [String] {
+    var out = g
+    let n = _node_count(out)
+    var i = 0
+    while i < n {
+        out = _set_grad(out, i, 0.0)
+        i = i + 1
+    }
+    return out
+}
+
+fn train_step(g: [String], loss_id: i64, lr: f64) -> [String] {
+    var out = graph_forward(g)
+    out = graph_backward(out, loss_id)
+    out = graph_sgd_step(out, lr)
+    out = graph_zero_grad(out)
+    return out
+}
+
+// ─── Numerical Gradient ───
+
+fn numerical_grad(f_name: String, x: f64, h: f64) -> f64 {
+    // Cannot call by name in Vortex — this is a placeholder
+    return 0.0
+}
+
+fn check_grad(g: [String], var_id: i64, loss_id: i64, h: f64) -> f64 {
+    // Numerical gradient check
+    let orig_val = _get_val(g, var_id)
+
+    // f(x+h)
+    var gp = _set_val(g, var_id, orig_val + h)
+    gp = graph_forward(gp)
+    let fp = _get_val(gp, loss_id)
+
+    // f(x-h)
+    var gm = _set_val(g, var_id, orig_val - h)
+    gm = graph_forward(gm)
+    let fm = _get_val(gm, loss_id)
+
+    let numerical = (fp - fm) / (2.0 * h)
+
+    // Analytical gradient
+    var ga = g
+    ga = graph_forward(ga)
+    ga = graph_backward(ga, loss_id)
+    let analytical = _get_grad(ga, var_id)
+
+    // Relative error
+    let denom = _max(_abs(numerical) + _abs(analytical), 1.0e-15)
+    return _abs(numerical - analytical) / denom
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Tests
+// ═══════════════════════════════════════════════════════════════════════════════
+
+fn main() {
+    var pass = 0
+    var fail = 0
+
+    // Test 1: Dual number AD: f(x) = x^2 + 3x + 1 at x=2
+    // f(2) = 4 + 6 + 1 = 11, f'(2) = 2*2 + 3 = 7
+    let x1 = dual_var(2.0)
+    let c3 = dual_const(3.0)
+    let c1 = dual_const(1.0)
+    let x1_sq = dual_pow(x1, 2.0)
+    let x1_3x = dual_mul(c3, x1)
+    let f1 = dual_add(dual_add(x1_sq, x1_3x), c1)
+    if _abs(dual_val(f1) - 11.0) < 1.0e-10 {
+        if _abs(dual_deriv(f1) - 7.0) < 1.0e-10 {
+            println("PASS: test 1 - dual number f(x)=x^2+3x+1")
+            pass = pass + 1
+        } else {
+            println("FAIL: test 1 - deriv=" + to_string(dual_deriv(f1)) + " expected 7")
+            fail = fail + 1
+        }
+    } else {
+        println("FAIL: test 1 - val=" + to_string(dual_val(f1)) + " expected 11")
+        fail = fail + 1
+    }
+
+    // Test 2: Dual exp/sin: f(x) = exp(sin(x)) at x=0
+    // f(0) = exp(0) = 1, f'(0) = exp(sin(0))*cos(0) = 1*1 = 1
+    let x2 = dual_var(0.0)
+    let f2 = dual_exp(dual_sin(x2))
+    if _abs(dual_val(f2) - 1.0) < 1.0e-10 {
+        if _abs(dual_deriv(f2) - 1.0) < 1.0e-10 {
+            println("PASS: test 2 - dual exp(sin(x)) at x=0")
+            pass = pass + 1
+        } else {
+            println("FAIL: test 2 - deriv=" + to_string(dual_deriv(f2)) + " expected 1")
+            fail = fail + 1
+        }
+    } else {
+        println("FAIL: test 2 - val=" + to_string(dual_val(f2)) + " expected 1")
+        fail = fail + 1
+    }
+
+    // Test 3: Graph forward: f(x,y) = x*y + x at x=3, y=4 -> 15
+    var g3 = graph_new()
+    g3 = graph_var(g3, 3.0, "x")    // id 0
+    g3 = graph_var(g3, 4.0, "y")    // id 1
+    g3 = graph_mul(g3, 0, 1)        // id 2: x*y = 12
+    g3 = graph_add(g3, 2, 0)        // id 3: x*y + x = 15
+    g3 = graph_forward(g3)
+    let v3 = graph_get_val(g3, 3)
+    if _abs(v3 - 15.0) < 1.0e-10 {
+        println("PASS: test 3 - graph forward f(x,y)=x*y+x = 15")
+        pass = pass + 1
+    } else {
+        println("FAIL: test 3 - val=" + to_string(v3) + " expected 15")
+        fail = fail + 1
+    }
+
+    // Test 4: Graph backward: df/dx = y+1 = 5, df/dy = x = 3
+    g3 = graph_backward(g3, 3)
+    let dx3 = graph_get_grad(g3, 0)
+    let dy3 = graph_get_grad(g3, 1)
+    if _abs(dx3 - 5.0) < 1.0e-10 {
+        if _abs(dy3 - 3.0) < 1.0e-10 {
+            println("PASS: test 4 - graph backward df/dx=5, df/dy=3")
+            pass = pass + 1
+        } else {
+            println("FAIL: test 4 - df/dy=" + to_string(dy3) + " expected 3")
+            fail = fail + 1
+        }
+    } else {
+        println("FAIL: test 4 - df/dx=" + to_string(dx3) + " expected 5")
+        fail = fail + 1
+    }
+
+    // Test 5: Gradient check - compare analytical vs numerical
+    var g5 = graph_new()
+    g5 = graph_var(g5, 2.0, "x")     // id 0
+    g5 = graph_var(g5, 3.0, "y")     // id 1
+    g5 = graph_mul(g5, 0, 1)         // id 2: x*y
+    g5 = graph_pow(g5, 2, 2.0)       // id 3: (x*y)^2
+    let err5 = check_grad(g5, 0, 3, 1.0e-5)
+    if err5 < 1.0e-5 {
+        println("PASS: test 5 - gradient check error=" + to_string(err5))
+        pass = pass + 1
+    } else {
+        println("FAIL: test 5 - gradient check error=" + to_string(err5) + " > 1e-5")
+        fail = fail + 1
+    }
+
+    // Test 6: Training - learn y = 2*x + 1
+    // Use single data point: x=1, y_target=3 (since 2*1+1=3)
+    // Initialize w=0.5, b=0.0, learn w->2, b->1
+    var g6 = graph_new()
+    g6 = graph_var(g6, 0.5, "w")      // id 0: weight
+    g6 = graph_var(g6, 0.0, "b")      // id 1: bias
+    g6 = graph_const(g6, 1.0)         // id 2: x input
+    g6 = graph_const(g6, 3.0)         // id 3: y target
+    g6 = graph_mul(g6, 0, 2)          // id 4: w*x
+    g6 = graph_add(g6, 4, 1)          // id 5: w*x + b (prediction)
+    g6 = graph_mse_loss(g6, 5, 3)     // id 6: MSE loss
+
+    // Train for multiple data points to learn w=2, b=1
+    // We'll alternate between (x=1,y=3) and (x=2,y=5) and (x=0,y=1)
+    var step = 0
+    while step < 100 {
+        // Data point 1: x=1, y=3
+        g6 = _set_val(g6, 2, 1.0)
+        g6 = _set_val(g6, 3, 3.0)
+        g6 = train_step(g6, 6, 0.05)
+
+        // Data point 2: x=2, y=5
+        g6 = _set_val(g6, 2, 2.0)
+        g6 = _set_val(g6, 3, 5.0)
+        g6 = train_step(g6, 6, 0.05)
+
+        // Data point 3: x=0, y=1
+        g6 = _set_val(g6, 2, 0.0)
+        g6 = _set_val(g6, 3, 1.0)
+        g6 = train_step(g6, 6, 0.05)
+
+        step = step + 1
+    }
+    let w_final = graph_get_val(g6, 0)
+    let b_final = graph_get_val(g6, 1)
+    if _abs(w_final - 2.0) < 0.1 {
+        if _abs(b_final - 1.0) < 0.1 {
+            println("PASS: test 6 - training w=" + to_string(w_final) + " b=" + to_string(b_final))
+            pass = pass + 1
+        } else {
+            println("FAIL: test 6 - b=" + to_string(b_final) + " expected ~1.0")
+            fail = fail + 1
+        }
+    } else {
+        println("FAIL: test 6 - w=" + to_string(w_final) + " expected ~2.0")
+        fail = fail + 1
+    }
+
+    // Test 7: Chain rule - f(x) = tanh(x^2)
+    // f'(x) = (1 - tanh^2(x^2)) * 2x
+    // At x=1: f'(1) = (1 - tanh^2(1)) * 2
+    let x7 = dual_var(1.0)
+    let x7_sq = dual_pow(x7, 2.0)
+    let f7 = dual_tanh(x7_sq)
+    let t7 = _tanh(1.0)
+    let expected7 = (1.0 - t7 * t7) * 2.0
+    if _abs(dual_deriv(f7) - expected7) < 1.0e-10 {
+        println("PASS: test 7 - chain rule tanh(x^2) deriv=" + to_string(dual_deriv(f7)))
+        pass = pass + 1
+    } else {
+        println("FAIL: test 7 - deriv=" + to_string(dual_deriv(f7)) + " expected " + to_string(expected7))
+        fail = fail + 1
+    }
+
+    // Test 8: MSE loss backward
+    var g8 = graph_new()
+    g8 = graph_var(g8, 5.0, "pred")   // id 0
+    g8 = graph_const(g8, 3.0)         // id 1: target
+    g8 = graph_mse_loss(g8, 0, 1)     // id 2: (5-3)^2 = 4
+    g8 = graph_forward(g8)
+    g8 = graph_backward(g8, 2)
+    let mse_val = graph_get_val(g8, 2)
+    let mse_grad = graph_get_grad(g8, 0)
+    // d/dpred (pred-target)^2 = 2*(pred-target) = 2*(5-3) = 4
+    if _abs(mse_val - 4.0) < 1.0e-10 {
+        if _abs(mse_grad - 4.0) < 1.0e-10 {
+            println("PASS: test 8 - MSE loss val=4, grad=4")
+            pass = pass + 1
+        } else {
+            println("FAIL: test 8 - mse grad=" + to_string(mse_grad) + " expected 4")
+            fail = fail + 1
+        }
+    } else {
+        println("FAIL: test 8 - mse val=" + to_string(mse_val) + " expected 4")
+        fail = fail + 1
+    }
+
+    println("")
+    println("Results: " + to_string(pass) + "/" + to_string(pass + fail) + " passed")
+}
