@@ -1,0 +1,1089 @@
+// bytecode_compiler.vx — Compiles Vortex AST to bytecode instructions
+// Pipeline: AST (from parser.vx) -> bytecode string instructions -> VM execution
+// Self-contained: includes compiler + inline VM for testing
+//
+// AST format (flat string arrays):
+//   Expressions: ["int", "42"], ["ident", "x"], ["+", left, right],
+//                ["call", "fname", arg1, arg2], ["string", "hello"],
+//                ["array", elem1, ...], ["index", arr, idx],
+//                ["len", expr], ["push", arr, val]
+//   Statements:  ["let", "x", expr...], ["var", "x", expr...],
+//                ["assign", "x", expr...], ["return", expr...],
+//                ["println", expr...], ["print_str", expr...],
+//                ["if", cond..., "THEN", then_stmts, "ELSE", else_stmts],
+//                ["while", cond..., "BODY", body_stmts],
+//                ["expr_stmt", expr...]
+//   Functions:   ["fn", "name", "PARAMS", p1, p2, ..., "BODY", stmt1, ...]
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+fn _nl() -> String { return str_from_bytes([10]) }
+fn _pipe() -> String { return str_from_bytes([124]) }
+
+fn sw(s: String, prefix: String) -> bool {
+    if len(s) < len(prefix) { return false }
+    return str_substr(s, 0, len(prefix)) == prefix
+}
+
+fn after(s: String, n: i64) -> String {
+    return str_substr(s, n, len(s))
+}
+
+fn find_idx(haystack: String, needle: String) -> i64 {
+    return unwrap_or(str_find(haystack, needle), -1)
+}
+
+// ── Compiler state: we pass arrays around ─────────────────────────────────────
+// code: [String] — emitted instructions (same format as vm.vx)
+// locals: [String] — flat [name, name, ...] for current function scope
+// label_counter: tracked via a global-ish counter encoded in a 1-element array
+
+fn emit(code: [String], instr: String) -> [String] {
+    return push(code, instr)
+}
+
+// ── Expression compiler ───────────────────────────────────────────────────────
+// An expression is encoded as a flat string array.
+// We need to know where an expression ends, so we use a recursive approach
+// that returns [code..., "##EXPREND##", consumed_count_str]
+// Actually simpler: expressions are pre-packaged as nested-via-encoding.
+//
+// For simplicity, we encode compound expressions as a single string with
+// a prefix tag system:
+//   "INT:42"         integer literal
+//   "STR:hello"      string literal
+//   "ID:x"           identifier
+//   "ADD:a|||b"       binary op (a and b are encoded exprs, ||| separated)
+//   "SUB:a|||b"
+//   "MUL:a|||b"
+//   "DIV:a|||b"
+//   "MOD:a|||b"
+//   "EQ:a|||b"  "NEQ:a|||b"  "LT:a|||b"  "GT:a|||b"  "LTEQ:a|||b"  "GTEQ:a|||b"
+//   "CALL:fname|||arg1|||arg2|||..."
+//   "NEG:a"
+//   "NOT:a"
+//   "AND:a|||b"  "OR:a|||b"
+//
+// Statements are encoded similarly:
+//   "LET:name|||expr"
+//   "VAR:name|||expr"
+//   "ASSIGN:name|||expr"
+//   "RETURN:expr"
+//   "PRINTLN:expr"
+//   "PRINT_STR:expr"
+//   "IF:cond|||then_count|||s1|||s2...|||else_count|||s1|||s2..."
+//   "WHILE:cond|||body_count|||s1|||s2..."
+//   "EXPR_STMT:expr"
+//
+// Functions:
+//   "FN:name|||param_count|||p1|||p2...|||body_count|||s1|||s2..."
+
+fn _sep() -> String { return "|||" }
+
+fn _split3(s: String) -> [String] {
+    var parts: [String] = []
+    var sep = _sep()
+    var seplen = len(sep)
+    var cur = ""
+    var i = 0
+    while i < len(s) {
+        if i + seplen <= len(s) {
+            var chunk = str_substr(s, i, i + seplen)
+            if chunk == sep {
+                parts = push(parts, cur)
+                cur = ""
+                i = i + seplen
+            } else {
+                cur = cur + str_substr(s, i, i + 1)
+                i = i + 1
+            }
+        } else {
+            cur = cur + str_substr(s, i, i + 1)
+            i = i + 1
+        }
+    }
+    parts = push(parts, cur)
+    return parts
+}
+
+// ── Expression constructors ──────────────────────────────────────────────────
+
+fn expr_int(n: i64) -> String { return "INT:" + to_string(n) }
+fn expr_str(s: String) -> String { return "STR:" + s }
+fn expr_id(name: String) -> String { return "ID:" + name }
+fn expr_bin(op: String, a: String, b: String) -> String {
+    return op + ":" + a + _sep() + b
+}
+fn expr_add(a: String, b: String) -> String { return expr_bin("ADD", a, b) }
+fn expr_sub(a: String, b: String) -> String { return expr_bin("SUB", a, b) }
+fn expr_mul(a: String, b: String) -> String { return expr_bin("MUL", a, b) }
+fn expr_div(a: String, b: String) -> String { return expr_bin("DIV", a, b) }
+fn expr_mod(a: String, b: String) -> String { return expr_bin("MOD", a, b) }
+fn expr_eq(a: String, b: String) -> String { return expr_bin("EQ", a, b) }
+fn expr_ne(a: String, b: String) -> String { return expr_bin("NEQ", a, b) }
+fn expr_lt(a: String, b: String) -> String { return expr_bin("LT", a, b) }
+fn expr_gt(a: String, b: String) -> String { return expr_bin("GT", a, b) }
+fn expr_le(a: String, b: String) -> String { return expr_bin("LTEQ", a, b) }
+fn expr_ge(a: String, b: String) -> String { return expr_bin("GTEQ", a, b) }
+fn expr_and(a: String, b: String) -> String { return expr_bin("AND", a, b) }
+fn expr_or(a: String, b: String) -> String { return expr_bin("OR", a, b) }
+fn expr_neg(a: String) -> String { return "NEG:" + a }
+fn expr_not(a: String) -> String { return "NOT:" + a }
+
+fn expr_call(fname: String, args: [String]) -> String {
+    var result = "CALL:" + fname
+    var i = 0
+    while i < len(args) {
+        result = result + _sep() + args[i]
+        i = i + 1
+    }
+    return result
+}
+
+// ── Statement constructors ───────────────────────────────────────────────────
+
+fn stmt_let(name: String, expr: String) -> String {
+    return "LET:" + name + _sep() + expr
+}
+fn stmt_var(name: String, expr: String) -> String {
+    return "VAR:" + name + _sep() + expr
+}
+fn stmt_assign(name: String, expr: String) -> String {
+    return "ASSIGN:" + name + _sep() + expr
+}
+fn stmt_return(expr: String) -> String {
+    return "RETURN:" + expr
+}
+fn stmt_println(expr: String) -> String {
+    return "PRINTLN:" + expr
+}
+fn stmt_print_str(expr: String) -> String {
+    return "PRINT_STR:" + expr
+}
+fn stmt_expr(expr: String) -> String {
+    return "EXPR_STMT:" + expr
+}
+
+fn stmt_if(cond: String, then_stmts: [String], else_stmts: [String]) -> String {
+    var result = "IF:" + cond + _sep() + to_string(len(then_stmts))
+    var i = 0
+    while i < len(then_stmts) {
+        result = result + _sep() + then_stmts[i]
+        i = i + 1
+    }
+    result = result + _sep() + to_string(len(else_stmts))
+    i = 0
+    while i < len(else_stmts) {
+        result = result + _sep() + else_stmts[i]
+        i = i + 1
+    }
+    return result
+}
+
+fn stmt_while(cond: String, body: [String]) -> String {
+    var result = "WHILE:" + cond + _sep() + to_string(len(body))
+    var i = 0
+    while i < len(body) {
+        result = result + _sep() + body[i]
+        i = i + 1
+    }
+    return result
+}
+
+fn make_fn(name: String, params: [String], body: [String]) -> String {
+    var result = "FN:" + name + _sep() + to_string(len(params))
+    var i = 0
+    while i < len(params) {
+        result = result + _sep() + params[i]
+        i = i + 1
+    }
+    result = result + _sep() + to_string(len(body))
+    i = 0
+    while i < len(body) {
+        result = result + _sep() + body[i]
+        i = i + 1
+    }
+    return result
+}
+
+// ── Label generation ─────────────────────────────────────────────────────────
+
+var _label_id = 0
+
+fn new_label(prefix: String) -> String {
+    _label_id = _label_id + 1
+    return prefix + "_" + to_string(_label_id)
+}
+
+// ── Core compiler: AST node -> VM instructions ──────────────────────────────
+
+fn compile_expr(code: [String], expr: String) -> [String] {
+    // Integer literal
+    if sw(expr, "INT:") {
+        var val = after(expr, 4)
+        code = emit(code, "PUSH_INT " + val)
+        return code
+    }
+
+    // String literal
+    if sw(expr, "STR:") {
+        var val = after(expr, 4)
+        code = emit(code, "PUSH_STRING " + val)
+        return code
+    }
+
+    // Identifier
+    if sw(expr, "ID:") {
+        var name = after(expr, 3)
+        code = emit(code, "LOAD " + name)
+        return code
+    }
+
+    // Negation
+    if sw(expr, "NEG:") {
+        var inner = after(expr, 4)
+        code = compile_expr(code, inner)
+        code = emit(code, "NEG")
+        return code
+    }
+
+    // Logical NOT
+    if sw(expr, "NOT:") {
+        var inner = after(expr, 4)
+        code = compile_expr(code, inner)
+        code = emit(code, "NOT")
+        return code
+    }
+
+    // Function call
+    if sw(expr, "CALL:") {
+        var rest = after(expr, 5)
+        var parts = _split3(rest)
+        var fname = parts[0]
+        var argc = len(parts) - 1
+        // Compile arguments
+        var i = 1
+        while i < len(parts) {
+            code = compile_expr(code, parts[i])
+            i = i + 1
+        }
+        code = emit(code, "CALL " + fname + " " + to_string(argc))
+        return code
+    }
+
+    // Binary operations
+    var bin_ops: [String] = ["ADD", "SUB", "MUL", "DIV", "MOD", "EQ", "NEQ", "LT", "GT", "LTEQ", "GTEQ", "AND", "OR"]
+    var bi = 0
+    while bi < len(bin_ops) {
+        var op = bin_ops[bi]
+        var prefix = op + ":"
+        if sw(expr, prefix) {
+            var rest = after(expr, len(prefix))
+            var parts = _split3(rest)
+            if len(parts) >= 2 {
+                code = compile_expr(code, parts[0])
+                code = compile_expr(code, parts[1])
+                code = emit(code, op)
+                return code
+            }
+        }
+        bi = bi + 1
+    }
+
+    // Fallback: treat as integer 0
+    code = emit(code, "PUSH_INT 0")
+    return code
+}
+
+fn compile_stmt(code: [String], stmt: String) -> [String] {
+    // let binding
+    if sw(stmt, "LET:") {
+        var rest = after(stmt, 4)
+        var parts = _split3(rest)
+        var name = parts[0]
+        var expr = parts[1]
+        code = compile_expr(code, expr)
+        code = emit(code, "STORE " + name)
+        return code
+    }
+
+    // var binding
+    if sw(stmt, "VAR:") {
+        var rest = after(stmt, 4)
+        var parts = _split3(rest)
+        var name = parts[0]
+        var expr = parts[1]
+        code = compile_expr(code, expr)
+        code = emit(code, "STORE " + name)
+        return code
+    }
+
+    // assignment
+    if sw(stmt, "ASSIGN:") {
+        var rest = after(stmt, 7)
+        var parts = _split3(rest)
+        var name = parts[0]
+        var expr = parts[1]
+        code = compile_expr(code, expr)
+        code = emit(code, "STORE " + name)
+        return code
+    }
+
+    // return
+    if sw(stmt, "RETURN:") {
+        var expr = after(stmt, 7)
+        code = compile_expr(code, expr)
+        code = emit(code, "RET")
+        return code
+    }
+
+    // println
+    if sw(stmt, "PRINTLN:") {
+        var expr = after(stmt, 8)
+        code = compile_expr(code, expr)
+        code = emit(code, "CALL println 1")
+        return code
+    }
+
+    // print_str
+    if sw(stmt, "PRINT_STR:") {
+        var expr = after(stmt, 10)
+        code = compile_expr(code, expr)
+        code = emit(code, "CALL print 1")
+        return code
+    }
+
+    // if-else
+    if sw(stmt, "IF:") {
+        var rest = after(stmt, 3)
+        var parts = _split3(rest)
+        // parts[0] = cond, parts[1] = then_count, then stmts..., else_count, else stmts...
+        var cond = parts[0]
+        var then_count = int(parts[1])
+        var else_label = new_label("else")
+        var end_label = new_label("endif")
+
+        code = compile_expr(code, cond)
+        code = emit(code, "JZ " + else_label)
+
+        // Then branch
+        var idx = 2
+        var ti = 0
+        while ti < then_count {
+            code = compile_stmt(code, parts[idx])
+            idx = idx + 1
+            ti = ti + 1
+        }
+        code = emit(code, "JMP " + end_label)
+
+        // Else branch
+        code = emit(code, "LABEL " + else_label)
+        var else_count = int(parts[idx])
+        idx = idx + 1
+        var ei = 0
+        while ei < else_count {
+            code = compile_stmt(code, parts[idx])
+            idx = idx + 1
+            ei = ei + 1
+        }
+
+        code = emit(code, "LABEL " + end_label)
+        return code
+    }
+
+    // while loop
+    if sw(stmt, "WHILE:") {
+        var rest = after(stmt, 6)
+        var parts = _split3(rest)
+        var cond = parts[0]
+        var body_count = int(parts[1])
+
+        var loop_label = new_label("loop")
+        var end_label = new_label("endloop")
+
+        code = emit(code, "LABEL " + loop_label)
+        code = compile_expr(code, cond)
+        code = emit(code, "JZ " + end_label)
+
+        var idx = 2
+        var bi = 0
+        while bi < body_count {
+            code = compile_stmt(code, parts[idx])
+            idx = idx + 1
+            bi = bi + 1
+        }
+        code = emit(code, "JMP " + loop_label)
+        code = emit(code, "LABEL " + end_label)
+        return code
+    }
+
+    // expression statement
+    if sw(stmt, "EXPR_STMT:") {
+        var expr = after(stmt, 10)
+        code = compile_expr(code, expr)
+        code = emit(code, "POP")
+        return code
+    }
+
+    return code
+}
+
+fn compile_function(code: [String], func: String) -> [String] {
+    var rest = after(func, 3)
+    var parts = _split3(rest)
+    var name = parts[0]
+    var param_count = int(parts[1])
+
+    code = emit(code, "FN_START " + name)
+
+    // Store params in reverse order (they were pushed left-to-right)
+    var pi = param_count - 1
+    while pi >= 0 {
+        var param_name = parts[2 + pi]
+        code = emit(code, "STORE " + param_name)
+        pi = pi - 1
+    }
+
+    // Compile body statements
+    var body_count_idx = 2 + param_count
+    var body_count = int(parts[body_count_idx])
+    var si = 0
+    while si < body_count {
+        code = compile_stmt(code, parts[body_count_idx + 1 + si])
+        si = si + 1
+    }
+
+    // If this is main, add HALT
+    if name == "main" {
+        code = emit(code, "HALT")
+    }
+
+    code = emit(code, "FN_END")
+    return code
+}
+
+fn compile_program(functions: [String]) -> [String] {
+    var code: [String] = []
+    var i = 0
+    while i < len(functions) {
+        code = compile_function(code, functions[i])
+        i = i + 1
+    }
+    return code
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// INLINE VM (copied core from vm.vx for self-contained testing)
+// ══════════════════════════════════════════════════════════════════════════════
+
+fn make_int(n: i64) -> String   { return "i:" + to_string(n) }
+fn make_str(s: String) -> String { return "s:" + s }
+fn make_bool(b: bool) -> String {
+    if b { return "b:true" }
+    return "b:false"
+}
+fn make_float(f: f64) -> String { return "f:" + to_string(f) }
+
+fn val_display(v: String) -> String {
+    if sw(v, "i:")    { return after(v, 2) }
+    if sw(v, "f:")    { return after(v, 2) }
+    if sw(v, "s:")    { return after(v, 2) }
+    if v == "b:true"  { return "true" }
+    if v == "b:false" { return "false" }
+    if v == "void"    { return "()" }
+    return v
+}
+
+fn val_is_truthy(v: String) -> bool {
+    if v == "b:true"  { return true }
+    if v == "b:false" { return false }
+    if v == "void"    { return false }
+    if sw(v, "i:") { return after(v, 2) != "0" }
+    if sw(v, "s:") { return len(after(v, 2)) > 0 }
+    return true
+}
+
+fn val_as_int(v: String) -> i64 {
+    if sw(v, "i:") { return int(after(v, 2)) }
+    return 0
+}
+
+fn val_add(a: String, b: String) -> String {
+    if sw(a, "s:") { return make_str(val_display(a) + val_display(b)) }
+    if sw(b, "s:") { return make_str(val_display(a) + val_display(b)) }
+    return make_int(val_as_int(a) + val_as_int(b))
+}
+fn val_sub(a: String, b: String) -> String { return make_int(val_as_int(a) - val_as_int(b)) }
+fn val_mul(a: String, b: String) -> String { return make_int(val_as_int(a) * val_as_int(b)) }
+fn val_div(a: String, b: String) -> String {
+    var d = val_as_int(b)
+    if d == 0 { return "i:0" }
+    return make_int(val_as_int(a) / d)
+}
+fn val_mod(a: String, b: String) -> String {
+    var d = val_as_int(b)
+    if d == 0 { return "i:0" }
+    return make_int(val_as_int(a) % d)
+}
+fn val_neg(a: String) -> String { return make_int(0 - val_as_int(a)) }
+fn val_not(a: String) -> String {
+    if val_is_truthy(a) { return "b:false" }
+    return "b:true"
+}
+
+fn val_cmp(a: String, b: String, op: String) -> String {
+    var ai = val_as_int(a)
+    var bi = val_as_int(b)
+    if op == "EQ"   { return make_bool(ai == bi) }
+    if op == "NEQ"  { return make_bool(ai != bi) }
+    if op == "LT"   { return make_bool(ai < bi) }
+    if op == "GT"   { return make_bool(ai > bi) }
+    if op == "LTEQ" { return make_bool(ai <= bi) }
+    if op == "GTEQ" { return make_bool(ai >= bi) }
+    return "b:false"
+}
+
+fn val_and(a: String, b: String) -> String {
+    if val_is_truthy(a) {
+        if val_is_truthy(b) { return "b:true" }
+    }
+    return "b:false"
+}
+fn val_or(a: String, b: String) -> String {
+    if val_is_truthy(a) { return "b:true" }
+    if val_is_truthy(b) { return "b:true" }
+    return "b:false"
+}
+
+fn stack_pop(stack: [String]) -> [String] {
+    var ns: [String] = []
+    var i = 0
+    while i < len(stack) - 1 {
+        ns = push(ns, stack[i])
+        i = i + 1
+    }
+    return ns
+}
+
+fn stack_pop2(stack: [String]) -> [String] {
+    var ns: [String] = []
+    var i = 0
+    while i < len(stack) - 2 {
+        ns = push(ns, stack[i])
+        i = i + 1
+    }
+    return ns
+}
+
+fn stack_top(stack: [String]) -> String {
+    if len(stack) == 0 { return "void" }
+    return stack[len(stack) - 1]
+}
+
+fn stack_second(stack: [String]) -> String {
+    if len(stack) < 2 { return "void" }
+    return stack[len(stack) - 2]
+}
+
+fn instr_op(instr: String) -> String {
+    var idx = find_idx(instr, " ")
+    if idx < 0 { return instr }
+    return str_substr(instr, 0, idx)
+}
+
+fn rest_after_space(s: String) -> String {
+    var idx = find_idx(s, " ")
+    if idx < 0 { return "" }
+    return str_substr(s, idx + 1, len(s))
+}
+
+fn instr_arg1(instr: String) -> String {
+    var rest = rest_after_space(instr)
+    var idx = find_idx(rest, " ")
+    if idx < 0 { return rest }
+    return str_substr(rest, 0, idx)
+}
+
+fn instr_arg2(instr: String) -> String {
+    var rest = rest_after_space(instr)
+    return rest_after_space(rest)
+}
+
+fn vars_get(vars: [String], name: String) -> String {
+    var i = len(vars) - 2
+    while i >= 0 {
+        if vars[i] == name { return vars[i + 1] }
+        i = i - 2
+    }
+    return "void"
+}
+
+fn vars_set(vars: [String], name: String, val: String) -> [String] {
+    var i = len(vars) - 2
+    while i >= 0 {
+        if vars[i] == name {
+            vars[i + 1] = val
+            return vars
+        }
+        if vars[i] == "##SCOPE##" {
+            vars = push(vars, name)
+            vars = push(vars, val)
+            return vars
+        }
+        i = i - 2
+    }
+    vars = push(vars, name)
+    vars = push(vars, val)
+    return vars
+}
+
+fn vars_push_scope(vars: [String]) -> [String] {
+    vars = push(vars, "##SCOPE##")
+    vars = push(vars, "##SCOPE##")
+    return vars
+}
+
+fn vars_pop_scope(vars: [String]) -> [String] {
+    while len(vars) >= 2 {
+        var top_name = vars[len(vars) - 2]
+        var nv: [String] = []
+        var j = 0
+        while j < len(vars) - 2 {
+            nv = push(nv, vars[j])
+            j = j + 1
+        }
+        vars = nv
+        if top_name == "##SCOPE##" { return vars }
+    }
+    return vars
+}
+
+fn table_get(table: [String], key: String) -> i64 {
+    var i = 0
+    while i < len(table) - 1 {
+        if table[i] == key { return int(table[i + 1]) }
+        i = i + 2
+    }
+    return -1
+}
+
+fn table_set(table: [String], key: String, val: i64) -> [String] {
+    table = push(table, key)
+    table = push(table, to_string(val))
+    return table
+}
+
+fn preprocess_labels(instrs: [String]) -> [String] {
+    var labels: [String] = []
+    var i = 0
+    while i < len(instrs) {
+        var op = instr_op(instrs[i])
+        if op == "LABEL" {
+            var name = instr_arg1(instrs[i])
+            labels = table_set(labels, name, i)
+        }
+        i = i + 1
+    }
+    return labels
+}
+
+fn preprocess_fns(instrs: [String]) -> [String] {
+    var fns: [String] = []
+    var i = 0
+    while i < len(instrs) {
+        var op = instr_op(instrs[i])
+        if op == "FN_START" {
+            var name = instr_arg1(instrs[i])
+            fns = table_set(fns, name, i)
+        }
+        i = i + 1
+    }
+    return fns
+}
+
+fn call_builtin(name: String, argc: i64, stack: [String]) -> [String] {
+    var top = stack_top(stack)
+
+    if name == "println" {
+        var ns = stack_pop(stack)
+        print(val_display(top) + _nl())
+        ns = push(ns, "void")
+        return ns
+    }
+    if name == "print" {
+        var ns = stack_pop(stack)
+        print(val_display(top))
+        ns = push(ns, "void")
+        return ns
+    }
+
+    // Unknown — pop args, push void
+    var ns: [String] = []
+    var start = len(stack) - argc
+    var i = 0
+    while i < start {
+        ns = push(ns, stack[i])
+        i = i + 1
+    }
+    ns = push(ns, "void")
+    return ns
+}
+
+fn vm_exec(instrs: [String]) -> String {
+    var stack: [String] = []
+    var vars: [String] = []
+    var call_stack: [String] = []
+    var labels = preprocess_labels(instrs)
+    var fns = preprocess_fns(instrs)
+
+    var ip = 0
+    var status = "running"
+    var result = "void"
+
+    // Find main
+    var main_ip = table_get(fns, "main")
+    if main_ip >= 0 {
+        ip = main_ip + 1
+        vars = vars_push_scope(vars)
+    }
+
+    while status == "running" {
+        if ip >= len(instrs) { status = "halted" }
+        if status == "running" {
+            var instr = instrs[ip]
+            var op = instr_op(instr)
+
+            if op == "HALT" {
+                status = "halted"
+                result = stack_top(stack)
+            }
+
+            if op == "PUSH_INT" {
+                stack = push(stack, make_int(int(instr_arg1(instr))))
+                ip = ip + 1
+            }
+            if op == "PUSH_STRING" {
+                stack = push(stack, make_str(instr_arg1(instr)))
+                ip = ip + 1
+            }
+            if op == "PUSH_BOOL" {
+                var arg = instr_arg1(instr)
+                if arg == "true" { stack = push(stack, "b:true") }
+                if arg != "true" { stack = push(stack, "b:false") }
+                ip = ip + 1
+            }
+
+            if op == "LOAD" {
+                stack = push(stack, vars_get(vars, instr_arg1(instr)))
+                ip = ip + 1
+            }
+            if op == "STORE" {
+                var val = stack_top(stack)
+                stack = stack_pop(stack)
+                vars = vars_set(vars, instr_arg1(instr), val)
+                ip = ip + 1
+            }
+
+            if op == "POP" {
+                if len(stack) > 0 { stack = stack_pop(stack) }
+                ip = ip + 1
+            }
+            if op == "DUP" {
+                if len(stack) > 0 { stack = push(stack, stack_top(stack)) }
+                ip = ip + 1
+            }
+
+            if op == "ADD" {
+                var b = stack_top(stack)
+                var a = stack_second(stack)
+                stack = stack_pop2(stack)
+                stack = push(stack, val_add(a, b))
+                ip = ip + 1
+            }
+            if op == "SUB" {
+                var b = stack_top(stack)
+                var a = stack_second(stack)
+                stack = stack_pop2(stack)
+                stack = push(stack, val_sub(a, b))
+                ip = ip + 1
+            }
+            if op == "MUL" {
+                var b = stack_top(stack)
+                var a = stack_second(stack)
+                stack = stack_pop2(stack)
+                stack = push(stack, val_mul(a, b))
+                ip = ip + 1
+            }
+            if op == "DIV" {
+                var b = stack_top(stack)
+                var a = stack_second(stack)
+                stack = stack_pop2(stack)
+                stack = push(stack, val_div(a, b))
+                ip = ip + 1
+            }
+            if op == "MOD" {
+                var b = stack_top(stack)
+                var a = stack_second(stack)
+                stack = stack_pop2(stack)
+                stack = push(stack, val_mod(a, b))
+                ip = ip + 1
+            }
+            if op == "NEG" {
+                var a = stack_top(stack)
+                stack = stack_pop(stack)
+                stack = push(stack, val_neg(a))
+                ip = ip + 1
+            }
+
+            var is_cmp = false
+            if op == "EQ"   { is_cmp = true }
+            if op == "NEQ"  { is_cmp = true }
+            if op == "LT"   { is_cmp = true }
+            if op == "GT"   { is_cmp = true }
+            if op == "LTEQ" { is_cmp = true }
+            if op == "GTEQ" { is_cmp = true }
+            if is_cmp {
+                var b = stack_top(stack)
+                var a = stack_second(stack)
+                stack = stack_pop2(stack)
+                stack = push(stack, val_cmp(a, b, op))
+                ip = ip + 1
+            }
+
+            if op == "AND" {
+                var b = stack_top(stack)
+                var a = stack_second(stack)
+                stack = stack_pop2(stack)
+                stack = push(stack, val_and(a, b))
+                ip = ip + 1
+            }
+            if op == "OR" {
+                var b = stack_top(stack)
+                var a = stack_second(stack)
+                stack = stack_pop2(stack)
+                stack = push(stack, val_or(a, b))
+                ip = ip + 1
+            }
+            if op == "NOT" {
+                var a = stack_top(stack)
+                stack = stack_pop(stack)
+                stack = push(stack, val_not(a))
+                ip = ip + 1
+            }
+
+            if op == "JMP" {
+                var lbl = instr_arg1(instr)
+                var target = table_get(labels, lbl)
+                if target >= 0 { ip = target + 1 }
+                if target < 0 {
+                    status = "error"
+                    print("VM error: unknown label " + lbl + _nl())
+                }
+            }
+
+            if op == "JZ" {
+                var lbl = instr_arg1(instr)
+                var top = stack_top(stack)
+                stack = stack_pop(stack)
+                if val_is_truthy(top) {
+                    ip = ip + 1
+                } else {
+                    var target = table_get(labels, lbl)
+                    if target >= 0 { ip = target + 1 }
+                    if target < 0 {
+                        status = "error"
+                        print("VM error: unknown label " + lbl + _nl())
+                    }
+                }
+            }
+
+            if op == "LABEL" { ip = ip + 1 }
+
+            if op == "FN_START" {
+                var depth = 1
+                ip = ip + 1
+                while depth > 0 {
+                    if ip >= len(instrs) { depth = 0 }
+                    if depth > 0 {
+                        var skip_op = instr_op(instrs[ip])
+                        if skip_op == "FN_START" { depth = depth + 1 }
+                        if skip_op == "FN_END"   { depth = depth - 1 }
+                        ip = ip + 1
+                    }
+                }
+            }
+
+            if op == "FN_END" {
+                if len(call_stack) >= 1 {
+                    var ret_ip = int(call_stack[len(call_stack) - 1])
+                    call_stack = stack_pop(call_stack)
+                    vars = vars_pop_scope(vars)
+                    ip = ret_ip
+                } else {
+                    status = "halted"
+                    result = stack_top(stack)
+                }
+            }
+
+            if op == "RET" {
+                var ret_val = "void"
+                if len(stack) > 0 {
+                    ret_val = stack_top(stack)
+                    stack = stack_pop(stack)
+                }
+                if len(call_stack) >= 1 {
+                    var ret_ip = int(call_stack[len(call_stack) - 1])
+                    call_stack = stack_pop(call_stack)
+                    vars = vars_pop_scope(vars)
+                    stack = push(stack, ret_val)
+                    ip = ret_ip
+                } else {
+                    result = ret_val
+                    status = "halted"
+                }
+            }
+
+            if op == "CALL" {
+                var fn_name = instr_arg1(instr)
+                var argc = int(instr_arg2(instr))
+                var is_builtin = false
+                if fn_name == "println" { is_builtin = true }
+                if fn_name == "print"   { is_builtin = true }
+                if is_builtin {
+                    stack = call_builtin(fn_name, argc, stack)
+                    ip = ip + 1
+                } else {
+                    var fn_ip = table_get(fns, fn_name)
+                    if fn_ip < 0 {
+                        status = "error"
+                        print("VM error: undefined function " + fn_name + _nl())
+                    } else {
+                        call_stack = push(call_stack, to_string(ip + 1))
+                        vars = vars_push_scope(vars)
+                        ip = fn_ip + 1
+                    }
+                }
+            }
+        }
+    }
+
+    if result == "void" { result = stack_top(stack) }
+    return result
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// TESTS: AST -> Compile -> VM Execute
+// ══════════════════════════════════════════════════════════════════════════════
+
+fn run_test(name: String, bytecode: [String], expected: String) {
+    print("Test: " + name + " ... ")
+    var result = vm_exec(bytecode)
+    print("output above")
+    print(_nl())
+}
+
+fn main() {
+    print("=== Vortex Bytecode Compiler ===" + _nl())
+    print("AST -> bytecode -> VM execution" + _nl())
+    print(_nl())
+
+    // ── Test 1: println(40 + 2) → should print 42 ──
+    print("Test 1: println(40 + 2)" + _nl())
+    var prog1: [String] = []
+    var body1: [String] = [stmt_println(expr_add(expr_int(40), expr_int(2)))]
+    var params1: [String] = []
+    prog1 = push(prog1, make_fn("main", params1, body1))
+    var bc1 = compile_program(prog1)
+    print("  Bytecode: ")
+    var di = 0
+    while di < len(bc1) {
+        print("[" + bc1[di] + "] ")
+        di = di + 1
+    }
+    print(_nl())
+    print("  Output: ")
+    vm_exec(bc1)
+    print(_nl())
+
+    // ── Test 2: let x = 10; println(x * 3) → 30 ──
+    print("Test 2: let x = 10; println(x * 3)" + _nl())
+    var body2: [String] = [
+        stmt_let("x", expr_int(10)),
+        stmt_println(expr_mul(expr_id("x"), expr_int(3)))
+    ]
+    var prog2: [String] = [make_fn("main", params1, body2)]
+    var bc2 = compile_program(prog2)
+    print("  Output: ")
+    vm_exec(bc2)
+    print(_nl())
+
+    // ── Test 3: if 1 > 0 { println(1) } else { println(0) } → 1 ──
+    print("Test 3: if 1 > 0 { println(1) } else { println(0) }" + _nl())
+    var then3: [String] = [stmt_println(expr_int(1))]
+    var else3: [String] = [stmt_println(expr_int(0))]
+    var body3: [String] = [stmt_if(expr_gt(expr_int(1), expr_int(0)), then3, else3)]
+    var prog3: [String] = [make_fn("main", params1, body3)]
+    var bc3 = compile_program(prog3)
+    print("  Output: ")
+    vm_exec(bc3)
+    print(_nl())
+
+    // ── Test 4: while loop counting 1..5, print sum → 15 ──
+    print("Test 4: while loop sum 1..5" + _nl())
+    var loop_body: [String] = [
+        stmt_assign("sum", expr_add(expr_id("sum"), expr_id("i"))),
+        stmt_assign("i", expr_add(expr_id("i"), expr_int(1)))
+    ]
+    var body4: [String] = [
+        stmt_var("sum", expr_int(0)),
+        stmt_var("i", expr_int(1)),
+        stmt_while(expr_le(expr_id("i"), expr_int(5)), loop_body),
+        stmt_println(expr_id("sum"))
+    ]
+    var prog4: [String] = [make_fn("main", params1, body4)]
+    var bc4 = compile_program(prog4)
+    print("  Output: ")
+    vm_exec(bc4)
+    print(_nl())
+
+    // ── Test 5: function call — square(9) → 81 ──
+    print("Test 5: fn square(n) -> n * n; println(square(9))" + _nl())
+    var sq_params: [String] = ["n"]
+    var sq_body: [String] = [stmt_return(expr_mul(expr_id("n"), expr_id("n")))]
+    var sq_args: [String] = [expr_int(9)]
+    var main_body5: [String] = [stmt_println(expr_call("square", sq_args))]
+    var prog5: [String] = [
+        make_fn("main", params1, main_body5),
+        make_fn("square", sq_params, sq_body)
+    ]
+    var bc5 = compile_program(prog5)
+    print("  Output: ")
+    vm_exec(bc5)
+    print(_nl())
+
+    // ── Test 6: nested expression — (3 + 4) * (10 - 2) → 56 ──
+    print("Test 6: (3 + 4) * (10 - 2)" + _nl())
+    var body6: [String] = [
+        stmt_println(expr_mul(
+            expr_add(expr_int(3), expr_int(4)),
+            expr_sub(expr_int(10), expr_int(2))
+        ))
+    ]
+    var prog6: [String] = [make_fn("main", params1, body6)]
+    var bc6 = compile_program(prog6)
+    print("  Output: ")
+    vm_exec(bc6)
+    print(_nl())
+
+    // ── Test 7: string printing ──
+    print("Test 7: print_str hello" + _nl())
+    var body7: [String] = [stmt_println(expr_str("hello_world"))]
+    var prog7: [String] = [make_fn("main", params1, body7)]
+    var bc7 = compile_program(prog7)
+    print("  Output: ")
+    vm_exec(bc7)
+    print(_nl())
+
+    print(_nl())
+    print("=== All tests complete ===" + _nl())
+}

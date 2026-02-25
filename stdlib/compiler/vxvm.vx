@@ -530,8 +530,9 @@ fn test_function_call() -> i64 {
     code = push(code, 50)   // 10: OP_CALL
     code = push(code, 2)    // 11: addr -> func_double at 2
     code = push(code, 1)    // 12: argc = 1
-    code = push(code, 60)   // 13: OP_PRINT_INT
-    code = push(code, 99)   // 14: OP_HALT
+    code = push(code, 4)    // 13: OP_DUP
+    code = push(code, 60)   // 14: OP_PRINT_INT
+    code = push(code, 99)   // 15: OP_HALT
 
     var strings = []
     let result = vm_exec(code, strings)
@@ -561,6 +562,7 @@ fn test_comparison() -> i64 {
     code = push(code, 1)    // OP_PUSH_INT
     code = push(code, 20)
     code = push(code, 22)   // OP_LT
+    code = push(code, 4)    // OP_DUP
     code = push(code, 60)   // OP_PRINT_INT
     code = push(code, 99)   // OP_HALT
 
@@ -581,6 +583,7 @@ fn test_globals() -> i64 {
     code = push(code, 1)    // OP_PUSH_INT
     code = push(code, 11)
     code = push(code, 10)   // OP_ADD
+    code = push(code, 4)    // OP_DUP
     code = push(code, 60)   // OP_PRINT_INT
     code = push(code, 99)   // OP_HALT
 
