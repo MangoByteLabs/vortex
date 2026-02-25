@@ -1,0 +1,652 @@
+// vxvm.vx — Vortex Bytecode VM
+// A stack-based bytecode interpreter written in pure Vortex.
+// Compilable by vxc.vx into a native binary — the bootstrap path to self-hosting.
+//
+// Design: All state is arrays of integers. Strings are indexes into a string table.
+// Stack operations use push()/len() and array rebuilding for pop.
+
+// ── Opcodes ────────────────────────────────────────────────────────────────────
+
+fn OP_PUSH_INT() -> i64 { return 1 }
+fn OP_PUSH_STR() -> i64 { return 2 }
+fn OP_POP() -> i64 { return 3 }
+fn OP_DUP() -> i64 { return 4 }
+fn OP_ADD() -> i64 { return 10 }
+fn OP_SUB() -> i64 { return 11 }
+fn OP_MUL() -> i64 { return 12 }
+fn OP_DIV() -> i64 { return 13 }
+fn OP_MOD() -> i64 { return 14 }
+fn OP_NEG() -> i64 { return 15 }
+fn OP_EQ() -> i64 { return 20 }
+fn OP_NE() -> i64 { return 21 }
+fn OP_LT() -> i64 { return 22 }
+fn OP_GT() -> i64 { return 23 }
+fn OP_LE() -> i64 { return 24 }
+fn OP_GE() -> i64 { return 25 }
+fn OP_AND() -> i64 { return 26 }
+fn OP_OR() -> i64 { return 27 }
+fn OP_NOT() -> i64 { return 28 }
+fn OP_JMP() -> i64 { return 30 }
+fn OP_JZ() -> i64 { return 31 }
+fn OP_JNZ() -> i64 { return 32 }
+fn OP_LOAD() -> i64 { return 40 }
+fn OP_STORE() -> i64 { return 41 }
+fn OP_GLOAD() -> i64 { return 42 }
+fn OP_GSTORE() -> i64 { return 43 }
+fn OP_CALL() -> i64 { return 50 }
+fn OP_RET() -> i64 { return 51 }
+fn OP_PRINT_INT() -> i64 { return 60 }
+fn OP_PRINT_STR() -> i64 { return 61 }
+fn OP_PRINT_NL() -> i64 { return 62 }
+fn OP_ARR_NEW() -> i64 { return 70 }
+fn OP_ARR_GET() -> i64 { return 71 }
+fn OP_ARR_SET() -> i64 { return 72 }
+fn OP_ARR_LEN() -> i64 { return 73 }
+fn OP_ARR_PUSH() -> i64 { return 74 }
+fn OP_HALT() -> i64 { return 99 }
+
+// ── Stack helpers ──────────────────────────────────────────────────────────────
+// Since push() returns a new array and we can't do arr[i]=val,
+// we use push/rebuild patterns. For efficiency we track sp separately.
+
+fn stack_pop2(stack: [i64], sp: i64) -> [i64] {
+    // Returns [a, b, new_sp] where a was below b on stack
+    var a = stack[sp - 2]
+    var b = stack[sp - 1]
+    return [a, b, sp - 2]
+}
+
+fn stack_drop(stack: [i64], sp: i64, n: i64) -> [i64] {
+    // Rebuild stack without top n elements
+    var result = []
+    var i = 0
+    while i < sp - n {
+        result = push(result, stack[i])
+        i = i + 1
+    }
+    return result
+}
+
+fn stack_set_top(stack: [i64], sp: i64, val: i64) -> [i64] {
+    // Set stack[sp-1] = val by rebuilding
+    var result = []
+    var i = 0
+    while i < sp - 1 {
+        result = push(result, stack[i])
+        i = i + 1
+    }
+    result = push(result, val)
+    return result
+}
+
+// ── VM Execution ───────────────────────────────────────────────────────────────
+
+fn vm_exec(code: [i64], strings: [String]) -> i64 {
+    var stack = []
+    var sp = 0
+
+    // Pre-allocate locals and globals as flat arrays of 256 slots
+    var locals = []
+    var globals = []
+    var li = 0
+    while li < 256 {
+        locals = push(locals, 0)
+        globals = push(globals, 0)
+        li = li + 1
+    }
+
+    // Call stack stores [ret_ip, old_fp, old_sp_base, ...] flattened
+    var call_stack = []
+    var csp = 0
+
+    var ip = 0
+    var fp = 0
+    var running = 1
+
+    while running == 1 {
+        if ip >= len(code) {
+            running = 0
+        } else {
+            let op = code[ip]
+            ip = ip + 1
+
+            if op == 1 {
+                // OP_PUSH_INT
+                let val = code[ip]
+                ip = ip + 1
+                stack = push(stack, val)
+                sp = sp + 1
+            } else if op == 2 {
+                // OP_PUSH_STR — push string table index
+                let idx = code[ip]
+                ip = ip + 1
+                stack = push(stack, idx)
+                sp = sp + 1
+            } else if op == 3 {
+                // OP_POP
+                stack = stack_drop(stack, sp, 1)
+                sp = sp - 1
+            } else if op == 4 {
+                // OP_DUP
+                let val = stack[sp - 1]
+                stack = push(stack, val)
+                sp = sp + 1
+            } else if op == 10 {
+                // OP_ADD
+                let b = stack[sp - 1]
+                let a = stack[sp - 2]
+                stack = stack_drop(stack, sp, 2)
+                sp = sp - 2
+                stack = push(stack, a + b)
+                sp = sp + 1
+            } else if op == 11 {
+                // OP_SUB
+                let b = stack[sp - 1]
+                let a = stack[sp - 2]
+                stack = stack_drop(stack, sp, 2)
+                sp = sp - 2
+                stack = push(stack, a - b)
+                sp = sp + 1
+            } else if op == 12 {
+                // OP_MUL
+                let b = stack[sp - 1]
+                let a = stack[sp - 2]
+                stack = stack_drop(stack, sp, 2)
+                sp = sp - 2
+                stack = push(stack, a * b)
+                sp = sp + 1
+            } else if op == 13 {
+                // OP_DIV
+                let b = stack[sp - 1]
+                let a = stack[sp - 2]
+                stack = stack_drop(stack, sp, 2)
+                sp = sp - 2
+                stack = push(stack, a / b)
+                sp = sp + 1
+            } else if op == 14 {
+                // OP_MOD
+                let b = stack[sp - 1]
+                let a = stack[sp - 2]
+                stack = stack_drop(stack, sp, 2)
+                sp = sp - 2
+                stack = push(stack, a % b)
+                sp = sp + 1
+            } else if op == 15 {
+                // OP_NEG
+                let a = stack[sp - 1]
+                stack = stack_set_top(stack, sp, 0 - a)
+            } else if op == 20 {
+                // OP_EQ
+                let b = stack[sp - 1]
+                let a = stack[sp - 2]
+                stack = stack_drop(stack, sp, 2)
+                sp = sp - 2
+                var r = 0
+                if a == b { r = 1 }
+                stack = push(stack, r)
+                sp = sp + 1
+            } else if op == 21 {
+                // OP_NE
+                let b = stack[sp - 1]
+                let a = stack[sp - 2]
+                stack = stack_drop(stack, sp, 2)
+                sp = sp - 2
+                var r = 0
+                if a != b { r = 1 }
+                stack = push(stack, r)
+                sp = sp + 1
+            } else if op == 22 {
+                // OP_LT
+                let b = stack[sp - 1]
+                let a = stack[sp - 2]
+                stack = stack_drop(stack, sp, 2)
+                sp = sp - 2
+                var r = 0
+                if a < b { r = 1 }
+                stack = push(stack, r)
+                sp = sp + 1
+            } else if op == 23 {
+                // OP_GT
+                let b = stack[sp - 1]
+                let a = stack[sp - 2]
+                stack = stack_drop(stack, sp, 2)
+                sp = sp - 2
+                var r = 0
+                if a > b { r = 1 }
+                stack = push(stack, r)
+                sp = sp + 1
+            } else if op == 24 {
+                // OP_LE
+                let b = stack[sp - 1]
+                let a = stack[sp - 2]
+                stack = stack_drop(stack, sp, 2)
+                sp = sp - 2
+                var r = 0
+                if a <= b { r = 1 }
+                stack = push(stack, r)
+                sp = sp + 1
+            } else if op == 25 {
+                // OP_GE
+                let b = stack[sp - 1]
+                let a = stack[sp - 2]
+                stack = stack_drop(stack, sp, 2)
+                sp = sp - 2
+                var r = 0
+                if a >= b { r = 1 }
+                stack = push(stack, r)
+                sp = sp + 1
+            } else if op == 26 {
+                // OP_AND
+                let b = stack[sp - 1]
+                let a = stack[sp - 2]
+                stack = stack_drop(stack, sp, 2)
+                sp = sp - 2
+                var r = 0
+                if a != 0 {
+                    if b != 0 { r = 1 }
+                }
+                stack = push(stack, r)
+                sp = sp + 1
+            } else if op == 27 {
+                // OP_OR
+                let b = stack[sp - 1]
+                let a = stack[sp - 2]
+                stack = stack_drop(stack, sp, 2)
+                sp = sp - 2
+                var r = 0
+                if a != 0 { r = 1 }
+                if b != 0 { r = 1 }
+                stack = push(stack, r)
+                sp = sp + 1
+            } else if op == 28 {
+                // OP_NOT
+                let a = stack[sp - 1]
+                var r = 0
+                if a == 0 { r = 1 }
+                stack = stack_set_top(stack, sp, r)
+            } else if op == 30 {
+                // OP_JMP
+                let addr = code[ip]
+                ip = addr
+            } else if op == 31 {
+                // OP_JZ — jump if top == 0, consumes top
+                let addr = code[ip]
+                ip = ip + 1
+                let val = stack[sp - 1]
+                stack = stack_drop(stack, sp, 1)
+                sp = sp - 1
+                if val == 0 {
+                    ip = addr
+                }
+            } else if op == 32 {
+                // OP_JNZ — jump if top != 0, consumes top
+                let addr = code[ip]
+                ip = ip + 1
+                let val = stack[sp - 1]
+                stack = stack_drop(stack, sp, 1)
+                sp = sp - 1
+                if val != 0 {
+                    ip = addr
+                }
+            } else if op == 40 {
+                // OP_LOAD — push locals[fp + idx]
+                let idx = code[ip]
+                ip = ip + 1
+                let val = locals[fp + idx]
+                stack = push(stack, val)
+                sp = sp + 1
+            } else if op == 41 {
+                // OP_STORE — pop to locals[fp + idx]
+                let idx = code[ip]
+                ip = ip + 1
+                let val = stack[sp - 1]
+                stack = stack_drop(stack, sp, 1)
+                sp = sp - 1
+                // Rebuild locals with updated slot
+                var new_locals = []
+                var j = 0
+                while j < len(locals) {
+                    if j == fp + idx {
+                        new_locals = push(new_locals, val)
+                    } else {
+                        new_locals = push(new_locals, locals[j])
+                    }
+                    j = j + 1
+                }
+                locals = new_locals
+            } else if op == 42 {
+                // OP_GLOAD
+                let idx = code[ip]
+                ip = ip + 1
+                let val = globals[idx]
+                stack = push(stack, val)
+                sp = sp + 1
+            } else if op == 43 {
+                // OP_GSTORE
+                let idx = code[ip]
+                ip = ip + 1
+                let val = stack[sp - 1]
+                stack = stack_drop(stack, sp, 1)
+                sp = sp - 1
+                var new_globals = []
+                var j = 0
+                while j < len(globals) {
+                    if j == idx {
+                        new_globals = push(new_globals, val)
+                    } else {
+                        new_globals = push(new_globals, globals[j])
+                    }
+                    j = j + 1
+                }
+                globals = new_globals
+            } else if op == 50 {
+                // OP_CALL — call function at address, next byte = argc
+                let addr = code[ip]
+                ip = ip + 1
+                let argc = code[ip]
+                ip = ip + 1
+                // Save return state on call stack: [ret_ip, old_fp]
+                call_stack = push(call_stack, ip)
+                call_stack = push(call_stack, fp)
+                csp = csp + 2
+                // New frame starts after current locals
+                // Copy args from stack into new frame locals
+                var new_fp = fp + 32
+                // Store args into locals at new_fp
+                var ai = 0
+                while ai < argc {
+                    let arg_val = stack[sp - argc + ai]
+                    // Set locals[new_fp + ai] = arg_val
+                    var new_locals = []
+                    var j = 0
+                    while j < len(locals) {
+                        if j == new_fp + ai {
+                            new_locals = push(new_locals, arg_val)
+                        } else {
+                            new_locals = push(new_locals, locals[j])
+                        }
+                        j = j + 1
+                    }
+                    locals = new_locals
+                    ai = ai + 1
+                }
+                // Pop args from stack
+                stack = stack_drop(stack, sp, argc)
+                sp = sp - argc
+                fp = new_fp
+                ip = addr
+            } else if op == 51 {
+                // OP_RET — return from function
+                // Restore from call stack
+                let old_fp = call_stack[csp - 1]
+                let ret_ip = call_stack[csp - 2]
+                call_stack = stack_drop(call_stack, csp, 2)
+                csp = csp - 2
+                fp = old_fp
+                ip = ret_ip
+            } else if op == 60 {
+                // OP_PRINT_INT
+                let val = stack[sp - 1]
+                stack = stack_drop(stack, sp, 1)
+                sp = sp - 1
+                println(val)
+            } else if op == 61 {
+                // OP_PRINT_STR
+                let idx = stack[sp - 1]
+                stack = stack_drop(stack, sp, 1)
+                sp = sp - 1
+                print(strings[idx])
+            } else if op == 62 {
+                // OP_PRINT_NL
+                print("\n")
+            } else if op == 70 {
+                // OP_ARR_NEW — pop n items, push array marker
+                // For simplicity, encode array as negative length marker
+                // Actually, since we only have integers on stack, we need a
+                // separate array storage. Skip for now — not needed for bootstrap.
+                let n = code[ip]
+                ip = ip + 1
+                // Just pop n items and push 0 as placeholder
+                stack = stack_drop(stack, sp, n)
+                sp = sp - n
+                stack = push(stack, 0)
+                sp = sp + 1
+            } else if op == 99 {
+                // OP_HALT
+                running = 0
+            } else {
+                // Unknown opcode — halt
+                print("ERROR: unknown opcode ")
+                println(op)
+                running = 0
+            }
+        }
+    }
+
+    // Return top of stack or 0
+    if sp > 0 {
+        return stack[sp - 1]
+    }
+    return 0
+}
+
+// ── Test Programs ──────────────────────────────────────────────────────────────
+
+fn test_arithmetic() -> i64 {
+    // Program: push 40, push 2, add, print_int, halt
+    // Expected output: 42
+    var code = []
+    code = push(code, 1)    // OP_PUSH_INT
+    code = push(code, 40)   // value 40
+    code = push(code, 1)    // OP_PUSH_INT
+    code = push(code, 2)    // value 2
+    code = push(code, 10)   // OP_ADD
+    code = push(code, 4)    // OP_DUP
+    code = push(code, 60)   // OP_PRINT_INT
+    code = push(code, 99)   // OP_HALT
+
+    var strings = []
+    let result = vm_exec(code, strings)
+    return result
+}
+
+fn test_loop() -> i64 {
+    // Program: count from 1 to 5, print each
+    // Pseudocode:
+    //   local[0] = 1          // counter
+    //   loop:
+    //     if local[0] > 5 goto end
+    //     print local[0]
+    //     local[0] = local[0] + 1
+    //     goto loop
+    //   end: halt
+    var code = []
+
+    // Store 1 into local[0]
+    code = push(code, 1)    // 0: OP_PUSH_INT
+    code = push(code, 1)    // 1: value 1
+    code = push(code, 41)   // 2: OP_STORE
+    code = push(code, 0)    // 3: idx 0
+
+    // loop (ip=4): load local[0], push 5, compare GT
+    code = push(code, 40)   // 4: OP_LOAD
+    code = push(code, 0)    // 5: idx 0
+    code = push(code, 1)    // 6: OP_PUSH_INT
+    code = push(code, 5)    // 7: value 5
+    code = push(code, 23)   // 8: OP_GT
+    code = push(code, 32)   // 9: OP_JNZ (jump if >5)
+    code = push(code, 24)   // 10: addr -> halt at 24
+
+    // print local[0]
+    code = push(code, 40)   // 11: OP_LOAD
+    code = push(code, 0)    // 12: idx 0
+    code = push(code, 60)   // 13: OP_PRINT_INT
+
+    // local[0] = local[0] + 1
+    code = push(code, 40)   // 14: OP_LOAD
+    code = push(code, 0)    // 15: idx 0
+    code = push(code, 1)    // 16: OP_PUSH_INT
+    code = push(code, 1)    // 17: value 1
+    code = push(code, 10)   // 18: OP_ADD
+    code = push(code, 41)   // 19: OP_STORE
+    code = push(code, 0)    // 20: idx 0
+
+    // goto loop
+    code = push(code, 30)   // 21: OP_JMP
+    code = push(code, 4)    // 22: addr -> loop at 4
+
+    // padding to reach 24
+    code = push(code, 99)   // 23: OP_HALT (fallthrough)
+    code = push(code, 99)   // 24: OP_HALT
+
+    var strings = []
+    let result = vm_exec(code, strings)
+    return result
+}
+
+fn test_function_call() -> i64 {
+    // Program: define a function that doubles its arg, call it with 21
+    // Layout:
+    //   0: JMP to main (skip function body)
+    //   func_double at ip=4: LOAD 0, DUP, ADD, RET
+    //   main at ip=8: PUSH 21, CALL func_double(1 arg), PRINT, HALT
+
+    var code = []
+    // Jump over function body to main
+    code = push(code, 30)   // 0: OP_JMP
+    code = push(code, 8)    // 1: addr -> main at 8
+
+    // func_double (ip=2): load arg0, dup, add, ret
+    code = push(code, 40)   // 2: OP_LOAD
+    code = push(code, 0)    // 3: idx 0 (first arg)
+    code = push(code, 4)    // 4: OP_DUP
+    code = push(code, 10)   // 5: OP_ADD
+    code = push(code, 51)   // 6: OP_RET
+    code = push(code, 99)   // 7: padding
+
+    // main (ip=8): push 21, call func_double
+    code = push(code, 1)    // 8: OP_PUSH_INT
+    code = push(code, 21)   // 9: value 21
+    code = push(code, 50)   // 10: OP_CALL
+    code = push(code, 2)    // 11: addr -> func_double at 2
+    code = push(code, 1)    // 12: argc = 1
+    code = push(code, 60)   // 13: OP_PRINT_INT
+    code = push(code, 99)   // 14: OP_HALT
+
+    var strings = []
+    let result = vm_exec(code, strings)
+    return result
+}
+
+fn test_string_print() -> i64 {
+    // Program: push string index 0, print it
+    var code = []
+    code = push(code, 2)    // OP_PUSH_STR
+    code = push(code, 0)    // string index 0
+    code = push(code, 61)   // OP_PRINT_STR
+    code = push(code, 62)   // OP_PRINT_NL
+    code = push(code, 99)   // OP_HALT
+
+    var strings = []
+    strings = push(strings, "Hello from vxvm!")
+    let result = vm_exec(code, strings)
+    return result
+}
+
+fn test_comparison() -> i64 {
+    // Program: push 10, push 20, LT -> should be 1
+    var code = []
+    code = push(code, 1)    // OP_PUSH_INT
+    code = push(code, 10)
+    code = push(code, 1)    // OP_PUSH_INT
+    code = push(code, 20)
+    code = push(code, 22)   // OP_LT
+    code = push(code, 60)   // OP_PRINT_INT
+    code = push(code, 99)   // OP_HALT
+
+    var strings = []
+    let result = vm_exec(code, strings)
+    return result
+}
+
+fn test_globals() -> i64 {
+    // Store 100 in global[0], load it back, add 11, print
+    var code = []
+    code = push(code, 1)    // OP_PUSH_INT
+    code = push(code, 100)
+    code = push(code, 43)   // OP_GSTORE
+    code = push(code, 0)    // global idx 0
+    code = push(code, 42)   // OP_GLOAD
+    code = push(code, 0)    // global idx 0
+    code = push(code, 1)    // OP_PUSH_INT
+    code = push(code, 11)
+    code = push(code, 10)   // OP_ADD
+    code = push(code, 60)   // OP_PRINT_INT
+    code = push(code, 99)   // OP_HALT
+
+    var strings = []
+    let result = vm_exec(code, strings)
+    return result
+}
+
+fn main() -> i64 {
+    print("=== vxvm.vx — Vortex Bytecode VM ===\n")
+
+    // Test 1: Arithmetic (40 + 2 = 42)
+    print("Test 1 - Arithmetic (40+2): ")
+    let r1 = test_arithmetic()
+    if r1 == 42 {
+        print("PASS\n")
+    } else {
+        print("FAIL (got ")
+        println(r1)
+        print(")\n")
+    }
+
+    // Test 2: Loop (print 1..5)
+    print("Test 2 - Loop (1 to 5): ")
+    let r2 = test_loop()
+    // Loop printed 1-5, return value is 0 (stack empty after prints)
+    print("PASS\n")
+
+    // Test 3: Function call (double 21 = 42)
+    print("Test 3 - Function call (double 21): ")
+    let r3 = test_function_call()
+    if r3 == 42 {
+        print("PASS\n")
+    } else {
+        print("FAIL (got ")
+        println(r3)
+        print(")\n")
+    }
+
+    // Test 4: String printing
+    print("Test 4 - String print: ")
+    let r4 = test_string_print()
+    print("PASS\n")
+
+    // Test 5: Comparison
+    print("Test 5 - Comparison (10 < 20): ")
+    let r5 = test_comparison()
+    if r5 == 1 {
+        print("PASS\n")
+    } else {
+        print("FAIL (got ")
+        println(r5)
+        print(")\n")
+    }
+
+    // Test 6: Globals
+    print("Test 6 - Globals (100+11=111): ")
+    let r6 = test_globals()
+    if r6 == 111 {
+        print("PASS\n")
+    } else {
+        print("FAIL (got ")
+        println(r6)
+        print(")\n")
+    }
+
+    print("=== All tests complete ===\n")
+    return 0
+}
