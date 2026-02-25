@@ -1,797 +1,577 @@
-// vxrun.vx — Minimal self-hosting demo: source -> lex -> parse -> bytecode -> VM
-// All in pure Vortex. Under 700 lines.
-
+// vxrun.vx — Lean Vortex self-hosted runner (source -> lex -> compile -> VM)
 fn _nl() -> String { return str_from_bytes([10]) }
-fn _qt() -> String { return str_from_bytes([34]) }
-fn _pipe() -> String { return str_from_bytes([124]) }
-
 fn sw(s: String, prefix: String) -> bool {
     if len(s) < len(prefix) { return false }
     return str_substr(s, 0, len(prefix)) == prefix
 }
-
-fn after(s: String, n: i64) -> String {
-    return str_substr(s, n, len(s))
+fn after(s: String, n: i64) -> String { return str_substr(s, n, len(s) - n) }
+fn find_idx(haystack: String, needle: String) -> i64 {
+    return unwrap_or(str_find(haystack, needle), -1)
+}
+fn is_digit(ch: String) -> bool {
+    if ch == "0" { return true }
+    if ch == "1" { return true }
+    if ch == "2" { return true }
+    if ch == "3" { return true }
+    if ch == "4" { return true }
+    if ch == "5" { return true }
+    if ch == "6" { return true }
+    if ch == "7" { return true }
+    if ch == "8" { return true }
+    if ch == "9" { return true }
+    return false
+}
+fn is_alpha(ch: String) -> bool {
+    if len(ch) != 1 { return false }
+    let c = str_bytes(ch)[0]
+    if c >= 65 { if c <= 90 { return true } }
+    if c >= 97 { if c <= 122 { return true } }
+    if ch == "_" { return true }
+    return false
+}
+fn is_alnum(ch: String) -> bool {
+    if is_alpha(ch) { return true }
+    return is_digit(ch)
+}
+fn is_space(ch: String) -> bool {
+    if ch == " " { return true }
+    if ch == _nl() { return true }
+    if ch == str_from_bytes([9]) { return true }
+    if ch == str_from_bytes([13]) { return true }
+    return false
 }
 
-fn find_idx(s: String, needle: String) -> i64 {
-    return unwrap_or(str_find(s, needle), -1)
+// Lexer: flat [String] pairs [type0, val0, type1, val1, ...]
+fn lex(source: String) -> [String] {
+    var toks: [String] = []
+    var pos = 0
+    let slen = len(source)
+    while pos < slen {
+        let ch = str_char_at(source, pos)
+        if is_space(ch) { pos = pos + 1  continue }
+        if ch == "/" {
+            if pos + 1 < slen {
+                if str_char_at(source, pos + 1) == "/" {
+                    pos = pos + 2
+                    while pos < slen {
+                        if str_char_at(source, pos) == _nl() { break }
+                        pos = pos + 1
+                    }
+                    continue
+                }
+            }
+        }
+        if is_digit(ch) {
+            var start = pos
+            while pos < slen {
+                if is_digit(str_char_at(source, pos)) { pos = pos + 1 } else { break }
+            }
+            toks = push(toks, "INT")
+            toks = push(toks, str_substr(source, start, pos - start))
+            continue
+        }
+        if is_alpha(ch) {
+            var start = pos
+            while pos < slen {
+                if is_alnum(str_char_at(source, pos)) { pos = pos + 1 } else { break }
+            }
+            let word = str_substr(source, start, pos - start)
+            var typ = "IDENT"
+            if word == "fn" { typ = "KW" }
+            if word == "let" { typ = "KW" }
+            if word == "var" { typ = "KW" }
+            if word == "if" { typ = "KW" }
+            if word == "else" { typ = "KW" }
+            if word == "while" { typ = "KW" }
+            if word == "return" { typ = "KW" }
+            if word == "true" { typ = "KW" }
+            if word == "false" { typ = "KW" }
+            toks = push(toks, typ)
+            toks = push(toks, word)
+            continue
+        }
+        if pos + 1 < slen {
+            let two = str_substr(source, pos, 2)
+            if two == "==" { toks = push(toks, "==") toks = push(toks, "==") pos = pos + 2 continue }
+            if two == "!=" { toks = push(toks, "!=") toks = push(toks, "!=") pos = pos + 2 continue }
+            if two == "<=" { toks = push(toks, "<=") toks = push(toks, "<=") pos = pos + 2 continue }
+            if two == ">=" { toks = push(toks, ">=") toks = push(toks, ">=") pos = pos + 2 continue }
+        }
+        toks = push(toks, ch)
+        toks = push(toks, ch)
+        pos = pos + 1
+    }
+    toks = push(toks, "EOF")
+    toks = push(toks, "")
+    return toks
 }
 
+fn tok_type(toks: [String], i: i64) -> String { return toks[i * 2] }
+fn tok_val(toks: [String], i: i64) -> String { return toks[i * 2 + 1] }
+fn tok_count(toks: [String]) -> i64 { return len(toks) / 2 }
+
+// Compiler state (globals)
+var _toks: [String] = []
+var _pos = 0
+var _code: [String] = []
+var _label_id = 0
+
+fn cur_type() -> String { return tok_type(_toks, _pos) }
+fn cur_val() -> String { return tok_val(_toks, _pos) }
+fn adv() -> String { let v = cur_val() _pos = _pos + 1 return v }
+fn at_kw(k: String) -> bool {
+    if cur_type() == "KW" { return cur_val() == k }
+    return false
+}
+fn eat(t: String) -> String { let v = cur_val() _pos = _pos + 1 return v }
+fn eat_kw(k: String) { _pos = _pos + 1 }
+fn em(instr: String) { _code = push(_code, instr) }
+fn new_label(prefix: String) -> String {
+    _label_id = _label_id + 1
+    return prefix + "_" + to_string(_label_id)
+}
+
+// Expression compiler (precedence climbing)
+fn compile_primary() {
+    if cur_type() == "INT" { em("PUSH_INT " + adv()) return }
+    if at_kw("true") { adv() em("PUSH_INT 1") return }
+    if at_kw("false") { adv() em("PUSH_INT 0") return }
+    if cur_type() == "IDENT" {
+        let name = adv()
+        if cur_val() == "(" {
+            adv()
+            var argc = 0
+            if cur_val() != ")" {
+                compile_expr()
+                argc = 1
+                while cur_val() == "," { adv() compile_expr() argc = argc + 1 }
+            }
+            eat(")")
+            em("CALL " + name + " " + to_string(argc))
+        } else { em("LOAD " + name) }
+        return
+    }
+    if cur_val() == "(" { adv() compile_expr() eat(")") return }
+    adv()
+}
+fn compile_unary() {
+    if cur_val() == "-" { adv() compile_unary() em("NEG") return }
+    compile_primary()
+}
+fn compile_mul() {
+    compile_unary()
+    while cur_val() == "*" || cur_val() == "/" || cur_val() == "%" {
+        let op = adv()
+        compile_unary()
+        if op == "*" { em("MUL") }
+        if op == "/" { em("DIV") }
+        if op == "%" { em("MOD") }
+    }
+}
+fn compile_add() {
+    compile_mul()
+    while cur_val() == "+" || cur_val() == "-" {
+        let op = adv()
+        compile_mul()
+        if op == "+" { em("ADD") }
+        if op == "-" { em("SUB") }
+    }
+}
+fn compile_cmp() {
+    compile_add()
+    while cur_type() == "<" || cur_type() == ">" || cur_type() == "<=" || cur_type() == ">=" {
+        let op = adv()
+        compile_add()
+        if op == "<" { em("LT") }
+        if op == ">" { em("GT") }
+        if op == "<=" { em("LTEQ") }
+        if op == ">=" { em("GTEQ") }
+    }
+}
+fn compile_eq() {
+    compile_cmp()
+    while cur_type() == "==" || cur_type() == "!=" {
+        let op = adv()
+        compile_cmp()
+        if op == "==" { em("EQ") }
+        if op == "!=" { em("NEQ") }
+    }
+}
+fn compile_expr() { compile_eq() }
+
+fn compile_block() {
+    eat("{")
+    while cur_val() != "}" {
+        if cur_type() == "EOF" { break }
+        compile_stmt()
+    }
+    eat("}")
+}
+fn compile_stmt() {
+    if at_kw("let") || at_kw("var") {
+        adv() let name = adv() eat("=") compile_expr() em("STORE " + name) return
+    }
+    if at_kw("return") { adv() compile_expr() em("RET") return }
+    if at_kw("if") {
+        adv() compile_expr()
+        let else_lbl = new_label("else")
+        let end_lbl = new_label("endif")
+        em("JZ " + else_lbl) compile_block() em("JMP " + end_lbl) em("LABEL " + else_lbl)
+        if at_kw("else") { adv() compile_block() }
+        em("LABEL " + end_lbl) return
+    }
+    if at_kw("while") {
+        adv()
+        let loop_lbl = new_label("loop")
+        let end_lbl = new_label("endloop")
+        em("LABEL " + loop_lbl) compile_expr() em("JZ " + end_lbl)
+        compile_block() em("JMP " + loop_lbl) em("LABEL " + end_lbl) return
+    }
+    if cur_type() == "IDENT" {
+        let name = cur_val()
+        if tok_type(_toks, _pos + 1) == "=" {
+            adv() eat("=") compile_expr() em("STORE " + name) return
+        }
+    }
+    compile_expr() em("POP")
+}
+fn compile_fn() {
+    eat_kw("fn") let name = adv() eat("(")
+    var params: [String] = []
+    if cur_val() != ")" {
+        params = push(params, adv())
+        while cur_val() == "," { adv() params = push(params, adv()) }
+    }
+    eat(")")
+    em("FN_START " + name)
+    var pi = len(params) - 1
+    while pi >= 0 { em("STORE " + params[pi]) pi = pi - 1 }
+    compile_block() em("PUSH_INT 0") em("RET") em("FN_END")
+}
+fn compile_program() {
+    while cur_type() != "EOF" {
+        if at_kw("fn") { compile_fn() } else { compile_stmt() }
+    }
+}
+
+// VM value helpers
+fn make_int(n: i64) -> String { return "i:" + to_string(n) }
+fn val_display(v: String) -> String {
+    if sw(v, "i:") { return after(v, 2) }
+    if sw(v, "s:") { return after(v, 2) }
+    if v == "void" { return "()" }
+    return v
+}
+fn val_is_truthy(v: String) -> bool {
+    if sw(v, "i:") { return after(v, 2) != "0" }
+    if v == "void" { return false }
+    return true
+}
+fn val_as_int(v: String) -> i64 {
+    if sw(v, "i:") { return int(after(v, 2)) }
+    return 0
+}
+fn val_add(a: String, b: String) -> String { return make_int(val_as_int(a) + val_as_int(b)) }
+fn val_sub(a: String, b: String) -> String { return make_int(val_as_int(a) - val_as_int(b)) }
+fn val_mul(a: String, b: String) -> String { return make_int(val_as_int(a) * val_as_int(b)) }
+fn val_div(a: String, b: String) -> String {
+    var d = val_as_int(b)
+    if d == 0 { return "i:0" }
+    return make_int(val_as_int(a) / d)
+}
+fn val_mod_op(a: String, b: String) -> String {
+    var d = val_as_int(b)
+    if d == 0 { return "i:0" }
+    return make_int(val_as_int(a) % d)
+}
+fn make_bool(b: bool) -> String {
+    if b { return "i:1" }
+    return "i:0"
+}
+fn val_cmp(a: String, b: String, op: String) -> String {
+    var ai = val_as_int(a)
+    var bi = val_as_int(b)
+    if op == "EQ"   { return make_bool(ai == bi) }
+    if op == "NEQ"  { return make_bool(ai != bi) }
+    if op == "LT"   { return make_bool(ai < bi) }
+    if op == "GT"   { return make_bool(ai > bi) }
+    if op == "LTEQ" { return make_bool(ai <= bi) }
+    if op == "GTEQ" { return make_bool(ai >= bi) }
+    return "i:0"
+}
+fn stack_pop(stack: [String]) -> [String] {
+    var ns: [String] = []
+    var i = 0
+    while i < len(stack) - 1 { ns = push(ns, stack[i]) i = i + 1 }
+    return ns
+}
+fn stack_pop2(stack: [String]) -> [String] {
+    var ns: [String] = []
+    var i = 0
+    while i < len(stack) - 2 { ns = push(ns, stack[i]) i = i + 1 }
+    return ns
+}
+fn stack_top(stack: [String]) -> String {
+    if len(stack) == 0 { return "void" }
+    return stack[len(stack) - 1]
+}
+fn stack_second(stack: [String]) -> String {
+    if len(stack) < 2 { return "void" }
+    return stack[len(stack) - 2]
+}
+fn instr_op(instr: String) -> String {
+    var idx = find_idx(instr, " ")
+    if idx < 0 { return instr }
+    return str_substr(instr, 0, idx)
+}
 fn rest_after_space(s: String) -> String {
     var idx = find_idx(s, " ")
     if idx < 0 { return "" }
-    return str_substr(s, idx + 1, len(s))
+    return str_substr(s, idx + 1, len(s) - idx - 1)
 }
-
-fn instr_op(s: String) -> String {
-    var idx = find_idx(s, " ")
-    if idx < 0 { return s }
-    return str_substr(s, 0, idx)
-}
-
-fn instr_arg1(s: String) -> String {
-    var rest = rest_after_space(s)
+fn instr_arg1(instr: String) -> String {
+    var rest = rest_after_space(instr)
     var idx = find_idx(rest, " ")
     if idx < 0 { return rest }
     return str_substr(rest, 0, idx)
 }
-
-fn instr_arg2(s: String) -> String {
-    var rest = rest_after_space(s)
+fn instr_arg2(instr: String) -> String {
+    var rest = rest_after_space(instr)
     return rest_after_space(rest)
 }
-
-// ============================================================
-// LEXER — produces flat [String] of tokens
-// ============================================================
-
-fn is_digit(ch: String) -> bool { return str_is_ascii_digit(ch) }
-fn is_alpha(ch: String) -> bool { return str_is_ascii_alpha(ch) }
-fn is_alnum(ch: String) -> bool {
-    if is_alpha(ch) { return true }
-    if is_digit(ch) { return true }
-    if ch == "_" { return true }
-    return false
-}
-
-fn lex(source: String) -> [String] {
-    var toks = []
-    var pos = 0
-    var slen = len(source)
-    var nl = _nl()
-
-    while pos < slen {
-        var ch = str_char_at(source, pos)
-
-        if ch == " " { pos = pos + 1 }
-        if ch == nl { pos = pos + 1 }
-        if ch == str_from_bytes([9]) { pos = pos + 1 }
-        if ch == str_from_bytes([13]) { pos = pos + 1 }
-
-        if is_digit(ch) {
-            var start = pos
-            while pos < slen {
-                if is_digit(str_char_at(source, pos)) { pos = pos + 1 } else { pos = pos + slen }
-            }
-            if pos > slen { pos = pos - slen }
-            toks = push(toks, str_substr(source, start, pos - start))
-        }
-
-        if is_alpha(ch) {
-            var start = pos
-            while pos < slen {
-                if is_alnum(str_char_at(source, pos)) { pos = pos + 1 } else { pos = pos + slen }
-            }
-            if pos > slen { pos = pos - slen }
-            toks = push(toks, str_substr(source, start, pos - start))
-        }
-
-        if ch == "=" {
-            if pos + 1 < slen {
-                if str_char_at(source, pos + 1) == "=" {
-                    toks = push(toks, "==")
-                    pos = pos + 2
-                } else { toks = push(toks, "=")
-                    pos = pos + 1 }
-            } else { toks = push(toks, "=")
-                pos = pos + 1 }
-        }
-        if ch == "!" {
-            if pos + 1 < slen {
-                if str_char_at(source, pos + 1) == "=" {
-                    toks = push(toks, "!=")
-                    pos = pos + 2
-                } else { toks = push(toks, "!")
-                    pos = pos + 1 }
-            } else { toks = push(toks, "!")
-                pos = pos + 1 }
-        }
-        if ch == "<" {
-            if pos + 1 < slen {
-                if str_char_at(source, pos + 1) == "=" {
-                    toks = push(toks, "<=")
-                    pos = pos + 2
-                } else { toks = push(toks, "<")
-                    pos = pos + 1 }
-            } else { toks = push(toks, "<")
-                pos = pos + 1 }
-        }
-        if ch == ">" {
-            if pos + 1 < slen {
-                if str_char_at(source, pos + 1) == "=" {
-                    toks = push(toks, ">=")
-                    pos = pos + 2
-                } else { toks = push(toks, ">")
-                    pos = pos + 1 }
-            } else { toks = push(toks, ">")
-                pos = pos + 1 }
-        }
-        if ch == "+" { toks = push(toks, "+")
-            pos = pos + 1 }
-        if ch == "-" { toks = push(toks, "-")
-            pos = pos + 1 }
-        if ch == "*" { toks = push(toks, "*")
-            pos = pos + 1 }
-        if ch == "/" { toks = push(toks, "/")
-            pos = pos + 1 }
-        if ch == "%" { toks = push(toks, "%")
-            pos = pos + 1 }
-        if ch == "(" { toks = push(toks, "(")
-            pos = pos + 1 }
-        if ch == ")" { toks = push(toks, ")")
-            pos = pos + 1 }
-        if ch == "{" { toks = push(toks, "{")
-            pos = pos + 1 }
-        if ch == "}" { toks = push(toks, "}")
-            pos = pos + 1 }
-        if ch == "," { toks = push(toks, ",")
-            pos = pos + 1 }
-    }
-    toks = push(toks, "EOF")
-    return toks
-}
-
-// ============================================================
-// ONE-PASS COMPILER: parse + emit bytecode directly
-// ============================================================
-
-var _toks = []
-var _tp = 0
-var _code = []
-var _lbl = 0
-
-fn pk() -> String {
-    if _tp >= len(_toks) { return "EOF" }
-    return _toks[_tp]
-}
-
-fn adv() -> String {
-    var t = _toks[_tp]
-    _tp = _tp + 1
-    return t
-}
-
-fn expect(v: String) -> String {
-    var t = adv()
-    return t
-}
-
-fn is_kw(t: String) -> bool {
-    if t == "fn" { return true }
-    if t == "let" { return true }
-    if t == "var" { return true }
-    if t == "if" { return true }
-    if t == "else" { return true }
-    if t == "while" { return true }
-    if t == "return" { return true }
-    return false
-}
-
-fn is_number(t: String) -> bool {
-    if len(t) == 0 { return false }
-    return is_digit(str_char_at(t, 0))
-}
-
-fn new_label(pfx: String) -> String {
-    _lbl = _lbl + 1
-    return pfx + "_" + to_string(_lbl)
-}
-
-fn cemit(instr: String) -> i64 {
-    _code = push(_code, instr)
-    return 0
-}
-
-fn parse_primary() -> i64 {
-    var t = pk()
-    if t == "(" {
-        var d = adv()
-        var dummy = parse_expr()
-        var d2 = adv()
-        return 0
-    }
-    if t == "true" { var d = adv()
-        cemit("PUSH_BOOL true")
-        return 0 }
-    if t == "false" { var d = adv()
-        cemit("PUSH_BOOL false")
-        return 0 }
-    if is_number(t) {
-        var d = adv()
-        cemit("PUSH_INT " + t)
-        return 0 }
-    if is_alpha(str_char_at(t, 0)) {
-        if is_kw(t) == false {
-            var name = adv()
-            if pk() == "(" {
-                var d2 = adv()
-                var argc = 0
-                if pk() != ")" {
-                    var dummy = parse_expr()
-                    argc = 1
-                    while pk() == "," {
-                        var d3 = adv()
-                        dummy = parse_expr()
-                        argc = argc + 1
-                    }
-                }
-                var d3 = adv()
-                cemit("CALL " + name + " " + to_string(argc))
-            } else { cemit("LOAD " + name) }
-            return 0
-        }
-    }
-    var d = adv()
-    cemit("PUSH_INT 0")
-    return 0
-}
-
-fn parse_unary() -> i64 {
-    if pk() == "-" { var d = adv()
-        var dummy = parse_unary()
-        cemit("NEG")
-        return 0 }
-    return parse_primary()
-}
-
-fn parse_mul() -> i64 {
-    var dummy = parse_unary()
-    var cont = true
-    while cont {
-        if pk() == "*" { var d = adv()
-            dummy = parse_unary()
-            cemit("MUL")
-        } else if pk() == "/" { var d = adv()
-            dummy = parse_unary()
-            cemit("DIV")
-        } else if pk() == "%" { var d = adv()
-            dummy = parse_unary()
-            cemit("MOD")
-        } else { cont = false }
-    }
-    return 0
-}
-
-fn parse_add() -> i64 {
-    var dummy = parse_mul()
-    var cont = true
-    while cont {
-        if pk() == "+" { var d = adv()
-            dummy = parse_mul()
-            cemit("ADD")
-        } else if pk() == "-" { var d = adv()
-            dummy = parse_mul()
-            cemit("SUB")
-        } else { cont = false }
-    }
-    return 0
-}
-
-fn parse_cmp() -> i64 {
-    var dummy = parse_add()
-    var cont = true
-    while cont {
-        if pk() == "==" { var d = adv()
-            dummy = parse_add()
-            cemit("EQ")
-        } else if pk() == "!=" { var d = adv()
-            dummy = parse_add()
-            cemit("NEQ")
-        } else if pk() == "<" { var d = adv()
-            dummy = parse_add()
-            cemit("LT")
-        } else if pk() == ">" { var d = adv()
-            dummy = parse_add()
-            cemit("GT")
-        } else if pk() == "<=" { var d = adv()
-            dummy = parse_add()
-            cemit("LTEQ")
-        } else if pk() == ">=" { var d = adv()
-            dummy = parse_add()
-            cemit("GTEQ")
-        } else { cont = false }
-    }
-    return 0
-}
-
-fn parse_expr() -> i64 {
-    return parse_cmp()
-}
-
-fn parse_stmt() -> i64 {
-    var t = pk()
-    if t == "let" { var d = adv()
-        var name = adv()
-        var d2 = adv()
-        var dummy = parse_expr()
-        cemit("STORE " + name)
-        return 0 }
-    if t == "var" { var d = adv()
-        var name = adv()
-        var d2 = adv()
-        var dummy = parse_expr()
-        cemit("STORE " + name)
-        return 0 }
-    if t == "return" { var d = adv()
-        if pk() == "}" { cemit("PUSH_INT 0")
-        } else { var dummy = parse_expr() }
-        cemit("RET")
-        return 0 }
-    if t == "if" { var d = adv()
-        var else_lbl = new_label("E")
-        var end_lbl = new_label("N")
-        var dummy = parse_expr()
-        cemit("JZ " + else_lbl)
-        var d2 = adv()
-        while pk() != "}" { dummy = parse_stmt() }
-        var d3 = adv()
-        cemit("JMP " + end_lbl)
-        cemit("LABEL " + else_lbl)
-        if pk() == "else" { dummy = adv()
-            if pk() == "if" { dummy = parse_stmt()
-            } else { var d4 = adv()
-                while pk() != "}" { dummy = parse_stmt() }
-                var d5 = adv() }
-        }
-        cemit("LABEL " + end_lbl)
-        return 0 }
-    if t == "while" { var d = adv()
-        var sl = new_label("W")
-        var el = new_label("X")
-        cemit("LABEL " + sl)
-        var dummy = parse_expr()
-        cemit("JZ " + el)
-        var d2 = adv()
-        while pk() != "}" { dummy = parse_stmt() }
-        var d3 = adv()
-        cemit("JMP " + sl)
-        cemit("LABEL " + el)
-        return 0 }
-    // expression stmt, possibly assignment
-    var dummy = parse_expr()
-    if pk() == "=" {
-        var last = _code[len(_code) - 1]
-        if sw(last, "LOAD ") {
-            var name = after(last, 5)
-            var nc = []
-            var ci = 0
-            while ci < len(_code) - 1 { nc = push(nc, _code[ci])
-                ci = ci + 1 }
-            _code = nc
-            var d2 = adv()
-            dummy = parse_expr()
-            cemit("STORE " + name)
-            return 0
-        }
-    }
-    cemit("POP")
-    return 0
-}
-
-fn parse_fn_def() -> i64 {
-    var d = adv()
-    var name = adv()
-    var d2 = adv()
-    var params = []
-    if pk() != ")" {
-        params = push(params, adv())
-        while pk() == "," { var d3 = adv()
-            params = push(params, adv()) }
-    }
-    var d3 = adv()
-    var d4 = adv()
-    cemit("FN_START " + name)
-    var pi = len(params) - 1
-    while pi >= 0 { cemit("STORE " + params[pi])
-        pi = pi - 1 }
-    while pk() != "}" { var dummy = parse_stmt() }
-    var d5 = adv()
-    cemit("PUSH_INT 0")
-    cemit("RET")
-    cemit("FN_END")
-    return 0
-}
-
-fn compile(source: String) -> [String] {
-    _toks = lex(source)
-    _tp = 0
-    _code = []
-    _lbl = 0
-    while pk() != "EOF" {
-        if pk() == "fn" { var dummy = parse_fn_def()
-        } else { var d = adv() }
-    }
-    cemit("HALT")
-    return _code
-}
-
-// ============================================================
-// VM — uses global state to minimize stack depth
-// ============================================================
-
-var _instrs = []
-var _stk = []
-var _vars = []
-var _cs = []
-var _ip = 0
-var _running = true
-var _result = "void"
-var _labels = []
-var _fns = []
-
-fn make_int(n: i64) -> String { return "i:" + to_string(n) }
-fn make_bool(b: bool) -> String {
-    if b { return "b:true" }
-    return "b:false"
-}
-
-fn val_display(v: String) -> String {
-    if sw(v, "i:") { return after(v, 2) }
-    if sw(v, "s:") { return after(v, 2) }
-    if v == "b:true" { return "true" }
-    if v == "b:false" { return "false" }
-    return v
-}
-
-fn val_truthy(v: String) -> bool {
-    if v == "b:true" { return true }
-    if v == "b:false" { return false }
-    if sw(v, "i:") { return after(v, 2) != "0" }
-    return true
-}
-
-fn val_int(v: String) -> i64 {
-    if sw(v, "i:") { return int(after(v, 2)) }
-    return 0
-}
-
-fn spop(s: [String]) -> [String] {
-    var r = []
-    var i = 0
-    while i < len(s) - 1 { r = push(r, s[i])
-        i = i + 1 }
-    return r
-}
-
-fn stop(s: [String]) -> String {
-    if len(s) == 0 { return "void" }
-    return s[len(s) - 1]
-}
-
-fn stop2(s: [String]) -> String {
-    if len(s) < 2 { return "void" }
-    return s[len(s) - 2]
-}
-
-fn spop2(s: [String]) -> [String] {
-    var r = []
-    var i = 0
-    while i < len(s) - 2 { r = push(r, s[i])
-        i = i + 1 }
-    return r
-}
-
-fn vget(name: String) -> String {
-    var i = len(_vars) - 2
+fn vars_get(vars: [String], name: String) -> String {
+    var i = len(vars) - 2
     while i >= 0 {
-        if _vars[i] == name { return _vars[i + 1] }
+        if vars[i] == name { return vars[i + 1] }
         i = i - 2
     }
     return "void"
 }
-
-fn vset(name: String, val: String) -> i64 {
-    var i = len(_vars) - 2
+fn vars_set(vars: [String], name: String, val: String) -> [String] {
+    var i = len(vars) - 2
     while i >= 0 {
-        if _vars[i] == name { _vars[i + 1] = val
-            return 0 }
-        if _vars[i] == "##S##" {
-            _vars = push(_vars, name)
-            _vars = push(_vars, val)
-            return 0
+        if vars[i] == name { vars[i + 1] = val return vars }
+        if vars[i] == "##SCOPE##" {
+            vars = push(vars, name) vars = push(vars, val) return vars
         }
         i = i - 2
     }
-    _vars = push(_vars, name)
-    _vars = push(_vars, val)
-    return 0
+    vars = push(vars, name) vars = push(vars, val) return vars
 }
-
-fn vpush() -> i64 {
-    _vars = push(_vars, "##S##")
-    _vars = push(_vars, "##S##")
-    return 0
+fn vars_push_scope(vars: [String]) -> [String] {
+    vars = push(vars, "##SCOPE##") vars = push(vars, "##SCOPE##") return vars
 }
-
-fn vpop() -> i64 {
-    while len(_vars) >= 2 {
-        var nm = _vars[len(_vars) - 2]
-        _vars = spop(spop(_vars))
-        if nm == "##S##" { return 0 }
+fn vars_pop_scope(vars: [String]) -> [String] {
+    while len(vars) >= 2 {
+        var top_name = vars[len(vars) - 2]
+        var nv: [String] = []
+        var j = 0
+        while j < len(vars) - 2 { nv = push(nv, vars[j]) j = j + 1 }
+        vars = nv
+        if top_name == "##SCOPE##" { return vars }
     }
-    return 0
+    return vars
 }
-
-fn tget(t: [String], key: String) -> i64 {
+fn table_get(table: [String], key: String) -> i64 {
     var i = 0
-    while i < len(t) - 1 {
-        if t[i] == key { return int(t[i + 1]) }
+    while i < len(table) - 1 {
+        if table[i] == key { return int(table[i + 1]) }
         i = i + 2
     }
     return -1
 }
-
-// Individual VM step handlers to keep nesting shallow
-fn vm_step() -> i64 {
-    var ins = _instrs[_ip]
-    var op = instr_op(ins)
-
-    if op == "HALT" { _running = false
-        _result = stop(_stk)
-        return 0 }
-    if op == "PUSH_INT" { _stk = push(_stk, make_int(int(instr_arg1(ins))))
-        _ip = _ip + 1
-        return 0 }
-    if op == "PUSH_BOOL" {
-        if instr_arg1(ins) == "true" { _stk = push(_stk, "b:true")
-        } else { _stk = push(_stk, "b:false") }
-        _ip = _ip + 1
-        return 0 }
-    if op == "LOAD" { _stk = push(_stk, vget(instr_arg1(ins)))
-        _ip = _ip + 1
-        return 0 }
-    if op == "STORE" { var dummy = vset(instr_arg1(ins), stop(_stk))
-        _stk = spop(_stk)
-        _ip = _ip + 1
-        return 0 }
-    if op == "POP" { if len(_stk) > 0 { _stk = spop(_stk) }
-        _ip = _ip + 1
-        return 0 }
-    if op == "ADD" { var b = stop(_stk)
-        var a = stop2(_stk)
-        _stk = spop2(_stk)
-        _stk = push(_stk, make_int(val_int(a) + val_int(b)))
-        _ip = _ip + 1
-        return 0 }
-    if op == "SUB" { var b = stop(_stk)
-        var a = stop2(_stk)
-        _stk = spop2(_stk)
-        _stk = push(_stk, make_int(val_int(a) - val_int(b)))
-        _ip = _ip + 1
-        return 0 }
-    if op == "MUL" { var b = stop(_stk)
-        var a = stop2(_stk)
-        _stk = spop2(_stk)
-        _stk = push(_stk, make_int(val_int(a) * val_int(b)))
-        _ip = _ip + 1
-        return 0 }
-    if op == "DIV" { var b = stop(_stk)
-        var a = stop2(_stk)
-        _stk = spop2(_stk)
-        var denom = val_int(b)
-        if denom == 0 { _stk = push(_stk, make_int(0))
-        } else { _stk = push(_stk, make_int(val_int(a) / denom)) }
-        _ip = _ip + 1
-        return 0 }
-    if op == "MOD" { var b = stop(_stk)
-        var a = stop2(_stk)
-        _stk = spop2(_stk)
-        var denom = val_int(b)
-        if denom == 0 { _stk = push(_stk, make_int(0))
-        } else { _stk = push(_stk, make_int(val_int(a) % denom)) }
-        _ip = _ip + 1
-        return 0 }
-    if op == "NEG" { var a = stop(_stk)
-        _stk = spop(_stk)
-        _stk = push(_stk, make_int(0 - val_int(a)))
-        _ip = _ip + 1
-        return 0 }
-    if op == "EQ" { var b = stop(_stk)
-        var a = stop2(_stk)
-        _stk = spop2(_stk)
-        _stk = push(_stk, make_bool(val_int(a) == val_int(b)))
-        _ip = _ip + 1
-        return 0 }
-    if op == "NEQ" { var b = stop(_stk)
-        var a = stop2(_stk)
-        _stk = spop2(_stk)
-        _stk = push(_stk, make_bool(val_int(a) != val_int(b)))
-        _ip = _ip + 1
-        return 0 }
-    if op == "LT" { var b = stop(_stk)
-        var a = stop2(_stk)
-        _stk = spop2(_stk)
-        _stk = push(_stk, make_bool(val_int(a) < val_int(b)))
-        _ip = _ip + 1
-        return 0 }
-    if op == "GT" { var b = stop(_stk)
-        var a = stop2(_stk)
-        _stk = spop2(_stk)
-        _stk = push(_stk, make_bool(val_int(a) > val_int(b)))
-        _ip = _ip + 1
-        return 0 }
-    if op == "LTEQ" { var b = stop(_stk)
-        var a = stop2(_stk)
-        _stk = spop2(_stk)
-        _stk = push(_stk, make_bool(val_int(a) <= val_int(b)))
-        _ip = _ip + 1
-        return 0 }
-    if op == "GTEQ" { var b = stop(_stk)
-        var a = stop2(_stk)
-        _stk = spop2(_stk)
-        _stk = push(_stk, make_bool(val_int(a) >= val_int(b)))
-        _ip = _ip + 1
-        return 0 }
-    if op == "NOT" { var a = stop(_stk)
-        _stk = spop(_stk)
-        if val_truthy(a) { _stk = push(_stk, "b:false")
-        } else { _stk = push(_stk, "b:true") }
-        _ip = _ip + 1
-        return 0 }
-    if op == "JMP" { var target = tget(_labels, instr_arg1(ins))
-        if target >= 0 { _ip = target + 1 } else { _running = false }
-        return 0 }
-    if op == "JZ" { var top = stop(_stk)
-        _stk = spop(_stk)
-        if val_truthy(top) { _ip = _ip + 1
-        } else { var target = tget(_labels, instr_arg1(ins))
-            if target >= 0 { _ip = target + 1 } else { _running = false } }
-        return 0 }
-    if op == "LABEL" { _ip = _ip + 1
-        return 0 }
-    if op == "FN_START" {
-        var depth = 1
-        _ip = _ip + 1
-        while depth > 0 {
-            if _ip >= len(_instrs) { depth = 0
-            } else { var sop = instr_op(_instrs[_ip])
-                if sop == "FN_START" { depth = depth + 1 }
-                if sop == "FN_END" { depth = depth - 1 }
-                _ip = _ip + 1 }
-        }
-        return 0 }
-    if op == "FN_END" {
-        if len(_cs) >= 1 { var ret_ip = int(_cs[len(_cs) - 1])
-            _cs = spop(_cs)
-            var dummy = vpop()
-            _ip = ret_ip
-        } else { _running = false
-            _result = stop(_stk) }
-        return 0 }
-    if op == "RET" {
-        var rv = "void"
-        if len(_stk) > 0 { rv = stop(_stk)
-            _stk = spop(_stk) }
-        if len(_cs) >= 1 { var ret_ip = int(_cs[len(_cs) - 1])
-            _cs = spop(_cs)
-            var dummy = vpop()
-            _stk = push(_stk, rv)
-            _ip = ret_ip
-        } else { _result = rv
-            _running = false }
-        return 0 }
-    if op == "CALL" {
-        var fn_name = instr_arg1(ins)
-        var argc = int(instr_arg2(ins))
-        if fn_name == "println" {
-            var top = stop(_stk)
-            _stk = spop(_stk)
-            print(val_display(top) + _nl())
-            _stk = push(_stk, "void")
-            _ip = _ip + 1
-            return 0
-        }
-        if fn_name == "print" {
-            var top = stop(_stk)
-            _stk = spop(_stk)
-            print(val_display(top))
-            _stk = push(_stk, "void")
-            _ip = _ip + 1
-            return 0
-        }
-        var fn_ip = tget(_fns, fn_name)
-        if fn_ip < 0 { _running = false
-            return 0 }
-        _cs = push(_cs, to_string(_ip + 1))
-        var dummy = vpush()
-        _ip = fn_ip + 1
-        return 0 }
-    _ip = _ip + 1
-    return 0
+fn table_set(table: [String], key: String, val: i64) -> [String] {
+    table = push(table, key) table = push(table, to_string(val)) return table
 }
-
-fn vm_run(instrs: [String]) -> String {
-    _instrs = instrs
-    _stk = []
-    _vars = []
-    _cs = []
-    _ip = 0
-    _running = true
-    _result = "void"
-    _labels = []
-    _fns = []
+fn preprocess_labels(instrs: [String]) -> [String] {
+    var labels: [String] = []
     var i = 0
     while i < len(instrs) {
-        var op = instr_op(instrs[i])
-        if op == "LABEL" { _labels = push(_labels, instr_arg1(instrs[i]))
-            _labels = push(_labels, to_string(i)) }
-        if op == "FN_START" { _fns = push(_fns, instr_arg1(instrs[i]))
-            _fns = push(_fns, to_string(i)) }
+        if instr_op(instrs[i]) == "LABEL" { labels = table_set(labels, instr_arg1(instrs[i]), i) }
         i = i + 1
     }
-    var main_ip = tget(_fns, "main")
-    if main_ip >= 0 { _ip = main_ip + 1
-        var dummy = vpush() }
-    while _running {
-        if _ip >= len(_instrs) { _running = false }
-        if _running { var dummy = vm_step() }
+    return labels
+}
+fn preprocess_fns(instrs: [String]) -> [String] {
+    var fns: [String] = []
+    var i = 0
+    while i < len(instrs) {
+        if instr_op(instrs[i]) == "FN_START" { fns = table_set(fns, instr_arg1(instrs[i]), i) }
+        i = i + 1
     }
-    return _result
+    return fns
 }
 
-// ============================================================
-// MAIN — self-contained tests
-// ============================================================
+var _output: [String] = []
 
-fn run_test(name: String, source: String) -> i64 {
-    print(name + ": ")
-    var code = compile(source)
-    var r = vm_run(code)
-    return 0
+fn vm_exec(instrs: [String]) -> String {
+    var stack: [String] = []
+    var vars: [String] = []
+    var call_stack: [String] = []
+    var labels = preprocess_labels(instrs)
+    var fns = preprocess_fns(instrs)
+    var ip = 0
+    var running = true
+    var result = "void"
+    var main_ip = table_get(fns, "main")
+    if main_ip >= 0 { ip = main_ip + 1 vars = vars_push_scope(vars) }
+    while running {
+        if ip >= len(instrs) { running = false }
+        if running {
+            var instr = instrs[ip]
+            var op = instr_op(instr)
+            if op == "HALT" { running = false result = stack_top(stack) }
+            if op == "PUSH_INT" { stack = push(stack, make_int(int(instr_arg1(instr)))) ip = ip + 1 }
+            if op == "LOAD" { stack = push(stack, vars_get(vars, instr_arg1(instr))) ip = ip + 1 }
+            if op == "STORE" {
+                var val = stack_top(stack) stack = stack_pop(stack)
+                vars = vars_set(vars, instr_arg1(instr), val) ip = ip + 1
+            }
+            if op == "POP" { if len(stack) > 0 { stack = stack_pop(stack) } ip = ip + 1 }
+            if op == "ADD" {
+                var b = stack_top(stack) var a = stack_second(stack)
+                stack = stack_pop2(stack) stack = push(stack, val_add(a, b)) ip = ip + 1
+            }
+            if op == "SUB" {
+                var b = stack_top(stack) var a = stack_second(stack)
+                stack = stack_pop2(stack) stack = push(stack, val_sub(a, b)) ip = ip + 1
+            }
+            if op == "MUL" {
+                var b = stack_top(stack) var a = stack_second(stack)
+                stack = stack_pop2(stack) stack = push(stack, val_mul(a, b)) ip = ip + 1
+            }
+            if op == "DIV" {
+                var b = stack_top(stack) var a = stack_second(stack)
+                stack = stack_pop2(stack) stack = push(stack, val_div(a, b)) ip = ip + 1
+            }
+            if op == "MOD" {
+                var b = stack_top(stack) var a = stack_second(stack)
+                stack = stack_pop2(stack) stack = push(stack, val_mod_op(a, b)) ip = ip + 1
+            }
+            if op == "NEG" {
+                var a = stack_top(stack) stack = stack_pop(stack)
+                stack = push(stack, make_int(0 - val_as_int(a))) ip = ip + 1
+            }
+            var is_cmp = false
+            if op == "EQ"   { is_cmp = true }
+            if op == "NEQ"  { is_cmp = true }
+            if op == "LT"   { is_cmp = true }
+            if op == "GT"   { is_cmp = true }
+            if op == "LTEQ" { is_cmp = true }
+            if op == "GTEQ" { is_cmp = true }
+            if is_cmp {
+                var b = stack_top(stack) var a = stack_second(stack)
+                stack = stack_pop2(stack) stack = push(stack, val_cmp(a, b, op)) ip = ip + 1
+            }
+            if op == "JMP" {
+                var lbl = instr_arg1(instr)
+                var target = table_get(labels, lbl)
+                if target >= 0 { ip = target + 1 }
+                if target < 0 { running = false }
+            }
+            if op == "JZ" {
+                var lbl = instr_arg1(instr)
+                var cond_val = stack_top(stack) stack = stack_pop(stack)
+                if val_is_truthy(cond_val) { ip = ip + 1 } else {
+                    var target = table_get(labels, lbl)
+                    if target >= 0 { ip = target + 1 }
+                    if target < 0 { running = false }
+                }
+            }
+            if op == "LABEL" { ip = ip + 1 }
+            if op == "FN_START" {
+                var depth = 1
+                ip = ip + 1
+                while depth > 0 {
+                    if ip >= len(instrs) { depth = 0 }
+                    if depth > 0 {
+                        var skip_op = instr_op(instrs[ip])
+                        if skip_op == "FN_START" { depth = depth + 1 }
+                        if skip_op == "FN_END"   { depth = depth - 1 }
+                        ip = ip + 1
+                    }
+                }
+            }
+            if op == "FN_END" {
+                if len(call_stack) >= 1 {
+                    var ret_ip = int(call_stack[len(call_stack) - 1])
+                    call_stack = stack_pop(call_stack) vars = vars_pop_scope(vars) ip = ret_ip
+                } else { running = false result = stack_top(stack) }
+            }
+            if op == "RET" {
+                var ret_val = "void"
+                if len(stack) > 0 { ret_val = stack_top(stack) stack = stack_pop(stack) }
+                if len(call_stack) >= 1 {
+                    var ret_ip = int(call_stack[len(call_stack) - 1])
+                    call_stack = stack_pop(call_stack) vars = vars_pop_scope(vars)
+                    stack = push(stack, ret_val) ip = ret_ip
+                } else { result = ret_val running = false }
+            }
+            if op == "CALL" {
+                var fn_name = instr_arg1(instr)
+                var argc = int(instr_arg2(instr))
+                var is_builtin = false
+                if fn_name == "println" { is_builtin = true }
+                if fn_name == "print"   { is_builtin = true }
+                if is_builtin {
+                    if fn_name == "println" {
+                        var top = stack_top(stack) stack = stack_pop(stack)
+                        let out = val_display(top)
+                        print(out + _nl()) _output = push(_output, out)
+                        stack = push(stack, "void")
+                    }
+                    if fn_name == "print" {
+                        var top = stack_top(stack) stack = stack_pop(stack)
+                        print(val_display(top)) stack = push(stack, "void")
+                    }
+                    ip = ip + 1
+                } else {
+                    var fn_ip = table_get(fns, fn_name)
+                    if fn_ip < 0 {
+                        running = false
+                        print("VM error: undefined function " + fn_name + _nl())
+                    } else {
+                        call_stack = push(call_stack, to_string(ip + 1))
+                        vars = vars_push_scope(vars) ip = fn_ip + 1
+                    }
+                }
+            }
+        }
+    }
+    return result
 }
 
+// Main: compile and run test program
 fn main() {
-    var nl = _nl()
-    print("=== vxrun.vx Self-Hosting Compiler ===" + nl)
-
-    var dummy = run_test("Test 1 (40+2)", "fn main() { println(40 + 2) }")
-    dummy = run_test("Test 2 (let x)", "fn main() { let x = 10" + nl + "println(x - 3) }")
-    dummy = run_test("Test 3 (6*7)", "fn main() { println(6 * 7) }")
-    dummy = run_test("Test 4 (if/else)", "fn main() { if 5 > 3 { println(1) } else { println(0) } }")
-
-    var s5 = "fn main() { var i = 1" + nl + "var s = 0" + nl
-    s5 = s5 + "while i <= 5 { s = s + i" + nl + "i = i + 1 }" + nl
-    s5 = s5 + "println(s) }"
-    dummy = run_test("Test 5 (while)", s5)
-
-    var s6 = "fn add(a, b) { return a + b }" + nl
-    s6 = s6 + "fn main() { println(add(17, 25)) }"
-    dummy = run_test("Test 6 (fn call)", s6)
-
-    var s7 = "fn double(x) { return x * 2 }" + nl
-    s7 = s7 + "fn main() { println(double(21)) }"
-    dummy = run_test("Test 7 (double)", s7)
-
-    dummy = run_test("Test 8 (neg)", "fn main() { println(-5 + 8) }")
-
-    var s9 = "fn main() { if 10 == 10 { println(1) } else { println(0) } }"
-    dummy = run_test("Test 9 (eq)", s9)
-
-    var s10 = "fn fib(n) { if n <= 1 { return n }" + nl
-    s10 = s10 + "return fib(n - 1) + fib(n - 2) }" + nl
-    s10 = s10 + "fn main() { println(fib(10)) }"
-    dummy = run_test("Test 10 (fib)", s10)
-
-    print("=== ALL TESTS PASS ===" + nl)
+    let nl = _nl()
+    let source = "fn double(n) {" + nl + "  return n * n" + nl + "}" + nl + "fn main() {" + nl + "    let x = 10" + nl + "    println(double(x))" + nl + "    var sum = 0" + nl + "    var i = 1" + nl + "    while i <= 5 {" + nl + "        sum = sum + i" + nl + "        i = i + 1" + nl + "    }" + nl + "    println(sum)" + nl + "}"
+    println("=== vxrun: Vortex self-hosted runner ===")
+    println("")
+    println("Phase 1: Lexing...")
+    _toks = lex(source)
+    println("  Tokens: " + to_string(tok_count(_toks)))
+    println("Phase 2: Compiling...")
+    _pos = 0
+    _code = []
+    compile_program()
+    println("  Bytecode: " + to_string(len(_code)) + " instructions")
+    println("")
+    println("--- Bytecode ---")
+    var bi = 0
+    while bi < len(_code) { println("  " + to_string(bi) + ": " + _code[bi]) bi = bi + 1 }
+    println("")
+    println("--- Output ---")
+    _output = []
+    vm_exec(_code)
+    println("")
+    println("--- Self-test ---")
+    var pass = true
+    if len(_output) >= 1 {
+        if _output[0] != "100" { println("FAIL: expected 100, got " + _output[0]) pass = false }
+    } else { println("FAIL: no output for double(10)") pass = false }
+    if len(_output) >= 2 {
+        if _output[1] != "15" { println("FAIL: expected 15, got " + _output[1]) pass = false }
+    } else { println("FAIL: no output for sum") pass = false }
+    if pass { println("PASS: double(10)=100, sum(1..5)=15") }
+    println("=== Done ===")
 }

@@ -1,0 +1,504 @@
+// vxpipe.vx — Complete Vortex-in-Vortex Pipeline
+// source -> lex -> parse+codegen -> VM execute, ALL in pure .vx
+
+fn _nl() -> String { return str_from_bytes([10]) }
+
+fn ch(s: String, i: i64) -> String {
+    if i >= len(s) { return "" }
+    return str_substr(s, i, 1)
+}
+fn is_dig(c: String) -> bool {
+    if c == "0" { return true }  if c == "1" { return true }
+    if c == "2" { return true }  if c == "3" { return true }
+    if c == "4" { return true }  if c == "5" { return true }
+    if c == "6" { return true }  if c == "7" { return true }
+    if c == "8" { return true }  if c == "9" { return true }
+    return false
+}
+fn is_al(c: String) -> bool {
+    if c == "_" { return true }
+    if c == "a" { return true }  if c == "b" { return true }  if c == "c" { return true }
+    if c == "d" { return true }  if c == "e" { return true }  if c == "f" { return true }
+    if c == "g" { return true }  if c == "h" { return true }  if c == "i" { return true }
+    if c == "j" { return true }  if c == "k" { return true }  if c == "l" { return true }
+    if c == "m" { return true }  if c == "n" { return true }  if c == "o" { return true }
+    if c == "p" { return true }  if c == "q" { return true }  if c == "r" { return true }
+    if c == "s" { return true }  if c == "t" { return true }  if c == "u" { return true }
+    if c == "v" { return true }  if c == "w" { return true }  if c == "x" { return true }
+    if c == "y" { return true }  if c == "z" { return true }
+    if c == "A" { return true }  if c == "B" { return true }  if c == "C" { return true }
+    if c == "D" { return true }  if c == "E" { return true }  if c == "F" { return true }
+    if c == "G" { return true }  if c == "H" { return true }  if c == "I" { return true }
+    if c == "J" { return true }  if c == "K" { return true }  if c == "L" { return true }
+    if c == "M" { return true }  if c == "N" { return true }  if c == "O" { return true }
+    if c == "P" { return true }  if c == "Q" { return true }  if c == "R" { return true }
+    if c == "S" { return true }  if c == "T" { return true }  if c == "U" { return true }
+    if c == "V" { return true }  if c == "W" { return true }  if c == "X" { return true }
+    if c == "Y" { return true }  if c == "Z" { return true }
+    return false
+}
+fn is_aln(c: String) -> bool {
+    if is_al(c) { return true }
+    return is_dig(c)
+}
+
+// == Lexer: flat array [kind, value, kind, value, ...] ==
+fn lex(src: String) -> [String] {
+    var toks: [String] = []
+    var pos = 0
+    var slen = len(src)
+    while pos < slen {
+        var c = ch(src, pos)
+        if c == " " { pos = pos + 1 }
+        else if is_dig(c) {
+            var num = ""
+            var dgo = true
+            while dgo {
+                if pos >= slen { dgo = false }
+                else if is_dig(ch(src, pos)) { num = num + ch(src, pos)  pos = pos + 1 }
+                else { dgo = false }
+            }
+            toks = push(toks, "I")
+            toks = push(toks, num)
+        }
+        else if is_al(c) {
+            var word = ""
+            var wgo = true
+            while wgo {
+                if pos >= slen { wgo = false }
+                else if is_aln(ch(src, pos)) { word = word + ch(src, pos)  pos = pos + 1 }
+                else { wgo = false }
+            }
+            toks = push(toks, "W")
+            toks = push(toks, word)
+        }
+        else {
+            var p2 = ""
+            var p2end = pos + 2
+            if pos + 1 < slen { p2 = str_substr(src, pos, p2end) }
+            if p2 == "<=" { toks = push(toks, "P")  toks = push(toks, "<=")  pos = pos + 2 }
+            else if p2 == ">=" { toks = push(toks, "P")  toks = push(toks, ">=")  pos = pos + 2 }
+            else if p2 == "==" { toks = push(toks, "P")  toks = push(toks, "==")  pos = pos + 2 }
+            else if p2 == "!=" { toks = push(toks, "P")  toks = push(toks, "!=")  pos = pos + 2 }
+            else { toks = push(toks, "P")  toks = push(toks, c)  pos = pos + 1 }
+        }
+    }
+    toks = push(toks, "E")
+    toks = push(toks, "")
+    return toks
+}
+
+// == Token stream ==
+var _toks: [String] = []
+var _tp = 0
+fn tk() -> String {
+    var i = _tp * 2
+    if i >= len(_toks) { return "E" }
+    return _toks[i]
+}
+fn tv() -> String {
+    var i = _tp * 2 + 1
+    if i >= len(_toks) { return "" }
+    return _toks[i]
+}
+fn adv() -> String { var vv = tv()  _tp = _tp + 1  return vv }
+fn eat(vv: String) -> bool { if tv() == vv { _tp = _tp + 1  return true }  return false }
+
+var _lc = 0
+fn nlbl(p: String) -> String { _lc = _lc + 1  return p + to_string(_lc) }
+fn em(c: [String], s: String) -> [String] { return push(c, s) }
+
+// == Parser + Codegen ==
+fn p_primary(code: [String]) -> [String] {
+    if tk() == "I" {
+        var vv = adv()
+        return em(code, "PUSH_INT " + vv)
+    }
+    if tk() == "W" {
+        var name = adv()
+        if tv() == "(" {
+            adv()
+            var argc = 0
+            if tv() != ")" {
+                code = p_expr(code)
+                argc = 1
+                while tv() == "," { adv()  code = p_expr(code)  argc = argc + 1 }
+            }
+            eat(")")
+            return em(code, "CALL " + name + " " + to_string(argc))
+        }
+        return em(code, "LOAD " + name)
+    }
+    if tv() == "(" {
+        adv()
+        code = p_expr(code)
+        eat(")")
+        return code
+    }
+    adv()
+    return code
+}
+
+fn p_mul(code: [String]) -> [String] {
+    code = p_primary(code)
+    var go = true
+    while go {
+        if tv() == "*" { adv()  code = p_primary(code)  code = em(code, "MUL") }
+        else if tv() == "/" { adv()  code = p_primary(code)  code = em(code, "DIV") }
+        else if tv() == "%" { adv()  code = p_primary(code)  code = em(code, "MOD") }
+        else { go = false }
+    }
+    return code
+}
+
+fn p_add(code: [String]) -> [String] {
+    code = p_mul(code)
+    var go = true
+    while go {
+        if tv() == "+" { adv()  code = p_mul(code)  code = em(code, "ADD") }
+        else if tv() == "-" { adv()  code = p_mul(code)  code = em(code, "SUB") }
+        else { go = false }
+    }
+    return code
+}
+
+fn p_expr(code: [String]) -> [String] {
+    code = p_add(code)
+    var vv = tv()
+    if vv == "<" { adv()  code = p_add(code)  return em(code, "LT") }
+    if vv == ">" { adv()  code = p_add(code)  return em(code, "GT") }
+    if vv == "<=" { adv()  code = p_add(code)  return em(code, "LE") }
+    if vv == ">=" { adv()  code = p_add(code)  return em(code, "GE") }
+    if vv == "==" { adv()  code = p_add(code)  return em(code, "EQ") }
+    if vv == "!=" { adv()  code = p_add(code)  return em(code, "NE") }
+    return code
+}
+
+fn p_block(code: [String]) -> [String] {
+    while tv() != "}" {
+        if tk() == "E" { return code }
+        code = p_stmt(code)
+    }
+    return code
+}
+
+fn p_stmt(code: [String]) -> [String] {
+    var vv = tv()
+    if vv == "let" {
+        adv()
+        var name = adv()
+        eat("=")
+        code = p_expr(code)
+        return em(code, "STORE " + name)
+    }
+    if vv == "var" {
+        adv()
+        var name = adv()
+        eat("=")
+        code = p_expr(code)
+        return em(code, "STORE " + name)
+    }
+    if vv == "return" {
+        adv()
+        if tv() != "}" { code = p_expr(code) }
+        else { code = em(code, "PUSH_INT 0") }
+        return em(code, "RET")
+    }
+    if vv == "if" {
+        adv()
+        code = p_expr(code)
+        var el = nlbl("el")
+        var en = nlbl("en")
+        code = em(code, "JZ " + el)
+        eat("{")
+        code = p_block(code)
+        eat("}")
+        code = em(code, "JMP " + en)
+        code = em(code, "LABEL " + el)
+        if tv() == "else" { adv()  eat("{")  code = p_block(code)  eat("}") }
+        return em(code, "LABEL " + en)
+    }
+    if vv == "while" {
+        adv()
+        var ll = nlbl("wl")
+        var el = nlbl("we")
+        code = em(code, "LABEL " + ll)
+        code = p_expr(code)
+        code = em(code, "JZ " + el)
+        eat("{")
+        code = p_block(code)
+        eat("}")
+        code = em(code, "JMP " + ll)
+        return em(code, "LABEL " + el)
+    }
+    if vv == "fn" {
+        adv()
+        var fname = adv()
+        eat("(")
+        var params: [String] = []
+        if tv() != ")" {
+            params = push(params, adv())
+            while tv() == "," { adv()  params = push(params, adv()) }
+        }
+        eat(")")
+        code = em(code, "FN_START " + fname)
+        var pi = len(params) - 1
+        while pi >= 0 { code = em(code, "STORE " + params[pi])  pi = pi - 1 }
+        eat("{")
+        code = p_block(code)
+        eat("}")
+        return em(code, "FN_END")
+    }
+    if tk() == "W" {
+        var name = adv()
+        if tv() == "=" {
+            adv()
+            code = p_expr(code)
+            return em(code, "STORE " + name)
+        }
+        if tv() == "(" {
+            adv()
+            var argc = 0
+            if tv() != ")" { code = p_expr(code)  argc = 1  while tv() == "," { adv()  code = p_expr(code)  argc = argc + 1 } }
+            eat(")")
+            return em(code, "CALL " + name + " " + to_string(argc))
+        }
+        return em(code, "LOAD " + name)
+    }
+    adv()
+    return code
+}
+
+fn compile(src: String) -> [String] {
+    _toks = lex(src)
+    _tp = 0
+    var code: [String] = []
+    while tk() != "E" { code = p_stmt(code) }
+    return em(code, "HALT")
+}
+
+// == VM ==
+fn sw(s: String, p: String) -> bool {
+    if len(s) < len(p) { return false }
+    return str_substr(s, 0, len(p)) == p
+}
+fn aft(s: String, n: i64) -> String { return str_substr(s, n, len(s)) }
+fn mki(n: i64) -> String { return "i:" + to_string(n) }
+fn gvi(vv: String) -> i64 { if sw(vv, "i:") { return int(aft(vv, 2)) }  return 0 }
+fn gvd(vv: String) -> String { if sw(vv, "i:") { return aft(vv, 2) }  return vv }
+fn gvt(vv: String) -> bool {
+    if vv == "i:0" { return false }
+    if vv == "v" { return false }
+    return true
+}
+
+fn spop(s: [String]) -> [String] {
+    var r: [String] = []
+    var i = 0
+    while i < len(s) - 1 { r = push(r, s[i])  i = i + 1 }
+    return r
+}
+fn stop(s: [String]) -> String {
+    if len(s) == 0 { return "i:0" }
+    return s[len(s) - 1]
+}
+
+fn fsp(s: String, c: String) -> i64 {
+    var i = 0
+    while i < len(s) {
+        if str_substr(s, i, 1) == c { return i }
+        i = i + 1
+    }
+    return -1
+}
+fn iop(instr: String) -> String {
+    var idx = fsp(instr, " ")
+    if idx < 0 { return instr }
+    return str_substr(instr, 0, idx)
+}
+fn ia1(instr: String) -> String {
+    var idx = fsp(instr, " ")
+    if idx < 0 { return "" }
+    var rest = aft(instr, idx + 1)
+    var idx2 = fsp(rest, " ")
+    if idx2 < 0 { return rest }
+    return str_substr(rest, 0, idx2)
+}
+fn ia2(instr: String) -> String {
+    var idx = fsp(instr, " ")
+    if idx < 0 { return "" }
+    var rest = aft(instr, idx + 1)
+    var idx2 = fsp(rest, " ")
+    if idx2 < 0 { return "" }
+    return aft(rest, idx2 + 1)
+}
+
+fn tget(tbl: [String], key: String) -> i64 {
+    var i = 0
+    while i < len(tbl) - 1 {
+        if tbl[i] == key { return int(tbl[i + 1]) }
+        i = i + 2
+    }
+    return -1
+}
+
+fn vget(vs: [String], name: String) -> String {
+    var i = len(vs) - 2
+    while i >= 0 {
+        if vs[i] == name { return vs[i + 1] }
+        i = i - 2
+    }
+    return "i:0"
+}
+fn vset(vs: [String], name: String, val: String) -> [String] {
+    var i = len(vs) - 2
+    while i >= 0 {
+        if vs[i] == name { vs[i + 1] = val  return vs }
+        if vs[i] == "##" {
+            vs = push(vs, name)
+            vs = push(vs, val)
+            return vs
+        }
+        i = i - 2
+    }
+    vs = push(vs, name)
+    vs = push(vs, val)
+    return vs
+}
+fn vpush(vs: [String]) -> [String] { return push(push(vs, "##"), "##") }
+fn vpop(vs: [String]) -> [String] {
+    while len(vs) >= 2 {
+        var k = vs[len(vs) - 2]
+        vs = spop(spop(vs))
+        if k == "##" { return vs }
+    }
+    return vs
+}
+
+fn vm_run(instrs: [String]) -> String {
+    var stack: [String] = []
+    var vars: [String] = []
+    var cs: [String] = []
+    var labels: [String] = []
+    var fns: [String] = []
+    var si = 0
+    while si < len(instrs) {
+        var sop = iop(instrs[si])
+        if sop == "LABEL" { labels = push(labels, ia1(instrs[si]))  labels = push(labels, to_string(si)) }
+        if sop == "FN_START" { fns = push(fns, ia1(instrs[si]))  fns = push(fns, to_string(si)) }
+        si = si + 1
+    }
+    var ip = 0
+    var mip = tget(fns, "main")
+    if mip >= 0 { ip = mip + 1  vars = vpush(vars) }
+    var run = true
+    while run {
+        if ip >= len(instrs) { run = false }
+        if run {
+            var instr = instrs[ip]
+            var op = iop(instr)
+            if op == "HALT" { run = false }
+            else if op == "PUSH_INT" { stack = push(stack, mki(int(ia1(instr))))  ip = ip + 1 }
+            else if op == "LOAD" { stack = push(stack, vget(vars, ia1(instr)))  ip = ip + 1 }
+            else if op == "STORE" { vars = vset(vars, ia1(instr), stop(stack))  stack = spop(stack)  ip = ip + 1 }
+            else if op == "POP" { if len(stack) > 0 { stack = spop(stack) }  ip = ip + 1 }
+            else if op == "ADD" { var b = gvi(stop(stack))  stack = spop(stack)  var a = gvi(stop(stack))  stack = spop(stack)  stack = push(stack, mki(a + b))  ip = ip + 1 }
+            else if op == "SUB" { var b = gvi(stop(stack))  stack = spop(stack)  var a = gvi(stop(stack))  stack = spop(stack)  stack = push(stack, mki(a - b))  ip = ip + 1 }
+            else if op == "MUL" { var b = gvi(stop(stack))  stack = spop(stack)  var a = gvi(stop(stack))  stack = spop(stack)  stack = push(stack, mki(a * b))  ip = ip + 1 }
+            else if op == "DIV" { var b = gvi(stop(stack))  stack = spop(stack)  var a = gvi(stop(stack))  stack = spop(stack)  stack = push(stack, mki(a / b))  ip = ip + 1 }
+            else if op == "MOD" { var b = gvi(stop(stack))  stack = spop(stack)  var a = gvi(stop(stack))  stack = spop(stack)  stack = push(stack, mki(a % b))  ip = ip + 1 }
+            else if op == "LT" { var b = gvi(stop(stack))  stack = spop(stack)  var a = gvi(stop(stack))  stack = spop(stack)  if a < b { stack = push(stack, mki(1)) } else { stack = push(stack, mki(0)) }  ip = ip + 1 }
+            else if op == "GT" { var b = gvi(stop(stack))  stack = spop(stack)  var a = gvi(stop(stack))  stack = spop(stack)  if a > b { stack = push(stack, mki(1)) } else { stack = push(stack, mki(0)) }  ip = ip + 1 }
+            else if op == "LE" { var b = gvi(stop(stack))  stack = spop(stack)  var a = gvi(stop(stack))  stack = spop(stack)  if a <= b { stack = push(stack, mki(1)) } else { stack = push(stack, mki(0)) }  ip = ip + 1 }
+            else if op == "GE" { var b = gvi(stop(stack))  stack = spop(stack)  var a = gvi(stop(stack))  stack = spop(stack)  if a >= b { stack = push(stack, mki(1)) } else { stack = push(stack, mki(0)) }  ip = ip + 1 }
+            else if op == "EQ" { var b = gvi(stop(stack))  stack = spop(stack)  var a = gvi(stop(stack))  stack = spop(stack)  if a == b { stack = push(stack, mki(1)) } else { stack = push(stack, mki(0)) }  ip = ip + 1 }
+            else if op == "NE" { var b = gvi(stop(stack))  stack = spop(stack)  var a = gvi(stop(stack))  stack = spop(stack)  if a != b { stack = push(stack, mki(1)) } else { stack = push(stack, mki(0)) }  ip = ip + 1 }
+            else if op == "JMP" { var t = tget(labels, ia1(instr))  if t >= 0 { ip = t + 1 } else { run = false } }
+            else if op == "JZ" {
+                var cv = stop(stack)  stack = spop(stack)
+                if gvt(cv) { ip = ip + 1 }
+                else { var t = tget(labels, ia1(instr))  if t >= 0 { ip = t + 1 } else { run = false } }
+            }
+            else if op == "LABEL" { ip = ip + 1 }
+            else if op == "FN_START" {
+                var depth = 1
+                ip = ip + 1
+                while depth > 0 {
+                    if ip >= len(instrs) { depth = 0 }
+                    if depth > 0 {
+                        var sk = iop(instrs[ip])
+                        if sk == "FN_START" { depth = depth + 1 }
+                        if sk == "FN_END" { depth = depth - 1 }
+                        ip = ip + 1
+                    }
+                }
+            }
+            else if op == "FN_END" {
+                if len(cs) >= 1 {
+                    var ri = int(cs[len(cs) - 1])
+                    cs = spop(cs)
+                    vars = vpop(vars)
+                    ip = ri
+                } else { run = false }
+            }
+            else if op == "RET" {
+                var rv = "i:0"
+                if len(stack) > 0 { rv = stop(stack)  stack = spop(stack) }
+                if len(cs) >= 1 {
+                    var ri = int(cs[len(cs) - 1])
+                    cs = spop(cs)
+                    vars = vpop(vars)
+                    stack = push(stack, rv)
+                    ip = ri
+                } else { run = false }
+            }
+            else if op == "CALL" {
+                var fname = ia1(instr)
+                var argc = int(ia2(instr))
+                if fname == "println" {
+                    var top = stop(stack)  stack = spop(stack)
+                    print(gvd(top) + _nl())
+                    stack = push(stack, "i:0")
+                    ip = ip + 1
+                } else {
+                    var fip = tget(fns, fname)
+                    if fip < 0 { print("ERR: " + fname + _nl())  run = false }
+                    else { cs = push(cs, to_string(ip + 1))  vars = vpush(vars)  ip = fip + 1 }
+                }
+            }
+            else { ip = ip + 1 }
+        }
+    }
+    return "done"
+}
+
+// == Main ==
+fn main() {
+    print("=== vxpipe: Vortex-in-Vortex Pipeline ===" + _nl())
+    print("source -> lex -> parse+codegen -> VM" + _nl() + _nl())
+
+    print("Test 1: println(40 + 2) -> 42" + _nl())
+    print("  Output: ")
+    vm_run(compile("fn main() { println(40 + 2) }"))
+    print(_nl())
+
+    print("Test 2: let x = 7  println(x * x) -> 49" + _nl())
+    print("  Output: ")
+    vm_run(compile("fn main() { let x = 7  println(x * x) }"))
+    print(_nl())
+
+    print("Test 3: while loop sum 1..5 -> 15" + _nl())
+    var c3 = compile("fn main() { var s = 0  var i = 1  while i <= 5 { s = s + i  i = i + 1 }  println(s) }")
+    var ci = 0
+    while ci < len(c3) { print("  [" + c3[ci] + "]" + _nl())  ci = ci + 1 }
+    print("  Output: ")
+    vm_run(c3)
+    print(_nl())
+
+    print("Test 4: fn double(n), println(double(21)) -> 42" + _nl())
+    print("  Output: ")
+    vm_run(compile("fn main() { fn double(n) { return n * 2 }  println(double(21)) }"))
+    print(_nl())
+
+    print("=== ALL TESTS COMPLETE ===" + _nl())
+}

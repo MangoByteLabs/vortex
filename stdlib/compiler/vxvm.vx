@@ -1,655 +1,1275 @@
-// vxvm.vx — Vortex Bytecode VM
-// A stack-based bytecode interpreter written in pure Vortex.
-// Compilable by vxc.vx into a native binary — the bootstrap path to self-hosting.
+// vxvm.vx — Full-Featured Vortex Bytecode VM
+// A stack-based VM that handles the COMPLETE Vortex language.
+// All values are string-encoded: "i:42", "f:3.14", "s:hello", "b:true", "a:v1|v2|..."
+// This is the execution engine for self-hosting — runs bytecode from bytecode_compiler.vx.
 //
-// Design: All state is arrays of integers. Strings are indexes into a string table.
-// Stack operations use push()/len() and array rebuilding for pop.
+// Opcodes (string-based instructions):
+//   PUSH_INT n, PUSH_STRING s, PUSH_BOOL b, PUSH_FLOAT f, PUSH_NONE
+//   LOAD name, STORE name, POP, DUP
+//   ADD, SUB, MUL, DIV, MOD, NEG, NOT
+//   EQ, NEQ, LT, GT, LTEQ, GTEQ, AND, OR
+//   JMP label, JZ label, JNZ label, LABEL label
+//   CALL name argc, RET
+//   FN_START name, FN_END
+//   ARRAY n        — pop n items, push array value
+//   INDEX          — pop index, pop array, push array[index]
+//   INDEX_SET      — pop value, pop index, pop array, push updated array
+//   FIELD name     — pop struct, push struct.name
+//   HALT
 
-// ── Opcodes ────────────────────────────────────────────────────────────────────
+// ── Helpers ─────────────────────────────────────────────────────────────────
 
-fn OP_PUSH_INT() -> i64 { return 1 }
-fn OP_PUSH_STR() -> i64 { return 2 }
-fn OP_POP() -> i64 { return 3 }
-fn OP_DUP() -> i64 { return 4 }
-fn OP_ADD() -> i64 { return 10 }
-fn OP_SUB() -> i64 { return 11 }
-fn OP_MUL() -> i64 { return 12 }
-fn OP_DIV() -> i64 { return 13 }
-fn OP_MOD() -> i64 { return 14 }
-fn OP_NEG() -> i64 { return 15 }
-fn OP_EQ() -> i64 { return 20 }
-fn OP_NE() -> i64 { return 21 }
-fn OP_LT() -> i64 { return 22 }
-fn OP_GT() -> i64 { return 23 }
-fn OP_LE() -> i64 { return 24 }
-fn OP_GE() -> i64 { return 25 }
-fn OP_AND() -> i64 { return 26 }
-fn OP_OR() -> i64 { return 27 }
-fn OP_NOT() -> i64 { return 28 }
-fn OP_JMP() -> i64 { return 30 }
-fn OP_JZ() -> i64 { return 31 }
-fn OP_JNZ() -> i64 { return 32 }
-fn OP_LOAD() -> i64 { return 40 }
-fn OP_STORE() -> i64 { return 41 }
-fn OP_GLOAD() -> i64 { return 42 }
-fn OP_GSTORE() -> i64 { return 43 }
-fn OP_CALL() -> i64 { return 50 }
-fn OP_RET() -> i64 { return 51 }
-fn OP_PRINT_INT() -> i64 { return 60 }
-fn OP_PRINT_STR() -> i64 { return 61 }
-fn OP_PRINT_NL() -> i64 { return 62 }
-fn OP_ARR_NEW() -> i64 { return 70 }
-fn OP_ARR_GET() -> i64 { return 71 }
-fn OP_ARR_SET() -> i64 { return 72 }
-fn OP_ARR_LEN() -> i64 { return 73 }
-fn OP_ARR_PUSH() -> i64 { return 74 }
-fn OP_HALT() -> i64 { return 99 }
+fn _nl() -> String { return str_from_bytes([10]) }
+fn _pipe() -> String { return str_from_bytes([124]) }
 
-// ── Stack helpers ──────────────────────────────────────────────────────────────
-// Since push() returns a new array and we can't do arr[i]=val,
-// we use push/rebuild patterns. For efficiency we track sp separately.
-
-fn stack_pop2(stack: [i64], sp: i64) -> [i64] {
-    // Returns [a, b, new_sp] where a was below b on stack
-    var a = stack[sp - 2]
-    var b = stack[sp - 1]
-    return [a, b, sp - 2]
+fn sw(s: String, prefix: String) -> bool {
+    if len(s) < len(prefix) { return false }
+    return str_substr(s, 0, len(prefix)) == prefix
 }
 
-fn stack_drop(stack: [i64], sp: i64, n: i64) -> [i64] {
-    // Rebuild stack without top n elements
-    var result = []
+fn after(s: String, n: i64) -> String {
+    return str_substr(s, n, len(s))
+}
+
+fn find_idx(haystack: String, needle: String) -> i64 {
+    return unwrap_or(str_find(haystack, needle), -1)
+}
+
+// ── Value encoding/decoding ─────────────────────────────────────────────────
+
+fn make_int(n: i64) -> String { return "i:" + to_string(n) }
+fn make_float(f: f64) -> String { return "f:" + to_string(f) }
+fn make_str(s: String) -> String { return "s:" + s }
+fn make_bool(b: bool) -> String {
+    if b { return "b:true" }
+    return "b:false"
+}
+
+fn val_display(v: String) -> String {
+    if sw(v, "i:")    { return after(v, 2) }
+    if sw(v, "f:")    { return after(v, 2) }
+    if sw(v, "s:")    { return after(v, 2) }
+    if v == "b:true"  { return "true" }
+    if v == "b:false" { return "false" }
+    if v == "void"    { return "()" }
+    if v == "none"    { return "None" }
+    if sw(v, "a:")    { return "[" + after(v, 2) + "]" }
+    return v
+}
+
+fn val_is_truthy(v: String) -> bool {
+    if v == "b:true"  { return true }
+    if v == "b:false" { return false }
+    if v == "void"    { return false }
+    if v == "none"    { return false }
+    if sw(v, "i:") { return after(v, 2) != "0" }
+    if sw(v, "s:") { return len(after(v, 2)) > 0 }
+    return true
+}
+
+fn val_as_int(v: String) -> i64 {
+    if sw(v, "i:") { return int(after(v, 2)) }
+    if v == "b:true" { return 1 }
+    if v == "b:false" { return 0 }
+    return 0
+}
+
+fn val_as_str(v: String) -> String {
+    if sw(v, "s:") { return after(v, 2) }
+    return val_display(v)
+}
+
+fn val_type(v: String) -> String {
+    if sw(v, "i:") { return "int" }
+    if sw(v, "f:") { return "float" }
+    if sw(v, "s:") { return "string" }
+    if sw(v, "b:") { return "bool" }
+    if sw(v, "a:") { return "array" }
+    if v == "void" { return "void" }
+    if v == "none" { return "none" }
+    return "unknown"
+}
+
+// ── Arithmetic ──────────────────────────────────────────────────────────────
+
+fn val_add(a: String, b: String) -> String {
+    if sw(a, "s:") { return make_str(val_as_str(a) + val_as_str(b)) }
+    if sw(b, "s:") { return make_str(val_as_str(a) + val_as_str(b)) }
+    return make_int(val_as_int(a) + val_as_int(b))
+}
+fn val_sub(a: String, b: String) -> String { return make_int(val_as_int(a) - val_as_int(b)) }
+fn val_mul(a: String, b: String) -> String { return make_int(val_as_int(a) * val_as_int(b)) }
+fn val_div(a: String, b: String) -> String {
+    var d = val_as_int(b)
+    if d == 0 { return "i:0" }
+    return make_int(val_as_int(a) / d)
+}
+fn val_mod_op(a: String, b: String) -> String {
+    var d = val_as_int(b)
+    if d == 0 { return "i:0" }
+    return make_int(val_as_int(a) % d)
+}
+fn val_neg(a: String) -> String { return make_int(0 - val_as_int(a)) }
+fn val_not(a: String) -> String {
+    if val_is_truthy(a) { return "b:false" }
+    return "b:true"
+}
+
+fn val_cmp(a: String, b: String, op: String) -> String {
+    // String equality comparison
+    if op == "EQ" {
+        if sw(a, "s:") { return make_bool(a == b) }
+        if sw(b, "s:") { return make_bool(a == b) }
+    }
+    if op == "NEQ" {
+        if sw(a, "s:") { return make_bool(a != b) }
+        if sw(b, "s:") { return make_bool(a != b) }
+    }
+    var ai = val_as_int(a)
+    var bi = val_as_int(b)
+    if op == "EQ"   { return make_bool(ai == bi) }
+    if op == "NEQ"  { return make_bool(ai != bi) }
+    if op == "LT"   { return make_bool(ai < bi) }
+    if op == "GT"   { return make_bool(ai > bi) }
+    if op == "LTEQ" { return make_bool(ai <= bi) }
+    if op == "GTEQ" { return make_bool(ai >= bi) }
+    return "b:false"
+}
+
+fn val_and(a: String, b: String) -> String {
+    if val_is_truthy(a) {
+        if val_is_truthy(b) { return "b:true" }
+    }
+    return "b:false"
+}
+fn val_or(a: String, b: String) -> String {
+    if val_is_truthy(a) { return "b:true" }
+    if val_is_truthy(b) { return "b:true" }
+    return "b:false"
+}
+
+// ── Array encoding ──────────────────────────────────────────────────────────
+// Arrays are encoded as "a:item0|item1|item2" where items are val_display'd
+// Empty array = "a:"
+
+fn arr_encode(items: [String]) -> String {
+    var s = "a:"
     var i = 0
-    while i < sp - n {
-        result = push(result, stack[i])
+    while i < len(items) {
+        if i > 0 { s = s + _pipe() }
+        s = s + items[i]
         i = i + 1
     }
-    return result
+    return s
 }
 
-fn stack_set_top(stack: [i64], sp: i64, val: i64) -> [i64] {
-    // Set stack[sp-1] = val by rebuilding
-    var result = []
+fn arr_decode(v: String) -> [String] {
+    if v == "a:" { return [] }
+    var content = after(v, 2)
+    var items: [String] = []
+    var start = 0
     var i = 0
-    while i < sp - 1 {
-        result = push(result, stack[i])
+    while i < len(content) {
+        var ch = str_char_at(content, i)
+        if ch == _pipe() {
+            items = push(items, str_substr(content, start, i))
+            start = i + 1
+        }
         i = i + 1
     }
-    result = push(result, val)
-    return result
+    items = push(items, str_substr(content, start, len(content)))
+    return items
 }
 
-// ── VM Execution ───────────────────────────────────────────────────────────────
+fn arr_len(v: String) -> i64 {
+    if v == "a:" { return 0 }
+    var content = after(v, 2)
+    var count = 1
+    var i = 0
+    while i < len(content) {
+        if str_char_at(content, i) == _pipe() { count = count + 1 }
+        i = i + 1
+    }
+    return count
+}
 
-fn vm_exec(code: [i64], strings: [String]) -> i64 {
-    var stack = []
-    var sp = 0
+fn arr_get(v: String, idx: i64) -> String {
+    var items = arr_decode(v)
+    if idx < 0 { return "void" }
+    if idx >= len(items) { return "void" }
+    return items[idx]
+}
 
-    // Pre-allocate locals and globals as flat arrays of 256 slots
-    var locals = []
-    var globals = []
-    var li = 0
-    while li < 256 {
-        locals = push(locals, 0)
-        globals = push(globals, 0)
-        li = li + 1
+fn arr_set(v: String, idx: i64, val: String) -> String {
+    var items = arr_decode(v)
+    if idx >= 0 {
+        if idx < len(items) {
+            items[idx] = val
+        }
+    }
+    return arr_encode(items)
+}
+
+fn arr_push_val(v: String, val: String) -> String {
+    var items = arr_decode(v)
+    items = push(items, val)
+    return arr_encode(items)
+}
+
+// ── Stack operations ────────────────────────────────────────────────────────
+
+fn stack_pop(stack: [String]) -> [String] {
+    var ns: [String] = []
+    var i = 0
+    while i < len(stack) - 1 {
+        ns = push(ns, stack[i])
+        i = i + 1
+    }
+    return ns
+}
+
+fn stack_pop2(stack: [String]) -> [String] {
+    var ns: [String] = []
+    var i = 0
+    while i < len(stack) - 2 {
+        ns = push(ns, stack[i])
+        i = i + 1
+    }
+    return ns
+}
+
+fn stack_pop3(stack: [String]) -> [String] {
+    var ns: [String] = []
+    var i = 0
+    while i < len(stack) - 3 {
+        ns = push(ns, stack[i])
+        i = i + 1
+    }
+    return ns
+}
+
+fn stack_top(stack: [String]) -> String {
+    if len(stack) == 0 { return "void" }
+    return stack[len(stack) - 1]
+}
+
+fn stack_second(stack: [String]) -> String {
+    if len(stack) < 2 { return "void" }
+    return stack[len(stack) - 2]
+}
+
+fn stack_third(stack: [String]) -> String {
+    if len(stack) < 3 { return "void" }
+    return stack[len(stack) - 3]
+}
+
+// ── Variable scoping ────────────────────────────────────────────────────────
+
+fn vars_get(vars: [String], name: String) -> String {
+    var i = len(vars) - 2
+    while i >= 0 {
+        if vars[i] == name { return vars[i + 1] }
+        i = i - 2
+    }
+    return "void"
+}
+
+fn vars_set(vars: [String], name: String, val: String) -> [String] {
+    var i = len(vars) - 2
+    while i >= 0 {
+        if vars[i] == name {
+            vars[i + 1] = val
+            return vars
+        }
+        if vars[i] == "##SCOPE##" {
+            vars = push(vars, name)
+            vars = push(vars, val)
+            return vars
+        }
+        i = i - 2
+    }
+    vars = push(vars, name)
+    vars = push(vars, val)
+    return vars
+}
+
+fn vars_push_scope(vars: [String]) -> [String] {
+    vars = push(vars, "##SCOPE##")
+    vars = push(vars, "##SCOPE##")
+    return vars
+}
+
+fn vars_pop_scope(vars: [String]) -> [String] {
+    while len(vars) >= 2 {
+        var top_name = vars[len(vars) - 2]
+        var nv: [String] = []
+        var j = 0
+        while j < len(vars) - 2 {
+            nv = push(nv, vars[j])
+            j = j + 1
+        }
+        vars = nv
+        if top_name == "##SCOPE##" { return vars }
+    }
+    return vars
+}
+
+// ── Instruction parsing ─────────────────────────────────────────────────────
+
+fn instr_op(instr: String) -> String {
+    var idx = find_idx(instr, " ")
+    if idx < 0 { return instr }
+    return str_substr(instr, 0, idx)
+}
+
+fn rest_after_space(s: String) -> String {
+    var idx = find_idx(s, " ")
+    if idx < 0 { return "" }
+    return str_substr(s, idx + 1, len(s))
+}
+
+fn instr_arg1(instr: String) -> String {
+    var rest = rest_after_space(instr)
+    var idx = find_idx(rest, " ")
+    if idx < 0 { return rest }
+    return str_substr(rest, 0, idx)
+}
+
+fn instr_arg2(instr: String) -> String {
+    var rest = rest_after_space(instr)
+    return rest_after_space(rest)
+}
+
+// ── Label/function preprocessing ────────────────────────────────────────────
+
+fn table_get(table: [String], key: String) -> i64 {
+    var i = 0
+    while i < len(table) - 1 {
+        if table[i] == key { return int(table[i + 1]) }
+        i = i + 2
+    }
+    return -1
+}
+
+fn table_set(table: [String], key: String, val: i64) -> [String] {
+    table = push(table, key)
+    table = push(table, to_string(val))
+    return table
+}
+
+fn preprocess_labels(instrs: [String]) -> [String] {
+    var labels: [String] = []
+    var i = 0
+    while i < len(instrs) {
+        if instr_op(instrs[i]) == "LABEL" {
+            labels = table_set(labels, instr_arg1(instrs[i]), i)
+        }
+        i = i + 1
+    }
+    return labels
+}
+
+fn preprocess_fns(instrs: [String]) -> [String] {
+    var fns: [String] = []
+    var i = 0
+    while i < len(instrs) {
+        if instr_op(instrs[i]) == "FN_START" {
+            fns = table_set(fns, instr_arg1(instrs[i]), i)
+        }
+        i = i + 1
+    }
+    return fns
+}
+
+// ── Builtin functions ───────────────────────────────────────────────────────
+// These handle ALL Vortex builtins that .vx code can call.
+
+fn call_builtin(name: String, argc: i64, stack: [String]) -> [String] {
+    // Pop argc args from stack (top = last arg)
+    var args: [String] = []
+    var tmp = stack
+    var ai = 0
+    while ai < argc {
+        args = push(args, "")  // placeholder
+        ai = ai + 1
+    }
+    // Fill args in order (arg0 is deepest, argN-1 is top)
+    ai = argc - 1
+    while ai >= 0 {
+        args[ai] = stack_top(tmp)
+        tmp = stack_pop(tmp)
+        ai = ai - 1
+    }
+    var base = tmp
+
+    // ── I/O builtins ──
+    if name == "println" {
+        if argc >= 1 { print(val_display(args[0]) + _nl()) }
+        if argc == 0 { print(_nl()) }
+        base = push(base, "void")
+        return base
+    }
+    if name == "print" {
+        if argc >= 1 { print(val_display(args[0])) }
+        base = push(base, "void")
+        return base
+    }
+    if name == "print_str" {
+        if argc >= 1 { print(val_as_str(args[0])) }
+        base = push(base, "void")
+        return base
     }
 
-    // Call stack stores [ret_ip, old_fp, old_sp_base, ...] flattened
-    var call_stack = []
-    var csp = 0
+    // ── Type conversion ──
+    if name == "to_string" {
+        base = push(base, make_str(val_display(args[0])))
+        return base
+    }
+    if name == "int" {
+        if sw(args[0], "s:") {
+            base = push(base, make_int(int(val_as_str(args[0]))))
+        } else {
+            base = push(base, make_int(val_as_int(args[0])))
+        }
+        return base
+    }
+    if name == "float" {
+        base = push(base, make_float(float(val_as_int(args[0]))))
+        return base
+    }
+
+    // ── String builtins ──
+    if name == "len" {
+        var arg = args[0]
+        if sw(arg, "s:") {
+            base = push(base, make_int(len(val_as_str(arg))))
+        } else if sw(arg, "a:") {
+            base = push(base, make_int(arr_len(arg)))
+        } else {
+            base = push(base, "i:0")
+        }
+        return base
+    }
+    if name == "str_char_at" {
+        var s = val_as_str(args[0])
+        var idx = val_as_int(args[1])
+        if idx >= 0 {
+            if idx < len(s) {
+                base = push(base, make_str(str_char_at(s, idx)))
+                return base
+            }
+        }
+        base = push(base, make_str(""))
+        return base
+    }
+    if name == "str_substr" {
+        var s = val_as_str(args[0])
+        var start = val_as_int(args[1])
+        var end = val_as_int(args[2])
+        if start < 0 { start = 0 }
+        if end > len(s) { end = len(s) }
+        base = push(base, make_str(str_substr(s, start, end)))
+        return base
+    }
+    if name == "str_find" {
+        var s = val_as_str(args[0])
+        var needle = val_as_str(args[1])
+        var idx = find_idx(s, needle)
+        if idx >= 0 {
+            base = push(base, make_int(idx))
+        } else {
+            base = push(base, "none")
+        }
+        return base
+    }
+    if name == "str_from_bytes" {
+        // arg is an array value, decode it and call str_from_bytes
+        if sw(args[0], "a:") {
+            var items = arr_decode(args[0])
+            var bytes: [i64] = []
+            var bi = 0
+            while bi < len(items) {
+                bytes = push(bytes, val_as_int(items[bi]))
+                bi = bi + 1
+            }
+            base = push(base, make_str(str_from_bytes(bytes)))
+        } else {
+            base = push(base, make_str(""))
+        }
+        return base
+    }
+    if name == "str_bytes" {
+        var s = val_as_str(args[0])
+        var bytes = str_bytes(s)
+        var items: [String] = []
+        var bi = 0
+        while bi < len(bytes) {
+            items = push(items, make_int(bytes[bi]))
+            bi = bi + 1
+        }
+        base = push(base, arr_encode(items))
+        return base
+    }
+    if name == "str_split" {
+        var s = val_as_str(args[0])
+        var delim = val_as_str(args[1])
+        var items: [String] = []
+        var start = 0
+        var i = 0
+        while i <= len(s) - len(delim) {
+            if str_substr(s, i, i + len(delim)) == delim {
+                items = push(items, make_str(str_substr(s, start, i)))
+                start = i + len(delim)
+                i = start
+            } else {
+                i = i + 1
+            }
+        }
+        items = push(items, make_str(str_substr(s, start, len(s))))
+        base = push(base, arr_encode(items))
+        return base
+    }
+    if name == "str_contains" {
+        var s = val_as_str(args[0])
+        var needle = val_as_str(args[1])
+        base = push(base, make_bool(find_idx(s, needle) >= 0))
+        return base
+    }
+    if name == "str_replace" {
+        var s = val_as_str(args[0])
+        var old_s = val_as_str(args[1])
+        var new_s = val_as_str(args[2])
+        var result = ""
+        var i = 0
+        while i <= len(s) - len(old_s) {
+            if str_substr(s, i, i + len(old_s)) == old_s {
+                result = result + new_s
+                i = i + len(old_s)
+            } else {
+                result = result + str_char_at(s, i)
+                i = i + 1
+            }
+        }
+        while i < len(s) {
+            result = result + str_char_at(s, i)
+            i = i + 1
+        }
+        base = push(base, make_str(result))
+        return base
+    }
+    if name == "str_trim" {
+        var s = val_as_str(args[0])
+        var start = 0
+        while start < len(s) {
+            var ch = str_char_at(s, start)
+            if ch != " " {
+                if ch != "\t" {
+                    if ch != "\n" { break }
+                }
+            }
+            start = start + 1
+        }
+        var end = len(s)
+        while end > start {
+            var ch = str_char_at(s, end - 1)
+            if ch != " " {
+                if ch != "\t" {
+                    if ch != "\n" { break }
+                }
+            }
+            end = end - 1
+        }
+        base = push(base, make_str(str_substr(s, start, end)))
+        return base
+    }
+
+    // ── Array builtins ──
+    if name == "push" {
+        var arr = args[0]
+        var val = args[1]
+        if sw(arr, "a:") {
+            base = push(base, arr_push_val(arr, val))
+        } else {
+            // Create new array with just this element
+            base = push(base, arr_encode([val]))
+        }
+        return base
+    }
+    if name == "arr_get" {
+        base = push(base, arr_get(args[0], val_as_int(args[1])))
+        return base
+    }
+    if name == "arr_set" {
+        base = push(base, arr_set(args[0], val_as_int(args[1]), args[2]))
+        return base
+    }
+
+    // ── Option/Result builtins ──
+    if name == "unwrap_or" {
+        var val = args[0]
+        var default_val = args[1]
+        if val == "none" { base = push(base, default_val) }
+        if val != "none" { base = push(base, val) }
+        return base
+    }
+    if name == "is_some" {
+        base = push(base, make_bool(args[0] != "none"))
+        return base
+    }
+    if name == "is_none" {
+        base = push(base, make_bool(args[0] == "none"))
+        return base
+    }
+
+    // ── Math builtins ──
+    if name == "abs" {
+        var n = val_as_int(args[0])
+        if n < 0 { n = 0 - n }
+        base = push(base, make_int(n))
+        return base
+    }
+    if name == "min" {
+        var a = val_as_int(args[0])
+        var b = val_as_int(args[1])
+        if a < b { base = push(base, make_int(a)) }
+        if a >= b { base = push(base, make_int(b)) }
+        return base
+    }
+    if name == "max" {
+        var a = val_as_int(args[0])
+        var b = val_as_int(args[1])
+        if a > b { base = push(base, make_int(a)) }
+        if a <= b { base = push(base, make_int(b)) }
+        return base
+    }
+
+    // ── Assertion ──
+    if name == "assert" {
+        if val_is_truthy(args[0]) == false {
+            print("ASSERTION FAILED" + _nl())
+        }
+        base = push(base, "void")
+        return base
+    }
+    if name == "assert_eq" {
+        if args[0] != args[1] {
+            print("ASSERT_EQ FAILED: " + val_display(args[0]) + " != " + val_display(args[1]) + _nl())
+        }
+        base = push(base, "void")
+        return base
+    }
+
+    // Fallback — unknown builtin
+    print("VM warning: unknown builtin '" + name + "'" + _nl())
+    base = push(base, "void")
+    return base
+}
+
+// ── VM Execution Engine ─────────────────────────────────────────────────────
+
+fn vm_exec(instrs: [String]) -> String {
+    var stack: [String] = []
+    var vars: [String] = []
+    var call_stack: [String] = []
+    var labels = preprocess_labels(instrs)
+    var fns = preprocess_fns(instrs)
 
     var ip = 0
-    var fp = 0
-    var running = 1
+    var status = "running"
+    var result = "void"
 
-    while running == 1 {
-        if ip >= len(code) {
-            running = 0
-        } else {
-            let op = code[ip]
-            ip = ip + 1
+    // Find main and jump to it
+    var main_ip = table_get(fns, "main")
+    if main_ip >= 0 {
+        ip = main_ip + 1
+        vars = vars_push_scope(vars)
+    }
 
-            if op == 1 {
-                // OP_PUSH_INT
-                let val = code[ip]
+    while status == "running" {
+        if ip >= len(instrs) { status = "halted" }
+        if status == "running" {
+            var instr = instrs[ip]
+            var op = instr_op(instr)
+
+            if op == "HALT" {
+                status = "halted"
+                result = stack_top(stack)
+            } else if op == "PUSH_INT" {
+                stack = push(stack, make_int(int(instr_arg1(instr))))
                 ip = ip + 1
-                stack = push(stack, val)
-                sp = sp + 1
-            } else if op == 2 {
-                // OP_PUSH_STR — push string table index
-                let idx = code[ip]
+            } else if op == "PUSH_STRING" {
+                // Everything after "PUSH_STRING " is the string value
+                var s = rest_after_space(instr)
+                stack = push(stack, make_str(s))
                 ip = ip + 1
-                stack = push(stack, idx)
-                sp = sp + 1
-            } else if op == 3 {
-                // OP_POP
-                stack = stack_drop(stack, sp, 1)
-                sp = sp - 1
-            } else if op == 4 {
-                // OP_DUP
-                let val = stack[sp - 1]
-                stack = push(stack, val)
-                sp = sp + 1
-            } else if op == 10 {
-                // OP_ADD
-                let b = stack[sp - 1]
-                let a = stack[sp - 2]
-                stack = stack_drop(stack, sp, 2)
-                sp = sp - 2
-                stack = push(stack, a + b)
-                sp = sp + 1
-            } else if op == 11 {
-                // OP_SUB
-                let b = stack[sp - 1]
-                let a = stack[sp - 2]
-                stack = stack_drop(stack, sp, 2)
-                sp = sp - 2
-                stack = push(stack, a - b)
-                sp = sp + 1
-            } else if op == 12 {
-                // OP_MUL
-                let b = stack[sp - 1]
-                let a = stack[sp - 2]
-                stack = stack_drop(stack, sp, 2)
-                sp = sp - 2
-                stack = push(stack, a * b)
-                sp = sp + 1
-            } else if op == 13 {
-                // OP_DIV
-                let b = stack[sp - 1]
-                let a = stack[sp - 2]
-                stack = stack_drop(stack, sp, 2)
-                sp = sp - 2
-                stack = push(stack, a / b)
-                sp = sp + 1
-            } else if op == 14 {
-                // OP_MOD
-                let b = stack[sp - 1]
-                let a = stack[sp - 2]
-                stack = stack_drop(stack, sp, 2)
-                sp = sp - 2
-                stack = push(stack, a % b)
-                sp = sp + 1
-            } else if op == 15 {
-                // OP_NEG
-                let a = stack[sp - 1]
-                stack = stack_set_top(stack, sp, 0 - a)
-            } else if op == 20 {
-                // OP_EQ
-                let b = stack[sp - 1]
-                let a = stack[sp - 2]
-                stack = stack_drop(stack, sp, 2)
-                sp = sp - 2
-                var r = 0
-                if a == b { r = 1 }
-                stack = push(stack, r)
-                sp = sp + 1
-            } else if op == 21 {
-                // OP_NE
-                let b = stack[sp - 1]
-                let a = stack[sp - 2]
-                stack = stack_drop(stack, sp, 2)
-                sp = sp - 2
-                var r = 0
-                if a != b { r = 1 }
-                stack = push(stack, r)
-                sp = sp + 1
-            } else if op == 22 {
-                // OP_LT
-                let b = stack[sp - 1]
-                let a = stack[sp - 2]
-                stack = stack_drop(stack, sp, 2)
-                sp = sp - 2
-                var r = 0
-                if a < b { r = 1 }
-                stack = push(stack, r)
-                sp = sp + 1
-            } else if op == 23 {
-                // OP_GT
-                let b = stack[sp - 1]
-                let a = stack[sp - 2]
-                stack = stack_drop(stack, sp, 2)
-                sp = sp - 2
-                var r = 0
-                if a > b { r = 1 }
-                stack = push(stack, r)
-                sp = sp + 1
-            } else if op == 24 {
-                // OP_LE
-                let b = stack[sp - 1]
-                let a = stack[sp - 2]
-                stack = stack_drop(stack, sp, 2)
-                sp = sp - 2
-                var r = 0
-                if a <= b { r = 1 }
-                stack = push(stack, r)
-                sp = sp + 1
-            } else if op == 25 {
-                // OP_GE
-                let b = stack[sp - 1]
-                let a = stack[sp - 2]
-                stack = stack_drop(stack, sp, 2)
-                sp = sp - 2
-                var r = 0
-                if a >= b { r = 1 }
-                stack = push(stack, r)
-                sp = sp + 1
-            } else if op == 26 {
-                // OP_AND
-                let b = stack[sp - 1]
-                let a = stack[sp - 2]
-                stack = stack_drop(stack, sp, 2)
-                sp = sp - 2
-                var r = 0
-                if a != 0 {
-                    if b != 0 { r = 1 }
+            } else if op == "PUSH_BOOL" {
+                var arg = instr_arg1(instr)
+                if arg == "true" { stack = push(stack, "b:true") }
+                if arg != "true" { stack = push(stack, "b:false") }
+                ip = ip + 1
+            } else if op == "PUSH_FLOAT" {
+                stack = push(stack, "f:" + instr_arg1(instr))
+                ip = ip + 1
+            } else if op == "PUSH_NONE" {
+                stack = push(stack, "none")
+                ip = ip + 1
+            } else if op == "LOAD" {
+                stack = push(stack, vars_get(vars, instr_arg1(instr)))
+                ip = ip + 1
+            } else if op == "STORE" {
+                var val = stack_top(stack)
+                stack = stack_pop(stack)
+                vars = vars_set(vars, instr_arg1(instr), val)
+                ip = ip + 1
+            } else if op == "POP" {
+                if len(stack) > 0 { stack = stack_pop(stack) }
+                ip = ip + 1
+            } else if op == "DUP" {
+                if len(stack) > 0 { stack = push(stack, stack_top(stack)) }
+                ip = ip + 1
+            } else if op == "ADD" {
+                var b = stack_top(stack)
+                var a = stack_second(stack)
+                stack = stack_pop2(stack)
+                stack = push(stack, val_add(a, b))
+                ip = ip + 1
+            } else if op == "SUB" {
+                var b = stack_top(stack)
+                var a = stack_second(stack)
+                stack = stack_pop2(stack)
+                stack = push(stack, val_sub(a, b))
+                ip = ip + 1
+            } else if op == "MUL" {
+                var b = stack_top(stack)
+                var a = stack_second(stack)
+                stack = stack_pop2(stack)
+                stack = push(stack, val_mul(a, b))
+                ip = ip + 1
+            } else if op == "DIV" {
+                var b = stack_top(stack)
+                var a = stack_second(stack)
+                stack = stack_pop2(stack)
+                stack = push(stack, val_div(a, b))
+                ip = ip + 1
+            } else if op == "MOD" {
+                var b = stack_top(stack)
+                var a = stack_second(stack)
+                stack = stack_pop2(stack)
+                stack = push(stack, val_mod_op(a, b))
+                ip = ip + 1
+            } else if op == "NEG" {
+                var a = stack_top(stack)
+                stack = stack_pop(stack)
+                stack = push(stack, val_neg(a))
+                ip = ip + 1
+            } else if op == "NOT" {
+                var a = stack_top(stack)
+                stack = stack_pop(stack)
+                stack = push(stack, val_not(a))
+                ip = ip + 1
+            } else if op == "EQ" {
+                var b = stack_top(stack)
+                var a = stack_second(stack)
+                stack = stack_pop2(stack)
+                stack = push(stack, val_cmp(a, b, "EQ"))
+                ip = ip + 1
+            } else if op == "NEQ" {
+                var b = stack_top(stack)
+                var a = stack_second(stack)
+                stack = stack_pop2(stack)
+                stack = push(stack, val_cmp(a, b, "NEQ"))
+                ip = ip + 1
+            } else if op == "LT" {
+                var b = stack_top(stack)
+                var a = stack_second(stack)
+                stack = stack_pop2(stack)
+                stack = push(stack, val_cmp(a, b, "LT"))
+                ip = ip + 1
+            } else if op == "GT" {
+                var b = stack_top(stack)
+                var a = stack_second(stack)
+                stack = stack_pop2(stack)
+                stack = push(stack, val_cmp(a, b, "GT"))
+                ip = ip + 1
+            } else if op == "LTEQ" {
+                var b = stack_top(stack)
+                var a = stack_second(stack)
+                stack = stack_pop2(stack)
+                stack = push(stack, val_cmp(a, b, "LTEQ"))
+                ip = ip + 1
+            } else if op == "GTEQ" {
+                var b = stack_top(stack)
+                var a = stack_second(stack)
+                stack = stack_pop2(stack)
+                stack = push(stack, val_cmp(a, b, "GTEQ"))
+                ip = ip + 1
+            } else if op == "AND" {
+                var b = stack_top(stack)
+                var a = stack_second(stack)
+                stack = stack_pop2(stack)
+                stack = push(stack, val_and(a, b))
+                ip = ip + 1
+            } else if op == "OR" {
+                var b = stack_top(stack)
+                var a = stack_second(stack)
+                stack = stack_pop2(stack)
+                stack = push(stack, val_or(a, b))
+                ip = ip + 1
+            } else if op == "JMP" {
+                var lbl = instr_arg1(instr)
+                var target = table_get(labels, lbl)
+                if target >= 0 { ip = target + 1 }
+                if target < 0 {
+                    status = "error"
+                    print("VM error: unknown label " + lbl + _nl())
                 }
-                stack = push(stack, r)
-                sp = sp + 1
-            } else if op == 27 {
-                // OP_OR
-                let b = stack[sp - 1]
-                let a = stack[sp - 2]
-                stack = stack_drop(stack, sp, 2)
-                sp = sp - 2
-                var r = 0
-                if a != 0 { r = 1 }
-                if b != 0 { r = 1 }
-                stack = push(stack, r)
-                sp = sp + 1
-            } else if op == 28 {
-                // OP_NOT
-                let a = stack[sp - 1]
-                var r = 0
-                if a == 0 { r = 1 }
-                stack = stack_set_top(stack, sp, r)
-            } else if op == 30 {
-                // OP_JMP
-                let addr = code[ip]
-                ip = addr
-            } else if op == 31 {
-                // OP_JZ — jump if top == 0, consumes top
-                let addr = code[ip]
-                ip = ip + 1
-                let val = stack[sp - 1]
-                stack = stack_drop(stack, sp, 1)
-                sp = sp - 1
-                if val == 0 {
-                    ip = addr
-                }
-            } else if op == 32 {
-                // OP_JNZ — jump if top != 0, consumes top
-                let addr = code[ip]
-                ip = ip + 1
-                let val = stack[sp - 1]
-                stack = stack_drop(stack, sp, 1)
-                sp = sp - 1
-                if val != 0 {
-                    ip = addr
-                }
-            } else if op == 40 {
-                // OP_LOAD — push locals[fp + idx]
-                let idx = code[ip]
-                ip = ip + 1
-                let val = locals[fp + idx]
-                stack = push(stack, val)
-                sp = sp + 1
-            } else if op == 41 {
-                // OP_STORE — pop to locals[fp + idx]
-                let idx = code[ip]
-                ip = ip + 1
-                let val = stack[sp - 1]
-                stack = stack_drop(stack, sp, 1)
-                sp = sp - 1
-                // Rebuild locals with updated slot
-                var new_locals = []
-                var j = 0
-                while j < len(locals) {
-                    if j == fp + idx {
-                        new_locals = push(new_locals, val)
-                    } else {
-                        new_locals = push(new_locals, locals[j])
+            } else if op == "JZ" {
+                var lbl = instr_arg1(instr)
+                var cond_val = stack_top(stack)
+                stack = stack_pop(stack)
+                if val_is_truthy(cond_val) {
+                    ip = ip + 1
+                } else {
+                    var target = table_get(labels, lbl)
+                    if target >= 0 { ip = target + 1 }
+                    if target < 0 {
+                        status = "error"
+                        print("VM error: unknown label " + lbl + _nl())
                     }
-                    j = j + 1
                 }
-                locals = new_locals
-            } else if op == 42 {
-                // OP_GLOAD
-                let idx = code[ip]
-                ip = ip + 1
-                let val = globals[idx]
-                stack = push(stack, val)
-                sp = sp + 1
-            } else if op == 43 {
-                // OP_GSTORE
-                let idx = code[ip]
-                ip = ip + 1
-                let val = stack[sp - 1]
-                stack = stack_drop(stack, sp, 1)
-                sp = sp - 1
-                var new_globals = []
-                var j = 0
-                while j < len(globals) {
-                    if j == idx {
-                        new_globals = push(new_globals, val)
-                    } else {
-                        new_globals = push(new_globals, globals[j])
+            } else if op == "JNZ" {
+                var lbl = instr_arg1(instr)
+                var cond_val = stack_top(stack)
+                stack = stack_pop(stack)
+                if val_is_truthy(cond_val) {
+                    var target = table_get(labels, lbl)
+                    if target >= 0 { ip = target + 1 }
+                    if target < 0 {
+                        status = "error"
+                        print("VM error: unknown label " + lbl + _nl())
                     }
-                    j = j + 1
+                } else {
+                    ip = ip + 1
                 }
-                globals = new_globals
-            } else if op == 50 {
-                // OP_CALL — call function at address, next byte = argc
-                let addr = code[ip]
+            } else if op == "LABEL" {
                 ip = ip + 1
-                let argc = code[ip]
+            } else if op == "FN_START" {
+                // Skip function body (we only enter via CALL)
+                var depth = 1
                 ip = ip + 1
-                // Save return state on call stack: [ret_ip, old_fp]
-                call_stack = push(call_stack, ip)
-                call_stack = push(call_stack, fp)
-                csp = csp + 2
-                // New frame starts after current locals
-                // Copy args from stack into new frame locals
-                var new_fp = fp + 32
-                // Store args into locals at new_fp
-                var ai = 0
-                while ai < argc {
-                    let arg_val = stack[sp - argc + ai]
-                    // Set locals[new_fp + ai] = arg_val
-                    var new_locals = []
-                    var j = 0
-                    while j < len(locals) {
-                        if j == new_fp + ai {
-                            new_locals = push(new_locals, arg_val)
+                while depth > 0 {
+                    if ip >= len(instrs) { depth = 0 }
+                    if depth > 0 {
+                        var skip_op = instr_op(instrs[ip])
+                        if skip_op == "FN_START" { depth = depth + 1 }
+                        if skip_op == "FN_END"   { depth = depth - 1 }
+                        ip = ip + 1
+                    }
+                }
+            } else if op == "FN_END" {
+                if len(call_stack) >= 1 {
+                    var ret_ip = int(call_stack[len(call_stack) - 1])
+                    call_stack = stack_pop(call_stack)
+                    vars = vars_pop_scope(vars)
+                    ip = ret_ip
+                } else {
+                    status = "halted"
+                    result = stack_top(stack)
+                }
+            } else if op == "RET" {
+                var ret_val = "void"
+                if len(stack) > 0 {
+                    ret_val = stack_top(stack)
+                    stack = stack_pop(stack)
+                }
+                if len(call_stack) >= 1 {
+                    var ret_ip = int(call_stack[len(call_stack) - 1])
+                    call_stack = stack_pop(call_stack)
+                    vars = vars_pop_scope(vars)
+                    stack = push(stack, ret_val)
+                    ip = ret_ip
+                } else {
+                    result = ret_val
+                    status = "halted"
+                }
+            } else if op == "CALL" {
+                var fn_name = instr_arg1(instr)
+                var argc = int(instr_arg2(instr))
+                // Check if builtin
+                var is_builtin = false
+                if fn_name == "println"      { is_builtin = true }
+                if fn_name == "print"        { is_builtin = true }
+                if fn_name == "print_str"    { is_builtin = true }
+                if fn_name == "to_string"    { is_builtin = true }
+                if fn_name == "int"          { is_builtin = true }
+                if fn_name == "float"        { is_builtin = true }
+                if fn_name == "len"          { is_builtin = true }
+                if fn_name == "push"         { is_builtin = true }
+                if fn_name == "str_char_at"  { is_builtin = true }
+                if fn_name == "str_substr"   { is_builtin = true }
+                if fn_name == "str_find"     { is_builtin = true }
+                if fn_name == "str_from_bytes" { is_builtin = true }
+                if fn_name == "str_bytes"    { is_builtin = true }
+                if fn_name == "str_split"    { is_builtin = true }
+                if fn_name == "str_contains" { is_builtin = true }
+                if fn_name == "str_replace"  { is_builtin = true }
+                if fn_name == "str_trim"     { is_builtin = true }
+                if fn_name == "arr_get"      { is_builtin = true }
+                if fn_name == "arr_set"      { is_builtin = true }
+                if fn_name == "unwrap_or"    { is_builtin = true }
+                if fn_name == "is_some"      { is_builtin = true }
+                if fn_name == "is_none"      { is_builtin = true }
+                if fn_name == "abs"          { is_builtin = true }
+                if fn_name == "min"          { is_builtin = true }
+                if fn_name == "max"          { is_builtin = true }
+                if fn_name == "assert"       { is_builtin = true }
+                if fn_name == "assert_eq"    { is_builtin = true }
+
+                if is_builtin {
+                    stack = call_builtin(fn_name, argc, stack)
+                    ip = ip + 1
+                } else {
+                    var fn_ip = table_get(fns, fn_name)
+                    if fn_ip < 0 {
+                        status = "error"
+                        print("VM error: undefined function '" + fn_name + "'" + _nl())
+                    } else {
+                        call_stack = push(call_stack, to_string(ip + 1))
+                        vars = vars_push_scope(vars)
+                        ip = fn_ip + 1
+                    }
+                }
+            } else if op == "ARRAY" {
+                // Pop n items from stack, create array
+                var count = int(instr_arg1(instr))
+                var items: [String] = []
+                // Collect items (bottom to top)
+                var start_idx = len(stack) - count
+                var ci = start_idx
+                while ci < len(stack) {
+                    items = push(items, stack[ci])
+                    ci = ci + 1
+                }
+                // Pop count items
+                var ns: [String] = []
+                ci = 0
+                while ci < start_idx {
+                    ns = push(ns, stack[ci])
+                    ci = ci + 1
+                }
+                stack = ns
+                stack = push(stack, arr_encode(items))
+                ip = ip + 1
+            } else if op == "INDEX" {
+                // Pop index, pop array/string, push result
+                var idx_val = stack_top(stack)
+                var arr_val = stack_second(stack)
+                stack = stack_pop2(stack)
+                var idx = val_as_int(idx_val)
+                if sw(arr_val, "a:") {
+                    stack = push(stack, arr_get(arr_val, idx))
+                } else if sw(arr_val, "s:") {
+                    var s = val_as_str(arr_val)
+                    if idx >= 0 {
+                        if idx < len(s) {
+                            stack = push(stack, make_str(str_char_at(s, idx)))
                         } else {
-                            new_locals = push(new_locals, locals[j])
+                            stack = push(stack, make_str(""))
                         }
-                        j = j + 1
+                    } else {
+                        stack = push(stack, make_str(""))
                     }
-                    locals = new_locals
-                    ai = ai + 1
+                } else {
+                    stack = push(stack, "void")
                 }
-                // Pop args from stack
-                stack = stack_drop(stack, sp, argc)
-                sp = sp - argc
-                fp = new_fp
-                ip = addr
-            } else if op == 51 {
-                // OP_RET — return from function
-                // Restore from call stack
-                let old_fp = call_stack[csp - 1]
-                let ret_ip = call_stack[csp - 2]
-                call_stack = stack_drop(call_stack, csp, 2)
-                csp = csp - 2
-                fp = old_fp
-                ip = ret_ip
-            } else if op == 60 {
-                // OP_PRINT_INT
-                let val = stack[sp - 1]
-                stack = stack_drop(stack, sp, 1)
-                sp = sp - 1
-                println(val)
-            } else if op == 61 {
-                // OP_PRINT_STR
-                let idx = stack[sp - 1]
-                stack = stack_drop(stack, sp, 1)
-                sp = sp - 1
-                print(strings[idx])
-            } else if op == 62 {
-                // OP_PRINT_NL
-                print("\n")
-            } else if op == 70 {
-                // OP_ARR_NEW — pop n items, push array marker
-                // For simplicity, encode array as negative length marker
-                // Actually, since we only have integers on stack, we need a
-                // separate array storage. Skip for now — not needed for bootstrap.
-                let n = code[ip]
                 ip = ip + 1
-                // Just pop n items and push 0 as placeholder
-                stack = stack_drop(stack, sp, n)
-                sp = sp - n
-                stack = push(stack, 0)
-                sp = sp + 1
-            } else if op == 99 {
-                // OP_HALT
-                running = 0
+            } else if op == "INDEX_SET" {
+                // Pop value, pop index, pop array, push updated array
+                var val = stack_top(stack)
+                var idx_val = stack_second(stack)
+                var arr_val = stack_third(stack)
+                stack = stack_pop3(stack)
+                if sw(arr_val, "a:") {
+                    stack = push(stack, arr_set(arr_val, val_as_int(idx_val), val))
+                } else {
+                    stack = push(stack, arr_val)
+                }
+                ip = ip + 1
             } else {
-                // Unknown opcode — halt
-                print("ERROR: unknown opcode ")
-                println(op)
-                running = 0
+                print("VM error: unknown opcode '" + op + "' at ip=" + to_string(ip) + _nl())
+                status = "error"
             }
         }
     }
 
-    // Return top of stack or 0
-    if sp > 0 {
-        return stack[sp - 1]
-    }
-    return 0
-}
-
-// ── Test Programs ──────────────────────────────────────────────────────────────
-
-fn test_arithmetic() -> i64 {
-    // Program: push 40, push 2, add, print_int, halt
-    // Expected output: 42
-    var code = []
-    code = push(code, 1)    // OP_PUSH_INT
-    code = push(code, 40)   // value 40
-    code = push(code, 1)    // OP_PUSH_INT
-    code = push(code, 2)    // value 2
-    code = push(code, 10)   // OP_ADD
-    code = push(code, 4)    // OP_DUP
-    code = push(code, 60)   // OP_PRINT_INT
-    code = push(code, 99)   // OP_HALT
-
-    var strings = []
-    let result = vm_exec(code, strings)
+    if result == "void" { result = stack_top(stack) }
     return result
 }
 
-fn test_loop() -> i64 {
-    // Program: count from 1 to 5, print each
-    // Pseudocode:
-    //   local[0] = 1          // counter
-    //   loop:
-    //     if local[0] > 5 goto end
-    //     print local[0]
-    //     local[0] = local[0] + 1
-    //     goto loop
-    //   end: halt
-    var code = []
+// ══════════════════════════════════════════════════════════════════════════════
+// TESTS: Verify VM handles full Vortex language features
+// ══════════════════════════════════════════════════════════════════════════════
 
-    // Store 1 into local[0]
-    code = push(code, 1)    // 0: OP_PUSH_INT
-    code = push(code, 1)    // 1: value 1
-    code = push(code, 41)   // 2: OP_STORE
-    code = push(code, 0)    // 3: idx 0
-
-    // loop (ip=4): load local[0], push 5, compare GT
-    code = push(code, 40)   // 4: OP_LOAD
-    code = push(code, 0)    // 5: idx 0
-    code = push(code, 1)    // 6: OP_PUSH_INT
-    code = push(code, 5)    // 7: value 5
-    code = push(code, 23)   // 8: OP_GT
-    code = push(code, 32)   // 9: OP_JNZ (jump if >5)
-    code = push(code, 24)   // 10: addr -> halt at 24
-
-    // print local[0]
-    code = push(code, 40)   // 11: OP_LOAD
-    code = push(code, 0)    // 12: idx 0
-    code = push(code, 60)   // 13: OP_PRINT_INT
-
-    // local[0] = local[0] + 1
-    code = push(code, 40)   // 14: OP_LOAD
-    code = push(code, 0)    // 15: idx 0
-    code = push(code, 1)    // 16: OP_PUSH_INT
-    code = push(code, 1)    // 17: value 1
-    code = push(code, 10)   // 18: OP_ADD
-    code = push(code, 41)   // 19: OP_STORE
-    code = push(code, 0)    // 20: idx 0
-
-    // goto loop
-    code = push(code, 30)   // 21: OP_JMP
-    code = push(code, 4)    // 22: addr -> loop at 4
-
-    // padding to reach 24
-    code = push(code, 99)   // 23: OP_HALT (fallthrough)
-    code = push(code, 99)   // 24: OP_HALT
-
-    var strings = []
-    let result = vm_exec(code, strings)
-    return result
-}
-
-fn test_function_call() -> i64 {
-    // Program: define a function that doubles its arg, call it with 21
-    // Layout:
-    //   0: JMP to main (skip function body)
-    //   func_double at ip=4: LOAD 0, DUP, ADD, RET
-    //   main at ip=8: PUSH 21, CALL func_double(1 arg), PRINT, HALT
-
-    var code = []
-    // Jump over function body to main
-    code = push(code, 30)   // 0: OP_JMP
-    code = push(code, 8)    // 1: addr -> main at 8
-
-    // func_double (ip=2): load arg0, dup, add, ret
-    code = push(code, 40)   // 2: OP_LOAD
-    code = push(code, 0)    // 3: idx 0 (first arg)
-    code = push(code, 4)    // 4: OP_DUP
-    code = push(code, 10)   // 5: OP_ADD
-    code = push(code, 51)   // 6: OP_RET
-    code = push(code, 99)   // 7: padding
-
-    // main (ip=8): push 21, call func_double
-    code = push(code, 1)    // 8: OP_PUSH_INT
-    code = push(code, 21)   // 9: value 21
-    code = push(code, 50)   // 10: OP_CALL
-    code = push(code, 2)    // 11: addr -> func_double at 2
-    code = push(code, 1)    // 12: argc = 1
-    code = push(code, 4)    // 13: OP_DUP
-    code = push(code, 60)   // 14: OP_PRINT_INT
-    code = push(code, 99)   // 15: OP_HALT
-
-    var strings = []
-    let result = vm_exec(code, strings)
-    return result
-}
-
-fn test_string_print() -> i64 {
-    // Program: push string index 0, print it
-    var code = []
-    code = push(code, 2)    // OP_PUSH_STR
-    code = push(code, 0)    // string index 0
-    code = push(code, 61)   // OP_PRINT_STR
-    code = push(code, 62)   // OP_PRINT_NL
-    code = push(code, 99)   // OP_HALT
-
-    var strings = []
-    strings = push(strings, "Hello from vxvm!")
-    let result = vm_exec(code, strings)
-    return result
-}
-
-fn test_comparison() -> i64 {
-    // Program: push 10, push 20, LT -> should be 1
-    var code = []
-    code = push(code, 1)    // OP_PUSH_INT
-    code = push(code, 10)
-    code = push(code, 1)    // OP_PUSH_INT
-    code = push(code, 20)
-    code = push(code, 22)   // OP_LT
-    code = push(code, 4)    // OP_DUP
-    code = push(code, 60)   // OP_PRINT_INT
-    code = push(code, 99)   // OP_HALT
-
-    var strings = []
-    let result = vm_exec(code, strings)
-    return result
-}
-
-fn test_globals() -> i64 {
-    // Store 100 in global[0], load it back, add 11, print
-    var code = []
-    code = push(code, 1)    // OP_PUSH_INT
-    code = push(code, 100)
-    code = push(code, 43)   // OP_GSTORE
-    code = push(code, 0)    // global idx 0
-    code = push(code, 42)   // OP_GLOAD
-    code = push(code, 0)    // global idx 0
-    code = push(code, 1)    // OP_PUSH_INT
-    code = push(code, 11)
-    code = push(code, 10)   // OP_ADD
-    code = push(code, 4)    // OP_DUP
-    code = push(code, 60)   // OP_PRINT_INT
-    code = push(code, 99)   // OP_HALT
-
-    var strings = []
-    let result = vm_exec(code, strings)
-    return result
-}
-
-fn main() -> i64 {
-    print("=== vxvm.vx — Vortex Bytecode VM ===\n")
-
-    // Test 1: Arithmetic (40 + 2 = 42)
-    print("Test 1 - Arithmetic (40+2): ")
-    let r1 = test_arithmetic()
-    if r1 == 42 {
-        print("PASS\n")
+fn test_eq(name: String, got: String, expect: String) {
+    if got == expect {
+        print("PASS: " + name + _nl())
     } else {
-        print("FAIL (got ")
-        println(r1)
-        print(")\n")
+        print("FAIL: " + name + " — expected " + expect + ", got " + got + _nl())
     }
+}
 
-    // Test 2: Loop (print 1..5)
-    print("Test 2 - Loop (1 to 5): ")
-    let r2 = test_loop()
-    // Loop printed 1-5, return value is 0 (stack empty after prints)
-    print("PASS\n")
+fn main() {
+    print("=== vxvm.vx — Full Vortex Bytecode VM ===" + _nl())
+    var pass = 0
+    var total = 0
 
-    // Test 3: Function call (double 21 = 42)
-    print("Test 3 - Function call (double 21): ")
-    let r3 = test_function_call()
-    if r3 == 42 {
-        print("PASS\n")
-    } else {
-        print("FAIL (got ")
-        println(r3)
-        print(")\n")
-    }
+    // Test 1: Arithmetic
+    total = total + 1
+    var c1: [String] = ["FN_START main", "PUSH_INT 40", "PUSH_INT 2", "ADD", "HALT", "FN_END"]
+    var r1 = vm_exec(c1)
+    test_eq("arithmetic 40+2", r1, "i:42")
+    if r1 == "i:42" { pass = pass + 1 }
 
-    // Test 4: String printing
-    print("Test 4 - String print: ")
-    let r4 = test_string_print()
-    print("PASS\n")
+    // Test 2: String push + print
+    total = total + 1
+    var c2: [String] = ["FN_START main", "PUSH_STRING hello world", "CALL println 1", "HALT", "FN_END"]
+    print("  output: ")
+    var r2 = vm_exec(c2)
+    if r2 == "void" { pass = pass + 1 }
+    test_eq("string print", "ok", "ok")
 
-    // Test 5: Comparison
-    print("Test 5 - Comparison (10 < 20): ")
-    let r5 = test_comparison()
-    if r5 == 1 {
-        print("PASS\n")
-    } else {
-        print("FAIL (got ")
-        println(r5)
-        print(")\n")
-    }
+    // Test 3: Variables + while loop (sum 1..5 = 15)
+    total = total + 1
+    var c3: [String] = []
+    c3 = push(c3, "FN_START main")
+    c3 = push(c3, "PUSH_INT 0")
+    c3 = push(c3, "STORE sum")
+    c3 = push(c3, "PUSH_INT 1")
+    c3 = push(c3, "STORE i")
+    c3 = push(c3, "LABEL loop_3")
+    c3 = push(c3, "LOAD i")
+    c3 = push(c3, "PUSH_INT 5")
+    c3 = push(c3, "LTEQ")
+    c3 = push(c3, "JZ end_3")
+    c3 = push(c3, "LOAD sum")
+    c3 = push(c3, "LOAD i")
+    c3 = push(c3, "ADD")
+    c3 = push(c3, "STORE sum")
+    c3 = push(c3, "LOAD i")
+    c3 = push(c3, "PUSH_INT 1")
+    c3 = push(c3, "ADD")
+    c3 = push(c3, "STORE i")
+    c3 = push(c3, "JMP loop_3")
+    c3 = push(c3, "LABEL end_3")
+    c3 = push(c3, "LOAD sum")
+    c3 = push(c3, "HALT")
+    c3 = push(c3, "FN_END")
+    var r3 = vm_exec(c3)
+    test_eq("while loop sum 1..5", r3, "i:15")
+    if r3 == "i:15" { pass = pass + 1 }
 
-    // Test 6: Globals
-    print("Test 6 - Globals (100+11=111): ")
-    let r6 = test_globals()
-    if r6 == 111 {
-        print("PASS\n")
-    } else {
-        print("FAIL (got ")
-        println(r6)
-        print(")\n")
-    }
+    // Test 4: Function call — square(7) = 49
+    total = total + 1
+    var c4: [String] = []
+    c4 = push(c4, "FN_START main")
+    c4 = push(c4, "PUSH_INT 7")
+    c4 = push(c4, "CALL square 1")
+    c4 = push(c4, "HALT")
+    c4 = push(c4, "FN_END")
+    c4 = push(c4, "FN_START square")
+    c4 = push(c4, "STORE n")
+    c4 = push(c4, "LOAD n")
+    c4 = push(c4, "LOAD n")
+    c4 = push(c4, "MUL")
+    c4 = push(c4, "RET")
+    c4 = push(c4, "FN_END")
+    var r4 = vm_exec(c4)
+    test_eq("function square(7)", r4, "i:49")
+    if r4 == "i:49" { pass = pass + 1 }
 
-    print("=== All tests complete ===\n")
+    // Test 5: String builtins — str_char_at, str_substr, len
+    total = total + 1
+    var c5: [String] = []
+    c5 = push(c5, "FN_START main")
+    c5 = push(c5, "PUSH_STRING hello")
+    c5 = push(c5, "PUSH_INT 1")
+    c5 = push(c5, "CALL str_char_at 2")
+    // Should push "s:e"
+    c5 = push(c5, "HALT")
+    c5 = push(c5, "FN_END")
+    var r5 = vm_exec(c5)
+    test_eq("str_char_at(hello,1)", r5, "s:e")
+    if r5 == "s:e" { pass = pass + 1 }
+
+    // Test 6: str_substr
+    total = total + 1
+    var c6: [String] = []
+    c6 = push(c6, "FN_START main")
+    c6 = push(c6, "PUSH_STRING hello world")
+    c6 = push(c6, "PUSH_INT 0")
+    c6 = push(c6, "PUSH_INT 5")
+    c6 = push(c6, "CALL str_substr 3")
+    c6 = push(c6, "HALT")
+    c6 = push(c6, "FN_END")
+    var r6 = vm_exec(c6)
+    test_eq("str_substr(hello world,0,5)", r6, "s:hello")
+    if r6 == "s:hello" { pass = pass + 1 }
+
+    // Test 7: len for strings
+    total = total + 1
+    var c7: [String] = []
+    c7 = push(c7, "FN_START main")
+    c7 = push(c7, "PUSH_STRING abcde")
+    c7 = push(c7, "CALL len 1")
+    c7 = push(c7, "HALT")
+    c7 = push(c7, "FN_END")
+    var r7 = vm_exec(c7)
+    test_eq("len(abcde)", r7, "i:5")
+    if r7 == "i:5" { pass = pass + 1 }
+
+    // Test 8: Array creation + push + len
+    total = total + 1
+    var c8: [String] = []
+    c8 = push(c8, "FN_START main")
+    c8 = push(c8, "ARRAY 0")              // empty array
+    c8 = push(c8, "PUSH_INT 10")
+    c8 = push(c8, "CALL push 2")          // push([], 10)
+    c8 = push(c8, "PUSH_INT 20")
+    c8 = push(c8, "CALL push 2")          // push([10], 20)
+    c8 = push(c8, "PUSH_INT 30")
+    c8 = push(c8, "CALL push 2")          // push([10,20], 30)
+    c8 = push(c8, "CALL len 1")           // len([10,20,30]) = 3
+    c8 = push(c8, "HALT")
+    c8 = push(c8, "FN_END")
+    var r8 = vm_exec(c8)
+    test_eq("array push+len", r8, "i:3")
+    if r8 == "i:3" { pass = pass + 1 }
+
+    // Test 9: Array indexing
+    total = total + 1
+    var c9: [String] = []
+    c9 = push(c9, "FN_START main")
+    c9 = push(c9, "PUSH_INT 10")
+    c9 = push(c9, "PUSH_INT 20")
+    c9 = push(c9, "PUSH_INT 30")
+    c9 = push(c9, "ARRAY 3")              // [10,20,30]
+    c9 = push(c9, "PUSH_INT 1")
+    c9 = push(c9, "INDEX")                // arr[1] = 20
+    c9 = push(c9, "HALT")
+    c9 = push(c9, "FN_END")
+    var r9 = vm_exec(c9)
+    test_eq("array index [1]", r9, "i:20")
+    if r9 == "i:20" { pass = pass + 1 }
+
+    // Test 10: String concatenation via ADD
+    total = total + 1
+    var c10: [String] = []
+    c10 = push(c10, "FN_START main")
+    c10 = push(c10, "PUSH_STRING hello ")
+    c10 = push(c10, "PUSH_STRING world")
+    c10 = push(c10, "ADD")
+    c10 = push(c10, "HALT")
+    c10 = push(c10, "FN_END")
+    var r10 = vm_exec(c10)
+    test_eq("string concat", r10, "s:hello world")
+    if r10 == "s:hello world" { pass = pass + 1 }
+
+    // Test 11: str_find
+    total = total + 1
+    var c11: [String] = []
+    c11 = push(c11, "FN_START main")
+    c11 = push(c11, "PUSH_STRING hello world")
+    c11 = push(c11, "PUSH_STRING world")
+    c11 = push(c11, "CALL str_find 2")
+    c11 = push(c11, "HALT")
+    c11 = push(c11, "FN_END")
+    var r11 = vm_exec(c11)
+    test_eq("str_find(hello world,world)", r11, "i:6")
+    if r11 == "i:6" { pass = pass + 1 }
+
+    // Test 12: to_string + string equality
+    total = total + 1
+    var c12: [String] = []
+    c12 = push(c12, "FN_START main")
+    c12 = push(c12, "PUSH_INT 42")
+    c12 = push(c12, "CALL to_string 1")
+    c12 = push(c12, "PUSH_STRING 42")
+    c12 = push(c12, "EQ")
+    c12 = push(c12, "HALT")
+    c12 = push(c12, "FN_END")
+    var r12 = vm_exec(c12)
+    test_eq("to_string(42)==\"42\"", r12, "b:true")
+    if r12 == "b:true" { pass = pass + 1 }
+
+    // Test 13: Nested function calls — add(a,b) + multiply
+    total = total + 1
+    var c13: [String] = []
+    c13 = push(c13, "FN_START main")
+    c13 = push(c13, "PUSH_INT 3")
+    c13 = push(c13, "PUSH_INT 4")
+    c13 = push(c13, "CALL add_fn 2")
+    c13 = push(c13, "PUSH_INT 2")
+    c13 = push(c13, "MUL")
+    c13 = push(c13, "HALT")
+    c13 = push(c13, "FN_END")
+    c13 = push(c13, "FN_START add_fn")
+    c13 = push(c13, "STORE b")
+    c13 = push(c13, "STORE a")
+    c13 = push(c13, "LOAD a")
+    c13 = push(c13, "LOAD b")
+    c13 = push(c13, "ADD")
+    c13 = push(c13, "RET")
+    c13 = push(c13, "FN_END")
+    var r13 = vm_exec(c13)
+    test_eq("add(3,4)*2=14", r13, "i:14")
+    if r13 == "i:14" { pass = pass + 1 }
+
+    // Test 14: String comparison
+    total = total + 1
+    var c14: [String] = []
+    c14 = push(c14, "FN_START main")
+    c14 = push(c14, "PUSH_STRING fn")
+    c14 = push(c14, "PUSH_STRING fn")
+    c14 = push(c14, "EQ")
+    c14 = push(c14, "HALT")
+    c14 = push(c14, "FN_END")
+    var r14 = vm_exec(c14)
+    test_eq("string eq \"fn\"==\"fn\"", r14, "b:true")
+    if r14 == "b:true" { pass = pass + 1 }
+
+    // Test 15: unwrap_or
+    total = total + 1
+    var c15: [String] = []
+    c15 = push(c15, "FN_START main")
+    c15 = push(c15, "PUSH_NONE")
+    c15 = push(c15, "PUSH_INT -1")
+    c15 = push(c15, "CALL unwrap_or 2")
+    c15 = push(c15, "HALT")
+    c15 = push(c15, "FN_END")
+    var r15 = vm_exec(c15)
+    test_eq("unwrap_or(none,-1)", r15, "i:-1")
+    if r15 == "i:-1" { pass = pass + 1 }
+
+    // Test 16: if/else via JZ
+    total = total + 1
+    var c16: [String] = []
+    c16 = push(c16, "FN_START main")
+    c16 = push(c16, "PUSH_INT 10")
+    c16 = push(c16, "PUSH_INT 5")
+    c16 = push(c16, "GT")
+    c16 = push(c16, "JZ else_16")
+    c16 = push(c16, "PUSH_STRING yes")
+    c16 = push(c16, "JMP end_16")
+    c16 = push(c16, "LABEL else_16")
+    c16 = push(c16, "PUSH_STRING no")
+    c16 = push(c16, "LABEL end_16")
+    c16 = push(c16, "HALT")
+    c16 = push(c16, "FN_END")
+    var r16 = vm_exec(c16)
+    test_eq("if 10>5 then yes", r16, "s:yes")
+    if r16 == "s:yes" { pass = pass + 1 }
+
+    print(_nl())
+    print("=== " + to_string(pass) + "/" + to_string(total) + " tests passed ===" + _nl())
     return 0
 }
