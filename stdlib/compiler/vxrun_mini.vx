@@ -1,0 +1,500 @@
+// vxrun_mini.vx — Minimal self-hosting Vortex runner (lex→parse→compile→VM)
+fn _nl() -> String { return str_from_bytes([10]) }
+fn sw(s: String, prefix: String) -> bool {
+    if len(s) < len(prefix) { return false }
+    return str_substr(s, 0, len(prefix)) == prefix
+}
+fn aft(s: String, n: i64) -> String { return str_substr(s, n, len(s)) }
+fn ss(s: String, start: i64, end: i64) -> String { return str_substr(s, start, end - start) }
+fn fi(s: String, needle: String) -> i64 { return unwrap_or(str_find(s, needle), -1) }
+
+fn is_digit(c: String) -> bool {
+    if c == "0" { return true } if c == "1" { return true } if c == "2" { return true }
+    if c == "3" { return true } if c == "4" { return true } if c == "5" { return true }
+    if c == "6" { return true } if c == "7" { return true } if c == "8" { return true }
+    if c == "9" { return true } return false
+}
+fn is_alpha(c: String) -> bool {
+    if c == "_" { return true }
+    if c == "a" { return true } if c == "b" { return true } if c == "c" { return true }
+    if c == "d" { return true } if c == "e" { return true } if c == "f" { return true }
+    if c == "g" { return true } if c == "h" { return true } if c == "i" { return true }
+    if c == "j" { return true } if c == "k" { return true } if c == "l" { return true }
+    if c == "m" { return true } if c == "n" { return true } if c == "o" { return true }
+    if c == "p" { return true } if c == "q" { return true } if c == "r" { return true }
+    if c == "s" { return true } if c == "t" { return true } if c == "u" { return true }
+    if c == "v" { return true } if c == "w" { return true } if c == "x" { return true }
+    if c == "y" { return true } if c == "z" { return true }
+    if c == "A" { return true } if c == "B" { return true } if c == "C" { return true }
+    if c == "D" { return true } if c == "E" { return true } if c == "F" { return true }
+    if c == "G" { return true } if c == "H" { return true } if c == "I" { return true }
+    if c == "J" { return true } if c == "K" { return true } if c == "L" { return true }
+    if c == "M" { return true } if c == "N" { return true } if c == "O" { return true }
+    if c == "P" { return true } if c == "Q" { return true } if c == "R" { return true }
+    if c == "S" { return true } if c == "T" { return true } if c == "U" { return true }
+    if c == "V" { return true } if c == "W" { return true } if c == "X" { return true }
+    if c == "Y" { return true } if c == "Z" { return true }
+    return false
+}
+fn is_alnum(c: String) -> bool {
+    if is_alpha(c) { return true }
+    return is_digit(c)
+}
+
+// ── Lexer ──────────────────────────────────────────────────────────────
+fn lex(src: String) -> [String] {
+    var toks: [String] = []
+    var i = 0
+    var slen = len(src)
+    var qt = str_from_bytes([34])
+    while i < slen {
+        var c = str_char_at(src, i)
+        if c == " " { i = i + 1 }
+        else if c == str_from_bytes([10]) { i = i + 1 }
+        else if c == str_from_bytes([13]) { i = i + 1 }
+        else if c == str_from_bytes([9]) { i = i + 1 }
+        else if is_digit(c) {
+            var start = i
+            var go = true
+            while go { if i >= slen { go = false } else if is_digit(str_char_at(src, i)) { i = i + 1 } else { go = false } }
+            toks = push(toks, "INT:" + ss(src, start, i))
+        }
+        else if c == qt {
+            i = i + 1
+            var start = i
+            var go = true
+            while go { if i >= slen { go = false } else if str_char_at(src, i) == qt { go = false } else { i = i + 1 } }
+            toks = push(toks, "STR:" + ss(src, start, i))
+            i = i + 1
+        }
+        else if is_alpha(c) {
+            var start = i
+            var go = true
+            while go { if i >= slen { go = false } else if is_alnum(str_char_at(src, i)) { i = i + 1 } else { go = false } }
+            var w = ss(src, start, i)
+            if w == "fn" { toks = push(toks, "KW:fn") }
+            else if w == "let" { toks = push(toks, "KW:let") }
+            else if w == "var" { toks = push(toks, "KW:var") }
+            else if w == "if" { toks = push(toks, "KW:if") }
+            else if w == "else" { toks = push(toks, "KW:else") }
+            else if w == "while" { toks = push(toks, "KW:while") }
+            else if w == "return" { toks = push(toks, "KW:return") }
+            else if w == "true" { toks = push(toks, "BOOL:true") }
+            else if w == "false" { toks = push(toks, "BOOL:false") }
+            else { toks = push(toks, "ID:" + w) }
+        }
+        else if c == "=" {
+            if i + 1 < slen {
+                if str_char_at(src, i + 1) == "=" { toks = push(toks, "OP:==") i = i + 2 }
+                else { toks = push(toks, "EQ") i = i + 1 }
+            } else { toks = push(toks, "EQ") i = i + 1 }
+        }
+        else if c == "!" {
+            if i + 1 < slen {
+                if str_char_at(src, i + 1) == "=" { toks = push(toks, "OP:!=") i = i + 2 }
+                else { toks = push(toks, "OP:!") i = i + 1 }
+            } else { toks = push(toks, "OP:!") i = i + 1 }
+        }
+        else if c == "<" {
+            if i + 1 < slen {
+                if str_char_at(src, i + 1) == "=" { toks = push(toks, "OP:<=") i = i + 2 }
+                else { toks = push(toks, "OP:<") i = i + 1 }
+            } else { toks = push(toks, "OP:<") i = i + 1 }
+        }
+        else if c == ">" {
+            if i + 1 < slen {
+                if str_char_at(src, i + 1) == "=" { toks = push(toks, "OP:>=") i = i + 2 }
+                else { toks = push(toks, "OP:>") i = i + 1 }
+            } else { toks = push(toks, "OP:>") i = i + 1 }
+        }
+        else if c == "+" { toks = push(toks, "OP:+") i = i + 1 }
+        else if c == "-" { toks = push(toks, "OP:-") i = i + 1 }
+        else if c == "*" { toks = push(toks, "OP:*") i = i + 1 }
+        else if c == "/" { toks = push(toks, "OP:/") i = i + 1 }
+        else if c == "%" { toks = push(toks, "OP:%") i = i + 1 }
+        else if c == "(" { toks = push(toks, "LPAREN") i = i + 1 }
+        else if c == ")" { toks = push(toks, "RPAREN") i = i + 1 }
+        else if c == "{" { toks = push(toks, "LBRACE") i = i + 1 }
+        else if c == "}" { toks = push(toks, "RBRACE") i = i + 1 }
+        else if c == "," { toks = push(toks, "COMMA") i = i + 1 }
+        else { i = i + 1 }
+    }
+    toks = push(toks, "EOF")
+    return toks
+}
+
+// ── Parser globals ─────────────────────────────────────────────────────
+var _lbl_id = 0
+fn new_lbl(p: String) -> String { _lbl_id = _lbl_id + 1 return p + "_" + to_string(_lbl_id) }
+var _toks: [String] = []
+var _pos = 0
+fn peek() -> String { if _pos >= len(_toks) { return "EOF" } return _toks[_pos] }
+fn advance() -> String { var t = peek() _pos = _pos + 1 return t }
+fn expect(e: String) -> String { var t = advance() return t }
+fn em(code: [String], instr: String) -> [String] { return push(code, instr) }
+
+// ── Expression parsing ─────────────────────────────────────────────────
+fn parse_primary(code: [String]) -> [String] {
+    var t = peek()
+    if sw(t, "INT:") { advance() return em(code, "PUSH_INT " + aft(t, 4)) }
+    if sw(t, "STR:") { advance() return em(code, "PUSH_STRING " + aft(t, 4)) }
+    if t == "BOOL:true" { advance() return em(code, "PUSH_BOOL true") }
+    if t == "BOOL:false" { advance() return em(code, "PUSH_BOOL false") }
+    if sw(t, "ID:") {
+        var name = aft(t, 3)
+        advance()
+        if peek() == "LPAREN" {
+            advance()
+            var argc = 0
+            if peek() != "RPAREN" {
+                code = parse_expr(code)
+                argc = 1
+                while peek() == "COMMA" { advance() code = parse_expr(code) argc = argc + 1 }
+            }
+            expect("RPAREN")
+            return em(code, "CALL " + name + " " + to_string(argc))
+        }
+        return em(code, "LOAD " + name)
+    }
+    if t == "LPAREN" { advance() code = parse_expr(code) expect("RPAREN") return code }
+    if t == "OP:-" { advance() code = parse_primary(code) return em(code, "NEG") }
+    advance()
+    return code
+}
+
+fn prec(op: String) -> i64 {
+    if op == "OP:*" { return 5 } if op == "OP:/" { return 5 } if op == "OP:%" { return 5 }
+    if op == "OP:+" { return 4 } if op == "OP:-" { return 4 }
+    if op == "OP:<" { return 3 } if op == "OP:>" { return 3 }
+    if op == "OP:<=" { return 3 } if op == "OP:>=" { return 3 }
+    if op == "OP:==" { return 2 } if op == "OP:!=" { return 2 }
+    return 0
+}
+
+fn op_instr(op: String) -> String {
+    if op == "OP:+" { return "ADD" } if op == "OP:-" { return "SUB" }
+    if op == "OP:*" { return "MUL" } if op == "OP:/" { return "DIV" } if op == "OP:%" { return "MOD" }
+    if op == "OP:==" { return "EQ" } if op == "OP:!=" { return "NEQ" }
+    if op == "OP:<" { return "LT" } if op == "OP:>" { return "GT" }
+    if op == "OP:<=" { return "LTEQ" } if op == "OP:>=" { return "GTEQ" }
+    return "ADD"
+}
+
+fn parse_expr_bp(code: [String], min_p: i64) -> [String] {
+    code = parse_primary(code)
+    while prec(peek()) >= min_p {
+        var op = peek()
+        var p = prec(op)
+        advance()
+        code = parse_expr_bp(code, p + 1)
+        code = em(code, op_instr(op))
+    }
+    return code
+}
+fn parse_expr(code: [String]) -> [String] { return parse_expr_bp(code, 1) }
+
+// ── Statement parsing ──────────────────────────────────────────────────
+fn parse_block(code: [String]) -> [String] {
+    expect("LBRACE")
+    while peek() != "RBRACE" { if peek() == "EOF" { return code } code = parse_stmt(code) }
+    expect("RBRACE")
+    return code
+}
+
+fn parse_stmt(code: [String]) -> [String] {
+    var t = peek()
+    if t == "KW:let" {
+        advance()
+        var name = aft(advance(), 3)
+        expect("EQ")
+        code = parse_expr(code)
+        return em(code, "STORE " + name)
+    }
+    if t == "KW:var" {
+        advance()
+        var name = aft(advance(), 3)
+        expect("EQ")
+        code = parse_expr(code)
+        return em(code, "STORE " + name)
+    }
+    if t == "KW:if" {
+        advance()
+        code = parse_expr(code)
+        var el = new_lbl("else")
+        var en = new_lbl("endif")
+        code = em(code, "JZ " + el)
+        code = parse_block(code)
+        if peek() == "KW:else" {
+            advance()
+            code = em(code, "JMP " + en)
+            code = em(code, "LABEL " + el)
+            code = parse_block(code)
+            code = em(code, "LABEL " + en)
+        } else { code = em(code, "LABEL " + el) }
+        return code
+    }
+    if t == "KW:while" {
+        advance()
+        var ll = new_lbl("loop")
+        var el = new_lbl("endloop")
+        code = em(code, "LABEL " + ll)
+        code = parse_expr(code)
+        code = em(code, "JZ " + el)
+        code = parse_block(code)
+        code = em(code, "JMP " + ll)
+        code = em(code, "LABEL " + el)
+        return code
+    }
+    if t == "KW:return" {
+        advance()
+        if peek() != "RBRACE" { if peek() != "EOF" { code = parse_expr(code) } }
+        return em(code, "RET")
+    }
+    if sw(t, "ID:") {
+        var name = aft(t, 3)
+        advance()
+        if peek() == "EQ" {
+            advance()
+            code = parse_expr(code)
+            return em(code, "STORE " + name)
+        }
+        _pos = _pos - 1
+        code = parse_expr(code)
+        code = em(code, "POP")
+        return code
+    }
+    code = parse_expr(code)
+    code = em(code, "POP")
+    return code
+}
+
+fn parse_program(code: [String]) -> [String] {
+    while peek() != "EOF" {
+        if peek() == "KW:fn" {
+            advance()
+            var name = aft(advance(), 3)
+            expect("LPAREN")
+            var params: [String] = []
+            if peek() != "RPAREN" {
+                params = push(params, aft(advance(), 3))
+                while peek() == "COMMA" { advance() params = push(params, aft(advance(), 3)) }
+            }
+            expect("RPAREN")
+            code = em(code, "FN_START " + name)
+            var pi = len(params) - 1
+            while pi >= 0 { code = em(code, "STORE " + params[pi]) pi = pi - 1 }
+            code = parse_block(code)
+            code = em(code, "RET")
+            code = em(code, "FN_END")
+        } else { advance() }
+    }
+    return code
+}
+
+fn compile(src: String) -> [String] {
+    _toks = lex(src)
+    _pos = 0
+    var code: [String] = []
+    return parse_program(code)
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+// INLINE VM
+// ══════════════════════════════════════════════════════════════════════════
+fn mk_i(n: i64) -> String { return "i:" + to_string(n) }
+fn mk_s(s: String) -> String { return "s:" + s }
+fn vd(v: String) -> String {
+    if sw(v, "i:") { return aft(v, 2) }
+    if sw(v, "s:") { return aft(v, 2) }
+    if v == "b:true" { return "true" }
+    if v == "b:false" { return "false" }
+    return v
+}
+fn vi(v: String) -> i64 { if sw(v, "i:") { return int(aft(v, 2)) } return 0 }
+fn vt(v: String) -> bool {
+    if v == "b:true" { return true } if v == "b:false" { return false }
+    if v == "void" { return false }
+    if sw(v, "i:") { return aft(v, 2) != "0" }
+    return true
+}
+fn mb(b: bool) -> String { if b { return "b:true" } return "b:false" }
+
+fn sp(s: [String]) -> [String] {
+    var n: [String] = []
+    var i = 0
+    while i < len(s) - 1 { n = push(n, s[i]) i = i + 1 }
+    return n
+}
+fn sp2(s: [String]) -> [String] {
+    var n: [String] = []
+    var i = 0
+    while i < len(s) - 2 { n = push(n, s[i]) i = i + 1 }
+    return n
+}
+fn st(s: [String]) -> String { if len(s) == 0 { return "void" } return s[len(s) - 1] }
+fn s2(s: [String]) -> String { if len(s) < 2 { return "void" } return s[len(s) - 2] }
+
+fn iop(instr: String) -> String {
+    var idx = fi(instr, " ")
+    if idx < 0 { return instr }
+    return ss(instr, 0, idx)
+}
+fn ia1(instr: String) -> String {
+    var idx = fi(instr, " ")
+    if idx < 0 { return "" }
+    var rest = aft(instr, idx + 1)
+    var idx2 = fi(rest, " ")
+    if idx2 < 0 { return rest }
+    return ss(rest, 0, idx2)
+}
+fn ia2(instr: String) -> String {
+    var idx = fi(instr, " ")
+    if idx < 0 { return "" }
+    var rest = aft(instr, idx + 1)
+    var idx2 = fi(rest, " ")
+    if idx2 < 0 { return "" }
+    return aft(rest, idx2 + 1)
+}
+
+fn vg(vars: [String], name: String) -> String {
+    var i = len(vars) - 2
+    while i >= 0 { if vars[i] == name { return vars[i + 1] } i = i - 2 }
+    return "void"
+}
+fn vs(vars: [String], name: String, val: String) -> [String] {
+    var i = len(vars) - 2
+    while i >= 0 {
+        if vars[i] == name { vars[i + 1] = val return vars }
+        if vars[i] == "##S##" { vars = push(vars, name) return push(vars, val) }
+        i = i - 2
+    }
+    vars = push(vars, name)
+    return push(vars, val)
+}
+fn vps(vars: [String]) -> [String] { vars = push(vars, "##S##") return push(vars, "##S##") }
+fn vpp(vars: [String]) -> [String] {
+    while len(vars) >= 2 {
+        var tn = vars[len(vars) - 2]
+        var nv: [String] = []
+        var j = 0
+        while j < len(vars) - 2 { nv = push(nv, vars[j]) j = j + 1 }
+        vars = nv
+        if tn == "##S##" { return vars }
+    }
+    return vars
+}
+fn tg(t: [String], k: String) -> i64 {
+    var i = 0
+    while i < len(t) - 1 { if t[i] == k { return int(t[i + 1]) } i = i + 2 }
+    return -1
+}
+fn ts(t: [String], k: String, v: i64) -> [String] {
+    t = push(t, k)
+    return push(t, to_string(v))
+}
+
+fn vm_exec(ins: [String]) -> String {
+    var stack: [String] = []
+    var vars: [String] = []
+    var cs: [String] = []
+    var labels: [String] = []
+    var fns: [String] = []
+    var i = 0
+    while i < len(ins) {
+        var o = iop(ins[i])
+        if o == "LABEL" { labels = ts(labels, ia1(ins[i]), i) }
+        if o == "FN_START" { fns = ts(fns, ia1(ins[i]), i) }
+        i = i + 1
+    }
+    var ip = 0
+    var run = true
+    var mip = tg(fns, "main")
+    if mip >= 0 { ip = mip + 1 vars = vps(vars) }
+    while run {
+        if ip >= len(ins) { run = false }
+        if run {
+            var instr = ins[ip]
+            var op = iop(instr)
+            if op == "HALT" { run = false }
+            else if op == "PUSH_INT" { stack = push(stack, mk_i(int(ia1(instr)))) ip = ip + 1 }
+            else if op == "PUSH_STRING" { stack = push(stack, mk_s(ia1(instr))) ip = ip + 1 }
+            else if op == "PUSH_BOOL" {
+                if ia1(instr) == "true" { stack = push(stack, "b:true") } else { stack = push(stack, "b:false") }
+                ip = ip + 1
+            }
+            else if op == "LOAD" { stack = push(stack, vg(vars, ia1(instr))) ip = ip + 1 }
+            else if op == "STORE" { var v = st(stack) stack = sp(stack) vars = vs(vars, ia1(instr), v) ip = ip + 1 }
+            else if op == "POP" { if len(stack) > 0 { stack = sp(stack) } ip = ip + 1 }
+            else if op == "ADD" { var b = st(stack) var a = s2(stack) stack = sp2(stack) if sw(a, "s:") { stack = push(stack, mk_s(vd(a) + vd(b))) } else { stack = push(stack, mk_i(vi(a) + vi(b))) } ip = ip + 1 }
+            else if op == "SUB" { var b = st(stack) var a = s2(stack) stack = sp2(stack) stack = push(stack, mk_i(vi(a) - vi(b))) ip = ip + 1 }
+            else if op == "MUL" { var b = st(stack) var a = s2(stack) stack = sp2(stack) stack = push(stack, mk_i(vi(a) * vi(b))) ip = ip + 1 }
+            else if op == "DIV" { var b = st(stack) var a = s2(stack) stack = sp2(stack) var d = vi(b) if d == 0 { stack = push(stack, "i:0") } else { stack = push(stack, mk_i(vi(a) / d)) } ip = ip + 1 }
+            else if op == "MOD" { var b = st(stack) var a = s2(stack) stack = sp2(stack) var d = vi(b) if d == 0 { stack = push(stack, "i:0") } else { stack = push(stack, mk_i(vi(a) % d)) } ip = ip + 1 }
+            else if op == "NEG" { var a = st(stack) stack = sp(stack) stack = push(stack, mk_i(0 - vi(a))) ip = ip + 1 }
+            else if op == "EQ" { var b = st(stack) var a = s2(stack) stack = sp2(stack) stack = push(stack, mb(vi(a) == vi(b))) ip = ip + 1 }
+            else if op == "NEQ" { var b = st(stack) var a = s2(stack) stack = sp2(stack) stack = push(stack, mb(vi(a) != vi(b))) ip = ip + 1 }
+            else if op == "LT" { var b = st(stack) var a = s2(stack) stack = sp2(stack) stack = push(stack, mb(vi(a) < vi(b))) ip = ip + 1 }
+            else if op == "GT" { var b = st(stack) var a = s2(stack) stack = sp2(stack) stack = push(stack, mb(vi(a) > vi(b))) ip = ip + 1 }
+            else if op == "LTEQ" { var b = st(stack) var a = s2(stack) stack = sp2(stack) stack = push(stack, mb(vi(a) <= vi(b))) ip = ip + 1 }
+            else if op == "GTEQ" { var b = st(stack) var a = s2(stack) stack = sp2(stack) stack = push(stack, mb(vi(a) >= vi(b))) ip = ip + 1 }
+            else if op == "JMP" {
+                var target = tg(labels, ia1(instr))
+                if target >= 0 { ip = target + 1 } else { run = false }
+            }
+            else if op == "JZ" {
+                var cond = st(stack)
+                stack = sp(stack)
+                if vt(cond) { ip = ip + 1 }
+                else { var target = tg(labels, ia1(instr)) if target >= 0 { ip = target + 1 } else { run = false } }
+            }
+            else if op == "LABEL" { ip = ip + 1 }
+            else if op == "FN_START" {
+                var depth = 1
+                ip = ip + 1
+                while depth > 0 {
+                    if ip >= len(ins) { depth = 0 }
+                    if depth > 0 { var so = iop(ins[ip]) if so == "FN_START" { depth = depth + 1 } if so == "FN_END" { depth = depth - 1 } ip = ip + 1 }
+                }
+            }
+            else if op == "FN_END" {
+                if len(cs) >= 1 { var ri = int(cs[len(cs) - 1]) cs = sp(cs) vars = vpp(vars) ip = ri }
+                else { run = false }
+            }
+            else if op == "RET" {
+                var rv = "void"
+                if len(stack) > 0 { rv = st(stack) stack = sp(stack) }
+                if len(cs) >= 1 { var ri = int(cs[len(cs) - 1]) cs = sp(cs) vars = vpp(vars) stack = push(stack, rv) ip = ri }
+                else { run = false }
+            }
+            else if op == "CALL" {
+                var fn_name = ia1(instr)
+                var argc = int(ia2(instr))
+                if fn_name == "println" { var top = st(stack) stack = sp(stack) print(vd(top) + _nl()) stack = push(stack, "void") ip = ip + 1 }
+                else if fn_name == "print" { var top = st(stack) stack = sp(stack) print(vd(top)) stack = push(stack, "void") ip = ip + 1 }
+                else {
+                    var fip = tg(fns, fn_name)
+                    if fip < 0 { run = false print("VM error: undefined " + fn_name + _nl()) }
+                    else { cs = push(cs, to_string(ip + 1)) vars = vps(vars) ip = fip + 1 }
+                }
+            }
+            else { ip = ip + 1 }
+        }
+    }
+    return st(stack)
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+fn run_test(label: String, src: String) {
+    print("--- " + label + " ---" + _nl())
+    var code = compile(src)
+    vm_exec(code)
+}
+
+fn main() {
+    print("=== vxrun_mini: Lex -> Parse -> Compile -> VM ===" + _nl())
+    var nl = _nl()
+    run_test("Test 1: println(40 + 2)", "fn main() { println(40 + 2) }")
+    run_test("Test 2: let x=10 println(x*3)", "fn main() { let x = 10" + nl + " println(x * 3) }")
+    run_test("Test 3: while loop 1..5", "fn main() { var i = 1" + nl + " while i <= 5 { println(i)" + nl + " i = i + 1 } }")
+    print("=== done ===" + _nl())
+}
