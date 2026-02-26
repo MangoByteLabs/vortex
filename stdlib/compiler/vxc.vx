@@ -246,6 +246,14 @@ fn lex(source: String) -> [String] {
                 tokens = push(tokens, tok_new("KW", "println", line, start_col))
             } else if word == "print_str" {
                 tokens = push(tokens, tok_new("KW", "print_str", line, start_col))
+            } else if word == "true" {
+                tokens = push(tokens, tok_new("TRUE", "true", line, start_col))
+            } else if word == "false" {
+                tokens = push(tokens, tok_new("FALSE", "false", line, start_col))
+            } else if word == "break" {
+                tokens = push(tokens, tok_new("KW", "break", line, start_col))
+            } else if word == "continue" {
+                tokens = push(tokens, tok_new("KW", "continue", line, start_col))
             } else {
                 tokens = push(tokens, tok_new("IDENT", word, line, start_col))
             }
@@ -445,6 +453,34 @@ fn lex(source: String) -> [String] {
                 pos = pos + 1
                 col = col + 1
             }
+        } else if ch == "&" {
+            if pos + 1 < src_len {
+                if str_char_at(source, pos + 1) == "&" {
+                    tokens = push(tokens, tok_new("LAND", "&&", line, col))
+                    pos = pos + 2
+                    col = col + 2
+                } else {
+                    pos = pos + 1
+                    col = col + 1
+                }
+            } else {
+                pos = pos + 1
+                col = col + 1
+            }
+        } else if ch == "|" {
+            if pos + 1 < src_len {
+                if str_char_at(source, pos + 1) == "|" {
+                    tokens = push(tokens, tok_new("LOR", "||", line, col))
+                    pos = pos + 2
+                    col = col + 2
+                } else {
+                    pos = pos + 1
+                    col = col + 1
+                }
+            } else {
+                pos = pos + 1
+                col = col + 1
+            }
         } else {
             // Skip unknown character
             pos = pos + 1
@@ -534,7 +570,27 @@ fn p_at_kw(kw: String) -> bool {
 // --- Expression parsing with precedence ---
 
 fn parse_expr() -> [String] {
-    return parse_comparison()
+    return parse_logical_or()
+}
+
+fn parse_logical_or() -> [String] {
+    var left = parse_logical_and()
+    while p_at("LOR") {
+        p_advance()
+        let right = parse_logical_and()
+        left = ["||", left, right]
+    }
+    return left
+}
+
+fn parse_logical_and() -> [String] {
+    var left = parse_comparison()
+    while p_at("LAND") {
+        p_advance()
+        let right = parse_comparison()
+        left = ["&&", left, right]
+    }
+    return left
 }
 
 fn parse_comparison() -> [String] {
@@ -620,10 +676,25 @@ fn parse_unary() -> [String] {
         let expr = parse_unary()
         return ["neg", expr]
     }
+    if p_at("NOT") {
+        p_advance()
+        let expr = parse_unary()
+        return ["not", expr]
+    }
     return parse_primary()
 }
 
 fn parse_primary() -> [String] {
+    if p_at("TRUE") {
+        p_advance()
+        return ["int", "1"]
+    }
+
+    if p_at("FALSE") {
+        p_advance()
+        return ["int", "0"]
+    }
+
     if p_at("INT") {
         let tok = p_advance()
         return ["int", tok[1]]
@@ -711,6 +782,72 @@ fn parse_primary() -> [String] {
             }
         }
 
+        // to_string(expr) builtin
+        if name == "to_string" {
+            if p_at("LPAREN") {
+                p_advance()
+                let arg = parse_expr()
+                p_expect("RPAREN")
+                return ["to_string", arg]
+            }
+        }
+
+        // int(expr) builtin — string to int
+        if name == "int" {
+            if p_at("LPAREN") {
+                p_advance()
+                let arg = parse_expr()
+                p_expect("RPAREN")
+                return ["int_parse", arg]
+            }
+        }
+
+        // str_char_at(s, i) builtin
+        if name == "str_char_at" {
+            if p_at("LPAREN") {
+                p_advance()
+                let s_arg = parse_expr()
+                p_expect("COMMA")
+                let i_arg = parse_expr()
+                p_expect("RPAREN")
+                return ["str_char_at", s_arg, i_arg]
+            }
+        }
+
+        // str_substr(s, start, length) builtin
+        if name == "str_substr" {
+            if p_at("LPAREN") {
+                p_advance()
+                let s_arg = parse_expr()
+                p_expect("COMMA")
+                let start_arg = parse_expr()
+                p_expect("COMMA")
+                let len_arg = parse_expr()
+                p_expect("RPAREN")
+                return ["str_substr", s_arg, start_arg, len_arg]
+            }
+        }
+
+        // str_bytes(s) builtin
+        if name == "str_bytes" {
+            if p_at("LPAREN") {
+                p_advance()
+                let arg = parse_expr()
+                p_expect("RPAREN")
+                return ["str_bytes", arg]
+            }
+        }
+
+        // str_from_bytes(arr) builtin
+        if name == "str_from_bytes" {
+            if p_at("LPAREN") {
+                p_advance()
+                let arg = parse_expr()
+                p_expect("RPAREN")
+                return ["str_from_bytes", arg]
+            }
+        }
+
         // Check for function call
         if p_at("LPAREN") {
             p_advance()
@@ -791,6 +928,16 @@ fn parse_stmt() -> [String] {
         }
         let expr = parse_expr()
         return ["return", expr]
+    }
+
+    if p_at_kw("break") {
+        p_advance()
+        return ["break"]
+    }
+
+    if p_at_kw("continue") {
+        p_advance()
+        return ["continue"]
     }
 
     if p_at_kw("if") {
@@ -924,14 +1071,24 @@ fn parse_fn_def() -> [String] {
 
 fn parse_program() -> [String] {
     var fns = []
+    var global_stmts = []
     while p_peek_type() != "EOF" {
         if p_at_kw("fn") {
             fns = push(fns, parse_fn_def())
+        } else if p_at_kw("var") {
+            let s = parse_stmt()
+            global_stmts = push(global_stmts, s)
+        } else if p_at_kw("let") {
+            let s = parse_stmt()
+            global_stmts = push(global_stmts, s)
         } else {
-            println("Parse error: expected fn at top level, got " + p_peek_type())
+            println("Parse error: expected fn/var/let at top level, got " + p_peek_type())
             p_advance()
         }
     }
+    // Always create _vx_init_globals (may have empty body)
+    let init_fn = ["fn", "_vx_init_globals", [], global_stmts]
+    fns = push(fns, init_fn)
     return fns
 }
 
@@ -1248,6 +1405,37 @@ fn emit_cvtsi2sd_xmm0_rax(code: [i64]) -> [i64] {
 var _locals: [String] = []
 var _local_types: [String] = []
 
+// --- Global variables ---
+var _global_names: [String] = []
+var _global_types: [String] = []
+var _compiling_globals = 0
+
+fn globals_find(name: String) -> i64 {
+    var i = 0
+    while i < len(_global_names) {
+        if _global_names[i] == name {
+            return i
+        }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+fn globals_add(name: String) -> i64 {
+    _global_names = push(_global_names, name)
+    _global_types = push(_global_types, "int")
+    return len(_global_names) - 1
+}
+
+fn GLOBAL_BASE_ADDR() -> i64 {
+    // Fixed address for global variables (in .bss segment)
+    return 6291456
+}
+
+fn globals_addr(idx: i64) -> i64 {
+    return GLOBAL_BASE_ADDR() + idx * 8
+}
+
 fn locals_find(name: String) -> i64 {
     var i = 0
     while i < len(_locals) {
@@ -1282,6 +1470,10 @@ fn locals_get_type(idx: i64) -> String {
     }
     return "int"
 }
+
+// --- Loop label stack for break/continue ---
+var _loop_break_labels: [String] = []
+var _loop_continue_labels: [String] = []
 
 // --- Label/fixup management ---
 var _label_counter = 0
@@ -1529,7 +1721,54 @@ fn expr_is_float(expr: [String]) -> bool {
         return expr_is_float(expr[1])
     }
     if kind == "call" {
+        let fname = expr[1]
+        if fname == "to_string" {
+            return false
+        }
+        if fname == "str_char_at" {
+            return false
+        }
+        if fname == "str_substr" {
+            return false
+        }
         return false
+    }
+    return false
+}
+
+fn expr_is_string(expr: [String]) -> bool {
+    let kind = expr[0]
+    if kind == "string" {
+        return true
+    }
+    if kind == "ident" {
+        let idx = locals_find(expr[1])
+        if idx >= 0 {
+            return locals_get_type(idx) == "string"
+        }
+    }
+    if kind == "+" {
+        if expr_is_string(expr[1]) {
+            return true
+        }
+        if expr_is_string(expr[2]) {
+            return true
+        }
+    }
+    if kind == "call" {
+        let fname = expr[1]
+        if fname == "to_string" {
+            return true
+        }
+        if fname == "str_char_at" {
+            return true
+        }
+        if fname == "str_substr" {
+            return true
+        }
+        if fname == "str_from_bytes" {
+            return true
+        }
     }
     return false
 }
@@ -1557,8 +1796,18 @@ fn compile_expr(code: [i64], expr: [String]) -> [i64] {
             let off = locals_offset(idx)
             code = emit_load_local(code, off, REG_RAX())
         } else {
-            println("codegen error: undefined variable '" + name + "'")
-            code = emit_mov_reg_imm64(code, REG_RAX(), 0)
+            let gidx = globals_find(name)
+            if gidx >= 0 {
+                let addr = globals_addr(gidx)
+                code = emit_mov_reg_imm64(code, REG_RCX(), addr)
+                // mov rax, [rcx]: 48 8B 01
+                code = emit_u8(code, 72)
+                code = emit_u8(code, 139)
+                code = emit_u8(code, 1)
+            } else {
+                println("codegen error: undefined variable '" + name + "'")
+                code = emit_mov_reg_imm64(code, REG_RAX(), 0)
+            }
         }
         return code
     }
@@ -1584,6 +1833,98 @@ fn compile_expr(code: [i64], expr: [String]) -> [i64] {
         return code
     }
 
+    if kind == "not" {
+        code = compile_expr(code, expr[1])
+        // test rax, rax: 48 85 C0
+        code = emit_u8(code, 72)
+        code = emit_u8(code, 133)
+        code = emit_u8(code, 192)
+        // setz al: 0F 94 C0
+        code = emit_u8(code, 15)
+        code = emit_u8(code, 148)
+        code = emit_u8(code, 192)
+        // movzx rax, al: 48 0F B6 C0
+        code = emit_u8(code, 72)
+        code = emit_u8(code, 15)
+        code = emit_u8(code, 182)
+        code = emit_u8(code, 192)
+        return code
+    }
+
+    if kind == "&&" {
+        let false_label = fresh_label("land_false")
+        let end_label = fresh_label("land_end")
+        code = compile_expr(code, expr[1])
+        // test rax, rax
+        code = emit_u8(code, 72)
+        code = emit_u8(code, 133)
+        code = emit_u8(code, 192)
+        // je false_label
+        code = emit_u8(code, 15)
+        code = emit_u8(code, 132)
+        add_fixup(len(code), false_label)
+        code = emit_u32_le(code, 0)
+        code = compile_expr(code, expr[2])
+        // test rax, rax; setne al; movzx rax, al
+        code = emit_u8(code, 72)
+        code = emit_u8(code, 133)
+        code = emit_u8(code, 192)
+        code = emit_u8(code, 15)
+        code = emit_u8(code, 149)
+        code = emit_u8(code, 192)
+        code = emit_u8(code, 72)
+        code = emit_u8(code, 15)
+        code = emit_u8(code, 182)
+        code = emit_u8(code, 192)
+        // jmp end_label
+        code = emit_u8(code, 233)
+        add_fixup(len(code), end_label)
+        code = emit_u32_le(code, 0)
+        // false_label:
+        add_label(false_label, len(code))
+        code = emit_mov_reg_imm64(code, REG_RAX(), 0)
+        // end_label:
+        add_label(end_label, len(code))
+        return code
+    }
+
+    if kind == "||" {
+        let true_label = fresh_label("lor_true")
+        let end_label = fresh_label("lor_end")
+        code = compile_expr(code, expr[1])
+        // test rax, rax
+        code = emit_u8(code, 72)
+        code = emit_u8(code, 133)
+        code = emit_u8(code, 192)
+        // jne true_label
+        code = emit_u8(code, 15)
+        code = emit_u8(code, 133)
+        add_fixup(len(code), true_label)
+        code = emit_u32_le(code, 0)
+        code = compile_expr(code, expr[2])
+        // test rax, rax; setne al; movzx rax, al
+        code = emit_u8(code, 72)
+        code = emit_u8(code, 133)
+        code = emit_u8(code, 192)
+        code = emit_u8(code, 15)
+        code = emit_u8(code, 149)
+        code = emit_u8(code, 192)
+        code = emit_u8(code, 72)
+        code = emit_u8(code, 15)
+        code = emit_u8(code, 182)
+        code = emit_u8(code, 192)
+        // jmp end_label
+        code = emit_u8(code, 233)
+        add_fixup(len(code), end_label)
+        code = emit_u32_le(code, 0)
+        // true_label:
+        add_label(true_label, len(code))
+        code = emit_mov_reg_imm64(code, REG_RAX(), 1)
+        // end_label:
+        add_label(end_label, len(code))
+        return code
+    }
+
     if kind == "+" {
         if expr_is_float(expr) {
             // Float addition using SSE
@@ -1598,6 +1939,18 @@ fn compile_expr(code: [i64], expr: [String]) -> [i64] {
             code = emit_addsd(code)
             // result in xmm0 -> RAX
             code = emit_movq_rax_xmm0(code)
+            return code
+        }
+        if expr_is_string(expr) {
+            // String concatenation: _vx_str_concat(a, b) -> new string ptr
+            code = compile_expr(code, expr[2])
+            code = emit_push_reg(code, REG_RAX())
+            code = compile_expr(code, expr[1])
+            code = emit_mov_reg_reg(code, REG_RDI(), REG_RAX())
+            code = emit_pop_reg(code, REG_RSI())
+            code = emit_u8(code, 232)
+            add_fixup(len(code), "_vx_str_concat")
+            code = emit_u32_le(code, 0)
             return code
         }
         code = compile_expr(code, expr[2])
@@ -1695,6 +2048,29 @@ fn compile_expr(code: [i64], expr: [String]) -> [i64] {
 
     // Comparison operators: result 0 or 1 in RAX
     if kind == "==" {
+        if expr_is_string(expr[1]) {
+            // String equality: call _vx_str_eq(a, b) -> 0 or 1
+            code = compile_expr(code, expr[2])
+            code = emit_push_reg(code, REG_RAX())
+            code = compile_expr(code, expr[1])
+            code = emit_mov_reg_reg(code, REG_RDI(), REG_RAX())
+            code = emit_pop_reg(code, REG_RSI())
+            code = emit_u8(code, 232)
+            add_fixup(len(code), "_vx_str_eq")
+            code = emit_u32_le(code, 0)
+            return code
+        }
+        if expr_is_string(expr[2]) {
+            code = compile_expr(code, expr[2])
+            code = emit_push_reg(code, REG_RAX())
+            code = compile_expr(code, expr[1])
+            code = emit_mov_reg_reg(code, REG_RDI(), REG_RAX())
+            code = emit_pop_reg(code, REG_RSI())
+            code = emit_u8(code, 232)
+            add_fixup(len(code), "_vx_str_eq")
+            code = emit_u32_le(code, 0)
+            return code
+        }
         code = compile_expr(code, expr[2])
         code = emit_push_reg(code, REG_RAX())
         code = compile_expr(code, expr[1])
@@ -1713,6 +2089,39 @@ fn compile_expr(code: [i64], expr: [String]) -> [i64] {
     }
 
     if kind == "!=" {
+        if expr_is_string(expr[1]) {
+            // String inequality: call _vx_str_eq then invert
+            code = compile_expr(code, expr[2])
+            code = emit_push_reg(code, REG_RAX())
+            code = compile_expr(code, expr[1])
+            code = emit_mov_reg_reg(code, REG_RDI(), REG_RAX())
+            code = emit_pop_reg(code, REG_RSI())
+            code = emit_u8(code, 232)
+            add_fixup(len(code), "_vx_str_eq")
+            code = emit_u32_le(code, 0)
+            // xor rax, 1: 48 83 F0 01
+            code = emit_u8(code, 72)
+            code = emit_u8(code, 131)
+            code = emit_u8(code, 240)
+            code = emit_u8(code, 1)
+            return code
+        }
+        if expr_is_string(expr[2]) {
+            code = compile_expr(code, expr[2])
+            code = emit_push_reg(code, REG_RAX())
+            code = compile_expr(code, expr[1])
+            code = emit_mov_reg_reg(code, REG_RDI(), REG_RAX())
+            code = emit_pop_reg(code, REG_RSI())
+            code = emit_u8(code, 232)
+            add_fixup(len(code), "_vx_str_eq")
+            code = emit_u32_le(code, 0)
+            // xor rax, 1
+            code = emit_u8(code, 72)
+            code = emit_u8(code, 131)
+            code = emit_u8(code, 240)
+            code = emit_u8(code, 1)
+            return code
+        }
         code = compile_expr(code, expr[2])
         code = emit_push_reg(code, REG_RAX())
         code = compile_expr(code, expr[1])
@@ -1805,6 +2214,15 @@ fn compile_expr(code: [i64], expr: [String]) -> [i64] {
             code = emit_mov_reg_reg(code, REG_RDI(), REG_RAX())
             code = emit_u8(code, 232)
             add_fixup(len(code), "_vx_print_float")
+            code = emit_u32_le(code, 0)
+            return code
+        }
+        if expr_is_string(inner) {
+            // String println: compile expr, call _vx_println_str
+            code = compile_expr(code, inner)
+            code = emit_mov_reg_reg(code, REG_RDI(), REG_RAX())
+            code = emit_u8(code, 232)
+            add_fixup(len(code), "_vx_println_str")
             code = emit_u32_le(code, 0)
             return code
         }
@@ -1939,6 +2357,75 @@ fn compile_expr(code: [i64], expr: [String]) -> [i64] {
         return code
     }
 
+    if kind == "to_string" {
+        // to_string(int_expr) -> string ptr
+        code = compile_expr(code, expr[1])
+        code = emit_mov_reg_reg(code, REG_RDI(), REG_RAX())
+        code = emit_u8(code, 232)
+        add_fixup(len(code), "_vx_to_string")
+        code = emit_u32_le(code, 0)
+        return code
+    }
+
+    if kind == "int_parse" {
+        // int(string_expr) -> integer
+        code = compile_expr(code, expr[1])
+        code = emit_mov_reg_reg(code, REG_RDI(), REG_RAX())
+        code = emit_u8(code, 232)
+        add_fixup(len(code), "_vx_str_to_int")
+        code = emit_u32_le(code, 0)
+        return code
+    }
+
+    if kind == "str_char_at" {
+        // str_char_at(s, i) -> single-char string
+        code = compile_expr(code, expr[2])  // index -> RAX
+        code = emit_push_reg(code, REG_RAX())
+        code = compile_expr(code, expr[1])  // string -> RAX
+        code = emit_mov_reg_reg(code, REG_RDI(), REG_RAX())
+        code = emit_pop_reg(code, REG_RSI())
+        code = emit_u8(code, 232)
+        add_fixup(len(code), "_vx_str_char_at")
+        code = emit_u32_le(code, 0)
+        return code
+    }
+
+    if kind == "str_substr" {
+        // str_substr(s, start, len) -> substring
+        code = compile_expr(code, expr[3])  // len -> RAX
+        code = emit_push_reg(code, REG_RAX())
+        code = compile_expr(code, expr[2])  // start -> RAX
+        code = emit_push_reg(code, REG_RAX())
+        code = compile_expr(code, expr[1])  // string -> RAX
+        code = emit_mov_reg_reg(code, REG_RDI(), REG_RAX())
+        code = emit_pop_reg(code, REG_RSI())  // start
+        code = emit_pop_reg(code, REG_RDX())  // len
+        code = emit_u8(code, 232)
+        add_fixup(len(code), "_vx_str_substr")
+        code = emit_u32_le(code, 0)
+        return code
+    }
+
+    if kind == "str_bytes" {
+        // str_bytes(s) -> array of byte values
+        code = compile_expr(code, expr[1])
+        code = emit_mov_reg_reg(code, REG_RDI(), REG_RAX())
+        code = emit_u8(code, 232)
+        add_fixup(len(code), "_vx_str_bytes")
+        code = emit_u32_le(code, 0)
+        return code
+    }
+
+    if kind == "str_from_bytes" {
+        // str_from_bytes(arr) -> string
+        code = compile_expr(code, expr[1])
+        code = emit_mov_reg_reg(code, REG_RDI(), REG_RAX())
+        code = emit_u8(code, 232)
+        add_fixup(len(code), "_vx_str_from_bytes")
+        code = emit_u32_le(code, 0)
+        return code
+    }
+
     if kind == "call" {
         let fname = expr[1]
         let argc = len(expr) - 2
@@ -1972,9 +2459,24 @@ fn compile_stmt(code: [i64], stmt: [String]) -> [i64] {
 
     if kind == "let" {
         let name = stmt[1]
+        if _compiling_globals == 1 {
+            let gidx = globals_add(name)
+            code = compile_expr(code, stmt[2])
+            // mov rcx, addr; mov [rcx], rax
+            let addr = globals_addr(gidx)
+            code = emit_mov_reg_imm64(code, REG_RCX(), addr)
+            // mov [rcx], rax: 48 89 01
+            code = emit_u8(code, 72)
+            code = emit_u8(code, 137)
+            code = emit_u8(code, 1)
+            return code
+        }
         let idx = locals_add(name)
         if expr_is_float(stmt[2]) {
             locals_set_type(idx, "float")
+        }
+        if expr_is_string(stmt[2]) {
+            locals_set_type(idx, "string")
         }
         code = compile_expr(code, stmt[2])
         let off = locals_offset(idx)
@@ -1984,9 +2486,24 @@ fn compile_stmt(code: [i64], stmt: [String]) -> [i64] {
 
     if kind == "var" {
         let name = stmt[1]
+        if _compiling_globals == 1 {
+            let gidx = globals_add(name)
+            code = compile_expr(code, stmt[2])
+            // mov rcx, addr; mov [rcx], rax
+            let addr = globals_addr(gidx)
+            code = emit_mov_reg_imm64(code, REG_RCX(), addr)
+            // mov [rcx], rax: 48 89 01
+            code = emit_u8(code, 72)
+            code = emit_u8(code, 137)
+            code = emit_u8(code, 1)
+            return code
+        }
         let idx = locals_add(name)
         if expr_is_float(stmt[2]) {
             locals_set_type(idx, "float")
+        }
+        if expr_is_string(stmt[2]) {
+            locals_set_type(idx, "string")
         }
         code = compile_expr(code, stmt[2])
         let off = locals_offset(idx)
@@ -2002,10 +2519,26 @@ fn compile_stmt(code: [i64], stmt: [String]) -> [i64] {
             if expr_is_float(stmt[2]) {
                 locals_set_type(idx, "float")
             }
+            if expr_is_string(stmt[2]) {
+                locals_set_type(idx, "string")
+            }
             let off = locals_offset(idx)
             code = emit_store_local(code, REG_RAX(), off)
         } else {
-            println("codegen error: undefined variable '" + name + "' in assignment")
+            let gidx = globals_find(name)
+            if gidx >= 0 {
+                let addr = globals_addr(gidx)
+                // save rax, load addr into rcx, store rax to [rcx]
+                code = emit_push_reg(code, REG_RAX())
+                code = emit_mov_reg_imm64(code, REG_RCX(), addr)
+                code = emit_pop_reg(code, REG_RAX())
+                // mov [rcx], rax: 48 89 01
+                code = emit_u8(code, 72)
+                code = emit_u8(code, 137)
+                code = emit_u8(code, 1)
+            } else {
+                println("codegen error: undefined variable '" + name + "' in assignment")
+            }
         }
         return code
     }
@@ -2111,9 +2644,38 @@ fn compile_stmt(code: [i64], stmt: [String]) -> [i64] {
         return code
     }
 
+    if kind == "break" {
+        let nloops = len(_loop_break_labels)
+        if nloops > 0 {
+            let brk_lbl = _loop_break_labels[nloops - 1]
+            code = emit_u8(code, 233)
+            add_fixup(len(code), brk_lbl)
+            code = emit_u32_le(code, 0)
+        } else {
+            println("codegen error: break outside of loop")
+        }
+        return code
+    }
+
+    if kind == "continue" {
+        let nloops = len(_loop_continue_labels)
+        if nloops > 0 {
+            let cont_lbl = _loop_continue_labels[nloops - 1]
+            code = emit_u8(code, 233)
+            add_fixup(len(code), cont_lbl)
+            code = emit_u32_le(code, 0)
+        } else {
+            println("codegen error: continue outside of loop")
+        }
+        return code
+    }
+
     if kind == "while" {
         let loop_label = fresh_label("while")
         let end_label = fresh_label("endwhile")
+        // Push loop labels for break/continue
+        _loop_break_labels = push(_loop_break_labels, end_label)
+        _loop_continue_labels = push(_loop_continue_labels, loop_label)
         // loop_label:
         add_label(loop_label, len(code))
         // Compile condition
@@ -2141,6 +2703,17 @@ fn compile_stmt(code: [i64], stmt: [String]) -> [i64] {
         code = emit_u32_le(code, 0)
         // end_label:
         add_label(end_label, len(code))
+        // Pop loop labels
+        var new_brk: [String] = []
+        var new_cont: [String] = []
+        var li = 0
+        while li < len(_loop_break_labels) - 1 {
+            new_brk = push(new_brk, _loop_break_labels[li])
+            new_cont = push(new_cont, _loop_continue_labels[li])
+            li = li + 1
+        }
+        _loop_break_labels = new_brk
+        _loop_continue_labels = new_cont
         return code
     }
 
@@ -2155,6 +2728,13 @@ fn compile_function(code: [i64], func: [String]) -> [i64] {
     let body = func[3]
 
     register_function(name, len(code))
+
+    // Set globals flag for _vx_init_globals
+    if name == "_vx_init_globals" {
+        _compiling_globals = 1
+    } else {
+        _compiling_globals = 0
+    }
 
     // Reset locals
     _locals = []
@@ -3625,6 +4205,979 @@ fn emit_print_float_v3() -> [i64] {
     return out
 }
 
+// --- Helper: emit inline mmap(size in rdi) -> rax ---
+fn emit_inline_mmap(out: [i64]) -> [i64] {
+    out = push(out, 72)    // mov rsi, rdi
+    out = push(out, 137)
+    out = push(out, 254)
+    out = push(out, 72)    // mov rdi, 0
+    out = push(out, 199)
+    out = push(out, 199)
+    out = push(out, 0)
+    out = push(out, 0)
+    out = push(out, 0)
+    out = push(out, 0)
+    out = push(out, 72)    // mov rax, 9
+    out = push(out, 199)
+    out = push(out, 192)
+    out = push(out, 9)
+    out = push(out, 0)
+    out = push(out, 0)
+    out = push(out, 0)
+    out = push(out, 72)    // mov rdx, 3
+    out = push(out, 199)
+    out = push(out, 194)
+    out = push(out, 3)
+    out = push(out, 0)
+    out = push(out, 0)
+    out = push(out, 0)
+    out = push(out, 73)    // mov r10, 34
+    out = push(out, 199)
+    out = push(out, 194)
+    out = push(out, 34)
+    out = push(out, 0)
+    out = push(out, 0)
+    out = push(out, 0)
+    out = push(out, 73)    // mov r8, -1
+    out = push(out, 199)
+    out = push(out, 192)
+    out = push(out, 255)
+    out = push(out, 255)
+    out = push(out, 255)
+    out = push(out, 255)
+    out = push(out, 73)    // mov r9, 0
+    out = push(out, 199)
+    out = push(out, 193)
+    out = push(out, 0)
+    out = push(out, 0)
+    out = push(out, 0)
+    out = push(out, 0)
+    out = push(out, 15)    // syscall
+    out = push(out, 5)
+    return out
+}
+
+// --- Runtime: _vx_println_str stub ---
+fn emit_println_str_stub() -> [i64] {
+    var out: [i64] = []
+    out = push(out, 85)    // push rbp
+    out = push(out, 72)
+    out = push(out, 137)
+    out = push(out, 229)   // mov rbp, rsp
+    out = push(out, 72)
+    out = push(out, 131)
+    out = push(out, 236)
+    out = push(out, 32)   // sub rsp, 32
+    out = push(out, 72)
+    out = push(out, 137)
+    out = push(out, 125)
+    out = push(out, 248)  // mov [rbp-8], rdi
+    // write(1, rdi+8, [rdi])
+    out = push(out, 72)
+    out = push(out, 141)
+    out = push(out, 119)
+    out = push(out, 8)    // lea rsi, [rdi+8]
+    out = push(out, 72)
+    out = push(out, 139)
+    out = push(out, 23)   // mov rdx, [rdi]
+    out = push(out, 72)
+    out = push(out, 199)
+    out = push(out, 192)
+    out = push(out, 1)
+    out = push(out, 0)
+    out = push(out, 0)
+    out = push(out, 0)    // mov rax, 1
+    out = push(out, 72)
+    out = push(out, 199)
+    out = push(out, 199)
+    out = push(out, 1)
+    out = push(out, 0)
+    out = push(out, 0)
+    out = push(out, 0)    // mov rdi, 1
+    out = push(out, 15)
+    out = push(out, 5)    // syscall
+    // write newline
+    out = push(out, 198)
+    out = push(out, 69)
+    out = push(out, 240)
+    out = push(out, 10)   // mov byte [rbp-16], 10
+    out = push(out, 72)
+    out = push(out, 141)
+    out = push(out, 117)
+    out = push(out, 240)  // lea rsi, [rbp-16]
+    out = push(out, 72)
+    out = push(out, 199)
+    out = push(out, 194)
+    out = push(out, 1)
+    out = push(out, 0)
+    out = push(out, 0)
+    out = push(out, 0)    // mov rdx, 1
+    out = push(out, 72)
+    out = push(out, 199)
+    out = push(out, 192)
+    out = push(out, 1)
+    out = push(out, 0)
+    out = push(out, 0)
+    out = push(out, 0)    // mov rax, 1
+    out = push(out, 72)
+    out = push(out, 199)
+    out = push(out, 199)
+    out = push(out, 1)
+    out = push(out, 0)
+    out = push(out, 0)
+    out = push(out, 0)    // mov rdi, 1
+    out = push(out, 15)
+    out = push(out, 5)    // syscall
+    out = push(out, 72)
+    out = push(out, 137)
+    out = push(out, 236)  // mov rsp, rbp
+    out = push(out, 93)   // pop rbp
+    out = push(out, 195)  // ret
+    return out
+}
+
+// --- Runtime: _vx_str_eq stub ---
+fn emit_str_eq_stub() -> [i64] {
+    var out: [i64] = []
+    out = push(out, 85)    // push rbp
+    out = push(out, 72)
+    out = push(out, 137)
+    out = push(out, 229)   // mov rbp, rsp
+    // len_a = [rdi]
+    out = push(out, 72)
+    out = push(out, 139)
+    out = push(out, 7)    // mov rax, [rdi]
+    // len_b = [rsi]
+    out = push(out, 72)
+    out = push(out, 139)
+    out = push(out, 14)   // mov rcx, [rsi]
+    // cmp rax, rcx
+    out = push(out, 72)
+    out = push(out, 57)
+    out = push(out, 200)
+    // jne .not_equal
+    out = push(out, 117)
+    let jne_patch = len(out)
+    out = push(out, 0)
+    // lengths equal, compare bytes
+    out = push(out, 72)
+    out = push(out, 137)
+    out = push(out, 193)  // mov rcx, rax
+    out = push(out, 72)
+    out = push(out, 131)
+    out = push(out, 199)
+    out = push(out, 8)    // add rdi, 8
+    out = push(out, 72)
+    out = push(out, 131)
+    out = push(out, 198)
+    out = push(out, 8)    // add rsi, 8
+    // test rcx, rcx; jz .equal
+    out = push(out, 72)
+    out = push(out, 133)
+    out = push(out, 201)
+    out = push(out, 116)
+    let jz_eq = len(out)
+    out = push(out, 0)
+    // .loop:
+    let loop_pos = len(out)
+    out = push(out, 138)
+    out = push(out, 7)    // mov al, [rdi]
+    out = push(out, 58)
+    out = push(out, 6)    // cmp al, [rsi]
+    out = push(out, 117)
+    let jne2 = len(out)
+    out = push(out, 0)    // jne .not_equal
+    out = push(out, 72)
+    out = push(out, 255)
+    out = push(out, 199)  // inc rdi
+    out = push(out, 72)
+    out = push(out, 255)
+    out = push(out, 198)  // inc rsi
+    out = push(out, 72)
+    out = push(out, 255)
+    out = push(out, 201)  // dec rcx
+    out = push(out, 117)  // jnz .loop
+    var loop_off = (loop_pos - len(out) - 1) % 256
+    if loop_off < 0 {
+        loop_off = loop_off + 256
+    }
+    out = push(out, loop_off)
+    // .equal:
+    out[jz_eq] = len(out) - jz_eq - 1
+    out = push(out, 72)
+    out = push(out, 199)
+    out = push(out, 192)
+    out = push(out, 1)
+    out = push(out, 0)
+    out = push(out, 0)
+    out = push(out, 0)    // mov rax, 1
+    out = push(out, 235)  // jmp .done
+    let jmp_done = len(out)
+    out = push(out, 0)
+    // .not_equal:
+    let ne_pos = len(out)
+    out[jne_patch] = ne_pos - jne_patch - 1
+    out[jne2] = ne_pos - jne2 - 1
+    out = push(out, 72)
+    out = push(out, 199)
+    out = push(out, 192)
+    out = push(out, 0)
+    out = push(out, 0)
+    out = push(out, 0)
+    out = push(out, 0)    // mov rax, 0
+    // .done:
+    out[jmp_done] = len(out) - jmp_done - 1
+    out = push(out, 93)   // pop rbp
+    out = push(out, 195)  // ret
+    return out
+}
+
+// --- Runtime: _vx_str_concat stub ---
+fn emit_str_concat_stub() -> [i64] {
+    var out: [i64] = []
+    out = push(out, 85)    // push rbp
+    out = push(out, 72)
+    out = push(out, 137)
+    out = push(out, 229)   // mov rbp, rsp
+    out = push(out, 72)
+    out = push(out, 131)
+    out = push(out, 236)
+    out = push(out, 48)   // sub rsp, 48
+    // [rbp-8]=a, [rbp-16]=b
+    out = push(out, 72)
+    out = push(out, 137)
+    out = push(out, 125)
+    out = push(out, 248)
+    out = push(out, 72)
+    out = push(out, 137)
+    out = push(out, 117)
+    out = push(out, 240)
+    // len_a, save [rbp-24]
+    out = push(out, 72)
+    out = push(out, 139)
+    out = push(out, 7)    // mov rax, [rdi]
+    out = push(out, 72)
+    out = push(out, 137)
+    out = push(out, 69)
+    out = push(out, 232)
+    // len_b
+    out = push(out, 72)
+    out = push(out, 139)
+    out = push(out, 14)   // mov rcx, [rsi]
+    // new_len = rax + rcx
+    out = push(out, 72)
+    out = push(out, 1)
+    out = push(out, 200)  // add rax, rcx
+    // save [rbp-32]
+    out = push(out, 72)
+    out = push(out, 137)
+    out = push(out, 69)
+    out = push(out, 224)
+    // alloc new_len + 8
+    out = push(out, 72)
+    out = push(out, 131)
+    out = push(out, 192)
+    out = push(out, 8)
+    out = push(out, 72)
+    out = push(out, 137)
+    out = push(out, 199)  // mov rdi, rax
+    out = emit_inline_mmap(out)
+    // save [rbp-40]
+    out = push(out, 72)
+    out = push(out, 137)
+    out = push(out, 69)
+    out = push(out, 216)
+    // store new_len
+    out = push(out, 72)
+    out = push(out, 139)
+    out = push(out, 77)
+    out = push(out, 224)  // mov rcx, [rbp-32]
+    out = push(out, 72)
+    out = push(out, 137)
+    out = push(out, 8)    // mov [rax], rcx
+    // copy a: dst=rax+8, src=[rbp-8]+8, count=[rbp-24]
+    out = push(out, 72)
+    out = push(out, 141)
+    out = push(out, 120)
+    out = push(out, 8)    // lea rdi, [rax+8]
+    out = push(out, 72)
+    out = push(out, 139)
+    out = push(out, 117)
+    out = push(out, 248)  // mov rsi, [rbp-8]
+    out = push(out, 72)
+    out = push(out, 131)
+    out = push(out, 198)
+    out = push(out, 8)    // add rsi, 8
+    out = push(out, 72)
+    out = push(out, 139)
+    out = push(out, 77)
+    out = push(out, 232)  // mov rcx, [rbp-24]
+    out = push(out, 243)
+    out = push(out, 164)  // rep movsb
+    // copy b: src=[rbp-16]+8, count=new_len-len_a
+    out = push(out, 72)
+    out = push(out, 139)
+    out = push(out, 117)
+    out = push(out, 240)  // mov rsi, [rbp-16]
+    out = push(out, 72)
+    out = push(out, 131)
+    out = push(out, 198)
+    out = push(out, 8)    // add rsi, 8
+    out = push(out, 72)
+    out = push(out, 139)
+    out = push(out, 77)
+    out = push(out, 224)  // mov rcx, [rbp-32]
+    out = push(out, 72)
+    out = push(out, 43)
+    out = push(out, 77)
+    out = push(out, 232)  // sub rcx, [rbp-24]
+    out = push(out, 243)
+    out = push(out, 164)  // rep movsb
+    // return
+    out = push(out, 72)
+    out = push(out, 139)
+    out = push(out, 69)
+    out = push(out, 216)
+    out = push(out, 72)
+    out = push(out, 137)
+    out = push(out, 236)
+    out = push(out, 93)
+    out = push(out, 195)
+    return out
+}
+
+// --- Runtime: _vx_to_string stub ---
+fn emit_to_string_stub() -> [i64] {
+    var out: [i64] = []
+    out = push(out, 85)    // push rbp
+    out = push(out, 72)
+    out = push(out, 137)
+    out = push(out, 229)   // mov rbp, rsp
+    out = push(out, 72)
+    out = push(out, 131)
+    out = push(out, 236)
+    out = push(out, 48)   // sub rsp, 48
+    // save input [rbp-8]
+    out = push(out, 72)
+    out = push(out, 137)
+    out = push(out, 125)
+    out = push(out, 248)
+    // alloc 32 bytes
+    out = push(out, 72)
+    out = push(out, 199)
+    out = push(out, 199)
+    out = push(out, 32)
+    out = push(out, 0)
+    out = push(out, 0)
+    out = push(out, 0)
+    out = emit_inline_mmap(out)
+    // save buf [rbp-16]
+    out = push(out, 72)
+    out = push(out, 137)
+    out = push(out, 69)
+    out = push(out, 240)
+    // r8 = value
+    out = push(out, 72)
+    out = push(out, 139)
+    out = push(out, 69)
+    out = push(out, 248)  // mov rax, [rbp-8]
+    out = push(out, 73)
+    out = push(out, 137)
+    out = push(out, 192)  // mov r8, rax
+    // r9 = 0 (neg flag)
+    out = push(out, 77)
+    out = push(out, 49)
+    out = push(out, 201)
+    // test r8, r8; jns .pos
+    out = push(out, 77)
+    out = push(out, 133)
+    out = push(out, 192)
+    out = push(out, 121)
+    let jns_p = len(out)
+    out = push(out, 0)
+    // neg r8; r9=1
+    out = push(out, 73)
+    out = push(out, 247)
+    out = push(out, 216)
+    out = push(out, 73)
+    out = push(out, 199)
+    out = push(out, 193)
+    out = push(out, 1)
+    out = push(out, 0)
+    out = push(out, 0)
+    out = push(out, 0)
+    out[jns_p] = len(out) - jns_p - 1
+    // r10 = 0 (digit count)
+    out = push(out, 77)
+    out = push(out, 49)
+    out = push(out, 210)
+    // test r8; jnz .convert
+    out = push(out, 77)
+    out = push(out, 133)
+    out = push(out, 192)
+    out = push(out, 117)
+    let jnz_p = len(out)
+    out = push(out, 0)
+    // push '0', inc r10, jmp .write
+    out = push(out, 106)
+    out = push(out, 48)
+    out = push(out, 73)
+    out = push(out, 255)
+    out = push(out, 194)
+    out = push(out, 235)
+    let jmp_w = len(out)
+    out = push(out, 0)
+    // .convert:
+    let cvt = len(out)
+    out[jnz_p] = cvt - jnz_p - 1
+    out = push(out, 76)
+    out = push(out, 137)
+    out = push(out, 192)  // mov rax, r8
+    out = push(out, 72)
+    out = push(out, 49)
+    out = push(out, 210)  // xor rdx, rdx
+    out = push(out, 72)
+    out = push(out, 199)
+    out = push(out, 193)
+    out = push(out, 10)
+    out = push(out, 0)
+    out = push(out, 0)
+    out = push(out, 0)    // mov rcx, 10
+    out = push(out, 72)
+    out = push(out, 247)
+    out = push(out, 241)  // div rcx
+    out = push(out, 72)
+    out = push(out, 131)
+    out = push(out, 194)
+    out = push(out, 48)   // add rdx, 48
+    out = push(out, 82)   // push rdx
+    out = push(out, 73)
+    out = push(out, 255)
+    out = push(out, 194)  // inc r10
+    out = push(out, 73)
+    out = push(out, 137)
+    out = push(out, 192)  // mov r8, rax
+    out = push(out, 77)
+    out = push(out, 133)
+    out = push(out, 192)  // test r8, r8
+    var cd = (cvt - len(out) - 2) % 256
+    if cd < 0 {
+        cd = cd + 256
+    }
+    out = push(out, 117)
+    out = push(out, cd)
+    // .write:
+    out[jmp_w] = len(out) - jmp_w - 1
+    // total len = r10 + r9
+    out = push(out, 76)
+    out = push(out, 137)
+    out = push(out, 209)  // mov rcx, r10
+    out = push(out, 76)
+    out = push(out, 1)
+    out = push(out, 201)  // add rcx, r9
+    // store at [buf]
+    out = push(out, 72)
+    out = push(out, 139)
+    out = push(out, 69)
+    out = push(out, 240)  // mov rax, [rbp-16]
+    out = push(out, 72)
+    out = push(out, 137)
+    out = push(out, 8)    // mov [rax], rcx
+    out = push(out, 72)
+    out = push(out, 141)
+    out = push(out, 120)
+    out = push(out, 8)    // lea rdi, [rax+8]
+    // if neg, write '-'
+    out = push(out, 77)
+    out = push(out, 133)
+    out = push(out, 201)
+    out = push(out, 116)
+    let jz_s = len(out)
+    out = push(out, 0)
+    out = push(out, 198)
+    out = push(out, 7)
+    out = push(out, 45)   // mov byte [rdi], '-'
+    out = push(out, 72)
+    out = push(out, 255)
+    out = push(out, 199)  // inc rdi
+    out[jz_s] = len(out) - jz_s - 1
+    // pop digits
+    let pl = len(out)
+    out = push(out, 77)
+    out = push(out, 133)
+    out = push(out, 210)  // test r10, r10
+    out = push(out, 116)
+    let jz_e = len(out)
+    out = push(out, 0)
+    out = push(out, 88)   // pop rax
+    out = push(out, 136)
+    out = push(out, 7)    // mov [rdi], al
+    out = push(out, 72)
+    out = push(out, 255)
+    out = push(out, 199)  // inc rdi
+    out = push(out, 73)
+    out = push(out, 255)
+    out = push(out, 202)  // dec r10
+    var pd = (pl - len(out) - 2) % 256
+    if pd < 0 {
+        pd = pd + 256
+    }
+    out = push(out, 235)
+    out = push(out, pd)
+    out[jz_e] = len(out) - jz_e - 1
+    // return buf
+    out = push(out, 72)
+    out = push(out, 139)
+    out = push(out, 69)
+    out = push(out, 240)
+    out = push(out, 72)
+    out = push(out, 137)
+    out = push(out, 236)
+    out = push(out, 93)
+    out = push(out, 195)
+    return out
+}
+
+// --- Runtime: _vx_str_to_int stub ---
+fn emit_str_to_int_stub() -> [i64] {
+    var out: [i64] = []
+    out = push(out, 85)    // push rbp
+    out = push(out, 72)
+    out = push(out, 137)
+    out = push(out, 229)   // mov rbp, rsp
+    // rcx = [rdi] = len
+    out = push(out, 72)
+    out = push(out, 139)
+    out = push(out, 15)
+    // rsi = rdi + 8
+    out = push(out, 72)
+    out = push(out, 141)
+    out = push(out, 119)
+    out = push(out, 8)
+    // rax = 0
+    out = push(out, 72)
+    out = push(out, 49)
+    out = push(out, 192)
+    // r8 = 0 (neg)
+    out = push(out, 77)
+    out = push(out, 49)
+    out = push(out, 192)
+    // test rcx; jz .done
+    out = push(out, 72)
+    out = push(out, 133)
+    out = push(out, 201)
+    out = push(out, 116)
+    let jz_d = len(out)
+    out = push(out, 0)
+    // check '-'
+    out = push(out, 138)
+    out = push(out, 22)   // mov dl, [rsi]
+    out = push(out, 128)
+    out = push(out, 250)
+    out = push(out, 45)   // cmp dl, 45
+    out = push(out, 117)
+    let jne_l = len(out)
+    out = push(out, 0)
+    // neg flag
+    out = push(out, 73)
+    out = push(out, 199)
+    out = push(out, 192)
+    out = push(out, 1)
+    out = push(out, 0)
+    out = push(out, 0)
+    out = push(out, 0)
+    out = push(out, 72)
+    out = push(out, 255)
+    out = push(out, 198)  // inc rsi
+    out = push(out, 72)
+    out = push(out, 255)
+    out = push(out, 201)  // dec rcx
+    // .parse:
+    let pl2 = len(out)
+    out[jne_l] = pl2 - jne_l - 1
+    out = push(out, 72)
+    out = push(out, 133)
+    out = push(out, 201)
+    out = push(out, 116)
+    let jz_n = len(out)
+    out = push(out, 0)
+    out = push(out, 72)
+    out = push(out, 107)
+    out = push(out, 192)
+    out = push(out, 10)   // imul rax, 10
+    out = push(out, 72)
+    out = push(out, 15)
+    out = push(out, 182)
+    out = push(out, 22)   // movzx rdx, byte [rsi]
+    out = push(out, 72)
+    out = push(out, 131)
+    out = push(out, 234)
+    out = push(out, 48)   // sub rdx, 48
+    out = push(out, 72)
+    out = push(out, 1)
+    out = push(out, 208)  // add rax, rdx
+    out = push(out, 72)
+    out = push(out, 255)
+    out = push(out, 198)  // inc rsi
+    out = push(out, 72)
+    out = push(out, 255)
+    out = push(out, 201)  // dec rcx
+    var ld = (pl2 - len(out) - 2) % 256
+    if ld < 0 {
+        ld = ld + 256
+    }
+    out = push(out, 235)
+    out = push(out, ld)
+    // .negate:
+    out[jz_n] = len(out) - jz_n - 1
+    out = push(out, 77)
+    out = push(out, 133)
+    out = push(out, 192)
+    out = push(out, 116)
+    let jz_d2 = len(out)
+    out = push(out, 0)
+    out = push(out, 72)
+    out = push(out, 247)
+    out = push(out, 216)  // neg rax
+    let done_pos = len(out)
+    out[jz_d] = done_pos - jz_d - 1
+    out[jz_d2] = done_pos - jz_d2 - 1
+    out = push(out, 93)
+    out = push(out, 195)
+    return out
+}
+
+// --- Runtime: _vx_str_char_at stub ---
+fn emit_str_char_at_stub() -> [i64] {
+    var out: [i64] = []
+    out = push(out, 85)
+    out = push(out, 72)
+    out = push(out, 137)
+    out = push(out, 229)
+    out = push(out, 72)
+    out = push(out, 131)
+    out = push(out, 236)
+    out = push(out, 32)
+    // save [rbp-8]=str, [rbp-16]=idx
+    out = push(out, 72)
+    out = push(out, 137)
+    out = push(out, 125)
+    out = push(out, 248)
+    out = push(out, 72)
+    out = push(out, 137)
+    out = push(out, 117)
+    out = push(out, 240)
+    // load byte: add rsi, 8; movzx r8, byte [rdi+rsi]
+    out = push(out, 72)
+    out = push(out, 131)
+    out = push(out, 198)
+    out = push(out, 8)
+    out = push(out, 76)
+    out = push(out, 15)
+    out = push(out, 182)
+    out = push(out, 4)
+    out = push(out, 55)   // movzx r8, byte [rdi+rsi]
+    // alloc 9 bytes
+    out = push(out, 72)
+    out = push(out, 199)
+    out = push(out, 199)
+    out = push(out, 9)
+    out = push(out, 0)
+    out = push(out, 0)
+    out = push(out, 0)
+    out = emit_inline_mmap(out)
+    // store len=1
+    out = push(out, 72)
+    out = push(out, 199)
+    out = push(out, 0)
+    out = push(out, 1)
+    out = push(out, 0)
+    out = push(out, 0)
+    out = push(out, 0)
+    // store byte
+    out = push(out, 68)
+    out = push(out, 136)
+    out = push(out, 64)
+    out = push(out, 8)    // mov [rax+8], r8b
+    out = push(out, 72)
+    out = push(out, 137)
+    out = push(out, 236)
+    out = push(out, 93)
+    out = push(out, 195)
+    return out
+}
+
+// --- Runtime: _vx_str_substr stub ---
+fn emit_str_substr_stub() -> [i64] {
+    var out: [i64] = []
+    out = push(out, 85)
+    out = push(out, 72)
+    out = push(out, 137)
+    out = push(out, 229)
+    out = push(out, 72)
+    out = push(out, 131)
+    out = push(out, 236)
+    out = push(out, 48)
+    // [rbp-8]=str, [rbp-16]=start, [rbp-24]=sublen
+    out = push(out, 72)
+    out = push(out, 137)
+    out = push(out, 125)
+    out = push(out, 248)
+    out = push(out, 72)
+    out = push(out, 137)
+    out = push(out, 117)
+    out = push(out, 240)
+    out = push(out, 72)
+    out = push(out, 137)
+    out = push(out, 85)
+    out = push(out, 232)
+    // alloc rdx + 8
+    out = push(out, 72)
+    out = push(out, 141)
+    out = push(out, 122)
+    out = push(out, 8)    // lea rdi, [rdx+8]
+    out = emit_inline_mmap(out)
+    out = push(out, 72)
+    out = push(out, 137)
+    out = push(out, 69)
+    out = push(out, 224)  // save [rbp-32]
+    // store sublen
+    out = push(out, 72)
+    out = push(out, 139)
+    out = push(out, 77)
+    out = push(out, 232)
+    out = push(out, 72)
+    out = push(out, 137)
+    out = push(out, 8)    // mov [rax], rcx
+    // copy
+    out = push(out, 72)
+    out = push(out, 141)
+    out = push(out, 120)
+    out = push(out, 8)    // lea rdi, [rax+8]
+    out = push(out, 72)
+    out = push(out, 139)
+    out = push(out, 117)
+    out = push(out, 248)  // mov rsi, [rbp-8]
+    out = push(out, 72)
+    out = push(out, 131)
+    out = push(out, 198)
+    out = push(out, 8)    // add rsi, 8
+    out = push(out, 72)
+    out = push(out, 3)
+    out = push(out, 117)
+    out = push(out, 240)  // add rsi, [rbp-16]
+    out = push(out, 243)
+    out = push(out, 164)  // rep movsb
+    out = push(out, 72)
+    out = push(out, 139)
+    out = push(out, 69)
+    out = push(out, 224)
+    out = push(out, 72)
+    out = push(out, 137)
+    out = push(out, 236)
+    out = push(out, 93)
+    out = push(out, 195)
+    return out
+}
+
+// --- Runtime: _vx_str_bytes stub ---
+fn emit_str_bytes_stub() -> [i64] {
+    var out: [i64] = []
+    out = push(out, 85)
+    out = push(out, 72)
+    out = push(out, 137)
+    out = push(out, 229)
+    out = push(out, 72)
+    out = push(out, 131)
+    out = push(out, 236)
+    out = push(out, 32)
+    out = push(out, 72)
+    out = push(out, 137)
+    out = push(out, 125)
+    out = push(out, 248)  // [rbp-8]=str
+    // len
+    out = push(out, 72)
+    out = push(out, 139)
+    out = push(out, 15)
+    out = push(out, 72)
+    out = push(out, 137)
+    out = push(out, 77)
+    out = push(out, 240)  // [rbp-16]=len
+    // alloc (len+1)*8
+    out = push(out, 72)
+    out = push(out, 131)
+    out = push(out, 193)
+    out = push(out, 1)
+    out = push(out, 72)
+    out = push(out, 193)
+    out = push(out, 225)
+    out = push(out, 3)
+    out = push(out, 72)
+    out = push(out, 137)
+    out = push(out, 207)
+    out = emit_inline_mmap(out)
+    out = push(out, 72)
+    out = push(out, 137)
+    out = push(out, 69)
+    out = push(out, 232)  // [rbp-24]=arr
+    // store len
+    out = push(out, 72)
+    out = push(out, 139)
+    out = push(out, 77)
+    out = push(out, 240)
+    out = push(out, 72)
+    out = push(out, 137)
+    out = push(out, 8)
+    // rsi=str+8, rdi=arr+8
+    out = push(out, 72)
+    out = push(out, 139)
+    out = push(out, 117)
+    out = push(out, 248)
+    out = push(out, 72)
+    out = push(out, 131)
+    out = push(out, 198)
+    out = push(out, 8)
+    out = push(out, 72)
+    out = push(out, 141)
+    out = push(out, 120)
+    out = push(out, 8)
+    out = push(out, 72)
+    out = push(out, 133)
+    out = push(out, 201)
+    out = push(out, 116)
+    let jz_d3 = len(out)
+    out = push(out, 0)
+    let lp3 = len(out)
+    out = push(out, 72)
+    out = push(out, 15)
+    out = push(out, 182)
+    out = push(out, 6)    // movzx rax, byte [rsi]
+    out = push(out, 72)
+    out = push(out, 137)
+    out = push(out, 7)    // mov [rdi], rax
+    out = push(out, 72)
+    out = push(out, 131)
+    out = push(out, 199)
+    out = push(out, 8)
+    out = push(out, 72)
+    out = push(out, 255)
+    out = push(out, 198)
+    out = push(out, 72)
+    out = push(out, 255)
+    out = push(out, 201)
+    var ld3 = (lp3 - len(out) - 2) % 256
+    if ld3 < 0 {
+        ld3 = ld3 + 256
+    }
+    out = push(out, 117)
+    out = push(out, ld3)
+    out[jz_d3] = len(out) - jz_d3 - 1
+    out = push(out, 72)
+    out = push(out, 139)
+    out = push(out, 69)
+    out = push(out, 232)
+    out = push(out, 72)
+    out = push(out, 137)
+    out = push(out, 236)
+    out = push(out, 93)
+    out = push(out, 195)
+    return out
+}
+
+// --- Runtime: _vx_str_from_bytes stub ---
+fn emit_str_from_bytes_stub() -> [i64] {
+    var out: [i64] = []
+    out = push(out, 85)
+    out = push(out, 72)
+    out = push(out, 137)
+    out = push(out, 229)
+    out = push(out, 72)
+    out = push(out, 131)
+    out = push(out, 236)
+    out = push(out, 32)
+    out = push(out, 72)
+    out = push(out, 137)
+    out = push(out, 125)
+    out = push(out, 248)  // [rbp-8]=arr
+    out = push(out, 72)
+    out = push(out, 139)
+    out = push(out, 15)
+    out = push(out, 72)
+    out = push(out, 137)
+    out = push(out, 77)
+    out = push(out, 240)  // [rbp-16]=len
+    // alloc len + 8
+    out = push(out, 72)
+    out = push(out, 141)
+    out = push(out, 121)
+    out = push(out, 8)
+    out = emit_inline_mmap(out)
+    out = push(out, 72)
+    out = push(out, 137)
+    out = push(out, 69)
+    out = push(out, 232)  // [rbp-24]=result
+    // store len
+    out = push(out, 72)
+    out = push(out, 139)
+    out = push(out, 77)
+    out = push(out, 240)
+    out = push(out, 72)
+    out = push(out, 137)
+    out = push(out, 8)
+    // rsi=arr+8, rdi=result+8
+    out = push(out, 72)
+    out = push(out, 139)
+    out = push(out, 117)
+    out = push(out, 248)
+    out = push(out, 72)
+    out = push(out, 131)
+    out = push(out, 198)
+    out = push(out, 8)
+    out = push(out, 72)
+    out = push(out, 141)
+    out = push(out, 120)
+    out = push(out, 8)
+    out = push(out, 72)
+    out = push(out, 133)
+    out = push(out, 201)
+    out = push(out, 116)
+    let jz_d4 = len(out)
+    out = push(out, 0)
+    let lp4 = len(out)
+    out = push(out, 72)
+    out = push(out, 139)
+    out = push(out, 6)    // mov rax, [rsi]
+    out = push(out, 136)
+    out = push(out, 7)    // mov [rdi], al
+    out = push(out, 72)
+    out = push(out, 131)
+    out = push(out, 198)
+    out = push(out, 8)
+    out = push(out, 72)
+    out = push(out, 255)
+    out = push(out, 199)
+    out = push(out, 72)
+    out = push(out, 255)
+    out = push(out, 201)
+    var ld4 = (lp4 - len(out) - 2) % 256
+    if ld4 < 0 {
+        ld4 = ld4 + 256
+    }
+    out = push(out, 117)
+    out = push(out, ld4)
+    out[jz_d4] = len(out) - jz_d4 - 1
+    out = push(out, 72)
+    out = push(out, 139)
+    out = push(out, 69)
+    out = push(out, 232)
+    out = push(out, 72)
+    out = push(out, 137)
+    out = push(out, 236)
+    out = push(out, 93)
+    out = push(out, 195)
+    return out
+}
+
 // --- Program compiler ---
 fn compile_program(fns: [String]) -> [i64] {
     var code: [i64] = []
@@ -3640,12 +5193,21 @@ fn compile_program(fns: [String]) -> [i64] {
     _string_data = []
     _string_offsets = []
     _string_lengths = []
+    _loop_break_labels = []
+    _loop_continue_labels = []
+    _global_names = []
+    _global_types = []
+    _compiling_globals = 0
 
     // First: emit _start that calls main then does exit(rax)
     // We'll register it and emit it first, then compile user functions
 
-    // _start stub: call main, mov rdi rax, mov rax 60, syscall
+    // _start stub: call _vx_init_globals, call main, mov rdi rax, mov rax 60, syscall
     register_function("_start", 0)
+    // call _vx_init_globals
+    code = emit_u8(code, 232)
+    add_fixup(len(code), "_vx_init_globals")
+    code = emit_u32_le(code, 0)
     // call main (will be fixed up)
     code = emit_u8(code, 232)
     add_fixup(len(code), "main")
@@ -3700,6 +5262,87 @@ fn compile_program(fns: [String]) -> [i64] {
     while pfi < len(print_float_code) {
         code = push(code, print_float_code[pfi])
         pfi = pfi + 1
+    }
+
+    // Emit _vx_println_str runtime stub
+    let println_str_code = emit_println_str_stub()
+    register_function("_vx_println_str", len(code))
+    var plsi = 0
+    while plsi < len(println_str_code) {
+        code = push(code, println_str_code[plsi])
+        plsi = plsi + 1
+    }
+
+    // Emit _vx_str_eq runtime stub
+    let str_eq_code = emit_str_eq_stub()
+    register_function("_vx_str_eq", len(code))
+    var sei = 0
+    while sei < len(str_eq_code) {
+        code = push(code, str_eq_code[sei])
+        sei = sei + 1
+    }
+
+    // Emit _vx_str_concat runtime stub
+    let str_concat_code = emit_str_concat_stub()
+    register_function("_vx_str_concat", len(code))
+    var sci = 0
+    while sci < len(str_concat_code) {
+        code = push(code, str_concat_code[sci])
+        sci = sci + 1
+    }
+
+    // Emit _vx_to_string runtime stub
+    let to_string_code = emit_to_string_stub()
+    register_function("_vx_to_string", len(code))
+    var tsi = 0
+    while tsi < len(to_string_code) {
+        code = push(code, to_string_code[tsi])
+        tsi = tsi + 1
+    }
+
+    // Emit _vx_str_to_int runtime stub
+    let str_to_int_code = emit_str_to_int_stub()
+    register_function("_vx_str_to_int", len(code))
+    var stii = 0
+    while stii < len(str_to_int_code) {
+        code = push(code, str_to_int_code[stii])
+        stii = stii + 1
+    }
+
+    // Emit _vx_str_char_at runtime stub
+    let str_char_at_code = emit_str_char_at_stub()
+    register_function("_vx_str_char_at", len(code))
+    var scai = 0
+    while scai < len(str_char_at_code) {
+        code = push(code, str_char_at_code[scai])
+        scai = scai + 1
+    }
+
+    // Emit _vx_str_substr runtime stub
+    let str_substr_code = emit_str_substr_stub()
+    register_function("_vx_str_substr", len(code))
+    var ssi = 0
+    while ssi < len(str_substr_code) {
+        code = push(code, str_substr_code[ssi])
+        ssi = ssi + 1
+    }
+
+    // Emit _vx_str_bytes runtime stub
+    let str_bytes_code = emit_str_bytes_stub()
+    register_function("_vx_str_bytes", len(code))
+    var sbi = 0
+    while sbi < len(str_bytes_code) {
+        code = push(code, str_bytes_code[sbi])
+        sbi = sbi + 1
+    }
+
+    // Emit _vx_str_from_bytes runtime stub
+    let str_from_bytes_code = emit_str_from_bytes_stub()
+    register_function("_vx_str_from_bytes", len(code))
+    var sfbi = 0
+    while sfbi < len(str_from_bytes_code) {
+        code = push(code, str_from_bytes_code[sfbi])
+        sfbi = sfbi + 1
     }
 
     // Compile user functions
@@ -3780,7 +5423,14 @@ fn compile_program(fns: [String]) -> [i64] {
 
 fn make_elf(code: [i64]) -> [i64] {
     let code_len = len(code)
-    let header_size = 120
+    let num_globals = len(_global_names)
+    let bss_size = num_globals * 8
+    // 2 program headers if globals exist, 1 otherwise
+    var phnum = 1
+    if num_globals > 0 {
+        phnum = 2
+    }
+    let header_size = 64 + phnum * 56
     let total_size = header_size + code_len
     let base_addr = 4194304
     let entry = base_addr + header_size
@@ -3822,8 +5472,8 @@ fn make_elf(code: [i64]) -> [i64] {
     buf = emit_u16_le(buf, 64)
     // e_phentsize = 56
     buf = emit_u16_le(buf, 56)
-    // e_phnum = 1
-    buf = emit_u16_le(buf, 1)
+    // e_phnum
+    buf = emit_u16_le(buf, phnum)
     // e_shentsize = 0
     buf = emit_u16_le(buf, 0)
     // e_shnum = 0
@@ -3831,7 +5481,7 @@ fn make_elf(code: [i64]) -> [i64] {
     // e_shstrndx = 0
     buf = emit_u16_le(buf, 0)
 
-    // === Program Header (56 bytes) ===
+    // === Program Header 1: code (56 bytes) ===
     // p_type = PT_LOAD (1)
     buf = emit_u32_le(buf, 1)
     // p_flags = PF_R | PF_W | PF_X (7)
@@ -3848,6 +5498,28 @@ fn make_elf(code: [i64]) -> [i64] {
     buf = emit_u64_le(buf, total_size)
     // p_align = 0x1000
     buf = emit_u64_le(buf, 4096)
+
+    // === Program Header 2: .bss for globals (56 bytes) ===
+    if num_globals > 0 {
+        let glob_base = GLOBAL_BASE_ADDR()
+        let glob_memsz = bss_size + 4096
+        // p_type = PT_LOAD (1)
+        buf = emit_u32_le(buf, 1)
+        // p_flags = PF_R | PF_W (6)
+        buf = emit_u32_le(buf, 6)
+        // p_offset = 0
+        buf = emit_u64_le(buf, 0)
+        // p_vaddr = glob_base
+        buf = emit_u64_le(buf, glob_base)
+        // p_paddr = glob_base
+        buf = emit_u64_le(buf, glob_base)
+        // p_filesz = 0 (bss, no file content)
+        buf = emit_u64_le(buf, 0)
+        // p_memsz = glob_memsz
+        buf = emit_u64_le(buf, glob_memsz)
+        // p_align = 0x1000
+        buf = emit_u64_le(buf, 4096)
+    }
 
     // === Append code ===
     var ci = 0
