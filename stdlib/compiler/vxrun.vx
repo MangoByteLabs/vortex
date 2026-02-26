@@ -186,17 +186,34 @@ fn vb_arr(f: String) -> bool {
 }
 fn t_make(shape: String, val: f64) -> String { let id=arr_new() var i=0 let sz=shape_size(shape) while i<sz{arr_push(id,mf(val)) i=i+1} return mt(id,shape) }
 fn t_shape_from_arr(av: String) -> String { let aid=varr_id(av) let n=arr_len(aid) var s="" var i=0 while i<n{if i>0{s=s+","} s=s+vs(arr_get(aid,i)) i=i+1} return s }
+// Autodiff tape
+var _tape_ops: [String] = [] var _tape_args: [String] = [] var _tape_len = 0
+var _grads: [String] = [] var _grad_keys: [String] = [] var _grad_active = false
+fn grad_set(tid: String, v: String) { var i=0 while i<len(_grad_keys){if _grad_keys[i]==tid{_grads[i]=v return} i=i+1} _grad_keys=push(_grad_keys,tid) _grads=push(_grads,v) }
+fn grad_get(tid: String) -> String { var i=0 while i<len(_grad_keys){if _grad_keys[i]==tid{return _grads[i]} i=i+1} return "" }
+fn tape_rec(op: String, args: String) { _tape_ops=push(_tape_ops,op) _tape_args=push(_tape_args,args) _tape_len=_tape_len+1 }
+fn t_add_data(aid: i64, bid: i64, sh: String) -> String { let id=arr_new() let sz=shape_size(sh) var i=0 while i<sz{arr_push(id,mf(vf(arr_get(aid,i))+vf(arr_get(bid,i)))) i=i+1} return mt(id,sh) }
+fn t_mul_data(aid: i64, bid: i64, sh: String) -> String { let id=arr_new() let sz=shape_size(sh) var i=0 while i<sz{arr_push(id,mf(vf(arr_get(aid,i))*vf(arr_get(bid,i)))) i=i+1} return mt(id,sh) }
+fn t_matmul_data(a: String, b: String) -> String { let ash=tensor_shape_str(a) let bsh=tensor_shape_str(b) let m=shape_dim(ash,0) let k=shape_dim(ash,1) let n=shape_dim(bsh,1) let aid=tensor_id(a) let bid=tensor_id(b) let id=arr_new() var i=0 while i<m{var j=0 while j<n{var s=0.0 var p=0 while p<k{s=s+vf(arr_get(aid,i*k+p))*vf(arr_get(bid,p*n+j)) p=p+1} arr_push(id,mf(s)) j=j+1} i=i+1} return mt(id,to_string(m)+","+to_string(n)) }
+fn t_scale(t: String, s: f64) -> String { let id=arr_new() let tid=tensor_id(t) let sh=tensor_shape_str(t) let sz=shape_size(sh) var i=0 while i<sz{arr_push(id,mf(vf(arr_get(tid,i))*s)) i=i+1} return mt(id,sh) }
+fn t_transpose(t: String) -> String { let sh=tensor_shape_str(t) let r=shape_dim(sh,0) let c=shape_dim(sh,1) let tid=tensor_id(t) let id=arr_new() var j=0 while j<c{var i=0 while i<r{arr_push(id,arr_get(tid,i*c+j)) i=i+1} j=j+1} return mt(id,to_string(c)+","+to_string(r)) }
+fn t_ones(sh: String) -> String { return t_make(sh,1.0) }
+fn grad_acc(tid: String, g: String) { let cur=grad_get(tid) if cur==""{grad_set(tid,g)}else{grad_set(tid,t_add_data(tensor_id(cur),tensor_id(g),tensor_shape_str(g)))} }
 fn vb_tensor(f: String) -> bool {
     if f=="tensor"{let av=vpop() let sh=t_shape_from_arr(av) vpush(t_make(sh,0.0)) return true}
     if f=="tensor_fill"{let val=vf(vpop()) let av=vpop() let sh=t_shape_from_arr(av) vpush(t_make(sh,val)) return true}
     if f=="tensor_get"{let iv=vpop() let t=vpop() let id=tensor_id(t) let sh=tensor_shape_str(t) let iid=varr_id(iv) let nd=shape_ndims(sh) var flat=0 var mult=1 var d=nd-1 while d>=0{flat=flat+vi(arr_get(iid,d))*mult mult=mult*shape_dim(sh,d) d=d-1} vpush(arr_get(id,flat)) return true}
     if f=="tensor_set"{let val=vpop() let iv=vpop() let t=vpop() let id=tensor_id(t) let sh=tensor_shape_str(t) let iid=varr_id(iv) let nd=shape_ndims(sh) var flat=0 var mult=1 var d=nd-1 while d>=0{flat=flat+vi(arr_get(iid,d))*mult mult=mult*shape_dim(sh,d) d=d-1} let nid=arr_clone(id) arr_set(nid,flat,val) vpush(mt(nid,sh)) return true}
     if f=="tensor_shape"{let t=vpop() let sh=tensor_shape_str(t) let id=arr_new() var cur="" var p=0 let sb=str_bytes(sh) while p<len(sb){if sb[p]==44{arr_push(id,mi(int(cur))) cur=""}else{cur=cur+str_char_at(sh,p)} p=p+1} if len(cur)>0{arr_push(id,mi(int(cur)))} vpush(ma(id)) return true}
-    if f=="tensor_add"{let b=vpop() let a=vpop() let id=arr_new() let sh=tensor_shape_str(a) let aid=tensor_id(a) let bid=tensor_id(b) var i=0 let sz=shape_size(sh) while i<sz{arr_push(id,mf(vf(arr_get(aid,i))+vf(arr_get(bid,i)))) i=i+1} vpush(mt(id,sh)) return true}
-    if f=="tensor_mul"{let b=vpop() let a=vpop() let id=arr_new() let sh=tensor_shape_str(a) let aid=tensor_id(a) let bid=tensor_id(b) var i=0 let sz=shape_size(sh) while i<sz{arr_push(id,mf(vf(arr_get(aid,i))*vf(arr_get(bid,i)))) i=i+1} vpush(mt(id,sh)) return true}
-    if f=="tensor_matmul"{let b=vpop() let a=vpop() let ash=tensor_shape_str(a) let bsh=tensor_shape_str(b) let m=shape_dim(ash,0) let k=shape_dim(ash,1) let n=shape_dim(bsh,1) let aid=tensor_id(a) let bid=tensor_id(b) let id=arr_new() var i=0 while i<m{var j=0 while j<n{var s=0.0 var p=0 while p<k{s=s+vf(arr_get(aid,i*k+p))*vf(arr_get(bid,p*n+j)) p=p+1} arr_push(id,mf(s)) j=j+1} i=i+1} vpush(mt(id,to_string(m)+","+to_string(n))) return true}
-    if f=="tensor_sum"{let t=vpop() let id=tensor_id(t) let sz=shape_size(tensor_shape_str(t)) var s=0.0 var i=0 while i<sz{s=s+vf(arr_get(id,i)) i=i+1} vpush(mf(s)) return true}
+    if f=="tensor_add"{let b=vpop() let a=vpop() let sh=tensor_shape_str(a) let r=t_add_data(tensor_id(a),tensor_id(b),sh) if _grad_active{tape_rec("add",a+"|"+b+"|"+r)} vpush(r) return true}
+    if f=="tensor_mul"{let b=vpop() let a=vpop() let sh=tensor_shape_str(a) let r=t_mul_data(tensor_id(a),tensor_id(b),sh) if _grad_active{tape_rec("mul",a+"|"+b+"|"+r)} vpush(r) return true}
+    if f=="tensor_matmul"{let b=vpop() let a=vpop() let r=t_matmul_data(a,b) if _grad_active{tape_rec("matmul",a+"|"+b+"|"+r)} vpush(r) return true}
+    if f=="tensor_sum"{let t=vpop() let id=tensor_id(t) let sz=shape_size(tensor_shape_str(t)) var s=0.0 var i=0 while i<sz{s=s+vf(arr_get(id,i)) i=i+1} let sh=tensor_shape_str(t) if _grad_active{tape_rec("sum",t+"|"+mf(s)+"|"+sh)} vpush(mf(s)) return true}
     if f=="tensor_reshape"{let sv=vpop() let t=vpop() let sh=t_shape_from_arr(sv) vpush(mt(tensor_id(t),sh)) return true}
+    if f=="tensor_requires_grad"{let t=vpop() _grad_active=true grad_set(t,t_make(tensor_shape_str(t),0.0)) vpush(t) return true}
+    if f=="tensor_backward"{ let loss=vpop() var ti=_tape_len-1 while ti>=0{ let op=_tape_ops[ti] let args=_tape_args[ti] if op=="sum"{ let p1=fidx(args,"|") let inp=str_substr(args,0,p1) let r2=str_substr(args,p1+1,len(args)-p1-1) let p2=fidx(r2,"|") let sh=str_substr(r2,p2+1,len(r2)-p2-1) let g=t_ones(sh) grad_acc(inp,g) } if op=="add"{ let p1=fidx(args,"|") let a=str_substr(args,0,p1) let r2=str_substr(args,p1+1,len(args)-p1-1) let p2=fidx(r2,"|") let b=str_substr(r2,0,p2) let c=str_substr(r2,p2+1,len(r2)-p2-1) let gc=grad_get(c) if gc!=""{grad_acc(a,gc) grad_acc(b,gc)} } if op=="mul"{ let p1=fidx(args,"|") let a=str_substr(args,0,p1) let r2=str_substr(args,p1+1,len(args)-p1-1) let p2=fidx(r2,"|") let b=str_substr(r2,0,p2) let c=str_substr(r2,p2+1,len(r2)-p2-1) let gc=grad_get(c) if gc!=""{let ga=t_mul_data(tensor_id(gc),tensor_id(b),tensor_shape_str(a)) let gb=t_mul_data(tensor_id(gc),tensor_id(a),tensor_shape_str(a)) grad_acc(a,ga) grad_acc(b,gb)} } if op=="matmul"{ let p1=fidx(args,"|") let a=str_substr(args,0,p1) let r2=str_substr(args,p1+1,len(args)-p1-1) let p2=fidx(r2,"|") let b=str_substr(r2,0,p2) let c=str_substr(r2,p2+1,len(r2)-p2-1) let gc=grad_get(c) if gc!=""{let ga=t_matmul_data(gc,t_transpose(b)) let gb=t_matmul_data(t_transpose(a),gc) grad_acc(a,ga) grad_acc(b,gb)} } ti=ti-1 } vpush("void") return true }
+    if f=="tensor_grad"{let t=vpop() let g=grad_get(t) if g==""{vpush(t_make("1",0.0))}else{vpush(g)} return true}
+    if f=="tensor_zero_grad"{let t=vpop() grad_set(t,t_make(tensor_shape_str(t),0.0)) vpush("void") return true}
     return false
 }
 fn vbuiltin(f: String) -> bool { if vb_io(f){return true} if vb_conv(f){return true} if vb_len(f){return true} if vb_str(f){return true} if vb_file(f){return true} if vb_math(f){return true} if vb_arr(f){return true} if vb_tensor(f){return true} return false }
