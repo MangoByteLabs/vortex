@@ -1755,6 +1755,18 @@ fn expr_is_string(expr: [String]) -> bool {
             return true
         }
     }
+    if kind == "to_string" {
+        return true
+    }
+    if kind == "str_char_at" {
+        return true
+    }
+    if kind == "str_substr" {
+        return true
+    }
+    if kind == "str_from_bytes" {
+        return true
+    }
     if kind == "call" {
         let fname = expr[1]
         if fname == "to_string" {
@@ -4867,16 +4879,21 @@ fn emit_str_char_at_stub() -> [i64] {
     out = push(out, 137)
     out = push(out, 117)
     out = push(out, 240)
-    // load byte: add rsi, 8; movzx r8, byte [rdi+rsi]
+    // load byte: add rsi, 8; movzx rax, byte [rdi+rsi]; save to [rbp-24]
     out = push(out, 72)
     out = push(out, 131)
     out = push(out, 198)
-    out = push(out, 8)
-    out = push(out, 76)
+    out = push(out, 8)    // add rsi, 8
+    out = push(out, 72)
     out = push(out, 15)
     out = push(out, 182)
     out = push(out, 4)
-    out = push(out, 55)   // movzx r8, byte [rdi+rsi]
+    out = push(out, 55)   // movzx rax, byte [rdi+rsi]  (48 0F B6 04 37)
+    // save byte in [rbp-24]
+    out = push(out, 72)
+    out = push(out, 137)
+    out = push(out, 69)
+    out = push(out, 232)  // mov [rbp-24], rax
     // alloc 9 bytes
     out = push(out, 72)
     out = push(out, 199)
@@ -4894,11 +4911,14 @@ fn emit_str_char_at_stub() -> [i64] {
     out = push(out, 0)
     out = push(out, 0)
     out = push(out, 0)
-    // store byte
-    out = push(out, 68)
+    // load saved byte and store at [rax+8]
+    out = push(out, 72)
+    out = push(out, 139)
+    out = push(out, 77)
+    out = push(out, 232)  // mov rcx, [rbp-24]
     out = push(out, 136)
-    out = push(out, 64)
-    out = push(out, 8)    // mov [rax+8], r8b
+    out = push(out, 72)
+    out = push(out, 8)    // mov [rax+8], cl
     out = push(out, 72)
     out = push(out, 137)
     out = push(out, 236)
