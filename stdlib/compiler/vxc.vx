@@ -848,6 +848,164 @@ fn parse_primary() -> [String] {
             }
         }
 
+        // sqrt(x) builtin
+        if name == "sqrt" {
+            if p_at("LPAREN") {
+                p_advance()
+                let arg = parse_expr()
+                p_expect("RPAREN")
+                return ["sqrt", arg]
+            }
+        }
+
+        // sin(x) builtin
+        if name == "sin" {
+            if p_at("LPAREN") {
+                p_advance()
+                let arg = parse_expr()
+                p_expect("RPAREN")
+                return ["sin", arg]
+            }
+        }
+
+        // cos(x) builtin
+        if name == "cos" {
+            if p_at("LPAREN") {
+                p_advance()
+                let arg = parse_expr()
+                p_expect("RPAREN")
+                return ["cos", arg]
+            }
+        }
+
+        // exp(x) builtin
+        if name == "exp" {
+            if p_at("LPAREN") {
+                p_advance()
+                let arg = parse_expr()
+                p_expect("RPAREN")
+                return ["exp", arg]
+            }
+        }
+
+        // log(x) builtin
+        if name == "log" {
+            if p_at("LPAREN") {
+                p_advance()
+                let arg = parse_expr()
+                p_expect("RPAREN")
+                return ["log", arg]
+            }
+        }
+
+        // pow(base, exp) builtin
+        if name == "pow" {
+            if p_at("LPAREN") {
+                p_advance()
+                let base_arg = parse_expr()
+                p_expect("COMMA")
+                let exp_arg = parse_expr()
+                p_expect("RPAREN")
+                return ["pow", base_arg, exp_arg]
+            }
+        }
+
+        // type_of(x) builtin
+        if name == "type_of" {
+            if p_at("LPAREN") {
+                p_advance()
+                let arg = parse_expr()
+                p_expect("RPAREN")
+                return ["type_of", arg]
+            }
+        }
+
+        // str_find(haystack, needle) builtin
+        if name == "str_find" {
+            if p_at("LPAREN") {
+                p_advance()
+                let h_arg = parse_expr()
+                p_expect("COMMA")
+                let n_arg = parse_expr()
+                p_expect("RPAREN")
+                return ["str_find", h_arg, n_arg]
+            }
+        }
+
+        // unwrap_or(val, default) builtin
+        if name == "unwrap_or" {
+            if p_at("LPAREN") {
+                p_advance()
+                let v_arg = parse_expr()
+                p_expect("COMMA")
+                let d_arg = parse_expr()
+                p_expect("RPAREN")
+                return ["unwrap_or", v_arg, d_arg]
+            }
+        }
+
+        // trim(s) builtin
+        if name == "trim" {
+            if p_at("LPAREN") {
+                p_advance()
+                let arg = parse_expr()
+                p_expect("RPAREN")
+                return ["trim", arg]
+            }
+        }
+
+        // read_file(path) builtin
+        if name == "read_file" {
+            if p_at("LPAREN") {
+                p_advance()
+                let arg = parse_expr()
+                p_expect("RPAREN")
+                return ["read_file", arg]
+            }
+        }
+
+        // write_file(path, content) builtin
+        if name == "write_file" {
+            if p_at("LPAREN") {
+                p_advance()
+                let p_arg = parse_expr()
+                p_expect("COMMA")
+                let c_arg = parse_expr()
+                p_expect("RPAREN")
+                return ["write_file", p_arg, c_arg]
+            }
+        }
+
+        // file_exists(path) builtin
+        if name == "file_exists" {
+            if p_at("LPAREN") {
+                p_advance()
+                let arg = parse_expr()
+                p_expect("RPAREN")
+                return ["file_exists", arg]
+            }
+        }
+
+        // print(expr) builtin — like println but no newline
+        if name == "print" {
+            if p_at("LPAREN") {
+                p_advance()
+                let arg = parse_expr()
+                p_expect("RPAREN")
+                return ["print", arg]
+            }
+        }
+
+        // float(x) builtin — int to float
+        if name == "float" {
+            if p_at("LPAREN") {
+                p_advance()
+                let arg = parse_expr()
+                p_expect("RPAREN")
+                return ["float_conv", arg]
+            }
+        }
+
         // Check for function call
         if p_at("LPAREN") {
             p_advance()
@@ -1422,6 +1580,10 @@ fn globals_find(name: String) -> i64 {
 }
 
 fn globals_add(name: String) -> i64 {
+    let existing = globals_find(name)
+    if existing >= 0 {
+        return existing
+    }
     _global_names = push(_global_names, name)
     _global_types = push(_global_types, "int")
     return len(_global_names) - 1
@@ -1720,6 +1882,27 @@ fn expr_is_float(expr: [String]) -> bool {
     if kind == "neg" {
         return expr_is_float(expr[1])
     }
+    if kind == "sqrt" {
+        return true
+    }
+    if kind == "sin" {
+        return true
+    }
+    if kind == "cos" {
+        return true
+    }
+    if kind == "exp" {
+        return true
+    }
+    if kind == "log" {
+        return true
+    }
+    if kind == "pow" {
+        return true
+    }
+    if kind == "float_conv" {
+        return true
+    }
     if kind == "call" {
         let fname = expr[1]
         if fname == "to_string" {
@@ -1765,6 +1948,15 @@ fn expr_is_string(expr: [String]) -> bool {
         return true
     }
     if kind == "str_from_bytes" {
+        return true
+    }
+    if kind == "trim" {
+        return true
+    }
+    if kind == "read_file" {
+        return true
+    }
+    if kind == "type_of" {
         return true
     }
     if kind == "call" {
@@ -2438,6 +2630,271 @@ fn compile_expr(code: [i64], expr: [String]) -> [i64] {
         return code
     }
 
+    if kind == "str_find" {
+        // str_find(haystack, needle) -> i64 index or -1
+        code = compile_expr(code, expr[2])  // needle -> RAX
+        code = emit_push_reg(code, REG_RAX())
+        code = compile_expr(code, expr[1])  // haystack -> RAX
+        code = emit_mov_reg_reg(code, REG_RDI(), REG_RAX())
+        code = emit_pop_reg(code, REG_RSI())
+        code = emit_u8(code, 232)
+        add_fixup(len(code), "_vx_str_find")
+        code = emit_u32_le(code, 0)
+        return code
+    }
+
+    if kind == "unwrap_or" {
+        // unwrap_or(val, default) -> val if >= 0, else default
+        code = compile_expr(code, expr[2])  // default -> RAX
+        code = emit_push_reg(code, REG_RAX())
+        code = compile_expr(code, expr[1])  // val -> RAX
+        code = emit_pop_reg(code, REG_RCX())  // default in RCX
+        // test rax, rax: 48 85 C0
+        code = emit_u8(code, 72)
+        code = emit_u8(code, 133)
+        code = emit_u8(code, 192)
+        // cmovs rax, rcx: 48 0F 48 C1 (if negative, use default)
+        code = emit_u8(code, 72)
+        code = emit_u8(code, 15)
+        code = emit_u8(code, 72)
+        code = emit_u8(code, 193)
+        return code
+    }
+
+    if kind == "trim" {
+        // trim(s) -> new trimmed string
+        code = compile_expr(code, expr[1])
+        code = emit_mov_reg_reg(code, REG_RDI(), REG_RAX())
+        code = emit_u8(code, 232)
+        add_fixup(len(code), "_vx_trim")
+        code = emit_u32_le(code, 0)
+        return code
+    }
+
+    if kind == "read_file" {
+        // read_file(path) -> string
+        code = compile_expr(code, expr[1])
+        code = emit_mov_reg_reg(code, REG_RDI(), REG_RAX())
+        code = emit_u8(code, 232)
+        add_fixup(len(code), "_vx_read_file")
+        code = emit_u32_le(code, 0)
+        return code
+    }
+
+    if kind == "write_file" {
+        // write_file(path, content)
+        code = compile_expr(code, expr[2])  // content -> RAX
+        code = emit_push_reg(code, REG_RAX())
+        code = compile_expr(code, expr[1])  // path -> RAX
+        code = emit_mov_reg_reg(code, REG_RDI(), REG_RAX())
+        code = emit_pop_reg(code, REG_RSI())
+        code = emit_u8(code, 232)
+        add_fixup(len(code), "_vx_write_file")
+        code = emit_u32_le(code, 0)
+        return code
+    }
+
+    if kind == "file_exists" {
+        // file_exists(path) -> 1 or 0
+        code = compile_expr(code, expr[1])
+        code = emit_mov_reg_reg(code, REG_RDI(), REG_RAX())
+        code = emit_u8(code, 232)
+        add_fixup(len(code), "_vx_file_exists")
+        code = emit_u32_le(code, 0)
+        return code
+    }
+
+    if kind == "print" {
+        let inner = expr[1]
+        if expr_is_string(inner) {
+            // String print without newline
+            code = compile_expr(code, inner)
+            code = emit_mov_reg_reg(code, REG_RDI(), REG_RAX())
+            code = emit_u8(code, 232)
+            add_fixup(len(code), "_vx_print_str")
+            code = emit_u32_le(code, 0)
+            return code
+        }
+        // Integer print without newline
+        code = compile_expr(code, inner)
+        code = emit_mov_reg_reg(code, REG_RDI(), REG_RAX())
+        code = emit_u8(code, 232)
+        add_fixup(len(code), "_vx_print_int_no_nl")
+        code = emit_u32_le(code, 0)
+        return code
+    }
+
+    if kind == "float_conv" {
+        // float(x): int -> float bits in RAX
+        code = compile_expr(code, expr[1])
+        // cvtsi2sd xmm0, rax: F2 48 0F 2A C0
+        code = emit_u8(code, 242)
+        code = emit_u8(code, 72)
+        code = emit_u8(code, 15)
+        code = emit_u8(code, 42)
+        code = emit_u8(code, 192)
+        // movq rax, xmm0: 66 48 0F 7E C0
+        code = emit_u8(code, 102)
+        code = emit_u8(code, 72)
+        code = emit_u8(code, 15)
+        code = emit_u8(code, 126)
+        code = emit_u8(code, 192)
+        return code
+    }
+
+    if kind == "sqrt" {
+        // sqrt(x): compile arg -> RAX (float bits), sqrtsd xmm0,xmm0, result -> RAX
+        code = compile_expr(code, expr[1])
+        code = emit_movq_xmm0_rax(code)
+        // sqrtsd xmm0, xmm0: F2 0F 51 C0
+        code = emit_u8(code, 242)
+        code = emit_u8(code, 15)
+        code = emit_u8(code, 81)
+        code = emit_u8(code, 192)
+        code = emit_movq_rax_xmm0(code)
+        return code
+    }
+
+    if kind == "sin" {
+        // sin(x): use x87 FPU fsin
+        code = compile_expr(code, expr[1])
+        // sub rsp, 8: 48 83 EC 08
+        code = emit_u8(code, 72)
+        code = emit_u8(code, 131)
+        code = emit_u8(code, 236)
+        code = emit_u8(code, 8)
+        // mov [rsp], rax: 48 89 04 24
+        code = emit_u8(code, 72)
+        code = emit_u8(code, 137)
+        code = emit_u8(code, 4)
+        code = emit_u8(code, 36)
+        // fld qword [rsp]: DD 04 24
+        code = emit_u8(code, 221)
+        code = emit_u8(code, 4)
+        code = emit_u8(code, 36)
+        // fsin: D9 FE
+        code = emit_u8(code, 217)
+        code = emit_u8(code, 254)
+        // fstp qword [rsp]: DD 1C 24
+        code = emit_u8(code, 221)
+        code = emit_u8(code, 28)
+        code = emit_u8(code, 36)
+        // mov rax, [rsp]: 48 8B 04 24
+        code = emit_u8(code, 72)
+        code = emit_u8(code, 139)
+        code = emit_u8(code, 4)
+        code = emit_u8(code, 36)
+        // add rsp, 8: 48 83 C4 08
+        code = emit_u8(code, 72)
+        code = emit_u8(code, 131)
+        code = emit_u8(code, 196)
+        code = emit_u8(code, 8)
+        return code
+    }
+
+    if kind == "cos" {
+        // cos(x): use x87 FPU fcos
+        code = compile_expr(code, expr[1])
+        // sub rsp, 8
+        code = emit_u8(code, 72)
+        code = emit_u8(code, 131)
+        code = emit_u8(code, 236)
+        code = emit_u8(code, 8)
+        // mov [rsp], rax
+        code = emit_u8(code, 72)
+        code = emit_u8(code, 137)
+        code = emit_u8(code, 4)
+        code = emit_u8(code, 36)
+        // fld qword [rsp]
+        code = emit_u8(code, 221)
+        code = emit_u8(code, 4)
+        code = emit_u8(code, 36)
+        // fcos: D9 FF
+        code = emit_u8(code, 217)
+        code = emit_u8(code, 255)
+        // fstp qword [rsp]
+        code = emit_u8(code, 221)
+        code = emit_u8(code, 28)
+        code = emit_u8(code, 36)
+        // mov rax, [rsp]
+        code = emit_u8(code, 72)
+        code = emit_u8(code, 139)
+        code = emit_u8(code, 4)
+        code = emit_u8(code, 36)
+        // add rsp, 8
+        code = emit_u8(code, 72)
+        code = emit_u8(code, 131)
+        code = emit_u8(code, 196)
+        code = emit_u8(code, 8)
+        return code
+    }
+
+    if kind == "exp" {
+        // exp(x): call _vx_exp runtime stub
+        code = compile_expr(code, expr[1])
+        code = emit_mov_reg_reg(code, REG_RDI(), REG_RAX())
+        code = emit_u8(code, 232)
+        add_fixup(len(code), "_vx_exp")
+        code = emit_u32_le(code, 0)
+        return code
+    }
+
+    if kind == "log" {
+        // log(x): call _vx_log runtime stub
+        code = compile_expr(code, expr[1])
+        code = emit_mov_reg_reg(code, REG_RDI(), REG_RAX())
+        code = emit_u8(code, 232)
+        add_fixup(len(code), "_vx_log")
+        code = emit_u32_le(code, 0)
+        return code
+    }
+
+    if kind == "pow" {
+        // pow(base, exp): call _vx_pow runtime stub
+        code = compile_expr(code, expr[2])  // exp -> RAX
+        code = emit_push_reg(code, REG_RAX())
+        code = compile_expr(code, expr[1])  // base -> RAX
+        code = emit_mov_reg_reg(code, REG_RDI(), REG_RAX())
+        code = emit_pop_reg(code, REG_RSI())
+        code = emit_u8(code, 232)
+        add_fixup(len(code), "_vx_pow")
+        code = emit_u32_le(code, 0)
+        return code
+    }
+
+    if kind == "type_of" {
+        // type_of(x): resolve type at compile time, return string
+        let arg = expr[1]
+        var type_str = "int"
+        if expr_is_float(arg) {
+            type_str = "float"
+        }
+        if expr_is_string(arg) {
+            type_str = "string"
+        }
+        let arg_kind = arg[0]
+        if arg_kind == "array" {
+            type_str = "array"
+        }
+        if arg_kind == "ident" {
+            let tidx = locals_find(arg[1])
+            if tidx >= 0 {
+                let ttype = locals_get_type(tidx)
+                if ttype == "array" {
+                    type_str = "array"
+                }
+            }
+        }
+        // Emit as a string constant (lea rax, [rip+disp32])
+        let str_idx = add_string_literal(type_str)
+        code = emit_u8(code, 72)
+        code = emit_u8(code, 141)
+        code = emit_u8(code, 5)
+        add_fixup(len(code), "_str_" + to_string(str_idx))
+        code = emit_u32_le(code, 0)
+        return code
+    }
+
     if kind == "call" {
         let fname = expr[1]
         let argc = len(expr) - 2
@@ -2567,6 +3024,16 @@ fn compile_stmt(code: [i64], stmt: [String]) -> [i64] {
     }
 
     if kind == "print_str" {
+        code = compile_expr(code, stmt)
+        return code
+    }
+
+    if kind == "print" {
+        code = compile_expr(code, stmt)
+        return code
+    }
+
+    if kind == "write_file" {
         code = compile_expr(code, stmt)
         return code
     }
@@ -5198,6 +5665,1335 @@ fn emit_str_from_bytes_stub() -> [i64] {
     return out
 }
 
+// --- Runtime: _vx_exp stub ---
+// exp(x) using x87: compute 2^(x * log2(e)) via f2xm1
+// rdi = float bits of x, returns float bits in rax
+fn emit_exp_stub() -> [i64] {
+    var out: [i64] = []
+    // push rbp; mov rbp, rsp; sub rsp, 16
+    out = push(out, 85)
+    out = push(out, 72)
+    out = push(out, 137)
+    out = push(out, 229)
+    out = push(out, 72)
+    out = push(out, 131)
+    out = push(out, 236)
+    out = push(out, 16)
+    // mov [rbp-8], rdi (store x bits)
+    out = push(out, 72)
+    out = push(out, 137)
+    out = push(out, 125)
+    out = push(out, 248)
+    // fld qword [rbp-8] — load x
+    out = push(out, 221)
+    out = push(out, 69)
+    out = push(out, 248)
+    // fldl2e — load log2(e)
+    out = push(out, 217)
+    out = push(out, 234)
+    // fmulp — st(1) = x * log2(e), pop
+    out = push(out, 222)
+    out = push(out, 201)
+    // Now st(0) = x * log2(e) = y
+    // Split into integer and fraction: fld st(0), frndint, fsub to get fraction
+    // fld st(0): D9 C0
+    out = push(out, 217)
+    out = push(out, 192)
+    // frndint: D9 FC
+    out = push(out, 217)
+    out = push(out, 252)
+    // Now st(0)=round(y), st(1)=y
+    // fsubr st(1), st(0) would be tricky; let's use fsub
+    // fxch st(1): D9 C9
+    out = push(out, 217)
+    out = push(out, 201)
+    // Now st(0)=y, st(1)=round(y)
+    // fsub st(0), st(1): D8 E1
+    out = push(out, 216)
+    out = push(out, 225)
+    // Now st(0)=frac=y-round(y), st(1)=round(y)
+    // f2xm1: D9 F0 — st(0) = 2^frac - 1
+    out = push(out, 217)
+    out = push(out, 240)
+    // fld1: D9 E8
+    out = push(out, 217)
+    out = push(out, 232)
+    // faddp: DE C1 — st(0) = 2^frac
+    out = push(out, 222)
+    out = push(out, 193)
+    // fscale: D9 FD — st(0) = 2^frac * 2^round(y) = 2^y = e^x
+    out = push(out, 217)
+    out = push(out, 253)
+    // fstp st(1): DD D9 — pop the round(y) copy
+    out = push(out, 221)
+    out = push(out, 217)
+    // fstp qword [rbp-8]: DD 5D F8
+    out = push(out, 221)
+    out = push(out, 93)
+    out = push(out, 248)
+    // mov rax, [rbp-8]: 48 8B 45 F8
+    out = push(out, 72)
+    out = push(out, 139)
+    out = push(out, 69)
+    out = push(out, 248)
+    // leave; ret
+    out = push(out, 201)
+    out = push(out, 195)
+    return out
+}
+
+// --- Runtime: _vx_log stub ---
+// log(x) using x87: ln(x) = log2(x) / log2(e) = log2(x) * ln(2)
+// rdi = float bits of x, returns float bits in rax
+fn emit_log_stub() -> [i64] {
+    var out: [i64] = []
+    // push rbp; mov rbp, rsp; sub rsp, 16
+    out = push(out, 85)
+    out = push(out, 72)
+    out = push(out, 137)
+    out = push(out, 229)
+    out = push(out, 72)
+    out = push(out, 131)
+    out = push(out, 236)
+    out = push(out, 16)
+    // mov [rbp-8], rdi
+    out = push(out, 72)
+    out = push(out, 137)
+    out = push(out, 125)
+    out = push(out, 248)
+    // fldln2: D9 ED — load ln(2)
+    out = push(out, 217)
+    out = push(out, 237)
+    // fld qword [rbp-8]: DD 45 F8 — load x
+    out = push(out, 221)
+    out = push(out, 69)
+    out = push(out, 248)
+    // fyl2x: D9 F1 — st(0) = ln(2) * log2(x) = ln(x)
+    out = push(out, 217)
+    out = push(out, 241)
+    // fstp qword [rbp-8]: DD 5D F8
+    out = push(out, 221)
+    out = push(out, 93)
+    out = push(out, 248)
+    // mov rax, [rbp-8]
+    out = push(out, 72)
+    out = push(out, 139)
+    out = push(out, 69)
+    out = push(out, 248)
+    // leave; ret
+    out = push(out, 201)
+    out = push(out, 195)
+    return out
+}
+
+// --- Runtime: _vx_pow stub ---
+// pow(base, exp) = 2^(exp * log2(base))
+// rdi = base float bits, rsi = exp float bits, returns float bits in rax
+fn emit_pow_stub() -> [i64] {
+    var out: [i64] = []
+    // push rbp; mov rbp, rsp; sub rsp, 16
+    out = push(out, 85)
+    out = push(out, 72)
+    out = push(out, 137)
+    out = push(out, 229)
+    out = push(out, 72)
+    out = push(out, 131)
+    out = push(out, 236)
+    out = push(out, 16)
+    // mov [rbp-8], rdi (base)
+    out = push(out, 72)
+    out = push(out, 137)
+    out = push(out, 125)
+    out = push(out, 248)
+    // mov [rbp-16], rsi (exp)
+    out = push(out, 72)
+    out = push(out, 137)
+    out = push(out, 117)
+    out = push(out, 240)
+    // fld qword [rbp-16]: DD 45 F0 — load exp
+    out = push(out, 221)
+    out = push(out, 69)
+    out = push(out, 240)
+    // fld qword [rbp-8]: DD 45 F8 — load base
+    out = push(out, 221)
+    out = push(out, 69)
+    out = push(out, 248)
+    // fyl2x: D9 F1 — st(0) = exp * log2(base)
+    out = push(out, 217)
+    out = push(out, 241)
+    // Now st(0) = y = exp * log2(base)
+    // Split into int + frac
+    // fld st(0): D9 C0
+    out = push(out, 217)
+    out = push(out, 192)
+    // frndint: D9 FC
+    out = push(out, 217)
+    out = push(out, 252)
+    // fxch st(1): D9 C9
+    out = push(out, 217)
+    out = push(out, 201)
+    // fsub st(0), st(1): D8 E1
+    out = push(out, 216)
+    out = push(out, 225)
+    // f2xm1: D9 F0
+    out = push(out, 217)
+    out = push(out, 240)
+    // fld1: D9 E8
+    out = push(out, 217)
+    out = push(out, 232)
+    // faddp: DE C1
+    out = push(out, 222)
+    out = push(out, 193)
+    // fscale: D9 FD
+    out = push(out, 217)
+    out = push(out, 253)
+    // fstp st(1): DD D9
+    out = push(out, 221)
+    out = push(out, 217)
+    // fstp qword [rbp-8]: DD 5D F8
+    out = push(out, 221)
+    out = push(out, 93)
+    out = push(out, 248)
+    // mov rax, [rbp-8]
+    out = push(out, 72)
+    out = push(out, 139)
+    out = push(out, 69)
+    out = push(out, 248)
+    // leave; ret
+    out = push(out, 201)
+    out = push(out, 195)
+    return out
+}
+
+// --- Runtime: _vx_str_find stub ---
+// rdi = haystack (string ptr), rsi = needle (string ptr)
+// Returns index in rax, or -1 if not found
+// String format: [u64 len][bytes...]
+fn emit_str_find_stub() -> [i64] {
+    var out: [i64] = []
+    // push rbp; mov rbp, rsp; sub rsp, 48
+    out = push(out, 85)
+    out = push(out, 72)
+    out = push(out, 137)
+    out = push(out, 229)
+    out = push(out, 72)
+    out = push(out, 131)
+    out = push(out, 236)
+    out = push(out, 48)
+    // [rbp-8] = haystack, [rbp-16] = needle
+    out = push(out, 72)
+    out = push(out, 137)
+    out = push(out, 125)
+    out = push(out, 248)
+    out = push(out, 72)
+    out = push(out, 137)
+    out = push(out, 117)
+    out = push(out, 240)
+    // r12 = haystack len = [rdi]
+    out = push(out, 76)
+    out = push(out, 139)
+    out = push(out, 39)
+    // r13 = needle len = [rsi]
+    out = push(out, 76)
+    out = push(out, 139)
+    out = push(out, 46)
+    // r14 = 0 (outer index i)
+    out = push(out, 73)
+    out = push(out, 199)
+    out = push(out, 198)
+    out = push(out, 0)
+    out = push(out, 0)
+    out = push(out, 0)
+    out = push(out, 0)
+    // if needle len == 0, return 0
+    out = push(out, 77)
+    out = push(out, 133)
+    out = push(out, 237)
+    out = push(out, 117)
+    out = push(out, 8)
+    // return 0
+    out = push(out, 72)
+    out = push(out, 49)
+    out = push(out, 192)
+    out = push(out, 72)
+    out = push(out, 137)
+    out = push(out, 236)
+    out = push(out, 93)
+    out = push(out, 195)
+    // .outer_loop:
+    let outer_loop = len(out)
+    // if i + needle_len > haystack_len, not found
+    // lea rcx, [r14 + r13]: 4B 8D 0C 2E
+    out = push(out, 75)
+    out = push(out, 141)
+    out = push(out, 12)
+    out = push(out, 46)
+    // cmp rcx, r12: 4C 39 E1
+    out = push(out, 76)
+    out = push(out, 57)
+    out = push(out, 225)
+    // ja .not_found
+    out = push(out, 119)
+    let ja_nf_pos = len(out)
+    out = push(out, 0)  // placeholder
+    // r15 = 0 (inner index j)
+    out = push(out, 73)
+    out = push(out, 199)
+    out = push(out, 199)
+    out = push(out, 0)
+    out = push(out, 0)
+    out = push(out, 0)
+    out = push(out, 0)
+    // .inner_loop:
+    let inner_loop = len(out)
+    // cmp r15, r13 (j >= needle_len?)
+    out = push(out, 77)
+    out = push(out, 57)
+    out = push(out, 239)
+    // jae .found
+    out = push(out, 115)
+    let jae_found_pos = len(out)
+    out = push(out, 0)  // placeholder
+    // load haystack[i+j]: movzx eax, byte [rbp-8]+8+r14+r15
+    // mov rdi, [rbp-8]
+    out = push(out, 72)
+    out = push(out, 139)
+    out = push(out, 125)
+    out = push(out, 248)
+    // lea rax, [rdi+8+r14]: add rdi,8; add rdi,r14
+    out = push(out, 72)
+    out = push(out, 131)
+    out = push(out, 199)
+    out = push(out, 8)
+    out = push(out, 76)
+    out = push(out, 1)
+    out = push(out, 247)
+    // add rdi, r15
+    out = push(out, 76)
+    out = push(out, 1)
+    out = push(out, 255)
+    // movzx eax, byte [rdi]: 0F B6 07
+    out = push(out, 15)
+    out = push(out, 182)
+    out = push(out, 7)
+    // load needle[j]: mov rsi, [rbp-16]; lea rsi, [rsi+8+r15]
+    out = push(out, 72)
+    out = push(out, 139)
+    out = push(out, 117)
+    out = push(out, 240)
+    out = push(out, 72)
+    out = push(out, 131)
+    out = push(out, 198)
+    out = push(out, 8)
+    out = push(out, 76)
+    out = push(out, 1)
+    out = push(out, 254)
+    // movzx ecx, byte [rsi]: 0F B6 0E
+    out = push(out, 15)
+    out = push(out, 182)
+    out = push(out, 14)
+    // cmp al, cl
+    out = push(out, 56)
+    out = push(out, 200)
+    // jne .next
+    out = push(out, 117)
+    let jne_next_pos = len(out)
+    out = push(out, 0)  // placeholder
+    // inc r15
+    out = push(out, 73)
+    out = push(out, 255)
+    out = push(out, 199)
+    // jmp .inner_loop
+    let jmp_inner = len(out)
+    let inner_delta = inner_loop - jmp_inner - 2
+    out = push(out, 235)
+    var inner_off = inner_delta % 256
+    if inner_off < 0 { inner_off = inner_off + 256 }
+    out = push(out, inner_off)
+    // .found:
+    let found_pos = len(out)
+    // patch jae_found
+    // return r14 (the index)
+    out = push(out, 76)
+    out = push(out, 137)
+    out = push(out, 240)  // mov rax, r14
+    out = push(out, 72)
+    out = push(out, 137)
+    out = push(out, 236)
+    out = push(out, 93)
+    out = push(out, 195)  // leave; ret
+    // .next:
+    let next_pos = len(out)
+    // inc r14
+    out = push(out, 73)
+    out = push(out, 255)
+    out = push(out, 198)
+    // jmp .outer_loop
+    let jmp_outer = len(out)
+    let outer_delta = outer_loop - jmp_outer - 2
+    out = push(out, 235)
+    var outer_off = outer_delta % 256
+    if outer_off < 0 { outer_off = outer_off + 256 }
+    out = push(out, outer_off)
+    // .not_found:
+    let not_found_pos = len(out)
+    // mov rax, -1
+    out = push(out, 72)
+    out = push(out, 199)
+    out = push(out, 192)
+    out = push(out, 255)
+    out = push(out, 255)
+    out = push(out, 255)
+    out = push(out, 255)
+    out = push(out, 72)
+    out = push(out, 137)
+    out = push(out, 236)
+    out = push(out, 93)
+    out = push(out, 195)  // leave; ret
+
+    // Patch jump targets
+    // ja_nf_pos -> not_found_pos
+    var p1 = not_found_pos - ja_nf_pos - 1
+    if p1 < 0 { p1 = p1 + 256 }
+    out[ja_nf_pos] = p1
+    // jae_found_pos -> found_pos
+    var p2 = found_pos - jae_found_pos - 1
+    if p2 < 0 { p2 = p2 + 256 }
+    out[jae_found_pos] = p2
+    // jne_next_pos -> next_pos
+    var p3 = next_pos - jne_next_pos - 1
+    if p3 < 0 { p3 = p3 + 256 }
+    out[jne_next_pos] = p3
+    return out
+}
+
+// --- Runtime: _vx_trim stub ---
+// rdi = string ptr (format: [u64 len][bytes...])
+// Returns new trimmed string ptr in rax
+fn emit_trim_stub() -> [i64] {
+    var out: [i64] = []
+    // push rbp; mov rbp, rsp; sub rsp, 48
+    out = push(out, 85)
+    out = push(out, 72)
+    out = push(out, 137)
+    out = push(out, 229)
+    out = push(out, 72)
+    out = push(out, 131)
+    out = push(out, 236)
+    out = push(out, 48)
+    // [rbp-8] = input string
+    out = push(out, 72)
+    out = push(out, 137)
+    out = push(out, 125)
+    out = push(out, 248)
+    // r12 = len = [rdi]
+    out = push(out, 76)
+    out = push(out, 139)
+    out = push(out, 39)
+    // r13 = start = 0
+    out = push(out, 73)
+    out = push(out, 199)
+    out = push(out, 197)
+    out = push(out, 0)
+    out = push(out, 0)
+    out = push(out, 0)
+    out = push(out, 0)
+    // r14 = end = len
+    out = push(out, 77)
+    out = push(out, 137)
+    out = push(out, 230)
+
+    // .skip_leading:
+    let skip_lead = len(out)
+    // cmp r13, r12: if start >= len, done
+    out = push(out, 77)
+    out = push(out, 57)
+    out = push(out, 229)
+    out = push(out, 115)  // jae .lead_done
+    let jae_ld_pos = len(out)
+    out = push(out, 0)
+    // load byte: mov rdi, [rbp-8]; movzx eax, byte [rdi+8+r13]
+    out = push(out, 72)
+    out = push(out, 139)
+    out = push(out, 125)
+    out = push(out, 248)
+    out = push(out, 72)
+    out = push(out, 131)
+    out = push(out, 199)
+    out = push(out, 8)
+    out = push(out, 76)
+    out = push(out, 1)
+    out = push(out, 239)
+    out = push(out, 15)
+    out = push(out, 182)
+    out = push(out, 7)
+    // cmp al, 32 (space)
+    out = push(out, 60)
+    out = push(out, 32)
+    out = push(out, 116)
+    out = push(out, 12)  // je .is_ws (skip 12 bytes to inc)
+    // cmp al, 9 (tab)
+    out = push(out, 60)
+    out = push(out, 9)
+    out = push(out, 116)
+    out = push(out, 8)
+    // cmp al, 10 (newline)
+    out = push(out, 60)
+    out = push(out, 10)
+    out = push(out, 116)
+    out = push(out, 4)
+    // cmp al, 13 (cr)
+    out = push(out, 60)
+    out = push(out, 13)
+    out = push(out, 117)  // jne .lead_done
+    let jne_ld_pos = len(out)
+    out = push(out, 0)
+    // .is_ws: inc r13; jmp .skip_leading
+    out = push(out, 73)
+    out = push(out, 255)
+    out = push(out, 197)
+    let jmp_sl = len(out)
+    let sl_delta = skip_lead - jmp_sl - 2
+    out = push(out, 235)
+    var sl_off = sl_delta % 256
+    if sl_off < 0 { sl_off = sl_off + 256 }
+    out = push(out, sl_off)
+
+    // .lead_done:
+    let lead_done = len(out)
+    // Patch jae and jne
+    var p_ld1 = lead_done - jae_ld_pos - 1
+    if p_ld1 < 0 { p_ld1 = p_ld1 + 256 }
+    out[jae_ld_pos] = p_ld1
+    var p_ld2 = lead_done - jne_ld_pos - 1
+    if p_ld2 < 0 { p_ld2 = p_ld2 + 256 }
+    out[jne_ld_pos] = p_ld2
+
+    // .skip_trailing:
+    let skip_trail = len(out)
+    // cmp r14, r13: if end <= start, done
+    out = push(out, 77)
+    out = push(out, 57)
+    out = push(out, 238)
+    out = push(out, 118)  // jbe .trail_done
+    let jbe_td_pos = len(out)
+    out = push(out, 0)
+    // load byte at end-1: mov rdi, [rbp-8]; movzx eax, byte [rdi+8+r14-1]
+    out = push(out, 72)
+    out = push(out, 139)
+    out = push(out, 125)
+    out = push(out, 248)
+    out = push(out, 72)
+    out = push(out, 131)
+    out = push(out, 199)
+    out = push(out, 8)
+    out = push(out, 76)
+    out = push(out, 1)
+    out = push(out, 247)
+    // movzx eax, byte [rdi-1]: 0F B6 47 FF
+    out = push(out, 15)
+    out = push(out, 182)
+    out = push(out, 71)
+    out = push(out, 255)
+    // check whitespace
+    out = push(out, 60)
+    out = push(out, 32)
+    out = push(out, 116)
+    out = push(out, 12)
+    out = push(out, 60)
+    out = push(out, 9)
+    out = push(out, 116)
+    out = push(out, 8)
+    out = push(out, 60)
+    out = push(out, 10)
+    out = push(out, 116)
+    out = push(out, 4)
+    out = push(out, 60)
+    out = push(out, 13)
+    out = push(out, 117)  // jne .trail_done
+    let jne_td_pos = len(out)
+    out = push(out, 0)
+    // dec r14; jmp .skip_trailing
+    out = push(out, 73)
+    out = push(out, 255)
+    out = push(out, 206)
+    let jmp_st = len(out)
+    let st_delta = skip_trail - jmp_st - 2
+    out = push(out, 235)
+    var st_off = st_delta % 256
+    if st_off < 0 { st_off = st_off + 256 }
+    out = push(out, st_off)
+
+    // .trail_done:
+    let trail_done = len(out)
+    var p_td1 = trail_done - jbe_td_pos - 1
+    if p_td1 < 0 { p_td1 = p_td1 + 256 }
+    out[jbe_td_pos] = p_td1
+    var p_td2 = trail_done - jne_td_pos - 1
+    if p_td2 < 0 { p_td2 = p_td2 + 256 }
+    out[jne_td_pos] = p_td2
+
+    // new_len = r14 - r13 (end - start)
+    // mov rcx, r14; sub rcx, r13
+    out = push(out, 76)
+    out = push(out, 137)
+    out = push(out, 241)
+    out = push(out, 76)
+    out = push(out, 41)
+    out = push(out, 233)
+    // [rbp-16] = new_len
+    out = push(out, 72)
+    out = push(out, 137)
+    out = push(out, 77)
+    out = push(out, 240)
+    // alloc new_len + 8 via mmap: mov rdi, rcx; add rdi, 8
+    out = push(out, 72)
+    out = push(out, 137)
+    out = push(out, 207)
+    out = push(out, 72)
+    out = push(out, 131)
+    out = push(out, 199)
+    out = push(out, 8)
+    out = emit_inline_mmap(out)
+    // [rbp-24] = result ptr
+    out = push(out, 72)
+    out = push(out, 137)
+    out = push(out, 69)
+    out = push(out, 232)
+    // store len: mov rcx, [rbp-16]; mov [rax], rcx
+    out = push(out, 72)
+    out = push(out, 139)
+    out = push(out, 77)
+    out = push(out, 240)
+    out = push(out, 72)
+    out = push(out, 137)
+    out = push(out, 8)
+    // copy bytes: src = [rbp-8]+8+r13, dst = rax+8, len = rcx
+    // rdi = rax+8
+    out = push(out, 72)
+    out = push(out, 141)
+    out = push(out, 120)
+    out = push(out, 8)
+    // rsi = [rbp-8]+8+r13
+    out = push(out, 72)
+    out = push(out, 139)
+    out = push(out, 117)
+    out = push(out, 248)
+    out = push(out, 72)
+    out = push(out, 131)
+    out = push(out, 198)
+    out = push(out, 8)
+    out = push(out, 76)
+    out = push(out, 1)
+    out = push(out, 238)
+    // rcx = new_len (already in rcx from [rbp-16])
+    out = push(out, 72)
+    out = push(out, 139)
+    out = push(out, 77)
+    out = push(out, 240)
+    // rep movsb: F3 A4
+    out = push(out, 243)
+    out = push(out, 164)
+    // return result ptr
+    out = push(out, 72)
+    out = push(out, 139)
+    out = push(out, 69)
+    out = push(out, 232)
+    // leave; ret
+    out = push(out, 201)
+    out = push(out, 195)
+    return out
+}
+
+// --- Runtime: _vx_read_file stub ---
+// rdi = path string ptr ([u64 len][bytes...])
+// Returns string ptr in rax, or empty string on error
+fn emit_read_file_stub() -> [i64] {
+    var out: [i64] = []
+    // push rbp; mov rbp, rsp; sub rsp, 64
+    out = push(out, 85)
+    out = push(out, 72)
+    out = push(out, 137)
+    out = push(out, 229)
+    out = push(out, 72)
+    out = push(out, 131)
+    out = push(out, 236)
+    out = push(out, 64)
+    // [rbp-8] = path string
+    out = push(out, 72)
+    out = push(out, 137)
+    out = push(out, 125)
+    out = push(out, 248)
+
+    // Need null-terminated path: alloc len+1, copy, null-terminate
+    // r12 = path len = [rdi]
+    out = push(out, 76)
+    out = push(out, 139)
+    out = push(out, 39)
+    // alloc r12+1: mov rdi, r12; add rdi, 1
+    out = push(out, 76)
+    out = push(out, 137)
+    out = push(out, 231)
+    out = push(out, 72)
+    out = push(out, 255)
+    out = push(out, 199)
+    out = emit_inline_mmap(out)
+    // [rbp-16] = path buf
+    out = push(out, 72)
+    out = push(out, 137)
+    out = push(out, 69)
+    out = push(out, 240)
+    // copy path bytes: rdi=buf, rsi=path+8, rcx=r12
+    out = push(out, 72)
+    out = push(out, 137)
+    out = push(out, 199)  // mov rdi, rax
+    out = push(out, 72)
+    out = push(out, 139)
+    out = push(out, 117)
+    out = push(out, 248)  // mov rsi, [rbp-8]
+    out = push(out, 72)
+    out = push(out, 131)
+    out = push(out, 198)
+    out = push(out, 8)    // add rsi, 8
+    out = push(out, 76)
+    out = push(out, 137)
+    out = push(out, 225)  // mov rcx, r12
+    out = push(out, 243)
+    out = push(out, 164)  // rep movsb
+    // null-terminate: mov byte [rdi], 0
+    out = push(out, 198)
+    out = push(out, 7)
+    out = push(out, 0)
+
+    // open(path_buf, O_RDONLY=0): syscall 2
+    out = push(out, 72)
+    out = push(out, 139)
+    out = push(out, 125)
+    out = push(out, 240)  // mov rdi, [rbp-16]
+    out = push(out, 72)
+    out = push(out, 49)
+    out = push(out, 246)  // xor rsi, rsi (O_RDONLY=0)
+    out = push(out, 72)
+    out = push(out, 199)
+    out = push(out, 192)
+    out = push(out, 2)
+    out = push(out, 0)
+    out = push(out, 0)
+    out = push(out, 0)  // mov rax, 2
+    out = push(out, 15)
+    out = push(out, 5)   // syscall
+    // if fd < 0, return empty string
+    out = push(out, 72)
+    out = push(out, 133)
+    out = push(out, 192)  // test rax, rax
+    out = push(out, 121)  // jns .fd_ok
+    let jns_ok_pos = len(out)
+    out = push(out, 0)
+    // return empty string: alloc 8 bytes, store 0 length
+    out = push(out, 72)
+    out = push(out, 199)
+    out = push(out, 199)
+    out = push(out, 8)
+    out = push(out, 0)
+    out = push(out, 0)
+    out = push(out, 0)
+    out = emit_inline_mmap(out)
+    out = push(out, 72)
+    out = push(out, 199)
+    out = push(out, 0)
+    out = push(out, 0)
+    out = push(out, 0)
+    out = push(out, 0)
+    out = push(out, 0)  // mov qword [rax], 0
+    out = push(out, 201)
+    out = push(out, 195)  // leave; ret
+
+    // .fd_ok:
+    let fd_ok = len(out)
+    var p_ok = fd_ok - jns_ok_pos - 1
+    if p_ok < 0 { p_ok = p_ok + 256 }
+    out[jns_ok_pos] = p_ok
+
+    // [rbp-24] = fd
+    out = push(out, 72)
+    out = push(out, 137)
+    out = push(out, 69)
+    out = push(out, 232)
+    // alloc read buffer (1MB): mov rdi, 1048576
+    out = push(out, 72)
+    out = push(out, 199)
+    out = push(out, 199)
+    out = push(out, 0)
+    out = push(out, 0)
+    out = push(out, 16)
+    out = push(out, 0)  // 0x100000 = 1048576
+    out = emit_inline_mmap(out)
+    // [rbp-32] = read buffer
+    out = push(out, 72)
+    out = push(out, 137)
+    out = push(out, 69)
+    out = push(out, 224)
+
+    // read(fd, buf, 1048576): syscall 0
+    out = push(out, 72)
+    out = push(out, 139)
+    out = push(out, 125)
+    out = push(out, 232)  // mov rdi, [rbp-24] (fd)
+    out = push(out, 72)
+    out = push(out, 139)
+    out = push(out, 117)
+    out = push(out, 224)  // mov rsi, [rbp-32] (buf)
+    out = push(out, 72)
+    out = push(out, 199)
+    out = push(out, 194)
+    out = push(out, 0)
+    out = push(out, 0)
+    out = push(out, 16)
+    out = push(out, 0)  // mov rdx, 1048576
+    out = push(out, 72)
+    out = push(out, 49)
+    out = push(out, 192)  // xor rax, rax (SYS_READ=0)
+    out = push(out, 15)
+    out = push(out, 5)   // syscall
+    // [rbp-40] = bytes_read
+    out = push(out, 72)
+    out = push(out, 137)
+    out = push(out, 69)
+    out = push(out, 216)
+
+    // close(fd): syscall 3
+    out = push(out, 72)
+    out = push(out, 139)
+    out = push(out, 125)
+    out = push(out, 232)  // mov rdi, [rbp-24]
+    out = push(out, 72)
+    out = push(out, 199)
+    out = push(out, 192)
+    out = push(out, 3)
+    out = push(out, 0)
+    out = push(out, 0)
+    out = push(out, 0)  // mov rax, 3
+    out = push(out, 15)
+    out = push(out, 5)   // syscall
+
+    // Build string: alloc bytes_read + 8, store len, copy data
+    out = push(out, 72)
+    out = push(out, 139)
+    out = push(out, 77)
+    out = push(out, 216)  // mov rcx, [rbp-40] (bytes_read)
+    // if bytes_read <= 0, return empty
+    out = push(out, 72)
+    out = push(out, 133)
+    out = push(out, 201)
+    out = push(out, 127)  // jg .has_data
+    let jg_hd_pos = len(out)
+    out = push(out, 0)
+    // empty string
+    out = push(out, 72)
+    out = push(out, 199)
+    out = push(out, 199)
+    out = push(out, 8)
+    out = push(out, 0)
+    out = push(out, 0)
+    out = push(out, 0)
+    out = emit_inline_mmap(out)
+    out = push(out, 72)
+    out = push(out, 199)
+    out = push(out, 0)
+    out = push(out, 0)
+    out = push(out, 0)
+    out = push(out, 0)
+    out = push(out, 0)
+    out = push(out, 201)
+    out = push(out, 195)
+
+    // .has_data:
+    let has_data = len(out)
+    var p_hd = has_data - jg_hd_pos - 1
+    if p_hd < 0 { p_hd = p_hd + 256 }
+    out[jg_hd_pos] = p_hd
+
+    // alloc bytes_read + 8
+    out = push(out, 72)
+    out = push(out, 139)
+    out = push(out, 125)
+    out = push(out, 216)  // mov rdi, [rbp-40]
+    out = push(out, 72)
+    out = push(out, 131)
+    out = push(out, 199)
+    out = push(out, 8)    // add rdi, 8
+    out = emit_inline_mmap(out)
+    // [rbp-48] = result
+    out = push(out, 72)
+    out = push(out, 137)
+    out = push(out, 69)
+    out = push(out, 208)
+    // store length
+    out = push(out, 72)
+    out = push(out, 139)
+    out = push(out, 77)
+    out = push(out, 216)  // mov rcx, [rbp-40]
+    out = push(out, 72)
+    out = push(out, 137)
+    out = push(out, 8)    // mov [rax], rcx
+    // copy: rdi=result+8, rsi=read_buf, rcx=bytes_read
+    out = push(out, 72)
+    out = push(out, 141)
+    out = push(out, 120)
+    out = push(out, 8)    // lea rdi, [rax+8]
+    out = push(out, 72)
+    out = push(out, 139)
+    out = push(out, 117)
+    out = push(out, 224)  // mov rsi, [rbp-32]
+    out = push(out, 72)
+    out = push(out, 139)
+    out = push(out, 77)
+    out = push(out, 216)  // mov rcx, [rbp-40]
+    out = push(out, 243)
+    out = push(out, 164)  // rep movsb
+    // return result
+    out = push(out, 72)
+    out = push(out, 139)
+    out = push(out, 69)
+    out = push(out, 208)  // mov rax, [rbp-48]
+    out = push(out, 201)
+    out = push(out, 195)  // leave; ret
+    return out
+}
+
+// --- Runtime: _vx_write_file stub ---
+// rdi = path string ptr, rsi = content string ptr
+fn emit_write_file_stub() -> [i64] {
+    var out: [i64] = []
+    // push rbp; mov rbp, rsp; sub rsp, 48
+    out = push(out, 85)
+    out = push(out, 72)
+    out = push(out, 137)
+    out = push(out, 229)
+    out = push(out, 72)
+    out = push(out, 131)
+    out = push(out, 236)
+    out = push(out, 48)
+    // [rbp-8] = path, [rbp-16] = content
+    out = push(out, 72)
+    out = push(out, 137)
+    out = push(out, 125)
+    out = push(out, 248)
+    out = push(out, 72)
+    out = push(out, 137)
+    out = push(out, 117)
+    out = push(out, 240)
+
+    // Null-terminate path
+    // r12 = path len
+    out = push(out, 76)
+    out = push(out, 139)
+    out = push(out, 39)  // mov r12, [rdi]
+    out = push(out, 76)
+    out = push(out, 137)
+    out = push(out, 231)  // mov rdi, r12
+    out = push(out, 72)
+    out = push(out, 255)
+    out = push(out, 199)  // inc rdi
+    out = emit_inline_mmap(out)
+    // [rbp-24] = path_buf
+    out = push(out, 72)
+    out = push(out, 137)
+    out = push(out, 69)
+    out = push(out, 232)
+    // copy path
+    out = push(out, 72)
+    out = push(out, 137)
+    out = push(out, 199)  // mov rdi, rax
+    out = push(out, 72)
+    out = push(out, 139)
+    out = push(out, 117)
+    out = push(out, 248)  // mov rsi, [rbp-8]
+    out = push(out, 72)
+    out = push(out, 131)
+    out = push(out, 198)
+    out = push(out, 8)    // add rsi, 8
+    out = push(out, 76)
+    out = push(out, 137)
+    out = push(out, 225)  // mov rcx, r12
+    out = push(out, 243)
+    out = push(out, 164)  // rep movsb
+    out = push(out, 198)
+    out = push(out, 7)
+    out = push(out, 0)    // mov byte [rdi], 0
+
+    // open(path_buf, O_WRONLY|O_CREAT|O_TRUNC = 1+64+512 = 577, 0644 = 420)
+    out = push(out, 72)
+    out = push(out, 139)
+    out = push(out, 125)
+    out = push(out, 232)  // mov rdi, [rbp-24]
+    // mov rsi, 577 (0x241)
+    out = push(out, 72)
+    out = push(out, 199)
+    out = push(out, 198)
+    out = push(out, 65)
+    out = push(out, 2)
+    out = push(out, 0)
+    out = push(out, 0)
+    // mov rdx, 420 (0x1A4)
+    out = push(out, 72)
+    out = push(out, 199)
+    out = push(out, 194)
+    out = push(out, 164)
+    out = push(out, 1)
+    out = push(out, 0)
+    out = push(out, 0)
+    // mov rax, 2 (SYS_OPEN)
+    out = push(out, 72)
+    out = push(out, 199)
+    out = push(out, 192)
+    out = push(out, 2)
+    out = push(out, 0)
+    out = push(out, 0)
+    out = push(out, 0)
+    out = push(out, 15)
+    out = push(out, 5)   // syscall
+
+    // [rbp-32] = fd
+    out = push(out, 72)
+    out = push(out, 137)
+    out = push(out, 69)
+    out = push(out, 224)
+
+    // write(fd, content+8, [content])
+    out = push(out, 72)
+    out = push(out, 137)
+    out = push(out, 199)  // mov rdi, rax (fd)
+    out = push(out, 72)
+    out = push(out, 139)
+    out = push(out, 69)
+    out = push(out, 240)  // mov rax, [rbp-16] (content)
+    out = push(out, 72)
+    out = push(out, 139)
+    out = push(out, 16)   // mov rdx, [rax] (len)
+    out = push(out, 72)
+    out = push(out, 141)
+    out = push(out, 112)
+    out = push(out, 8)    // lea rsi, [rax+8] (data)
+    out = push(out, 72)
+    out = push(out, 199)
+    out = push(out, 192)
+    out = push(out, 1)
+    out = push(out, 0)
+    out = push(out, 0)
+    out = push(out, 0)  // mov rax, 1 (SYS_WRITE)
+    out = push(out, 15)
+    out = push(out, 5)   // syscall
+
+    // close(fd)
+    out = push(out, 72)
+    out = push(out, 139)
+    out = push(out, 125)
+    out = push(out, 224)  // mov rdi, [rbp-32]
+    out = push(out, 72)
+    out = push(out, 199)
+    out = push(out, 192)
+    out = push(out, 3)
+    out = push(out, 0)
+    out = push(out, 0)
+    out = push(out, 0)  // mov rax, 3
+    out = push(out, 15)
+    out = push(out, 5)   // syscall
+
+    // return 0
+    out = push(out, 72)
+    out = push(out, 49)
+    out = push(out, 192)
+    out = push(out, 201)
+    out = push(out, 195)  // leave; ret
+    return out
+}
+
+// --- Runtime: _vx_file_exists stub ---
+// rdi = path string ptr
+// Returns 1 if exists, 0 otherwise
+// Uses access() syscall (21) with F_OK (0)
+fn emit_file_exists_stub() -> [i64] {
+    var out: [i64] = []
+    // push rbp; mov rbp, rsp; sub rsp, 32
+    out = push(out, 85)
+    out = push(out, 72)
+    out = push(out, 137)
+    out = push(out, 229)
+    out = push(out, 72)
+    out = push(out, 131)
+    out = push(out, 236)
+    out = push(out, 32)
+    // [rbp-8] = path string
+    out = push(out, 72)
+    out = push(out, 137)
+    out = push(out, 125)
+    out = push(out, 248)
+
+    // Null-terminate path: alloc len+1
+    out = push(out, 76)
+    out = push(out, 139)
+    out = push(out, 39)  // mov r12, [rdi] (len)
+    out = push(out, 76)
+    out = push(out, 137)
+    out = push(out, 231)  // mov rdi, r12
+    out = push(out, 72)
+    out = push(out, 255)
+    out = push(out, 199)  // inc rdi
+    out = emit_inline_mmap(out)
+    // [rbp-16] = path_buf
+    out = push(out, 72)
+    out = push(out, 137)
+    out = push(out, 69)
+    out = push(out, 240)
+    // copy
+    out = push(out, 72)
+    out = push(out, 137)
+    out = push(out, 199)
+    out = push(out, 72)
+    out = push(out, 139)
+    out = push(out, 117)
+    out = push(out, 248)
+    out = push(out, 72)
+    out = push(out, 131)
+    out = push(out, 198)
+    out = push(out, 8)
+    out = push(out, 76)
+    out = push(out, 137)
+    out = push(out, 225)
+    out = push(out, 243)
+    out = push(out, 164)
+    out = push(out, 198)
+    out = push(out, 7)
+    out = push(out, 0)
+
+    // access(path_buf, F_OK=0): syscall 21
+    out = push(out, 72)
+    out = push(out, 139)
+    out = push(out, 125)
+    out = push(out, 240)  // mov rdi, [rbp-16]
+    out = push(out, 72)
+    out = push(out, 49)
+    out = push(out, 246)  // xor rsi, rsi (F_OK=0)
+    out = push(out, 72)
+    out = push(out, 199)
+    out = push(out, 192)
+    out = push(out, 21)
+    out = push(out, 0)
+    out = push(out, 0)
+    out = push(out, 0)  // mov rax, 21
+    out = push(out, 15)
+    out = push(out, 5)   // syscall
+
+    // if rax == 0, return 1; else return 0
+    out = push(out, 72)
+    out = push(out, 133)
+    out = push(out, 192)  // test rax, rax
+    // sete al: 0F 94 C0
+    out = push(out, 15)
+    out = push(out, 148)
+    out = push(out, 192)
+    // movzx rax, al: 48 0F B6 C0
+    out = push(out, 72)
+    out = push(out, 15)
+    out = push(out, 182)
+    out = push(out, 192)
+    out = push(out, 201)
+    out = push(out, 195)  // leave; ret
+    return out
+}
+
+// --- Runtime: _vx_print_int_no_nl stub ---
+// Like _vx_print_int but without trailing newline
+// rdi = integer value
+fn emit_print_int_no_nl_stub() -> [i64] {
+    var out: [i64] = []
+    // sub rsp, 32 (buffer space)
+    out = push(out, 72)
+    out = push(out, 131)
+    out = push(out, 236)
+    out = push(out, 32)
+    // Save rdi
+    out = push(out, 72)
+    out = push(out, 137)
+    out = push(out, 248)  // mov rax, rdi
+
+    // Handle negative: save sign in r14
+    // push r14
+    out = push(out, 65)
+    out = push(out, 86)
+    // xor r14, r14
+    out = push(out, 77)
+    out = push(out, 49)
+    out = push(out, 246)
+    // test rax, rax
+    out = push(out, 72)
+    out = push(out, 133)
+    out = push(out, 192)
+    // jns .positive
+    out = push(out, 121)
+    out = push(out, 5)
+    // neg rax; mov r14, 1
+    out = push(out, 72)
+    out = push(out, 247)
+    out = push(out, 216)
+    // mov r14d, 1: 41 BE 01 00 00 00
+    out = push(out, 65)
+    out = push(out, 190)
+    out = push(out, 1)
+    out = push(out, 0)
+    out = push(out, 0)
+    out = push(out, 0)
+
+    // .positive:
+    // Use buffer at [rsp+8..rsp+31] for digits
+    // r12 = pointer to end of buffer
+    // push r12
+    out = push(out, 65)
+    out = push(out, 84)
+    // lea r12, [rsp+31]: 4C 8D 64 24 1F  -- wait, we pushed r14 and r12, so rsp shifted
+    // Actually let's use rsp+39 (32 + 8 for r14 push) -- this is getting complex
+    // Simpler: use stack buffer directly
+    // r12 points to end of digit area (rsp + 23 after pushes)
+    out = push(out, 76)
+    out = push(out, 141)
+    out = push(out, 100)
+    out = push(out, 36)
+    out = push(out, 38)   // lea r12, [rsp+38]
+
+    // Handle 0 case
+    out = push(out, 72)
+    out = push(out, 133)
+    out = push(out, 192)
+    out = push(out, 117)
+    out = push(out, 6)  // jnz .nonzero
+    // mov byte [r12], '0'
+    out = push(out, 65)
+    out = push(out, 198)
+    out = push(out, 4)
+    out = push(out, 36)
+    out = push(out, 48)
+    // jmp .print
+    out = push(out, 235)
+    let jmp_print_pos = len(out)
+    out = push(out, 0)
+
+    // .nonzero: convert digits
+    let nonzero = len(out)
+    // mov r8, 10: 49 C7 C0 0A 00 00 00
+    out = push(out, 73)
+    out = push(out, 199)
+    out = push(out, 192)
+    out = push(out, 10)
+    out = push(out, 0)
+    out = push(out, 0)
+    out = push(out, 0)
+
+    // .digit_loop:
+    let digit_loop = len(out)
+    // xor rdx, rdx; div r8
+    out = push(out, 72)
+    out = push(out, 49)
+    out = push(out, 210)
+    out = push(out, 73)
+    out = push(out, 247)
+    out = push(out, 240)
+    // add dl, '0'
+    out = push(out, 128)
+    out = push(out, 194)
+    out = push(out, 48)
+    // mov [r12], dl
+    out = push(out, 65)
+    out = push(out, 136)
+    out = push(out, 20)
+    out = push(out, 36)
+    // dec r12
+    out = push(out, 73)
+    out = push(out, 255)
+    out = push(out, 204)
+    // test rax, rax; jnz .digit_loop
+    out = push(out, 72)
+    out = push(out, 133)
+    out = push(out, 192)
+    let jnz_dl_pos = len(out)
+    let dl_delta = digit_loop - jnz_dl_pos - 2
+    out = push(out, 117)
+    var dl_off = dl_delta % 256
+    if dl_off < 0 { dl_off = dl_off + 256 }
+    out = push(out, dl_off)
+
+    // If negative, write '-'
+    out = push(out, 77)
+    out = push(out, 133)
+    out = push(out, 246)
+    out = push(out, 121)
+    out = push(out, 8)  // jns .print
+    out = push(out, 65)
+    out = push(out, 198)
+    out = push(out, 4)
+    out = push(out, 36)
+    out = push(out, 45)  // mov byte [r12], '-'
+    out = push(out, 73)
+    out = push(out, 255)
+    out = push(out, 204)  // dec r12
+
+    // .print:
+    let print_pos = len(out)
+    // patch jmp_print
+    var p_pp = print_pos - jmp_print_pos - 1
+    if p_pp < 0 { p_pp = p_pp + 256 }
+    out[jmp_print_pos] = p_pp
+
+    // write(1, r12+1, end-r12)
+    // lea rsi, [r12+1]
+    out = push(out, 73)
+    out = push(out, 141)
+    out = push(out, 116)
+    out = push(out, 36)
+    out = push(out, 1)
+    // lea rdx, [rsp+39] -- end of buffer
+    // Actually compute: rsp+39 - rsi = len
+    out = push(out, 72)
+    out = push(out, 141)
+    out = push(out, 84)
+    out = push(out, 36)
+    out = push(out, 39)  // lea rdx, [rsp+39]
+    out = push(out, 72)
+    out = push(out, 41)
+    out = push(out, 242)  // sub rdx, rsi
+    // mov rax, 1
+    out = push(out, 72)
+    out = push(out, 199)
+    out = push(out, 192)
+    out = push(out, 1)
+    out = push(out, 0)
+    out = push(out, 0)
+    out = push(out, 0)
+    // mov rdi, 1
+    out = push(out, 72)
+    out = push(out, 199)
+    out = push(out, 199)
+    out = push(out, 1)
+    out = push(out, 0)
+    out = push(out, 0)
+    out = push(out, 0)
+    // syscall
+    out = push(out, 15)
+    out = push(out, 5)
+
+    // pop r12; pop r14; add rsp, 32; ret
+    out = push(out, 65)
+    out = push(out, 92)
+    out = push(out, 65)
+    out = push(out, 94)
+    out = push(out, 72)
+    out = push(out, 131)
+    out = push(out, 196)
+    out = push(out, 32)
+    out = push(out, 195)
+    return out
+}
+
 // --- Program compiler ---
 fn compile_program(fns: [String]) -> [i64] {
     var code: [i64] = []
@@ -5363,6 +7159,108 @@ fn compile_program(fns: [String]) -> [i64] {
     while sfbi < len(str_from_bytes_code) {
         code = push(code, str_from_bytes_code[sfbi])
         sfbi = sfbi + 1
+    }
+
+    // Emit _vx_exp runtime stub
+    let exp_code = emit_exp_stub()
+    register_function("_vx_exp", len(code))
+    var exi = 0
+    while exi < len(exp_code) {
+        code = push(code, exp_code[exi])
+        exi = exi + 1
+    }
+
+    // Emit _vx_log runtime stub
+    let log_code = emit_log_stub()
+    register_function("_vx_log", len(code))
+    var lgi = 0
+    while lgi < len(log_code) {
+        code = push(code, log_code[lgi])
+        lgi = lgi + 1
+    }
+
+    // Emit _vx_pow runtime stub
+    let pow_code = emit_pow_stub()
+    register_function("_vx_pow", len(code))
+    var pwi = 0
+    while pwi < len(pow_code) {
+        code = push(code, pow_code[pwi])
+        pwi = pwi + 1
+    }
+
+    // Emit _vx_str_find runtime stub
+    let str_find_code = emit_str_find_stub()
+    register_function("_vx_str_find", len(code))
+    var sfi = 0
+    while sfi < len(str_find_code) {
+        code = push(code, str_find_code[sfi])
+        sfi = sfi + 1
+    }
+
+    // Emit _vx_trim runtime stub
+    let trim_code = emit_trim_stub()
+    register_function("_vx_trim", len(code))
+    var tri = 0
+    while tri < len(trim_code) {
+        code = push(code, trim_code[tri])
+        tri = tri + 1
+    }
+
+    // Emit _vx_read_file runtime stub
+    let read_file_code = emit_read_file_stub()
+    register_function("_vx_read_file", len(code))
+    var rfi = 0
+    while rfi < len(read_file_code) {
+        code = push(code, read_file_code[rfi])
+        rfi = rfi + 1
+    }
+
+    // Emit _vx_write_file runtime stub
+    let write_file_code = emit_write_file_stub()
+    register_function("_vx_write_file", len(code))
+    var wfi = 0
+    while wfi < len(write_file_code) {
+        code = push(code, write_file_code[wfi])
+        wfi = wfi + 1
+    }
+
+    // Emit _vx_file_exists runtime stub
+    let file_exists_code = emit_file_exists_stub()
+    register_function("_vx_file_exists", len(code))
+    var fei = 0
+    while fei < len(file_exists_code) {
+        code = push(code, file_exists_code[fei])
+        fei = fei + 1
+    }
+
+    // Emit _vx_print_int_no_nl runtime stub
+    let print_int_no_nl_code = emit_print_int_no_nl_stub()
+    register_function("_vx_print_int_no_nl", len(code))
+    var pinni = 0
+    while pinni < len(print_int_no_nl_code) {
+        code = push(code, print_int_no_nl_code[pinni])
+        pinni = pinni + 1
+    }
+
+    // Pre-register global variables so all functions can see them
+    // Scan for _vx_init_globals and register its var/let names
+    var gi = 0
+    while gi < len(fns) {
+        if fns[gi][1] == "_vx_init_globals" {
+            let gbody = fns[gi][3]
+            var gs = 0
+            while gs < len(gbody) {
+                let gstmt = gbody[gs]
+                if gstmt[0] == "var" {
+                    globals_add(gstmt[1])
+                }
+                if gstmt[0] == "let" {
+                    globals_add(gstmt[1])
+                }
+                gs = gs + 1
+            }
+        }
+        gi = gi + 1
     }
 
     // Compile user functions
