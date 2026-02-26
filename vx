@@ -1,0 +1,26 @@
+#!/bin/bash
+# vx — Vortex runtime launcher
+# Sets stack size and runs .vx files through the self-hosted runtime
+# Usage: ./vx <file.vx>
+#        ./vx (runs self-test)
+
+VORTEX_DIR="$(cd "$(dirname "$0")" && pwd)"
+BOOTSTRAP="$VORTEX_DIR/target/debug/vortex"
+
+if [ ! -f "$BOOTSTRAP" ]; then
+    echo "vx: bootstrap binary not found at $BOOTSTRAP"
+    exit 1
+fi
+
+ulimit -s unlimited 2>/dev/null
+
+if [ -n "$1" ]; then
+    # Run a .vx file through vxrun (self-hosted runtime)
+    echo "$1" > /tmp/vx_run_target
+    "$BOOTSTRAP" run "$VORTEX_DIR/stdlib/compiler/vxrun.vx"
+    rm -f /tmp/vx_run_target
+else
+    # No args — run vxrun self-test
+    rm -f /tmp/vx_run_target
+    "$BOOTSTRAP" run "$VORTEX_DIR/stdlib/compiler/vxrun.vx"
+fi
