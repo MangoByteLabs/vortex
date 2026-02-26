@@ -170,7 +170,40 @@ fn lex(source: String) -> [String] {
                     scanning_num = false
                 }
             }
-            tokens = push(tokens, tok_new("INT", str_substr(source, start, pos - start), line, start_col))
+            // Check for decimal point -> float literal
+            if pos < src_len {
+                if str_char_at(source, pos) == "." {
+                    if pos + 1 < src_len {
+                        if str_is_ascii_digit(str_char_at(source, pos + 1)) {
+                            // It's a float: consume '.' and fractional digits
+                            pos = pos + 1
+                            col = col + 1
+                            var scanning_frac = true
+                            while scanning_frac {
+                                if pos < src_len {
+                                    if str_is_ascii_digit(str_char_at(source, pos)) {
+                                        pos = pos + 1
+                                        col = col + 1
+                                    } else {
+                                        scanning_frac = false
+                                    }
+                                } else {
+                                    scanning_frac = false
+                                }
+                            }
+                            tokens = push(tokens, tok_new("FLOAT", str_substr(source, start, pos - start), line, start_col))
+                        } else {
+                            tokens = push(tokens, tok_new("INT", str_substr(source, start, pos - start), line, start_col))
+                        }
+                    } else {
+                        tokens = push(tokens, tok_new("INT", str_substr(source, start, pos - start), line, start_col))
+                    }
+                } else {
+                    tokens = push(tokens, tok_new("INT", str_substr(source, start, pos - start), line, start_col))
+                }
+            } else {
+                tokens = push(tokens, tok_new("INT", str_substr(source, start, pos - start), line, start_col))
+            }
         } else if str_is_ascii_alpha(ch) {
             let start = pos
             let start_col = col
@@ -594,6 +627,11 @@ fn parse_primary() -> [String] {
     if p_at("INT") {
         let tok = p_advance()
         return ["int", tok[1]]
+    }
+
+    if p_at("FLOAT") {
+        let tok = p_advance()
+        return ["float", tok[1]]
     }
 
     if p_at("STRING") {
@@ -1118,8 +1156,97 @@ fn emit_syscall_inst(code: [i64]) -> [i64] {
     return code
 }
 
+// --- SSE/float instructions ---
+
+// movq xmm0, rax: 66 48 0F 6E C0
+fn emit_movq_xmm0_rax(code: [i64]) -> [i64] {
+    code = emit_u8(code, 102)
+    code = emit_u8(code, 72)
+    code = emit_u8(code, 15)
+    code = emit_u8(code, 110)
+    code = emit_u8(code, 192)
+    return code
+}
+
+// movq rax, xmm0: 66 48 0F 7E C0
+fn emit_movq_rax_xmm0(code: [i64]) -> [i64] {
+    code = emit_u8(code, 102)
+    code = emit_u8(code, 72)
+    code = emit_u8(code, 15)
+    code = emit_u8(code, 126)
+    code = emit_u8(code, 192)
+    return code
+}
+
+// movq xmm1, rax: 66 48 0F 6E C8
+fn emit_movq_xmm1_rax(code: [i64]) -> [i64] {
+    code = emit_u8(code, 102)
+    code = emit_u8(code, 72)
+    code = emit_u8(code, 15)
+    code = emit_u8(code, 110)
+    code = emit_u8(code, 200)
+    return code
+}
+
+// addsd xmm0, xmm1: F2 0F 58 C1
+fn emit_addsd(code: [i64]) -> [i64] {
+    code = emit_u8(code, 242)
+    code = emit_u8(code, 15)
+    code = emit_u8(code, 88)
+    code = emit_u8(code, 193)
+    return code
+}
+
+// subsd xmm0, xmm1: F2 0F 5C C1
+fn emit_subsd(code: [i64]) -> [i64] {
+    code = emit_u8(code, 242)
+    code = emit_u8(code, 15)
+    code = emit_u8(code, 92)
+    code = emit_u8(code, 193)
+    return code
+}
+
+// mulsd xmm0, xmm1: F2 0F 59 C1
+fn emit_mulsd(code: [i64]) -> [i64] {
+    code = emit_u8(code, 242)
+    code = emit_u8(code, 15)
+    code = emit_u8(code, 89)
+    code = emit_u8(code, 193)
+    return code
+}
+
+// divsd xmm0, xmm1: F2 0F 5E C1
+fn emit_divsd(code: [i64]) -> [i64] {
+    code = emit_u8(code, 242)
+    code = emit_u8(code, 15)
+    code = emit_u8(code, 94)
+    code = emit_u8(code, 193)
+    return code
+}
+
+// cvttsd2si rax, xmm0: F2 48 0F 2C C0
+fn emit_cvttsd2si_rax_xmm0(code: [i64]) -> [i64] {
+    code = emit_u8(code, 242)
+    code = emit_u8(code, 72)
+    code = emit_u8(code, 15)
+    code = emit_u8(code, 44)
+    code = emit_u8(code, 192)
+    return code
+}
+
+// cvtsi2sd xmm0, rax: F2 48 0F 2A C0
+fn emit_cvtsi2sd_xmm0_rax(code: [i64]) -> [i64] {
+    code = emit_u8(code, 242)
+    code = emit_u8(code, 72)
+    code = emit_u8(code, 15)
+    code = emit_u8(code, 42)
+    code = emit_u8(code, 192)
+    return code
+}
+
 // --- Locals management ---
 var _locals: [String] = []
+var _local_types: [String] = []
 
 fn locals_find(name: String) -> i64 {
     var i = 0
@@ -1138,7 +1265,22 @@ fn locals_offset(idx: i64) -> i64 {
 
 fn locals_add(name: String) -> i64 {
     _locals = push(_locals, name)
+    _local_types = push(_local_types, "int")
     return len(_locals) - 1
+}
+
+fn locals_set_type(idx: i64, typ: String) -> i64 {
+    _local_types[idx] = typ
+    return 0
+}
+
+fn locals_get_type(idx: i64) -> String {
+    if idx >= 0 {
+        if idx < len(_local_types) {
+            return _local_types[idx]
+        }
+    }
+    return "int"
 }
 
 // --- Label/fixup management ---
@@ -1205,6 +1347,193 @@ fn register_function(name: String, addr: i64) -> i64 {
     return 0
 }
 
+// --- Float string to IEEE 754 bits (pure integer math) ---
+// Parses "3.14" -> IEEE 754 f64 bit pattern as i64
+fn float_str_to_bits(s: String) -> i64 {
+    // Find the dot position
+    var dot_pos = 0 - 1
+    var si = 0
+    let slen = len(s)
+    while si < slen {
+        if str_char_at(s, si) == "." {
+            dot_pos = si
+        }
+        si = si + 1
+    }
+    if dot_pos < 0 {
+        // No dot, treat as integer float
+        let ival = int(s)
+        if ival == 0 {
+            return 0
+        }
+        // Build float from integer
+        var val = ival
+        if val < 0 {
+            val = 0 - val
+        }
+        var exp = 1023 + 52
+        // Normalize: shift val so highest bit is at position 52
+        // First find how many bits val has
+        var bits_needed = 0
+        var tmp = val
+        while tmp > 0 {
+            bits_needed = bits_needed + 1
+            tmp = tmp / 2
+        }
+        // We need to shift to have exactly 53 bits (bit 52 is implicit 1)
+        if bits_needed > 53 {
+            var shift_right = bits_needed - 53
+            var sr = 0
+            while sr < shift_right {
+                val = val / 2
+                sr = sr + 1
+            }
+            exp = exp + shift_right
+        } else if bits_needed < 53 {
+            var shift_left = 53 - bits_needed
+            var sl = 0
+            while sl < shift_left {
+                val = val * 2
+                sl = sl + 1
+            }
+            exp = exp - shift_left
+        }
+        // Mantissa: lower 52 bits (remove implicit leading 1)
+        let mantissa = val - 4503599627370496
+        let result = exp * 4503599627370496 + mantissa
+        if ival < 0 {
+            return result + 9223372036854775807 + 1
+        }
+        return result
+    }
+    // Parse integer part
+    let int_str = str_substr(s, 0, dot_pos)
+    let frac_str = str_substr(s, dot_pos + 1, slen - dot_pos - 1)
+    var int_part = 0
+    if len(int_str) > 0 {
+        int_part = int(int_str)
+    }
+    var frac_digits = len(frac_str)
+    var frac_val = 0
+    if frac_digits > 0 {
+        frac_val = int(frac_str)
+    }
+    // Special case: 0.0
+    if int_part == 0 {
+        if frac_val == 0 {
+            return 0
+        }
+    }
+    // Compute the float value as a fixed-point number
+    // We need to find: value = int_part + frac_val / 10^frac_digits
+    // Then encode as IEEE 754 double
+    // Strategy: compute mantissa * 2^(-exp) = value
+    // Work with scaled integers: value_scaled = int_part * 10^frac_digits + frac_val
+    // denominator = 10^frac_digits
+    var denom = 1
+    var di = 0
+    while di < frac_digits {
+        denom = denom * 10
+        di = di + 1
+    }
+    var numerator = int_part * denom + frac_val
+    // Now we have value = numerator / denom
+    // Find exponent: how many times we multiply/divide by 2 to normalize
+    if numerator == 0 {
+        return 0
+    }
+    // We need to compute: mantissa_53bits * 2^(exp-52) = numerator / denom
+    // So mantissa_53bits = numerator * 2^(52-exp) / denom
+    // First find rough exponent by seeing how big numerator/denom is
+    var biased_exp = 1023
+    // Scale numerator/denom so that 1 <= numerator/denom < 2
+    // Equivalent: 1*denom <= numerator < 2*denom
+    while numerator >= 2 * denom {
+        denom = denom * 2
+        biased_exp = biased_exp + 1
+    }
+    while numerator < denom {
+        numerator = numerator * 2
+        biased_exp = biased_exp - 1
+    }
+    // Now denom <= numerator < 2*denom, meaning 1.xxx in binary
+    // Extract 52 bits of mantissa after the leading 1
+    // mantissa_frac = (numerator - denom) / denom, need 52 bits
+    numerator = numerator - denom
+    var mantissa = 0
+    var bi = 0
+    while bi < 52 {
+        numerator = numerator * 2
+        mantissa = mantissa * 2
+        if numerator >= denom {
+            mantissa = mantissa + 1
+            numerator = numerator - denom
+        }
+        bi = bi + 1
+    }
+    // Round: if remainder >= denom/2, round up
+    if numerator * 2 >= denom {
+        mantissa = mantissa + 1
+    }
+    // Compose: [sign=0][exponent=11bits][mantissa=52bits]
+    // sign * 2^63 + biased_exp * 2^52 + mantissa
+    let result = biased_exp * 4503599627370496 + mantissa
+    return result
+}
+
+// Check if an AST expression produces a float value
+fn expr_is_float(expr: [String]) -> bool {
+    let kind = expr[0]
+    if kind == "float" {
+        return true
+    }
+    if kind == "ident" {
+        let idx = locals_find(expr[1])
+        if idx >= 0 {
+            return locals_get_type(idx) == "float"
+        }
+    }
+    if kind == "+" {
+        if expr_is_float(expr[1]) {
+            return true
+        }
+        if expr_is_float(expr[2]) {
+            return true
+        }
+    }
+    if kind == "-" {
+        if expr_is_float(expr[1]) {
+            return true
+        }
+        if expr_is_float(expr[2]) {
+            return true
+        }
+    }
+    if kind == "*" {
+        if expr_is_float(expr[1]) {
+            return true
+        }
+        if expr_is_float(expr[2]) {
+            return true
+        }
+    }
+    if kind == "/" {
+        if expr_is_float(expr[1]) {
+            return true
+        }
+        if expr_is_float(expr[2]) {
+            return true
+        }
+    }
+    if kind == "neg" {
+        return expr_is_float(expr[1])
+    }
+    if kind == "call" {
+        return false
+    }
+    return false
+}
+
 // --- Expression compiler: result in RAX ---
 fn compile_expr(code: [i64], expr: [String]) -> [i64] {
     let kind = expr[0]
@@ -1212,6 +1541,12 @@ fn compile_expr(code: [i64], expr: [String]) -> [i64] {
     if kind == "int" {
         let val = int(expr[1])
         code = emit_mov_reg_imm64(code, REG_RAX(), val)
+        return code
+    }
+
+    if kind == "float" {
+        let bits = float_str_to_bits(expr[1])
+        code = emit_mov_reg_imm64(code, REG_RAX(), bits)
         return code
     }
 
@@ -1229,6 +1564,18 @@ fn compile_expr(code: [i64], expr: [String]) -> [i64] {
     }
 
     if kind == "neg" {
+        if expr_is_float(expr[1]) {
+            // Float negation: XOR sign bit
+            code = compile_expr(code, expr[1])
+            // xor rax with sign bit (1<<63)
+            // mov rcx, 0x8000000000000000; xor rax, rcx
+            code = emit_mov_reg_imm64(code, REG_RCX(), 0 - 9223372036854775807 - 1)
+            // xor rax, rcx: 48 31 C8
+            code = emit_u8(code, 72)
+            code = emit_u8(code, 49)
+            code = emit_u8(code, 200)
+            return code
+        }
         code = compile_expr(code, expr[1])
         // neg rax: 48 F7 D8
         code = emit_u8(code, 72)
@@ -1238,6 +1585,21 @@ fn compile_expr(code: [i64], expr: [String]) -> [i64] {
     }
 
     if kind == "+" {
+        if expr_is_float(expr) {
+            // Float addition using SSE
+            code = compile_expr(code, expr[2])
+            code = emit_push_reg(code, REG_RAX())
+            code = compile_expr(code, expr[1])
+            // left result in RAX -> xmm0
+            code = emit_movq_xmm0_rax(code)
+            // right from stack -> RAX -> xmm1
+            code = emit_pop_reg(code, REG_RAX())
+            code = emit_movq_xmm1_rax(code)
+            code = emit_addsd(code)
+            // result in xmm0 -> RAX
+            code = emit_movq_rax_xmm0(code)
+            return code
+        }
         code = compile_expr(code, expr[2])
         code = emit_push_reg(code, REG_RAX())
         code = compile_expr(code, expr[1])
@@ -1247,6 +1609,17 @@ fn compile_expr(code: [i64], expr: [String]) -> [i64] {
     }
 
     if kind == "-" {
+        if expr_is_float(expr) {
+            code = compile_expr(code, expr[2])
+            code = emit_push_reg(code, REG_RAX())
+            code = compile_expr(code, expr[1])
+            code = emit_movq_xmm0_rax(code)
+            code = emit_pop_reg(code, REG_RAX())
+            code = emit_movq_xmm1_rax(code)
+            code = emit_subsd(code)
+            code = emit_movq_rax_xmm0(code)
+            return code
+        }
         code = compile_expr(code, expr[2])
         code = emit_push_reg(code, REG_RAX())
         code = compile_expr(code, expr[1])
@@ -1256,6 +1629,17 @@ fn compile_expr(code: [i64], expr: [String]) -> [i64] {
     }
 
     if kind == "*" {
+        if expr_is_float(expr) {
+            code = compile_expr(code, expr[2])
+            code = emit_push_reg(code, REG_RAX())
+            code = compile_expr(code, expr[1])
+            code = emit_movq_xmm0_rax(code)
+            code = emit_pop_reg(code, REG_RAX())
+            code = emit_movq_xmm1_rax(code)
+            code = emit_mulsd(code)
+            code = emit_movq_rax_xmm0(code)
+            return code
+        }
         code = compile_expr(code, expr[2])
         code = emit_push_reg(code, REG_RAX())
         code = compile_expr(code, expr[1])
@@ -1265,6 +1649,17 @@ fn compile_expr(code: [i64], expr: [String]) -> [i64] {
     }
 
     if kind == "/" {
+        if expr_is_float(expr) {
+            code = compile_expr(code, expr[2])
+            code = emit_push_reg(code, REG_RAX())
+            code = compile_expr(code, expr[1])
+            code = emit_movq_xmm0_rax(code)
+            code = emit_pop_reg(code, REG_RAX())
+            code = emit_movq_xmm1_rax(code)
+            code = emit_divsd(code)
+            code = emit_movq_rax_xmm0(code)
+            return code
+        }
         // dividend in RAX, divisor in RCX
         // Need: compile divisor, push, compile dividend, pop rcx, cqo, idiv rcx
         code = compile_expr(code, expr[2])
@@ -1403,6 +1798,16 @@ fn compile_expr(code: [i64], expr: [String]) -> [i64] {
     }
 
     if kind == "println" {
+        let inner = expr[1]
+        if expr_is_float(inner) {
+            // Float println: compile expr, move to RDI as bits, call _vx_print_float
+            code = compile_expr(code, inner)
+            code = emit_mov_reg_reg(code, REG_RDI(), REG_RAX())
+            code = emit_u8(code, 232)
+            add_fixup(len(code), "_vx_print_float")
+            code = emit_u32_le(code, 0)
+            return code
+        }
         // Compile the expression, result in RAX
         // Move to RDI, call _vx_print_int runtime stub
         code = compile_expr(code, expr[1])
@@ -1568,6 +1973,9 @@ fn compile_stmt(code: [i64], stmt: [String]) -> [i64] {
     if kind == "let" {
         let name = stmt[1]
         let idx = locals_add(name)
+        if expr_is_float(stmt[2]) {
+            locals_set_type(idx, "float")
+        }
         code = compile_expr(code, stmt[2])
         let off = locals_offset(idx)
         code = emit_store_local(code, REG_RAX(), off)
@@ -1577,6 +1985,9 @@ fn compile_stmt(code: [i64], stmt: [String]) -> [i64] {
     if kind == "var" {
         let name = stmt[1]
         let idx = locals_add(name)
+        if expr_is_float(stmt[2]) {
+            locals_set_type(idx, "float")
+        }
         code = compile_expr(code, stmt[2])
         let off = locals_offset(idx)
         code = emit_store_local(code, REG_RAX(), off)
@@ -1588,6 +1999,9 @@ fn compile_stmt(code: [i64], stmt: [String]) -> [i64] {
         code = compile_expr(code, stmt[2])
         let idx = locals_find(name)
         if idx >= 0 {
+            if expr_is_float(stmt[2]) {
+                locals_set_type(idx, "float")
+            }
             let off = locals_offset(idx)
             code = emit_store_local(code, REG_RAX(), off)
         } else {
@@ -1744,6 +2158,7 @@ fn compile_function(code: [i64], func: [String]) -> [i64] {
 
     // Reset locals
     _locals = []
+    _local_types = []
 
     // Add params as locals
     var p = 0
@@ -2275,6 +2690,941 @@ fn emit_arr_push_stub() -> [i64] {
     return out
 }
 
+// --- Runtime: _vx_print_float stub ---
+// Input: float bits in RDI
+// Prints the float as "integer.fraction\n" with 6 decimal places
+fn emit_print_float_stub() -> [i64] {
+    var out: [i64] = []
+    // push rbp; mov rbp, rsp; sub rsp, 64
+    out = push(out, 85)
+    out = push(out, 72)
+    out = push(out, 137)
+    out = push(out, 229)
+    out = push(out, 72)
+    out = push(out, 131)
+    out = push(out, 236)
+    out = push(out, 64)
+    // Save rdi in [rbp-8]
+    out = push(out, 72)
+    out = push(out, 137)
+    out = push(out, 125)
+    out = push(out, 248)
+    // movq xmm0, rdi: 66 48 0F 6E C7
+    out = push(out, 102)
+    out = push(out, 72)
+    out = push(out, 15)
+    out = push(out, 110)
+    out = push(out, 199)
+    // Check sign: test rdi, rdi; jns skip_neg
+    out = push(out, 72)
+    out = push(out, 133)
+    out = push(out, 255)
+    out = push(out, 121)  // jns +29
+    out = push(out, 29)
+    // Negative: print '-' character
+    // mov byte [rbp-48], 0x2d
+    out = push(out, 198)
+    out = push(out, 69)
+    out = push(out, 208)  // -48
+    out = push(out, 45)
+    // write(1, rbp-48, 1)
+    out = push(out, 72)  // mov rax, 1
+    out = push(out, 199)
+    out = push(out, 192)
+    out = push(out, 1)
+    out = push(out, 0)
+    out = push(out, 0)
+    out = push(out, 0)
+    out = push(out, 72)  // mov rdi, 1
+    out = push(out, 199)
+    out = push(out, 199)
+    out = push(out, 1)
+    out = push(out, 0)
+    out = push(out, 0)
+    out = push(out, 0)
+    out = push(out, 72)  // lea rsi, [rbp-48]
+    out = push(out, 141)
+    out = push(out, 117)
+    out = push(out, 208)
+    out = push(out, 72)  // mov rdx, 1
+    out = push(out, 199)
+    out = push(out, 194)
+    out = push(out, 1)
+    out = push(out, 0)
+    out = push(out, 0)
+    out = push(out, 0)
+    // syscall
+    out = push(out, 15)
+    out = push(out, 5)
+    // Negate xmm0: load sign mask, xorpd
+    // Actually simpler: reload from [rbp-8], clear sign bit, movq back
+    // mov rdi, [rbp-8]; btr rdi, 63; movq xmm0, rdi
+    out = push(out, 72)  // mov rdi, [rbp-8]
+    out = push(out, 139)
+    out = push(out, 125)
+    out = push(out, 248)
+    // btr rdi, 63: 48 0F BA F7 3F
+    out = push(out, 72)
+    out = push(out, 15)
+    out = push(out, 186)
+    out = push(out, 247)
+    out = push(out, 63)
+    // movq xmm0, rdi: 66 48 0F 6E C7
+    out = push(out, 102)
+    out = push(out, 72)
+    out = push(out, 15)
+    out = push(out, 110)
+    out = push(out, 199)
+    // skip_neg:
+    // cvttsd2si rax, xmm0: F2 48 0F 2C C0
+    out = push(out, 242)
+    out = push(out, 72)
+    out = push(out, 15)
+    out = push(out, 44)
+    out = push(out, 192)
+    // Save integer part in [rbp-16]
+    out = push(out, 72)
+    out = push(out, 137)
+    out = push(out, 69)
+    out = push(out, 240)
+    // Save xmm0 in [rbp-24]: movq [rbp-24], xmm0 -> movq rdi, xmm0; mov [rbp-24], rdi
+    // movq rdi, xmm0: 66 48 0F 7E C7
+    out = push(out, 102)
+    out = push(out, 72)
+    out = push(out, 15)
+    out = push(out, 126)
+    out = push(out, 199)
+    out = push(out, 72)
+    out = push(out, 137)
+    out = push(out, 125)
+    out = push(out, 232)
+    // Print integer part: convert to string on stack
+    // Use same algorithm as print_int but no newline
+    // sub rsp, 32
+    out = push(out, 72)
+    out = push(out, 131)
+    out = push(out, 236)
+    out = push(out, 32)
+    // mov rax, [rbp-16] (integer part)
+    out = push(out, 72)
+    out = push(out, 139)
+    out = push(out, 69)
+    out = push(out, 240)
+    // lea rsi, [rsp+31]
+    out = push(out, 72)
+    out = push(out, 141)
+    out = push(out, 116)
+    out = push(out, 36)
+    out = push(out, 31)
+    // mov byte [rsi], '.' (0x2e) - we'll put dot after digits
+    // Actually, let's point rsi to end of buffer, write digits backwards, then write(digits), write('.'), write(frac)
+    // xor rcx, rcx
+    out = push(out, 72)
+    out = push(out, 49)
+    out = push(out, 201)
+    // mov r8, 10
+    out = push(out, 73)
+    out = push(out, 199)
+    out = push(out, 192)
+    out = push(out, 10)
+    out = push(out, 0)
+    out = push(out, 0)
+    out = push(out, 0)
+    // test rax, rax; jnz digit_loop
+    out = push(out, 72)
+    out = push(out, 133)
+    out = push(out, 192)
+    out = push(out, 117)  // jnz +7
+    out = push(out, 7)
+    // rax is 0: put '0' and set rcx=1
+    out = push(out, 72)  // dec rsi
+    out = push(out, 255)
+    out = push(out, 206)
+    out = push(out, 198)  // mov byte [rsi], '0'
+    out = push(out, 6)
+    out = push(out, 48)
+    out = push(out, 72)  // inc rcx (was xor'd to 0, now 1... actually need mov rcx, 1)
+    // Hmm, inc rcx after xor rcx gives 1. Let me check.
+    // Actually: xor rcx,rcx = 0, then inc rcx = 1. But we jump past digit_loop.
+    // Need to jump past the loop. Let me use jmp.
+    // Actually let me restructure: after test rax,rax, if zero, just write "0"
+    // This is getting very long. Let me simplify by just putting a jump over the digit loop.
+
+    // Scratch that complex approach. Let me restart the stub more simply.
+    // I'll write it as a complete self-contained piece.
+    return emit_print_float_stub_v2()
+}
+
+fn emit_print_float_stub_v2() -> [i64] {
+    var out: [i64] = []
+    // _vx_print_float: rdi = float bits
+    // Strategy: use a 48-byte buffer on stack for output string
+    // push rbp; mov rbp, rsp; sub rsp, 80
+    out = push(out, 85)
+    out = push(out, 72)
+    out = push(out, 137)
+    out = push(out, 229)
+    out = push(out, 72)
+    out = push(out, 131)
+    out = push(out, 236)
+    out = push(out, 80)
+
+    // Save float bits in [rbp-8]
+    // mov [rbp-8], rdi
+    out = push(out, 72)
+    out = push(out, 137)
+    out = push(out, 125)
+    out = push(out, 248)
+
+    // r12 = output buffer pointer = rbp-72
+    // lea r12, [rbp-72]: 4C 8D 65 B8
+    out = push(out, 76)
+    out = push(out, 141)
+    out = push(out, 101)
+    out = push(out, 184)
+
+    // r13 = current write position (index)
+    // xor r13, r13: 4D 31 ED
+    out = push(out, 77)
+    out = push(out, 49)
+    out = push(out, 237)
+
+    // Check sign bit: test rdi, rdi; jns .positive
+    out = push(out, 72)
+    out = push(out, 133)
+    out = push(out, 255)
+    out = push(out, 121)  // jns +7
+    out = push(out, 7)
+
+    // Write '-': mov byte [r12], 0x2d; inc r13
+    // mov byte [r12+r13], 0x2d: 41 C6 04 2C 2D
+    out = push(out, 65)
+    out = push(out, 198)
+    out = push(out, 4)
+    out = push(out, 44)
+    out = push(out, 45)
+    // inc r13: 49 FF C5
+    out = push(out, 73)
+    out = push(out, 255)
+    out = push(out, 197)
+
+    // .positive: clear sign bit in rdi, movq xmm0
+    // btr rdi, 63: 48 0F BA F7 3F
+    out = push(out, 72)
+    out = push(out, 15)
+    out = push(out, 186)
+    out = push(out, 247)
+    out = push(out, 63)
+
+    // movq xmm0, rdi: 66 48 0F 6E C7
+    out = push(out, 102)
+    out = push(out, 72)
+    out = push(out, 15)
+    out = push(out, 110)
+    out = push(out, 199)
+
+    // cvttsd2si rax, xmm0: F2 48 0F 2C C0  (integer part)
+    out = push(out, 242)
+    out = push(out, 72)
+    out = push(out, 15)
+    out = push(out, 44)
+    out = push(out, 192)
+
+    // Save xmm0 in [rbp-16] via rdi
+    // movq rdi, xmm0: 66 48 0F 7E C7
+    out = push(out, 102)
+    out = push(out, 72)
+    out = push(out, 15)
+    out = push(out, 126)
+    out = push(out, 199)
+    out = push(out, 72)  // mov [rbp-16], rdi
+    out = push(out, 137)
+    out = push(out, 125)
+    out = push(out, 240)
+
+    // Save integer part in [rbp-24]
+    // mov [rbp-24], rax
+    out = push(out, 72)
+    out = push(out, 137)
+    out = push(out, 69)
+    out = push(out, 232)
+
+    // Convert integer part to decimal digits (backwards into temp area)
+    // Use rbp-40 as temp buffer for int digits (8 bytes enough)
+    // lea rsi, [rbp-33]: point to end of temp area
+    out = push(out, 72)
+    out = push(out, 141)
+    out = push(out, 117)
+    out = push(out, 223)  // rbp-33
+
+    // xor rcx, rcx (digit count)
+    out = push(out, 72)
+    out = push(out, 49)
+    out = push(out, 201)
+
+    // mov r8, 10
+    out = push(out, 73)
+    out = push(out, 199)
+    out = push(out, 192)
+    out = push(out, 10)
+    out = push(out, 0)
+    out = push(out, 0)
+    out = push(out, 0)
+
+    // test rax, rax; jnz .int_loop
+    out = push(out, 72)
+    out = push(out, 133)
+    out = push(out, 192)
+    out = push(out, 117)  // jnz
+    out = push(out, 10)   // skip to int_loop
+
+    // rax == 0: write '0'
+    out = push(out, 72)  // dec rsi
+    out = push(out, 255)
+    out = push(out, 206)
+    out = push(out, 198)  // mov byte [rsi], '0'
+    out = push(out, 6)
+    out = push(out, 48)
+    out = push(out, 72)  // mov rcx, 1
+    out = push(out, 199)
+    out = push(out, 193)
+    out = push(out, 1)
+    out = push(out, 0)
+    out = push(out, 0)
+    out = push(out, 0)
+    // jmp .int_done (+16 bytes for loop)
+    out = push(out, 235)  // jmp short
+    out = push(out, 18)   // offset to after loop
+
+    // .int_loop: (at offset from jnz)
+    // xor rdx, rdx
+    out = push(out, 72)
+    out = push(out, 49)
+    out = push(out, 210)
+    // div r8
+    out = push(out, 73)
+    out = push(out, 247)
+    out = push(out, 240)
+    // add dl, '0'
+    out = push(out, 128)
+    out = push(out, 194)
+    out = push(out, 48)
+    // dec rsi
+    out = push(out, 72)
+    out = push(out, 255)
+    out = push(out, 206)
+    // mov [rsi], dl
+    out = push(out, 136)
+    out = push(out, 22)
+    // inc rcx
+    out = push(out, 72)
+    out = push(out, 255)
+    out = push(out, 193)
+    // test rax, rax; jnz .int_loop
+    out = push(out, 72)
+    out = push(out, 133)
+    out = push(out, 192)
+    out = push(out, 117)  // jnz
+    out = push(out, 234)  // -22 (back to xor rdx)
+
+    // .int_done:
+    // Copy int digits to output buffer: memcpy r12+r13, rsi, rcx
+    // Save rcx in r8
+    // mov r8, rcx: 49 89 C8
+    out = push(out, 73)
+    out = push(out, 137)
+    out = push(out, 200)
+
+    // .copy_int: (loop: copy byte by byte)
+    // test r8, r8; jz .copy_done
+    out = push(out, 77)
+    out = push(out, 133)
+    out = push(out, 192)
+    out = push(out, 116)  // jz
+    out = push(out, 12)   // skip loop body
+
+    // mov al, [rsi]: 8A 06
+    out = push(out, 138)
+    out = push(out, 6)
+    // mov [r12+r13], al: 43 88 04 2C
+    // Actually: 43 is REX.XB. Let me use: mov byte [r12+r13*1], al
+    // 42 88 04 2C
+    out = push(out, 66)
+    out = push(out, 136)
+    out = push(out, 4)
+    out = push(out, 44)
+    // inc rsi: 48 FF C6
+    out = push(out, 72)
+    out = push(out, 255)
+    out = push(out, 198)
+    // inc r13: 49 FF C5
+    out = push(out, 73)
+    out = push(out, 255)
+    out = push(out, 197)
+    // dec r8: 49 FF C8
+    out = push(out, 73)
+    out = push(out, 255)
+    out = push(out, 200)
+    // jmp .copy_int: EB -15
+    out = push(out, 235)
+    out = push(out, 238)  // -18... let me count: test(3)+jz(2)+mov(2)+mov(4)+inc(3)+inc(3)+dec(3)+jmp(2) = need to jump back 22 bytes
+    // Actually let me recount the bytes from test r8,r8:
+    // test r8,r8 = 4D 85 C0 = 3 bytes
+    // jz = 74 0C = 2 bytes
+    // mov al,[rsi] = 8A 06 = 2 bytes
+    // mov [r12+r13],al = 42 88 04 2C = 4 bytes
+    // inc rsi = 48 FF C6 = 3 bytes
+    // inc r13 = 49 FF C5 = 3 bytes
+    // dec r8 = 49 FF C8 = 3 bytes
+    // jmp = EB xx = 2 bytes
+    // Total loop body after test: 2+2+4+3+3+3+2 = 19
+    // Jump back from end of jmp to test r8: -(19+3) = -22
+    // Wait, from jmp instruction end to test start:
+    // jmp is at offset 3+2+2+4+3+3+3 = 20 from test
+    // After jmp (2 bytes), we're at offset 22 from test
+    // So offset = -22, which is 256-22 = 234
+    // Hmm I already put 238 above which is wrong. Let me fix.
+
+    // Actually, let me just redo this. The bytes above after .copy_done jz offset are wrong.
+    // Let me restart the copy loop more carefully.
+    // I'll scrap the last few instructions and redo.
+
+    // Actually this is getting way too complex byte by byte. Let me use a much simpler approach.
+    // Instead of building the string in memory, I'll just do multiple write() syscalls:
+    // 1. Write the integer part digits
+    // 2. Write "."
+    // 3. Write the fractional digits
+    // 4. Write "\n"
+
+    // Let me scrap the above and start completely fresh with a cleaner approach.
+    return emit_print_float_simple()
+}
+
+fn emit_print_float_simple() -> [i64] {
+    // Simple approach: call _vx_print_int for integer part (without newline - oh wait, print_int adds newline)
+    // Even simpler: just convert the entire thing to an integer representation
+    // Print as: integer_part * 1000000 + frac_part, formatted properly
+    //
+    // Simplest possible: multiply float by 1000000, convert to int, then:
+    // print (result / 1000000), '.', zero-padded (result % 1000000), newline
+    //
+    // But we need to do this all in machine code...
+    //
+    // OK, let me just write the whole thing as x86 machine code step by step.
+    // The function will:
+    // 1. movq xmm0, rdi (get the float)
+    // 2. Handle sign
+    // 3. Multiply by 1000000.0
+    // 4. cvttsd2si rax, xmm0 (get integer representation * 1000000)
+    // 5. Use the print_int algorithm to print with a dot inserted at the right place
+
+    var out: [i64] = []
+
+    // push rbp; mov rbp, rsp; sub rsp, 48
+    out = push(out, 85)
+    out = push(out, 72)
+    out = push(out, 137)
+    out = push(out, 229)
+    out = push(out, 72)
+    out = push(out, 131)
+    out = push(out, 236)
+    out = push(out, 48)
+
+    // movq xmm0, rdi: 66 48 0F 6E C7
+    out = push(out, 102)
+    out = push(out, 72)
+    out = push(out, 15)
+    out = push(out, 110)
+    out = push(out, 199)
+
+    // Save sign: test rdi, rdi; sets r14 to 1 if negative
+    // xor r14, r14: 4D 31 F6
+    out = push(out, 77)
+    out = push(out, 49)
+    out = push(out, 246)
+    // test rdi, rdi
+    out = push(out, 72)
+    out = push(out, 133)
+    out = push(out, 255)
+    // jns +8
+    out = push(out, 121)
+    out = push(out, 8)
+    // mov r14, 1: 49 C7 C6 01 00 00 00
+    out = push(out, 73)
+    out = push(out, 199)
+    out = push(out, 198)
+    out = push(out, 1)
+    out = push(out, 0)
+    out = push(out, 0)
+    out = push(out, 0)
+    // Clear sign bit: btr rdi, 63; movq xmm0, rdi
+    out = push(out, 72)  // btr rdi, 63
+    out = push(out, 15)
+    out = push(out, 186)
+    out = push(out, 247)
+    out = push(out, 63)
+    out = push(out, 102)  // movq xmm0, rdi
+    out = push(out, 72)
+    out = push(out, 15)
+    out = push(out, 110)
+    out = push(out, 199)
+
+    // Multiply xmm0 by 1000000.0
+    // Load 1000000.0 bits into rax, movq xmm1, rax, mulsd xmm0, xmm1
+    // 1000000.0 = 0x4124_0000_0000_0000 = 4696837146684686336
+    // mov rax, 4696837146684686336: 48 B8 <8 bytes>
+    out = push(out, 72)
+    out = push(out, 184)
+    // 0x41240000_00000000 in little-endian:
+    out = push(out, 0)
+    out = push(out, 0)
+    out = push(out, 0)
+    out = push(out, 0)
+    out = push(out, 0)
+    out = push(out, 0)
+    out = push(out, 36)   // 0x24
+    out = push(out, 65)   // 0x41
+
+    // movq xmm1, rax: 66 48 0F 6E C8
+    out = push(out, 102)
+    out = push(out, 72)
+    out = push(out, 15)
+    out = push(out, 110)
+    out = push(out, 200)
+
+    // mulsd xmm0, xmm1: F2 0F 59 C1
+    out = push(out, 242)
+    out = push(out, 15)
+    out = push(out, 89)
+    out = push(out, 193)
+
+    // Add 0.5 for rounding: load 0.5 into xmm1, addsd
+    // 0.5 = 0x3FE0_0000_0000_0000 = 4602678819172646912
+    out = push(out, 72)
+    out = push(out, 184)
+    out = push(out, 0)
+    out = push(out, 0)
+    out = push(out, 0)
+    out = push(out, 0)
+    out = push(out, 0)
+    out = push(out, 0)
+    out = push(out, 224)  // 0xE0
+    out = push(out, 63)   // 0x3F
+    out = push(out, 102)
+    out = push(out, 72)
+    out = push(out, 15)
+    out = push(out, 110)
+    out = push(out, 200)
+    // addsd xmm0, xmm1: F2 0F 58 C1
+    out = push(out, 242)
+    out = push(out, 15)
+    out = push(out, 88)
+    out = push(out, 193)
+
+    // cvttsd2si rax, xmm0: F2 48 0F 2C C0
+    out = push(out, 242)
+    out = push(out, 72)
+    out = push(out, 15)
+    out = push(out, 44)
+    out = push(out, 192)
+
+    // Now rax = value * 1000000 (as integer)
+    // Save in [rbp-8]
+    out = push(out, 72)
+    out = push(out, 137)
+    out = push(out, 69)
+    out = push(out, 248)
+
+    // Now build the output string on stack: up to 32 bytes at [rsp]
+    // We need to print: [sign] int_part . frac_part \n
+    // int_part = rax / 1000000
+    // frac_part = rax % 1000000 (zero-padded to 6 digits)
+
+    // First, write all digits of the full number backwards, then insert dot
+    // Actually easier: build string forward.
+    // Use rsp as buffer base, r12 as write index
+
+    // lea r12, [rbp-40]: 4C 8D 65 D8
+    out = push(out, 76)
+    out = push(out, 141)
+    out = push(out, 101)
+    out = push(out, 216)
+
+    // xor r13, r13 (write index): 4D 31 ED
+    out = push(out, 77)
+    out = push(out, 49)
+    out = push(out, 237)
+
+    // If negative, write '-'
+    // test r14, r14: 4D 85 F6
+    out = push(out, 77)
+    out = push(out, 133)
+    out = push(out, 246)
+    // jz +7
+    out = push(out, 116)
+    out = push(out, 7)
+    // mov byte [r12], '-': 41 C6 04 24 2D
+    out = push(out, 65)
+    out = push(out, 198)
+    out = push(out, 4)
+    out = push(out, 36)
+    out = push(out, 45)
+    // inc r13: 49 FF C5
+    out = push(out, 73)
+    out = push(out, 255)
+    out = push(out, 197)
+    // Hmm wait - this approach is also getting very complex.
+    // Let me just use multiple write() syscalls. That's much simpler.
+    //
+    // Plan:
+    // 1. If negative, write('-')
+    // 2. Compute int_part = total / 1000000, write digits of int_part
+    // 3. Write('.')
+    // 4. Compute frac = total % 1000000, write 6 digits (with leading zeros)
+    // 5. Write('\n')
+    //
+    // For writing digits, I need a small subroutine. But in a flat stub,
+    // I'll just inline the digit-writing loop twice.
+    //
+    // This is still complex. Let me take the simplest possible approach:
+    // Build the entire string in a buffer, then one write() call.
+
+    // Let me restart with a truly clean implementation.
+    return emit_print_float_v3()
+}
+
+fn emit_print_float_v3() -> [i64] {
+    // Approach: Build output in 32-byte buffer on stack, then single write() syscall
+    // rdi = float bits on entry
+    var out: [i64] = []
+
+    // push rbp; mov rbp, rsp
+    out = push(out, 85)
+    out = push(out, 72)
+    out = push(out, 137)
+    out = push(out, 229)
+    // push r12; push r13; push r14; push r15 (callee-saved)
+    out = push(out, 65)
+    out = push(out, 84)
+    out = push(out, 65)
+    out = push(out, 85)
+    out = push(out, 65)
+    out = push(out, 86)
+    out = push(out, 65)
+    out = push(out, 87)
+    // sub rsp, 48
+    out = push(out, 72)
+    out = push(out, 131)
+    out = push(out, 236)
+    out = push(out, 48)
+
+    // Clear sign bit, check negativity
+    // mov r14, rdi (save original bits)
+    out = push(out, 73)
+    out = push(out, 137)
+    out = push(out, 254)
+    // btr rdi, 63 -> clear sign
+    out = push(out, 72)
+    out = push(out, 15)
+    out = push(out, 186)
+    out = push(out, 247)
+    out = push(out, 63)
+    // movq xmm0, rdi
+    out = push(out, 102)
+    out = push(out, 72)
+    out = push(out, 15)
+    out = push(out, 110)
+    out = push(out, 199)
+
+    // Multiply by 1000000.0 (0x412E848000000000)
+    out = push(out, 72)
+    out = push(out, 184)
+    out = push(out, 0)
+    out = push(out, 0)
+    out = push(out, 0)
+    out = push(out, 0)
+    out = push(out, 128)
+    out = push(out, 132)
+    out = push(out, 46)
+    out = push(out, 65)
+    out = push(out, 102)
+    out = push(out, 72)
+    out = push(out, 15)
+    out = push(out, 110)
+    out = push(out, 200)
+    // mulsd
+    out = push(out, 242)
+    out = push(out, 15)
+    out = push(out, 89)
+    out = push(out, 193)
+    // Add 0.5 for rounding (0x3FE0000000000000)
+    out = push(out, 72)
+    out = push(out, 184)
+    out = push(out, 0)
+    out = push(out, 0)
+    out = push(out, 0)
+    out = push(out, 0)
+    out = push(out, 0)
+    out = push(out, 0)
+    out = push(out, 224)
+    out = push(out, 63)
+    out = push(out, 102)
+    out = push(out, 72)
+    out = push(out, 15)
+    out = push(out, 110)
+    out = push(out, 200)
+    out = push(out, 242)
+    out = push(out, 15)
+    out = push(out, 88)
+    out = push(out, 193)
+    // cvttsd2si rax, xmm0
+    out = push(out, 242)
+    out = push(out, 72)
+    out = push(out, 15)
+    out = push(out, 44)
+    out = push(out, 192)
+    // rax = val * 1000000 (integer, always positive)
+    // r15 = rax (save total)
+    out = push(out, 73)
+    out = push(out, 137)
+    out = push(out, 199)
+
+    // Build string backwards from rsp+31
+    // r12 = buffer end pointer
+    // lea r12, [rsp+31]: 4C 8D 64 24 1F
+    out = push(out, 76)
+    out = push(out, 141)
+    out = push(out, 100)
+    out = push(out, 36)
+    out = push(out, 31)
+
+    // Write newline at end
+    // mov byte [r12], 0x0a: 41 C6 04 24 0A
+    out = push(out, 65)
+    out = push(out, 198)
+    out = push(out, 4)
+    out = push(out, 36)
+    out = push(out, 10)
+    // dec r12: 49 FF CC
+    out = push(out, 73)
+    out = push(out, 255)
+    out = push(out, 204)
+
+    // Now write 6 fractional digits (rax % 1000000, but we have it in r15)
+    // mov rax, r15: 4C 89 F8
+    out = push(out, 76)
+    out = push(out, 137)
+    out = push(out, 248)
+    // r8 = 10
+    out = push(out, 73)
+    out = push(out, 199)
+    out = push(out, 192)
+    out = push(out, 10)
+    out = push(out, 0)
+    out = push(out, 0)
+    out = push(out, 0)
+
+    // Write 6 decimal digits (from right to left)
+    // rcx = 6
+    out = push(out, 72)
+    out = push(out, 199)
+    out = push(out, 193)
+    out = push(out, 6)
+    out = push(out, 0)
+    out = push(out, 0)
+    out = push(out, 0)
+
+    // .frac_loop:
+    let frac_loop_pos = len(out)
+    // xor rdx, rdx
+    out = push(out, 72)
+    out = push(out, 49)
+    out = push(out, 210)
+    // div r8
+    out = push(out, 73)
+    out = push(out, 247)
+    out = push(out, 240)
+    // add dl, '0'
+    out = push(out, 128)
+    out = push(out, 194)
+    out = push(out, 48)
+    // mov [r12], dl: 41 88 14 24
+    out = push(out, 65)
+    out = push(out, 136)
+    out = push(out, 20)
+    out = push(out, 36)
+    // dec r12
+    out = push(out, 73)
+    out = push(out, 255)
+    out = push(out, 204)
+    // dec rcx
+    out = push(out, 72)
+    out = push(out, 255)
+    out = push(out, 201)
+    // jnz .frac_loop
+    let frac_jnz_pos = len(out)
+    let frac_delta = frac_loop_pos - frac_jnz_pos - 2
+    out = push(out, 117)
+    var frac_off = frac_delta % 256
+    if frac_off < 0 {
+        frac_off = frac_off + 256
+    }
+    out = push(out, frac_off)
+
+    // Write dot: mov byte [r12], '.': 41 C6 04 24 2E
+    out = push(out, 65)
+    out = push(out, 198)
+    out = push(out, 4)
+    out = push(out, 36)
+    out = push(out, 46)
+    // dec r12
+    out = push(out, 73)
+    out = push(out, 255)
+    out = push(out, 204)
+
+    // rax still has int_part (after dividing 6 times by 10 from total)
+    // It's the quotient after removing 6 digits, which is total / 1000000 = int part
+    // Write integer part digits
+    // If rax == 0, write '0'
+    out = push(out, 72)
+    out = push(out, 133)
+    out = push(out, 192)
+    out = push(out, 117)  // jnz
+    out = push(out, 10)   // skip to int_loop (5+3+2=10 bytes)
+    // Write '0'
+    out = push(out, 65)
+    out = push(out, 198)
+    out = push(out, 4)
+    out = push(out, 36)
+    out = push(out, 48)
+    // dec r12
+    out = push(out, 73)
+    out = push(out, 255)
+    out = push(out, 204)
+    // jmp .int_done
+    out = push(out, 235)
+    out = push(out, 21)  // skip int_loop (3+3+3+4+3+3+2=21 bytes)
+
+    // .int_loop:
+    let int_loop_pos = len(out)
+    // xor rdx, rdx
+    out = push(out, 72)
+    out = push(out, 49)
+    out = push(out, 210)
+    // div r8
+    out = push(out, 73)
+    out = push(out, 247)
+    out = push(out, 240)
+    // add dl, '0'
+    out = push(out, 128)
+    out = push(out, 194)
+    out = push(out, 48)
+    // mov [r12], dl
+    out = push(out, 65)
+    out = push(out, 136)
+    out = push(out, 20)
+    out = push(out, 36)
+    // dec r12
+    out = push(out, 73)
+    out = push(out, 255)
+    out = push(out, 204)
+    // test rax, rax
+    out = push(out, 72)
+    out = push(out, 133)
+    out = push(out, 192)
+    // jnz .int_loop
+    let int_jnz_pos = len(out)
+    let int_delta = int_loop_pos - int_jnz_pos - 2
+    out = push(out, 117)
+    var int_off = int_delta % 256
+    if int_off < 0 {
+        int_off = int_off + 256
+    }
+    out = push(out, int_off)
+
+    // .int_done:
+    // If negative, write '-'
+    // test r14, r14: 4D 85 F6
+    out = push(out, 77)
+    out = push(out, 133)
+    out = push(out, 246)
+    // jns +8 (skip writing minus if not negative)
+    out = push(out, 121)
+    out = push(out, 8)
+    // Write '-'
+    out = push(out, 65)
+    out = push(out, 198)
+    out = push(out, 4)
+    out = push(out, 36)
+    out = push(out, 45)
+    // dec r12
+    out = push(out, 73)
+    out = push(out, 255)
+    out = push(out, 204)
+
+    // Now write(1, r12+1, rsp+32 - (r12+1))
+    // r12 points one before the first char
+    // First char is at r12+1
+    // Last char (newline) is at rsp+31
+    // Length = rsp+31 - r12  (since r12 is one before first char, and last is at rsp+31)
+    // lea rsi, [r12+1]: 49 8D 74 24 01
+    out = push(out, 73)
+    out = push(out, 141)
+    out = push(out, 116)
+    out = push(out, 36)
+    out = push(out, 1)
+
+    // rdx = length: lea rdx, [rsp+32]; sub rdx, rsi
+    // lea rdx, [rsp+32]: 48 8D 54 24 20
+    out = push(out, 72)
+    out = push(out, 141)
+    out = push(out, 84)
+    out = push(out, 36)
+    out = push(out, 32)
+    // sub rdx, rsi: 48 29 F2
+    out = push(out, 72)
+    out = push(out, 41)
+    out = push(out, 242)
+
+    // mov rax, 1 (SYS_WRITE)
+    out = push(out, 72)
+    out = push(out, 199)
+    out = push(out, 192)
+    out = push(out, 1)
+    out = push(out, 0)
+    out = push(out, 0)
+    out = push(out, 0)
+    // mov rdi, 1 (stdout)
+    out = push(out, 72)
+    out = push(out, 199)
+    out = push(out, 199)
+    out = push(out, 1)
+    out = push(out, 0)
+    out = push(out, 0)
+    out = push(out, 0)
+    // syscall
+    out = push(out, 15)
+    out = push(out, 5)
+
+    // Epilogue: add rsp, 48; pop r15; pop r14; pop r13; pop r12; pop rbp; ret
+    out = push(out, 72)
+    out = push(out, 131)
+    out = push(out, 196)
+    out = push(out, 48)
+    out = push(out, 65)
+    out = push(out, 95)
+    out = push(out, 65)
+    out = push(out, 94)
+    out = push(out, 65)
+    out = push(out, 93)
+    out = push(out, 65)
+    out = push(out, 92)
+    out = push(out, 93)
+    out = push(out, 195)
+
+    return out
+}
+
 // --- Program compiler ---
 fn compile_program(fns: [String]) -> [i64] {
     var code: [i64] = []
@@ -2341,6 +3691,15 @@ fn compile_program(fns: [String]) -> [i64] {
     while api < len(arr_push_code) {
         code = push(code, arr_push_code[api])
         api = api + 1
+    }
+
+    // Emit _vx_print_float runtime stub
+    let print_float_code = emit_print_float_stub()
+    register_function("_vx_print_float", len(code))
+    var pfi = 0
+    while pfi < len(print_float_code) {
+        code = push(code, print_float_code[pfi])
+        pfi = pfi + 1
     }
 
     // Compile user functions
@@ -2509,8 +3868,13 @@ fn main() {
 
     var source = ""
     var output_path = "/tmp/vortex_out"
-    var source_path = "/tmp/test_strings.vx"
-
+    var source_path = ""
+    if file_exists("/tmp/vx_compile_args") {
+        let args = trim(read_file("/tmp/vx_compile_args"))
+        let sp = unwrap_or(str_find(args, " "), -1)
+        if sp > 0 { source_path = str_substr(args, 0, sp) output_path = str_substr(args, sp + 1, len(args) - sp - 1) } else { source_path = args }
+    }
+    if len(source_path) == 0 { source_path = "/tmp/test_compile.vx" }
     println("Reading " + source_path + "...")
     source = read_source(source_path)
     if len(source) == 0 {

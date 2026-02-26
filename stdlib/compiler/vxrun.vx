@@ -1,272 +1,108 @@
-// vxrun.vx — Vortex self-hosted runtime (lex -> compile -> VM)
-// Full language: ints, floats, strings, arrays, functions, control flow, file I/O
-// Reads .vx files via /tmp/vx_run_target or runs self-test
+// vxrun.vx — Vortex self-hosted runtime (lex->compile->VM) with structs+imports
 fn _nl() -> String { return str_from_bytes([10]) }
-fn sw(s: String, p: String) -> bool {
-    if len(s) < len(p) { return false }
-    return str_substr(s, 0, len(p)) == p
-}
-fn after(s: String, n: i64) -> String { return str_substr(s, n, len(s) - n) }
-fn fidx(h: String, n: String) -> i64 { return unwrap_or(str_find(h, n), -1) }
-fn is_digit(ch: String) -> bool { let c = str_bytes(ch)[0] return c >= 48 && c <= 57 }
-fn is_alpha(ch: String) -> bool {
-    if len(ch) != 1 { return false }
-    let c = str_bytes(ch)[0]
-    if c >= 65 { if c <= 90 { return true } }
-    if c >= 97 { if c <= 122 { return true } }
-    return ch == "_"
-}
-fn is_alnum(ch: String) -> bool { if is_alpha(ch) { return true } return is_digit(ch) }
-fn is_space(ch: String) -> bool {
-    let c = str_bytes(ch)[0]
-    return c == 32 || c == 10 || c == 9 || c == 13
-}
-// === LEXER ===
+fn sw(s: String, p: String) -> bool { if len(s)<len(p){return false} return str_substr(s,0,len(p))==p }
+fn after(s: String, n: i64) -> String { return str_substr(s,n,len(s)-n) }
+fn fidx(h: String, n: String) -> i64 { return unwrap_or(str_find(h,n),-1) }
+fn is_digit(ch: String) -> bool { let c=str_bytes(ch)[0] return c>=48&&c<=57 }
+fn is_alpha(ch: String) -> bool { if len(ch)!=1{return false} let c=str_bytes(ch)[0] if c>=65{if c<=90{return true}} if c>=97{if c<=122{return true}} return ch=="_" }
+fn is_alnum(ch: String) -> bool { if is_alpha(ch){return true} return is_digit(ch) }
+fn is_space(ch: String) -> bool { let c=str_bytes(ch)[0] return c==32||c==10||c==9||c==13 }
 fn lex(src: String) -> [String] {
-    var t: [String] = []
-    var p = 0
-    let _sb = str_bytes(src)
-    let _sbn = len(_sb)
-    while p < _sbn {
-        if _sb[p] > 127 { p = p + 1 continue }
-        let ch = str_char_at(src, p)
-        if is_space(ch) { p = p + 1 continue }
-        // Comments
-        if ch == "/" { if p+1 < _sbn { if str_char_at(src, p+1) == "/" {
-            p = p + 2
-            while p < _sbn { if _sb[p] == 10 { break } p = p + 1 }
-            continue
-        } } }
-        // Numbers (int or float)
-        if is_digit(ch) {
-            var s = p
-            while p < _sbn { if is_digit(str_char_at(src, p)) { p = p + 1 } else { break } }
-            // Check for decimal point
-            if p < _sbn { if str_char_at(src, p) == "." {
-                p = p + 1
-                while p < _sbn { if is_digit(str_char_at(src, p)) { p = p + 1 } else { break } }
-                t = push(t, "FLT") t = push(t, str_substr(src, s, p - s)) continue
-            } }
-            t = push(t, "INT") t = push(t, str_substr(src, s, p - s)) continue
-        }
-        // String literals
-        if ch == "\"" {
-            p = p + 1
-            var sv = ""
-            while p < _sbn {
-                let sc = str_char_at(src, p)
-                if sc == "\\" { p = p+1 if p<_sbn { let e=str_char_at(src,p) if e=="n"{sv=sv+_nl()} if e=="t"{sv=sv+str_from_bytes([9])} if e=="\\"{sv=sv+"\\"} if e=="\""{sv=sv+"\""} p=p+1 } continue }
-                if sc == "\"" { p = p + 1 break }
-                sv = sv + sc p = p + 1
-            }
-            t = push(t, "STR") t = push(t, sv) continue
-        }
-        // Identifiers and keywords
-        if is_alpha(ch) {
-            var s = p
-            while p < _sbn { if is_alnum(str_char_at(src, p)) { p = p + 1 } else { break } }
-            let w = str_substr(src, s, p - s)
-            var tp = "IDENT"
-            if w=="fn"{tp="KW"} if w=="let"{tp="KW"} if w=="var"{tp="KW"} if w=="if"{tp="KW"} if w=="else"{tp="KW"} if w=="while"{tp="KW"} if w=="return"{tp="KW"} if w=="true"{tp="KW"} if w=="false"{tp="KW"} if w=="for"{tp="KW"} if w=="in"{tp="KW"}
-            t = push(t, tp) t = push(t, w) continue
-        }
-        // Two-char operators
-        if p+1 < _sbn {
-            let tw = str_substr(src, p, 2)
-            if tw=="=="{t=push(t,"==") t=push(t,"==") p=p+2 continue}
-            if tw=="!="{t=push(t,"!=") t=push(t,"!=") p=p+2 continue}
-            if tw=="<="{t=push(t,"<=") t=push(t,"<=") p=p+2 continue}
-            if tw==">="{t=push(t,">=") t=push(t,">=") p=p+2 continue}
-            if tw=="&&"{t=push(t,"&&") t=push(t,"&&") p=p+2 continue}
-            if tw=="||"{t=push(t,"||") t=push(t,"||") p=p+2 continue}
-        }
-        // Single char (includes [ ] , . etc)
-        t = push(t, ch) t = push(t, ch) p = p + 1
+    var t: [String] = [] var p=0 let _sb=str_bytes(src) let _sbn=len(_sb)
+    while p<_sbn {
+        if _sb[p]>127{p=p+1 continue} let ch=str_char_at(src,p)
+        if is_space(ch){p=p+1 continue}
+        if ch=="/"{if p+1<_sbn{if str_char_at(src,p+1)=="/"{p=p+2 while p<_sbn{if _sb[p]==10{break} p=p+1} continue}}}
+        if is_digit(ch){ var s=p while p<_sbn{if is_digit(str_char_at(src,p)){p=p+1}else{break}} if p<_sbn{if str_char_at(src,p)=="."{p=p+1 while p<_sbn{if is_digit(str_char_at(src,p)){p=p+1}else{break}} t=push(t,"FLT") t=push(t,str_substr(src,s,p-s)) continue}} t=push(t,"INT") t=push(t,str_substr(src,s,p-s)) continue }
+        if ch=="\"" { p=p+1 var sv="" while p<_sbn{let sc=str_char_at(src,p) if sc=="\\"{p=p+1 if p<_sbn{let e=str_char_at(src,p) if e=="n"{sv=sv+_nl()} if e=="t"{sv=sv+str_from_bytes([9])} if e=="\\"{sv=sv+"\\"} if e=="\""{sv=sv+"\""} p=p+1} continue} if sc=="\""{p=p+1 break} sv=sv+sc p=p+1} t=push(t,"STR") t=push(t,sv) continue }
+        if is_alpha(ch){ var s=p while p<_sbn{if is_alnum(str_char_at(src,p)){p=p+1}else{break}} let w=str_substr(src,s,p-s) var tp="IDENT" if w=="fn"{tp="KW"} if w=="let"{tp="KW"} if w=="var"{tp="KW"} if w=="if"{tp="KW"} if w=="else"{tp="KW"} if w=="while"{tp="KW"} if w=="return"{tp="KW"} if w=="true"{tp="KW"} if w=="false"{tp="KW"} if w=="for"{tp="KW"} if w=="in"{tp="KW"} if w=="struct"{tp="KW"} if w=="import"{tp="KW"} t=push(t,tp) t=push(t,w) continue }
+        if p+1<_sbn{ let tw=str_substr(src,p,2) if tw=="=="{t=push(t,"==") t=push(t,"==") p=p+2 continue} if tw=="!="{t=push(t,"!=") t=push(t,"!=") p=p+2 continue} if tw=="<="{t=push(t,"<=") t=push(t,"<=") p=p+2 continue} if tw==">="{t=push(t,">=") t=push(t,">=") p=p+2 continue} if tw=="&&"{t=push(t,"&&") t=push(t,"&&") p=p+2 continue} if tw=="||"{t=push(t,"||") t=push(t,"||") p=p+2 continue} }
+        t=push(t,ch) t=push(t,ch) p=p+1
     }
-    t = push(t, "EOF") t = push(t, "") return t
+    t=push(t,"EOF") t=push(t,"") return t
 }
-// === COMPILER (source -> bytecode) ===
-var _t: [String] = []
-var _p = 0
-var _c: [String] = []
-var _lid = 0
+var _t: [String] = [] var _p = 0 var _c: [String] = [] var _lid = 0
 fn ct() -> String { return _t[_p*2] }
 fn cv() -> String { return _t[_p*2+1] }
-fn adv() -> String { let v = cv() _p = _p + 1 return v }
-fn akw(k: String) -> bool { if ct() == "KW" { return cv() == k } return false }
-fn eat(x: String) -> String { let v = cv() _p = _p + 1 return v }
-fn em(i: String) { _c = push(_c, i) }
-fn nlbl(x: String) -> String { _lid = _lid + 1 return x + "_" + to_string(_lid) }
+fn adv() -> String { let v=cv() _p=_p+1 return v }
+fn akw(k: String) -> bool { if ct()=="KW"{return cv()==k} return false }
+fn eat(x: String) -> String { let v=cv() _p=_p+1 return v }
+fn em(i: String) { _c=push(_c,i) }
+fn nlbl(x: String) -> String { _lid=_lid+1 return x+"_"+to_string(_lid) }
+fn is_upper(ch: String) -> bool { let c=str_bytes(ch)[0] return c>=65&&c<=90 }
 fn c_primary() {
-    if ct()=="INT" { em("PI " + adv()) return }
-    if ct()=="FLT" { em("PF " + adv()) return }
-    if ct()=="STR" { em("PS " + adv()) return }
-    if akw("true") { adv() em("PI 1") return }
-    if akw("false") { adv() em("PI 0") return }
-    // Array literal [expr, expr, ...]
-    if ct()=="[" {
-        adv()
-        var cnt = 0
-        if ct() != "]" {
-            c_expr() cnt = 1
-            while cv() == "," { adv() c_expr() cnt = cnt + 1 }
-        }
-        eat("]")
-        em("ARR " + to_string(cnt))
-        return
-    }
+    if ct()=="INT"{em("PI "+adv()) return} if ct()=="FLT"{em("PF "+adv()) return}
+    if ct()=="STR"{em("PS "+adv()) return}
+    if akw("true"){adv() em("PI 1") return} if akw("false"){adv() em("PI 0") return}
+    if ct()=="[" { adv() var cnt=0 if ct()!="]"{c_expr() cnt=1 while cv()==","{adv() c_expr() cnt=cnt+1}} eat("]") em("ARR "+to_string(cnt)) return }
     if ct()=="IDENT" {
-        let nm = adv()
-        // Function call
-        if cv()=="(" { adv() var ac=0 if cv()!=")" { c_expr() ac=1 while cv()==","{adv() c_expr() ac=ac+1} } eat(")") em("CALL "+nm+" "+to_string(ac))
-        // Array index: nm[expr]
-        } else { if cv()=="[" { adv() c_expr() eat("]")
-            // Check for assignment: nm[expr] = val
-            em("AGET "+nm)
-        } else { em("LD "+nm) } }
+        let nm=adv()
+        if cv()=="(" { adv() var ac=0 if cv()!=")"{c_expr() ac=1 while cv()==","{adv() c_expr() ac=ac+1}} eat(")") em("CALL "+nm+" "+to_string(ac))
+        } else { if cv()=="{" { if len(nm)>0 { if is_upper(str_char_at(nm,0)) { adv() var fc=0 var flds="" if cv()!="}" { let f1=adv() eat(":") c_expr() flds=f1 fc=1 while cv()==","{adv() let fx=adv() eat(":") c_expr() flds=flds+","+fx fc=fc+1} } eat("}") em("SNEW "+nm+" "+to_string(fc)+" "+flds)
+        } else { em("LD "+nm) } } else { em("LD "+nm) }
+        } else { if cv()=="[" { adv() c_expr() eat("]") em("AGET "+nm)
+        } else { em("LD "+nm) } } }
+        while cv()=="."{adv() let fld=adv() em("FGET "+fld)}
         return
     }
-    if cv()=="(" { adv() c_expr() eat(")") return }
+    if cv()=="("{adv() c_expr() eat(")") return}
     adv()
 }
 fn c_unary() { if ct()=="-"{adv() c_unary() em("NEG") return} if ct()=="!"{adv() c_unary() em("NOT") return} c_primary() }
-fn c_mul() { c_unary() while ct()=="*"||ct()=="/"||ct()=="%"{ let o=adv() c_unary() if o=="*"{em("MUL")} if o=="/"{em("DIV")} if o=="%"{em("MOD")} } }
-fn c_add() { c_mul() while ct()=="+"||ct()=="-"{ let o=adv() c_mul() if o=="+"{em("ADD")} if o=="-"{em("SUB")} } }
-fn c_cmp() { c_add() while ct()=="<"||ct()==">"||ct()=="<="||ct()==">="{ let o=adv() c_add() if o=="<"{em("LT")} if o==">"{em("GT")} if o=="<="{em("LE")} if o==">="{em("GE")} } }
-fn c_eq() { c_cmp() while ct()=="=="||ct()=="!="{ let o=adv() c_cmp() if o=="=="{em("EQ")} if o=="!="{em("NE")} } }
-fn c_and() { c_eq() while ct()=="&&"{ adv() c_eq() em("AND") } }
-fn c_or() { c_and() while ct()=="||"{ adv() c_and() em("OR") } }
+fn c_mul() { c_unary() while ct()=="*"||ct()=="/"||ct()=="%"{let o=adv() c_unary() if o=="*"{em("MUL")} if o=="/"{em("DIV")} if o=="%"{em("MOD")}} }
+fn c_add() { c_mul() while ct()=="+"||ct()=="-"{let o=adv() c_mul() if o=="+"{em("ADD")} if o=="-"{em("SUB")}} }
+fn c_cmp() { c_add() while ct()=="<"||ct()==">"||ct()=="<="||ct()==">="{let o=adv() c_add() if o=="<"{em("LT")} if o==">"{em("GT")} if o=="<="{em("LE")} if o==">="{em("GE")}} }
+fn c_eq() { c_cmp() while ct()=="=="||ct()=="!="{let o=adv() c_cmp() if o=="=="{em("EQ")} if o=="!="{em("NE")}} }
+fn c_and() { c_eq() while ct()=="&&"{adv() c_eq() em("AND")} }
+fn c_or() { c_and() while ct()=="||"{adv() c_and() em("OR")} }
 fn c_expr() { c_or() }
-fn c_block() { eat("{") while cv()!="}" { if ct()=="EOF"{break} c_stmt() } eat("}") }
+fn c_block() { eat("{") while cv()!="}"{if ct()=="EOF"{break} c_stmt()} eat("}") }
 fn c_stmt() {
-    if akw("let")||akw("var") {
-        adv() let nm=adv()
-        // Skip type annotation: name: Type
-        if cv()==":" { adv() adv() }
-        eat("=") c_expr() em("ST "+nm) return
-    }
-    if akw("return") { adv() c_expr() em("RET") return }
-    if akw("if") { adv() c_expr() let el=nlbl("e") let en=nlbl("n") em("JZ "+el) c_block() em("JMP "+en) em("LBL "+el) if akw("else"){adv() c_block()} em("LBL "+en) return }
-    if akw("while") { adv() let lp=nlbl("l") let en=nlbl("x") em("LBL "+lp) c_expr() em("JZ "+en) c_block() em("JMP "+lp) em("LBL "+en) return }
-    // for i in range(n) { } or for x in arr { }
-    if akw("for") {
-        adv() let vname=adv() eat("in")
-        let lp=nlbl("fl") let en=nlbl("fx")
-        // Compile the iterable expression
-        c_expr()
-        em("ST ##iter") em("PI 0") em("ST ##idx")
-        em("LBL "+lp)
-        em("LD ##idx") em("LD ##iter") em("ALEN") em("LT") em("JZ "+en)
-        em("LD ##iter") em("LD ##idx") em("AIDX") em("ST "+vname)
-        c_block()
-        em("LD ##idx") em("PI 1") em("ADD") em("ST ##idx")
-        em("JMP "+lp) em("LBL "+en)
-        return
-    }
+    if akw("let")||akw("var") { adv() let nm=adv() if cv()==":"{adv() adv() if cv()=="="{eat("=") c_expr() em("ST "+nm)}else{em("PI 0") em("ST "+nm)} return } eat("=") c_expr() em("ST "+nm) return }
+    if akw("return"){adv() c_expr() em("RET") return}
+    if akw("if"){adv() c_expr() let el=nlbl("e") let en=nlbl("n") em("JZ "+el) c_block() em("JMP "+en) em("LBL "+el) if akw("else"){adv() c_block()} em("LBL "+en) return}
+    if akw("while"){adv() let lp=nlbl("l") let en=nlbl("x") em("LBL "+lp) c_expr() em("JZ "+en) c_block() em("JMP "+lp) em("LBL "+en) return}
+    if akw("for") { adv() let vname=adv() eat("in") let lp=nlbl("fl") let en=nlbl("fx") c_expr() em("ST ##iter") em("PI 0") em("ST ##idx") em("LBL "+lp) em("LD ##idx") em("LD ##iter") em("ALEN") em("LT") em("JZ "+en) em("LD ##iter") em("LD ##idx") em("AIDX") em("ST "+vname) c_block() em("LD ##idx") em("PI 1") em("ADD") em("ST ##idx") em("JMP "+lp) em("LBL "+en) return }
     if ct()=="IDENT" {
         let nm=cv()
-        // Assignment: name = expr
         if _t[(_p+1)*2]=="=" { adv() eat("=") c_expr() em("ST "+nm) return }
-        // Array element assignment: name[expr] = expr
-        if _t[(_p+1)*2]=="[" {
-            adv() eat("[") c_expr() eat("]") eat("=") c_expr()
-            em("ASET "+nm)
-            return
-        }
+        if _t[(_p+1)*2]=="[" { adv() eat("[") c_expr() eat("]") eat("=") c_expr() em("ASET "+nm) return }
+        if _t[(_p+1)*2]=="." { adv() eat(".") let fld=adv() eat("=") c_expr() em("FSET "+nm+" "+fld) return }
     }
     c_expr() em("POP")
 }
 fn c_fn() {
-    eat("fn") let nm=adv() eat("(")
-    var ps: [String] = []
-    if cv()!=")" {
-        ps = push(ps, adv())
-        // Skip type annotations on params
-        if cv()==":" { adv() adv() }
-        while cv()==","{adv() ps=push(ps,adv()) if cv()==":" { adv() adv() } }
-    }
-    eat(")")
-    // Skip return type annotation
-    if ct()=="-" { if _t[(_p+1)*2+1]==">" { adv() adv() adv() } }
-    em("FN "+nm)
-    var pi=len(ps)-1
-    while pi>=0 { em("ST "+ps[pi]) pi=pi-1 }
-    c_block() em("PI 0") em("RET") em("FE")
+    eat("fn") let nm=adv() eat("(") var ps: [String] = []
+    if cv()!=")"{ps=push(ps,adv()) if cv()==":"{adv() adv()} while cv()==","{adv() ps=push(ps,adv()) if cv()==":"{adv() adv()}}} eat(")")
+    if ct()=="-"{if _t[(_p+1)*2+1]==">"{adv() adv() adv()}}
+    em("FN "+nm) var pi=len(ps)-1 while pi>=0{em("ST "+ps[pi]) pi=pi-1} c_block() em("PI 0") em("RET") em("FE")
 }
+fn c_struct() { eat("struct") let nm=adv() eat("{") var fs="" if cv()!="}"{fs=adv() while cv()==","{adv() fs=fs+","+adv()}} eat("}") em("SDEF "+nm+" "+fs) }
 fn compile(src: String) {
-    _t = lex(src) _p = 0 _c = [] _lid = 0
-    while ct() != "EOF" { if akw("fn") { c_fn() } else { c_stmt() } }
-}
-// === VM VALUES ===
-// Tagged strings: i:42, f:3.14, s:hello, a:3 (array ref with id), void
-// Arrays stored in global array table
-var _arrs: [String] = []
-var _arrs_len: [i64] = []
-var _arr_count = 0
-fn arr_new() -> i64 {
-    let id = _arr_count
-    _arr_count = _arr_count + 1
-    _arrs_len = push(_arrs_len, 0)
-    return id
-}
-fn arr_push(id: i64, val: String) {
-    _arrs = push(_arrs, to_string(id) + ":" + to_string(_arrs_len[id]) + "=" + val)
-    _arrs_len[id] = _arrs_len[id] + 1
-}
-fn arr_get(id: i64, idx: i64) -> String {
-    let key = to_string(id) + ":" + to_string(idx) + "="
-    var i = len(_arrs) - 1
-    while i >= 0 {
-        if sw(_arrs[i], key) { return after(_arrs[i], len(key)) }
-        i = i - 1
+    _t=lex(src) _p=0 _c=[] _lid=0
+    while ct()!="EOF" {
+        if akw("import") { adv() let path=adv() let isrc=read_file(path) let itoks=lex(isrc) var nt: [String]=[] var j=0 while j<len(itoks)-2{nt=push(nt,itoks[j]) j=j+1} j=_p*2 while j<len(_t){nt=push(nt,_t[j]) j=j+1} _t=nt _p=0 continue }
+        if akw("struct"){c_struct()} else { if akw("fn"){c_fn()} else {c_stmt()} }
     }
-    return "void"
 }
-fn arr_set(id: i64, idx: i64, val: String) {
-    let key = to_string(id) + ":" + to_string(idx) + "="
-    _arrs = push(_arrs, key + val)
-}
-fn arr_len(id: i64) -> i64 {
-    if id < 0 { return 0 }
-    if id >= len(_arrs_len) { return 0 }
-    return _arrs_len[id]
-}
-fn arr_clone(id: i64) -> i64 {
-    let nid = arr_new()
-    var i = 0
-    let alen = arr_len(id)
-    while i < alen { arr_push(nid, arr_get(id, i)) i = i + 1 }
-    return nid
-}
-// === VM STATE ===
-var _vs: [String] = []
-var _vv: [String] = []
-var _vc: [String] = []
-var _vl: [String] = []
-var _vf: [String] = []
-var _vi: [String] = []
-var _ip = 0
-var _run = true
-var _out: [String] = []
-fn vpush(v: String) { _vs = push(_vs, v) }
-fn vpop() -> String {
-    if len(_vs)==0 { return "void" }
-    let v = _vs[len(_vs)-1]
-    var ns: [String] = [] var i=0 while i<len(_vs)-1{ns=push(ns,_vs[i]) i=i+1} _vs=ns
-    return v
-}
+var _arrs: [String] = [] var _arrs_len: [i64] = [] var _arr_count = 0
+fn arr_new() -> i64 { let id=_arr_count _arr_count=_arr_count+1 _arrs_len=push(_arrs_len,0) return id }
+fn arr_push(id: i64, val: String) { _arrs=push(_arrs,to_string(id)+":"+to_string(_arrs_len[id])+"="+val) _arrs_len[id]=_arrs_len[id]+1 }
+fn arr_get(id: i64, idx: i64) -> String { let key=to_string(id)+":"+to_string(idx)+"=" var i=len(_arrs)-1 while i>=0{if sw(_arrs[i],key){return after(_arrs[i],len(key))} i=i-1} return "void" }
+fn arr_set(id: i64, idx: i64, val: String) { _arrs=push(_arrs,to_string(id)+":"+to_string(idx)+"="+val) }
+fn arr_len(id: i64) -> i64 { if id<0{return 0} if id>=len(_arrs_len){return 0} return _arrs_len[id] }
+fn arr_clone(id: i64) -> i64 { let nid=arr_new() var i=0 let alen=arr_len(id) while i<alen{arr_push(nid,arr_get(id,i)) i=i+1} return nid }
+var _vs: [String] = [] var _vv: [String] = [] var _vc: [String] = [] var _vl: [String] = [] var _vf: [String] = [] var _vi: [String] = []
+var _ip = 0 var _run = true var _out: [String] = []
+fn vpush(v: String) { _vs=push(_vs,v) }
+fn vpop() -> String { if len(_vs)==0{return "void"} let v=_vs[len(_vs)-1] var ns: [String]=[] var i=0 while i<len(_vs)-1{ns=push(ns,_vs[i]) i=i+1} _vs=ns return v }
 fn vtop() -> String { if len(_vs)==0{return "void"} return _vs[len(_vs)-1] }
-// Value constructors
 fn mi(n: i64) -> String { return "i:"+to_string(n) }
 fn mf(x: f64) -> String { return "f:"+to_string(x) }
 fn ms(s: String) -> String { return "s:"+s }
 fn ma(id: i64) -> String { return "a:"+to_string(id) }
 fn mb(b: bool) -> String { if b{return "i:1"} return "i:0" }
-// Value queries
-fn vd(v: String) -> String {
-    if sw(v,"i:"){return after(v,2)} if sw(v,"f:"){return after(v,2)}
-    if sw(v,"s:"){return after(v,2)} if sw(v,"a:"){return "[array:"+after(v,2)+"]"} return v
-}
+fn vd(v: String) -> String { if sw(v,"i:"){return after(v,2)} if sw(v,"f:"){return after(v,2)} if sw(v,"s:"){return after(v,2)} if sw(v,"a:"){return "[array:"+after(v,2)+"]"} return v }
 fn vt(v: String) -> bool { if sw(v,"i:"){return after(v,2)!="0"} if sw(v,"f:"){return after(v,2)!="0.0"} if v=="void"{return false} return true }
 fn vi(v: String) -> i64 { if sw(v,"i:"){return int(after(v,2))} if sw(v,"f:"){return int(after(v,2))} return 0 }
 fn vf(v: String) -> f64 { if sw(v,"f:"){return float(after(v,2))} if sw(v,"i:"){return float(after(v,2))} return 0.0 }
@@ -275,24 +111,10 @@ fn vstr(v: String) -> bool { return sw(v,"s:") }
 fn vflt(v: String) -> bool { return sw(v,"f:") }
 fn varr(v: String) -> bool { return sw(v,"a:") }
 fn varr_id(v: String) -> i64 { if sw(v,"a:"){return int(after(v,2))} return -1 }
-// Arithmetic with float promotion
-fn vadd(a: String, b: String) -> String {
-    if vstr(a)||vstr(b){return ms(vs(a)+vs(b))}
-    if vflt(a)||vflt(b){return mf(vf(a)+vf(b))}
-    return mi(vi(a)+vi(b))
-}
-fn vsub(a: String, b: String) -> String {
-    if vflt(a)||vflt(b){return mf(vf(a)-vf(b))}
-    return mi(vi(a)-vi(b))
-}
-fn vmul(a: String, b: String) -> String {
-    if vflt(a)||vflt(b){return mf(vf(a)*vf(b))}
-    return mi(vi(a)*vi(b))
-}
-fn vdiv(a: String, b: String) -> String {
-    if vflt(a)||vflt(b){ var d=vf(b) if d==0.0{return "f:0.0"} return mf(vf(a)/d) }
-    var d=vi(b) if d==0{return "i:0"} return mi(vi(a)/d)
-}
+fn vadd(a: String, b: String) -> String { if vstr(a)||vstr(b){return ms(vs(a)+vs(b))} if vflt(a)||vflt(b){return mf(vf(a)+vf(b))} return mi(vi(a)+vi(b)) }
+fn vsub(a: String, b: String) -> String { if vflt(a)||vflt(b){return mf(vf(a)-vf(b))} return mi(vi(a)-vi(b)) }
+fn vmul(a: String, b: String) -> String { if vflt(a)||vflt(b){return mf(vf(a)*vf(b))} return mi(vi(a)*vi(b)) }
+fn vdiv(a: String, b: String) -> String { if vflt(a)||vflt(b){var d=vf(b) if d==0.0{return "f:0.0"} return mf(vf(a)/d)} var d=vi(b) if d==0{return "i:0"} return mi(vi(a)/d) }
 fn vmod(a: String, b: String) -> String { var d=vi(b) if d==0{return "i:0"} return mi(vi(a)%d) }
 fn vcmp_lt(a: String, b: String) -> String { if vflt(a)||vflt(b){return mb(vf(a)<vf(b))} return mb(vi(a)<vi(b)) }
 fn vcmp_gt(a: String, b: String) -> String { if vflt(a)||vflt(b){return mb(vf(a)>vf(b))} return mb(vi(a)>vi(b)) }
@@ -300,22 +122,10 @@ fn vcmp_le(a: String, b: String) -> String { if vflt(a)||vflt(b){return mb(vf(a)
 fn vcmp_ge(a: String, b: String) -> String { if vflt(a)||vflt(b){return mb(vf(a)>=vf(b))} return mb(vi(a)>=vi(b)) }
 fn vcmp_eq(a: String, b: String) -> String { if vstr(a)||vstr(b){return mb(vs(a)==vs(b))} if vflt(a)||vflt(b){return mb(vf(a)==vf(b))} return mb(vi(a)==vi(b)) }
 fn vcmp_ne(a: String, b: String) -> String { if vstr(a)||vstr(b){return mb(vs(a)!=vs(b))} if vflt(a)||vflt(b){return mb(vf(a)!=vf(b))} return mb(vi(a)!=vi(b)) }
-// Variable scoping
-fn vget(nm: String) -> String {
-    var i=len(_vv)-2
-    while i>=0 { if _vv[i]==nm{return _vv[i+1]} i=i-2 }
-    return "void"
-}
-fn vset(nm: String, val: String) {
-    var i=len(_vv)-2
-    while i>=0 { if _vv[i]==nm{_vv[i+1]=val return} if _vv[i]=="##S##"{_vv=push(_vv,nm) _vv=push(_vv,val) return} i=i-2 }
-    _vv=push(_vv,nm) _vv=push(_vv,val)
-}
+fn vget(nm: String) -> String { var i=len(_vv)-2 while i>=0{if _vv[i]==nm{return _vv[i+1]} i=i-2} return "void" }
+fn vset(nm: String, val: String) { var i=len(_vv)-2 while i>=0{if _vv[i]==nm{_vv[i+1]=val return} if _vv[i]=="##S##"{_vv=push(_vv,nm) _vv=push(_vv,val) return} i=i-2} _vv=push(_vv,nm) _vv=push(_vv,val) }
 fn vpscope() { _vv=push(_vv,"##S##") _vv=push(_vv,"##S##") }
-fn vpopscope() {
-    while len(_vv)>=2 { var tn=_vv[len(_vv)-2] var nv:[String]=[] var j=0 while j<len(_vv)-2{nv=push(nv,_vv[j]) j=j+1} _vv=nv if tn=="##S##"{return} }
-}
-// Instruction parsing
+fn vpopscope() { while len(_vv)>=2{var tn=_vv[len(_vv)-2] var nv:[String]=[] var j=0 while j<len(_vv)-2{nv=push(nv,_vv[j]) j=j+1} _vv=nv if tn=="##S##"{return}} }
 fn iop(i: String) -> String { var x=fidx(i," ") if x<0{return i} return str_substr(i,0,x) }
 fn irest(i: String) -> String { var x=fidx(i," ") if x<0{return ""} return str_substr(i,x+1,len(i)-x-1) }
 fn iarg1(i: String) -> String { var r=irest(i) var x=fidx(r," ") if x<0{return r} return str_substr(r,0,x) }
@@ -323,195 +133,141 @@ fn iarg2(i: String) -> String { return irest(irest(i)) }
 fn tget(t: [String], k: String) -> i64 { var i=0 while i<len(t)-1{if t[i]==k{return int(t[i+1])} i=i+2} return -1 }
 fn tset(t: [String], k: String, v: i64) -> [String] { t=push(t,k) t=push(t,to_string(v)) return t }
 fn vcpop() { var nc:[String]=[] var i=0 while i<len(_vc)-1{nc=push(nc,_vc[i]) i=i+1} _vc=nc }
-// === BUILTINS ===
+var _struct_defs: [String] = []
+fn sdef_reg(nm: String, fs: String) { _struct_defs=push(_struct_defs,nm+":"+fs) }
+fn sdef_fields(nm: String) -> String { var i=0 while i<len(_struct_defs){if sw(_struct_defs[i],nm+":"){return after(_struct_defs[i],len(nm)+1)} i=i+1} return "" }
+fn sdef_fidx(sn: String, fn2: String) -> i64 { let fs=sdef_fields(sn) var idx=0 var p=0 let fb=str_bytes(fs) var cur="" while p<len(fb){if fb[p]==44{if cur==fn2{return idx} idx=idx+1 cur=""}else{cur=cur+str_char_at(fs,p)} p=p+1} if cur==fn2{return idx} return -1 }
 fn vb_io(f: String) -> bool {
-    if f=="println" { let o=vd(vpop()) print(o+_nl()) _out=push(_out,o) vpush("void") return true }
-    if f=="print" { print(vd(vpop())) vpush("void") return true }
+    if f=="println"{let o=vd(vpop()) print(o+_nl()) _out=push(_out,o) vpush("void") return true}
+    if f=="print"{print(vd(vpop())) vpush("void") return true}
     return false
 }
 fn vb_conv(f: String) -> bool {
-    if f=="to_string" { vpush(ms(vd(vpop()))) return true }
-    if f=="int" { vpush(mi(int(vs(vpop())))) return true }
-    if f=="float" { vpush(mf(vf(vpop()))) return true }
-    if f=="type_of" {
-        let v=vpop()
-        if sw(v,"i:"){vpush(ms("int"))} else { if sw(v,"f:"){vpush(ms("float"))} else { if sw(v,"s:"){vpush(ms("string"))} else { if sw(v,"a:"){vpush(ms("array"))} else {vpush(ms("void"))} } } }
-        return true
-    }
+    if f=="to_string"{vpush(ms(vd(vpop()))) return true} if f=="int"{vpush(mi(int(vs(vpop())))) return true}
+    if f=="float"{vpush(mf(vf(vpop()))) return true}
+    if f=="type_of"{let v=vpop() if sw(v,"i:"){vpush(ms("int"))} else { if sw(v,"f:"){vpush(ms("float"))} else { if sw(v,"s:"){vpush(ms("string"))} else { if sw(v,"a:"){vpush(ms("array"))} else {vpush(ms("void"))}}}} return true}
     return false
 }
-fn vb_len(f: String) -> bool {
-    if f=="len" {
-        let t=vpop()
-        if vstr(t){vpush(mi(len(vs(t))))} else { if varr(t){vpush(mi(arr_len(varr_id(t))))} else {vpush("i:0")} }
-        return true
-    }
-    return false
-}
+fn vb_len(f: String) -> bool { if f=="len"{let t=vpop() if vstr(t){vpush(mi(len(vs(t))))} else { if varr(t){vpush(mi(arr_len(varr_id(t))))} else {vpush("i:0")}} return true} return false }
 fn vb_str(f: String) -> bool {
-    if f=="str_char_at" { let i=vi(vpop()) let s=vs(vpop()) vpush(ms(str_char_at(s,i))) return true }
-    if f=="str_substr" { let l=vi(vpop()) let s2=vi(vpop()) let s1=vs(vpop()) vpush(ms(str_substr(s1,s2,l))) return true }
-    if f=="str_find" { let n=vs(vpop()) let h=vs(vpop()) vpush(mi(unwrap_or(str_find(h,n),-1))) return true }
-    if f=="trim" { vpush(ms(trim(vs(vpop())))) return true }
+    if f=="str_char_at"{let i=vi(vpop()) let s=vs(vpop()) vpush(ms(str_char_at(s,i))) return true}
+    if f=="str_substr"{let l=vi(vpop()) let s2=vi(vpop()) let s1=vs(vpop()) vpush(ms(str_substr(s1,s2,l))) return true}
+    if f=="str_find"{let n=vs(vpop()) let h=vs(vpop()) vpush(mi(unwrap_or(str_find(h,n),-1))) return true}
+    if f=="trim"{vpush(ms(trim(vs(vpop())))) return true}
     return false
 }
 fn vb_file(f: String) -> bool {
-    if f=="read_file" { vpush(ms(read_file(vs(vpop())))) return true }
-    if f=="write_file" { let c=vs(vpop()) let p=vs(vpop()) write_file(p,c) vpush("void") return true }
-    if f=="file_exists" { if file_exists(vs(vpop())){vpush("i:1")}else{vpush("i:0")} return true }
+    if f=="read_file"{vpush(ms(read_file(vs(vpop())))) return true}
+    if f=="write_file"{let c=vs(vpop()) let p=vs(vpop()) write_file(p,c) vpush("void") return true}
+    if f=="file_exists"{if file_exists(vs(vpop())){vpush("i:1")}else{vpush("i:0")} return true}
     return false
 }
 fn vb_math(f: String) -> bool {
-    if f=="sqrt" { vpush(mf(sqrt(vf(vpop())))) return true }
-    if f=="abs" { let v=vpop() if vflt(v){let x=vf(v) if x<0.0{vpush(mf(0.0-x))}else{vpush(mf(x))}}else{let x=vi(v) if x<0{vpush(mi(0-x))}else{vpush(mi(x))}} return true }
-    if f=="sin" { vpush(mf(sin(vf(vpop())))) return true }
-    if f=="cos" { vpush(mf(cos(vf(vpop())))) return true }
-    if f=="exp" { vpush(mf(exp(vf(vpop())))) return true }
-    if f=="log" { vpush(mf(log(vf(vpop())))) return true }
-    if f=="pow" { let e=vf(vpop()) let b=vf(vpop()) vpush(mf(pow(b,e))) return true }
-    if f=="floor" { vpush(mi(int(vf(vpop())))) return true }
-    if f=="ceil" { let x=vf(vpop()) let ix=int(x) if float(ix)<x{vpush(mi(ix+1))}else{vpush(mi(ix))} return true }
+    if f=="sqrt"{vpush(mf(sqrt(vf(vpop())))) return true}
+    if f=="abs"{let v=vpop() if vflt(v){let x=vf(v) if x<0.0{vpush(mf(0.0-x))}else{vpush(mf(x))}}else{let x=vi(v) if x<0{vpush(mi(0-x))}else{vpush(mi(x))}} return true}
+    if f=="sin"{vpush(mf(sin(vf(vpop())))) return true} if f=="cos"{vpush(mf(cos(vf(vpop())))) return true}
+    if f=="exp"{vpush(mf(exp(vf(vpop())))) return true} if f=="log"{vpush(mf(log(vf(vpop())))) return true}
+    if f=="pow"{let e=vf(vpop()) let b=vf(vpop()) vpush(mf(pow(b,e))) return true}
+    if f=="floor"{vpush(mi(int(vf(vpop())))) return true}
+    if f=="ceil"{let x=vf(vpop()) let ix=int(x) if float(ix)<x{vpush(mi(ix+1))}else{vpush(mi(ix))} return true}
     return false
 }
 fn vb_arr(f: String) -> bool {
-    if f=="push" {
-        let val=vpop() let arr_v=vpop()
-        let oid=varr_id(arr_v) let nid=arr_clone(oid)
-        arr_push(nid, val) vpush(ma(nid))
-        return true
-    }
-    if f=="range" {
-        let n=vi(vpop()) let id=arr_new()
-        var i=0 while i<n{arr_push(id,mi(i)) i=i+1}
-        vpush(ma(id)) return true
-    }
+    if f=="push"{let val=vpop() let arr_v=vpop() let oid=varr_id(arr_v) let nid=arr_clone(oid) arr_push(nid,val) vpush(ma(nid)) return true}
+    if f=="range"{let n=vi(vpop()) let id=arr_new() var i=0 while i<n{arr_push(id,mi(i)) i=i+1} vpush(ma(id)) return true}
     return false
 }
-fn vbuiltin(f: String) -> bool {
-    if vb_io(f){return true} if vb_conv(f){return true} if vb_len(f){return true}
-    if vb_str(f){return true} if vb_file(f){return true} if vb_math(f){return true}
-    if vb_arr(f){return true}
-    return false
-}
-// === VM DISPATCH ===
+fn vbuiltin(f: String) -> bool { if vb_io(f){return true} if vb_conv(f){return true} if vb_len(f){return true} if vb_str(f){return true} if vb_file(f){return true} if vb_math(f){return true} if vb_arr(f){return true} return false }
 fn step_data(ins: String, op: String) -> bool {
-    if op=="PI" { vpush(mi(int(iarg1(ins)))) _ip=_ip+1 return true }
-    if op=="PF" { vpush(mf(float(iarg1(ins)))) _ip=_ip+1 return true }
-    if op=="PS" { vpush(ms(irest(ins))) _ip=_ip+1 return true }
-    if op=="LD" { vpush(vget(iarg1(ins))) _ip=_ip+1 return true }
-    if op=="ST" { vset(iarg1(ins),vpop()) _ip=_ip+1 return true }
-    if op=="POP" { vpop() _ip=_ip+1 return true }
+    if op=="PI"{vpush(mi(int(iarg1(ins)))) _ip=_ip+1 return true} if op=="PF"{vpush(mf(float(iarg1(ins)))) _ip=_ip+1 return true}
+    if op=="PS"{vpush(ms(irest(ins))) _ip=_ip+1 return true} if op=="LD"{vpush(vget(iarg1(ins))) _ip=_ip+1 return true}
+    if op=="ST"{vset(iarg1(ins),vpop()) _ip=_ip+1 return true} if op=="POP"{vpop() _ip=_ip+1 return true}
     return false
 }
 fn step_arr(ins: String, op: String) -> bool {
-    // ARR n — create array from top n stack values
-    if op=="ARR" {
-        let cnt=int(iarg1(ins)) let id=arr_new()
-        // Collect values from stack (they're in reverse order)
-        var vals: [String] = []
-        var ci=0 while ci<cnt{vals=push(vals,vpop()) ci=ci+1}
-        // Push in correct order
-        var ri=cnt-1 while ri>=0{arr_push(id,vals[ri]) ri=ri-1}
-        vpush(ma(id)) _ip=_ip+1 return true
-    }
-    // AGET name — arr[idx] where idx is on stack, name is var
-    if op=="AGET" {
-        let idx=vi(vpop()) let arr_v=vget(iarg1(ins))
-        vpush(arr_get(varr_id(arr_v), idx)) _ip=_ip+1 return true
-    }
-    // ASET name — name[idx] = val, val and idx on stack
-    if op=="ASET" {
-        let val=vpop() let idx=vi(vpop())
-        let arr_v=vget(iarg1(ins))
-        arr_set(varr_id(arr_v), idx, val) _ip=_ip+1 return true
-    }
-    // ALEN — push len of array on stack top
-    if op=="ALEN" { let arr_v=vpop() vpush(mi(arr_len(varr_id(arr_v)))) _ip=_ip+1 return true }
-    // AIDX — arr[idx] where idx and arr are on stack
-    if op=="AIDX" { let idx=vi(vpop()) let arr_v=vpop() vpush(arr_get(varr_id(arr_v),idx)) _ip=_ip+1 return true }
+    if op=="ARR"{let cnt=int(iarg1(ins)) let id=arr_new() var vals:[String]=[] var ci=0 while ci<cnt{vals=push(vals,vpop()) ci=ci+1} var ri=cnt-1 while ri>=0{arr_push(id,vals[ri]) ri=ri-1} vpush(ma(id)) _ip=_ip+1 return true}
+    if op=="AGET"{let idx=vi(vpop()) let arr_v=vget(iarg1(ins)) vpush(arr_get(varr_id(arr_v),idx)) _ip=_ip+1 return true}
+    if op=="ASET"{let val=vpop() let idx=vi(vpop()) let arr_v=vget(iarg1(ins)) arr_set(varr_id(arr_v),idx,val) _ip=_ip+1 return true}
+    if op=="ALEN"{let arr_v=vpop() vpush(mi(arr_len(varr_id(arr_v)))) _ip=_ip+1 return true}
+    if op=="AIDX"{let idx=vi(vpop()) let arr_v=vpop() vpush(arr_get(varr_id(arr_v),idx)) _ip=_ip+1 return true}
     return false
 }
 fn step_math(op: String) -> bool {
-    if op=="ADD" { let b=vpop() let a=vpop() vpush(vadd(a,b)) _ip=_ip+1 return true }
-    if op=="SUB" { let b=vpop() let a=vpop() vpush(vsub(a,b)) _ip=_ip+1 return true }
-    if op=="MUL" { let b=vpop() let a=vpop() vpush(vmul(a,b)) _ip=_ip+1 return true }
-    if op=="DIV" { let b=vpop() let a=vpop() vpush(vdiv(a,b)) _ip=_ip+1 return true }
-    if op=="MOD" { let b=vpop() let a=vpop() vpush(vmod(a,b)) _ip=_ip+1 return true }
-    if op=="NEG" { let v=vpop() if vflt(v){vpush(mf(0.0-vf(v)))}else{vpush(mi(0-vi(v)))} _ip=_ip+1 return true }
+    if op=="ADD"{let b=vpop() let a=vpop() vpush(vadd(a,b)) _ip=_ip+1 return true}
+    if op=="SUB"{let b=vpop() let a=vpop() vpush(vsub(a,b)) _ip=_ip+1 return true}
+    if op=="MUL"{let b=vpop() let a=vpop() vpush(vmul(a,b)) _ip=_ip+1 return true}
+    if op=="DIV"{let b=vpop() let a=vpop() vpush(vdiv(a,b)) _ip=_ip+1 return true}
+    if op=="MOD"{let b=vpop() let a=vpop() vpush(vmod(a,b)) _ip=_ip+1 return true}
+    if op=="NEG"{let v=vpop() if vflt(v){vpush(mf(0.0-vf(v)))}else{vpush(mi(0-vi(v)))} _ip=_ip+1 return true}
     return false
 }
 fn step_cmp(op: String) -> bool {
-    if op=="EQ" { let b=vpop() let a=vpop() vpush(vcmp_eq(a,b)) _ip=_ip+1 return true }
-    if op=="NE" { let b=vpop() let a=vpop() vpush(vcmp_ne(a,b)) _ip=_ip+1 return true }
-    if op=="LT" { let b=vpop() let a=vpop() vpush(vcmp_lt(a,b)) _ip=_ip+1 return true }
-    if op=="GT" { let b=vpop() let a=vpop() vpush(vcmp_gt(a,b)) _ip=_ip+1 return true }
-    if op=="LE" { let b=vpop() let a=vpop() vpush(vcmp_le(a,b)) _ip=_ip+1 return true }
-    if op=="GE" { let b=vpop() let a=vpop() vpush(vcmp_ge(a,b)) _ip=_ip+1 return true }
+    if op=="EQ"{let b=vpop() let a=vpop() vpush(vcmp_eq(a,b)) _ip=_ip+1 return true}
+    if op=="NE"{let b=vpop() let a=vpop() vpush(vcmp_ne(a,b)) _ip=_ip+1 return true}
+    if op=="LT"{let b=vpop() let a=vpop() vpush(vcmp_lt(a,b)) _ip=_ip+1 return true}
+    if op=="GT"{let b=vpop() let a=vpop() vpush(vcmp_gt(a,b)) _ip=_ip+1 return true}
+    if op=="LE"{let b=vpop() let a=vpop() vpush(vcmp_le(a,b)) _ip=_ip+1 return true}
+    if op=="GE"{let b=vpop() let a=vpop() vpush(vcmp_ge(a,b)) _ip=_ip+1 return true}
     return false
 }
 fn step_logic(op: String) -> bool {
-    if op=="NOT" { if vt(vpop()){vpush("i:0")}else{vpush("i:1")} _ip=_ip+1 return true }
-    if op=="AND" { let b=vpop() let a=vpop() if vt(a){if vt(b){vpush("i:1")}else{vpush("i:0")}}else{vpush("i:0")} _ip=_ip+1 return true }
-    if op=="OR" { let b=vpop() let a=vpop() if vt(a){vpush("i:1")}else{if vt(b){vpush("i:1")}else{vpush("i:0")}} _ip=_ip+1 return true }
+    if op=="NOT"{if vt(vpop()){vpush("i:0")}else{vpush("i:1")} _ip=_ip+1 return true}
+    if op=="AND"{let b=vpop() let a=vpop() if vt(a){if vt(b){vpush("i:1")}else{vpush("i:0")}}else{vpush("i:0")} _ip=_ip+1 return true}
+    if op=="OR"{let b=vpop() let a=vpop() if vt(a){vpush("i:1")}else{if vt(b){vpush("i:1")}else{vpush("i:0")}} _ip=_ip+1 return true}
     return false
 }
 fn step_flow(ins: String, op: String) -> bool {
-    if op=="JMP" { var tg=tget(_vl,iarg1(ins)) if tg>=0{_ip=tg+1}else{_run=false} return true }
-    if op=="JZ" { let cv=vpop() if vt(cv){_ip=_ip+1}else{ var tg=tget(_vl,iarg1(ins)) if tg>=0{_ip=tg+1}else{_run=false}} return true }
-    if op=="LBL" { _ip=_ip+1 return true }
+    if op=="JMP"{var tg=tget(_vl,iarg1(ins)) if tg>=0{_ip=tg+1}else{_run=false} return true}
+    if op=="JZ"{let cv=vpop() if vt(cv){_ip=_ip+1}else{var tg=tget(_vl,iarg1(ins)) if tg>=0{_ip=tg+1}else{_run=false}} return true}
+    if op=="LBL"{_ip=_ip+1 return true}
     return false
 }
 fn step_fn(ins: String, op: String) -> bool {
-    if op=="FN" { var d=1 _ip=_ip+1 while d>0{if _ip>=len(_vi){d=0}else{var so=iop(_vi[_ip]) if so=="FN"{d=d+1} if so=="FE"{d=d-1} _ip=_ip+1}} return true }
-    if op=="FE" { if len(_vc)>=1{var ri=int(_vc[len(_vc)-1]) vcpop() vpopscope() _ip=ri}else{_run=false} return true }
-    if op=="RET" { var rv=vpop() if len(_vc)>=1{var ri=int(_vc[len(_vc)-1]) vcpop() vpopscope() vpush(rv) _ip=ri}else{_run=false} return true }
-    if op=="CALL" { var fname=iarg1(ins) if vbuiltin(fname){_ip=_ip+1 return true} var fi=tget(_vf,fname) if fi<0{_run=false print("VM error: "+fname+_nl())}else{_vc=push(_vc,to_string(_ip+1)) vpscope() _ip=fi+1} return true }
+    if op=="FN"{var d=1 _ip=_ip+1 while d>0{if _ip>=len(_vi){d=0}else{var so=iop(_vi[_ip]) if so=="FN"{d=d+1} if so=="FE"{d=d-1} _ip=_ip+1}} return true}
+    if op=="FE"{if len(_vc)>=1{var ri=int(_vc[len(_vc)-1]) vcpop() vpopscope() _ip=ri}else{_run=false} return true}
+    if op=="RET"{var rv=vpop() if len(_vc)>=1{var ri=int(_vc[len(_vc)-1]) vcpop() vpopscope() vpush(rv) _ip=ri}else{_run=false} return true}
+    if op=="CALL"{var fname=iarg1(ins) if vbuiltin(fname){_ip=_ip+1 return true} var fi=tget(_vf,fname) if fi<0{_run=false print("VM error: "+fname+_nl())}else{_vc=push(_vc,to_string(_ip+1)) vpscope() _ip=fi+1} return true}
+    return false
+}
+fn step_struct(ins: String, op: String) -> bool {
+    if op=="SDEF"{_ip=_ip+1 return true}
+    if op=="SNEW"{ let sn=iarg1(ins) let rest=iarg2(ins) var sp=fidx(rest," ") var fc=0 var flds="" if sp>=0{fc=int(str_substr(rest,0,sp)) flds=str_substr(rest,sp+1,len(rest)-sp-1)}else{fc=int(rest)} let id=arr_new() if fc>0{var vals:[String]=[] var ci=0 while ci<fc{vals=push(vals,vpop()) ci=ci+1} var ri=fc-1 while ri>=0{arr_push(id,vals[ri]) ri=ri-1}}  vset("##stype:"+to_string(id),ms(sn)) vpush(ma(id)) _ip=_ip+1 return true }
+    if op=="FGET"{ let fld=iarg1(ins) let obj=vpop() let aid=varr_id(obj) let sn=vs(vget("##stype:"+to_string(aid))) let fs=sdef_fields(sn) var idx=0 var p=0 let fb=str_bytes(fs) var cur="" var found=false while p<len(fb){if fb[p]==44{if cur==fld{found=true} if !found{idx=idx+1} cur=""}else{cur=cur+str_char_at(fs,p)} p=p+1} if cur==fld{found=true} if found{vpush(arr_get(aid,idx))}else{vpush("void")} _ip=_ip+1 return true }
+    if op=="FSET"{ let nm=iarg1(ins) let fld=irest(irest(ins)) let val=vpop() let obj=vget(nm) let aid=varr_id(obj) let sn=vs(vget("##stype:"+to_string(aid))) let fs=sdef_fields(sn) var idx=0 var p=0 let fb=str_bytes(fs) var cur="" var found=false while p<len(fb){if fb[p]==44{if cur==fld{found=true} if !found{idx=idx+1} cur=""}else{cur=cur+str_char_at(fs,p)} p=p+1} if cur==fld{found=true} if found{arr_set(aid,idx,val)} _ip=_ip+1 return true }
     return false
 }
 fn vm_step() {
-    if _ip>=len(_vi) { _run=false return }
-    var ins=_vi[_ip]
-    var op=iop(ins)
-    if step_data(ins,op){return} if step_arr(ins,op){return}
-    if step_math(op){return} if step_cmp(op){return}
-    if step_logic(op){return} if step_flow(ins,op){return}
-    if step_fn(ins,op){return}
-    _ip=_ip+1
+    if _ip>=len(_vi){_run=false return} var ins=_vi[_ip] var op=iop(ins)
+    if step_data(ins,op){return} if step_arr(ins,op){return} if step_math(op){return}
+    if step_cmp(op){return} if step_logic(op){return} if step_flow(ins,op){return}
+    if step_fn(ins,op){return} if step_struct(ins,op){return} _ip=_ip+1
 }
 fn vm_run() {
-    _vs=[] _vv=[] _vc=[] _ip=0 _run=true _out=[]
+    _vs=[] _vv=[] _vc=[] _ip=0 _run=true _out=[] _struct_defs=[]
     _vl=[] _vf=[] _arrs=[] _arrs_len=[] _arr_count=0
-    var i=0 while i<len(_vi){let o=iop(_vi[i]) if o=="LBL"{_vl=tset(_vl,iarg1(_vi[i]),i)} if o=="FN"{_vf=tset(_vf,iarg1(_vi[i]),i)} i=i+1}
+    var i=0 while i<len(_vi){let o=iop(_vi[i]) if o=="LBL"{_vl=tset(_vl,iarg1(_vi[i]),i)} if o=="FN"{_vf=tset(_vf,iarg1(_vi[i]),i)} if o=="SDEF"{sdef_reg(iarg1(_vi[i]),iarg2(_vi[i]))} i=i+1}
     var mip=tget(_vf,"main")
-    if mip>=0 { _ip=mip+1 vpscope() }
-    while _run { vm_step() }
+    if mip>=0{_ip=mip+1 vpscope()} while _run{vm_step()}
 }
 fn run_source(src: String) { compile(src) _vi=_c vm_run() }
-fn run_file(path: String) {
-    let src=read_file(path)
-    if len(src)==0 { print("vxrun: empty/missing: "+path+_nl()) return }
-    run_source(src)
-}
+fn run_file(path: String) { let src=read_file(path) if len(src)==0{print("vxrun: empty/missing: "+path+_nl()) return} run_source(src) }
 fn self_test() -> bool {
     let nl=_nl()
     let src="fn fib(n) {"+nl+"  if n <= 1 { return n }"+nl+"  return fib(n-1)+fib(n-2)"+nl+"}"+nl+"fn main() {"+nl+"  println(fib(10))"+nl+"  let pi = 3.14159"+nl+"  println(pi * 2.0)"+nl+"  let arr = [10, 20, 30]"+nl+"  println(arr[1])"+nl+"  var s = 0"+nl+"  var i = 0"+nl+"  while i < len(arr) { s = s + arr[i] i = i + 1 }"+nl+"  println(s)"+nl+"}"
     run_source(src)
     var pass=true
     if len(_out)<4{println("FAIL: expected 4 outputs, got "+to_string(len(_out))) return false}
-    if _out[0]!="55"{println("FAIL: fib(10) expected 55, got "+_out[0]) pass=false}
-    if _out[1]!="6.28318"{println("FAIL: pi*2 expected 6.28318, got "+_out[1]) pass=false}
-    if _out[2]!="20"{println("FAIL: arr[1] expected 20, got "+_out[2]) pass=false}
-    if _out[3]!="60"{println("FAIL: sum(arr) expected 60, got "+_out[3]) pass=false}
+    if _out[0]!="55"{println("FAIL: fib(10)="+_out[0]) pass=false}
+    if _out[1]!="6.28318"{println("FAIL: pi*2="+_out[1]) pass=false}
+    if _out[2]!="20"{println("FAIL: arr[1]="+_out[2]) pass=false}
+    if _out[3]!="60"{println("FAIL: sum="+_out[3]) pass=false}
     return pass
 }
 fn main() {
     println("=== vxrun: Vortex self-hosted runtime ===")
-    if file_exists("/tmp/vx_run_target") {
-        let path=trim(read_file("/tmp/vx_run_target"))
-        if len(path)>0 { println("  Running: "+path) run_file(path) return }
-    }
+    if file_exists("/tmp/vx_run_target") { let path=trim(read_file("/tmp/vx_run_target")) if len(path)>0{println("  Running: "+path) run_file(path) return} }
     println("  (no target, running self-test)")
     let pass=self_test()
-    if pass { println("PASS: all tests OK (fib, floats, arrays)") }
+    if pass{println("PASS: all tests OK (fib, floats, arrays)")}
     println("=== Done ===")
 }
