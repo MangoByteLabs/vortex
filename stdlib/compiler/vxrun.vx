@@ -265,9 +265,7 @@ fn self_test() -> bool {
 }
 fn main() {
     println("=== vxrun: Vortex self-hosted runtime ===")
-    if file_exists("/tmp/vx_run_target") { let path=trim(read_file("/tmp/vx_run_target")) if len(path)>0{println("  Running: "+path) run_file(path) return} }
-    println("  (no target, running self-test)")
-    let pass=self_test()
-    if pass{println("PASS: all tests OK (fib, floats, arrays)")}
-    println("=== Done ===")
+    var src = ""
+    if file_exists("/tmp/vx_run_target") { let path=trim(read_file("/tmp/vx_run_target")) if len(path)>0{println("  Running: "+path) src=read_file(path)} }
+    if len(src)>0 { compile(src) _vi=_c vm_run() } else { println("  (no target, running self-test)") let pass=self_test() if pass{println("PASS: all tests OK (fib, floats, arrays)")} println("=== Done ===") }
 }
