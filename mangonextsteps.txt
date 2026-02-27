@@ -1,0 +1,81 @@
+Here's the full analysis of cell0.vx primitive coverage in genesis.sh:                                                                                                        
+                                                                                                                                                                                
+  Builtins cell0.vx Needs (not defined in cell0.vx itself)                                                                                                                      
+   
+  ┌────────────────────┬────────────────┬────────┐                                                                                                                              
+  │      Builtin       │ In genesis.sh? │ Status │
+  ├────────────────────┼────────────────┼────────┤                                                                                                                              
+  │ println            │ Yes            │ READY  │                                                                                                                              
+  ├────────────────────┼────────────────┼────────┤
+  │ len                │ Yes            │ READY  │
+  ├────────────────────┼────────────────┼────────┤
+  │ push               │ Yes            │ READY  │
+  ├────────────────────┼────────────────┼────────┤
+  │ mem_alloc          │ Yes            │ READY  │
+  ├────────────────────┼────────────────┼────────┤
+  │ mem_free           │ Yes            │ READY  │
+  ├────────────────────┼────────────────┼────────┤
+  │ mem_read_u8        │ Yes            │ READY  │
+  ├────────────────────┼────────────────┼────────┤
+  │ mem_write_u8       │ Yes            │ READY  │
+  ├────────────────────┼────────────────┼────────┤
+  │ syscall (6-arg)    │ Yes            │ READY  │
+  ├────────────────────┼────────────────┼────────┤
+  │ syscall1           │ Yes            │ READY  │
+  ├────────────────────┼────────────────┼────────┤
+  │ syscall2           │ Yes            │ READY  │
+  ├────────────────────┼────────────────┼────────┤
+  │ syscall3           │ Yes            │ READY  │
+  ├────────────────────┼────────────────┼────────┤
+  │ str_bytes          │ Yes            │ READY  │
+  ├────────────────────┼────────────────┼────────┤
+  │ str_from_bytes     │ Yes            │ READY  │
+  ├────────────────────┼────────────────┼────────┤
+  │ str_concat         │ Yes            │ READY  │
+  ├────────────────────┼────────────────┼────────┤
+  │ str_char_at        │ Yes            │ READY  │
+  ├────────────────────┼────────────────┼────────┤
+  │ str_substr         │ Yes            │ READY  │
+  ├────────────────────┼────────────────┼────────┤
+  │ str_is_ascii_alpha │ Yes            │ READY  │
+  ├────────────────────┼────────────────┼────────┤
+  │ str_is_ascii_digit │ Yes            │ READY  │
+  ├────────────────────┼────────────────┼────────┤
+  │ to_string          │ Yes            │ READY  │
+  ├────────────────────┼────────────────┼────────┤
+  │ int                │ Yes            │ READY  │
+  └────────────────────┴────────────────┴────────┘
+
+  Verdict: 20/20 builtins — ALL present in genesis.sh
+
+  Every external primitive that cell0.vx calls is implemented in genesis.sh. Genesis also has far more than cell0 needs — including the full Vortex hardware stack:
+
+  - Float ops: float, float_add/sub/mul/div/sqrt, float_to_int
+  - Float tensors: tensor_fadd/fsub/fmul/fdiv, tensor_fmatmul, tensor_softmax, tensor_layernorm, tensor_attention
+  - Activation functions: tensor_relu, tensor_sigmoid, tensor_tanh_f, tensor_gelu
+  - Tensor utilities: tensor_transpose, tensor_reshape, tensor_copy, tensor_fill_f, tensor_zeros, tensor_ones, tensor_rand
+  - BigInt/crypto: bigint_new/add/sub/mul/mod/modpow/gcd/modinv
+  - Gradient/training: grad_create/zero/accumulate/value/grad, adam_create/step
+  - RNG: rng_seed, rng_next, rng_float
+  - Ports/energy: port_create/write/read, energy_add/get
+  - Math: abs, min, max, pow
+
+  That's 90+ builtins in genesis.sh total. The real question isn't primitive coverage — it's whether cell0.vx actually compiles and runs through genesis.sh. Want me to test
+  that?
+
+✻ Crunched for 5m 11s              
+
+❯ We'll why wouldn't it compile ? We should implement all the builtins that cell0.vx needs and still don't have. Everything it needs to comunicate with CPU, RAM, GPU,          
+  VRAM, NETWORK, as primitives. The whole idea is facilitating things for the machine, reduce bottlenecks, overheads, memory issues, host device coms, model to model, and     
+  all AI, LLM important primitives that actual languages lack or are hard to implement. This is the foundation of the new AI era. Read the arquithecture, development plan,     
+   thinking.md and try to understand a bit more. The gap between AI and AGI and SGI, isn't hardware, is language.                                                               
+                                                                                                                                                                                
+● Read 3 files (ctrl+o to expand)                                                                                                                                               
+                                                                                                                                                                                
+❯ continue                                                                                                                                                                      
+                                                                                                                                                                                
+● I get it now. The vision is much bigger than just "does cell0.vx compile" — cell0.vx is the seed organism, and it needs every primitive a machine needs to talk directly to   
+  hardware, run AI, and communicate with other cells. The development plan still references MLIR/CUDA/PyTorch from the old Rust era — that's dead. Everything is Vortex now.    
+                                                                                                                                                                                
+  Let me map what cell0.vx currently has vs what it needs as the foundation for AGI-native computation.                                                                         
+                                                                                                                                                          
